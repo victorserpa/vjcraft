@@ -465,6 +465,28 @@ mod tests {
     }
 
     #[test]
+    fn probe_reads_codec_size_fps_and_length() {
+        let path = tmp("probe.mp4");
+        let (w, h) = (64u32, 48u32);
+        let mut r = Recorder::start_with_queue(&path, w, h, 30, 64).unwrap();
+        for _ in 0..30 {
+            assert!(r.push(vec![200u8; (w * h * 4) as usize]));
+        }
+        r.finish().unwrap();
+        let info = crate::probe(&path).expect("probe");
+        assert_eq!((info.width, info.height), (w, h));
+        assert!((info.fps - 30.0).abs() < 3.0, "{}", info.fps);
+        assert!(!info.codec.is_empty());
+        assert!(
+            info.duration > 0.5 && info.duration < 2.0,
+            "{}",
+            info.duration
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(crate::probe(&path), None);
+    }
+
+    #[test]
     fn dropping_recorder_finalizes_file() {
         let path = tmp("drop.mp4");
         let (w, h) = (64u32, 48u32);

@@ -18,6 +18,7 @@ pub mod playhead;
 pub mod shortcuts;
 pub mod slice_geom;
 pub mod timecode;
+pub mod transform;
 pub mod transition;
 
 pub use effects::EffectTarget;
@@ -27,7 +28,7 @@ use uuid::Uuid;
 use vjc_model::{
     BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId, FitMode,
     GroupId, Layer, LayerId, Param, PlayMode, Project, Source, Timecode, TimecodeCue, Track,
-    Transport, Value,
+    TransformField, Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -127,6 +128,33 @@ pub enum Command {
         column: ColumnIdx,
         pos: f64,
     },
+    /// Seeks the playing clip to a normalised file position 0..=1 (scrub bar). Runtime only.
+    SeekClip {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        pos: f64,
+    },
+    /// Sets the played region of the clip, normalised file positions with
+    /// `0 <= in_point` and `in_point + playback::MIN_REGION <= out_point <= 1`. Coalesces:
+    /// dragging a marker is one undo step.
+    SetInOut {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        in_point: f64,
+        out_point: f64,
+    },
+    /// How the clip is driven: free (both None), beat-synced (`beat_sync`) or following the
+    /// external timecode (`timecode_start`). Sets both at once so a mode switch is one undo
+    /// step; both set at once is `InvalidValue`.
+    SetClipSync {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        beat_sync: Option<f64>,
+        timecode_start: Option<Timecode>,
+    },
     /// Seeks the playing clip to cue `index`. Runtime only.
     JumpToCue {
         deck: DeckId,
@@ -161,6 +189,13 @@ pub enum Command {
     SetAnimation {
         target: AnimTarget,
         animation: Option<vjc_model::Animation>,
+    },
+    /// Sets one field of a track's transform (px / scale / degrees, clamped to its range).
+    /// Coalesces: slider drags are one undo step.
+    SetTransform {
+        target: EffectTarget,
+        field: TransformField,
+        value: f64,
     },
     /// Dashboard dial `dial` (0..8), value 0..=1 (coalesces).
     SetDashboardDial {
@@ -526,6 +561,10 @@ pub enum AnimTarget {
         column: ColumnIdx,
         param: usize,
     },
+    Transform {
+        target: EffectTarget,
+        field: TransformField,
+    },
 }
 
 /// Whose track `SetAudio` edits.
@@ -550,6 +589,7 @@ enum Target {
     Bpm,
     TimecodeCues,
     TimecodeStart(DeckId, LayerId, ColumnIdx),
+    InOut(DeckId, LayerId, ColumnIdx),
     MasterOpacity,
     MasterSpeed,
     GroupOpacity(GroupId),
@@ -559,6 +599,7 @@ enum Target {
     EffectDryWet(EffectId),
     GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
     Dial(u32),
+    Transform(EffectTarget, TransformField),
     Anim(AnimTarget),
     SliceMesh(Uuid),
     SliceMask(Uuid),
@@ -582,6 +623,12 @@ impl Command {
                 column,
                 ..
             } => Some(Target::TimecodeStart(*deck, *layer, *column)),
+            Command::SetInOut {
+                deck,
+                layer,
+                column,
+                ..
+            } => Some(Target::InOut(*deck, *layer, *column)),
             Command::SetScreenSize { screen, .. } => Some(Target::ScreenSize(*screen)),
             // Typing / dragging in the Art-Net setup emits one command per change.
             Command::SetScreenDevice { screen, .. } => Some(Target::ScreenDevice(*screen)),
@@ -592,6 +639,7 @@ impl Command {
                 Some(Target::SliceInput(*screen, *slice))
             }
             Command::SetDashboardDial { dial, .. } => Some(Target::Dial(*dial)),
+            Command::SetTransform { target, field, .. } => Some(Target::Transform(*target, *field)),
             // Dragging an animation field emits one command per frame.
             Command::SetAnimation { target, .. } => Some(Target::Anim(*target)),
             Command::SetMasterOpacity { .. } => Some(Target::MasterOpacity),
@@ -790,6 +838,9 @@ fn anim_param_mut(p: &mut Project, t: AnimTarget) -> Result<&mut Param, Error> {
                 return Err(Error::NotPlayable);
             };
             params.get_mut(param).ok_or(Error::InvalidValue)
+        }
+        AnimTarget::Transform { target, field } => {
+            Ok(effects::track_mut(p, target)?.transform.field_mut(field))
         }
     }
 }
@@ -1218,6 +1269,84 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     pos,
                 }],
             })
+        }
+        Command::SeekClip {
+            deck,
+            layer,
+            column,
+            pos,
+        } => {
+            transport_mut(p, deck, layer, column)?;
+            if !pos.is_finite() {
+                return Err(Error::InvalidValue);
+            }
+            Ok(Applied {
+                inverse: None,
+                events: vec![Event::Seek {
+                    deck,
+                    layer,
+                    column,
+                    pos: pos.clamp(0.0, 1.0),
+                }],
+            })
+        }
+        Command::SetInOut {
+            deck,
+            layer,
+            column,
+            in_point,
+            out_point,
+        } => {
+            if !(in_point.is_finite()
+                && out_point.is_finite()
+                && in_point >= 0.0
+                && out_point <= 1.0
+                && out_point - in_point >= playback::MIN_REGION)
+            {
+                return Err(Error::InvalidValue);
+            }
+            let t = transport_mut(p, deck, layer, column)?;
+            let prev = (t.in_point, t.out_point);
+            (t.in_point, t.out_point) = (in_point, out_point);
+            undoable(
+                Command::SetInOut {
+                    deck,
+                    layer,
+                    column,
+                    in_point: prev.0,
+                    out_point: prev.1,
+                },
+                vec![],
+            )
+        }
+        Command::SetClipSync {
+            deck,
+            layer,
+            column,
+            beat_sync,
+            timecode_start,
+        } => {
+            if beat_sync.is_some() && timecode_start.is_some()
+                || beat_sync.is_some_and(|b| !b.is_finite() || b <= 0.0)
+                || timecode_start.is_some_and(|t| !timecode::is_valid(&t))
+            {
+                return Err(Error::InvalidValue);
+            }
+            let t = transport_mut(p, deck, layer, column)?;
+            let prev = (
+                std::mem::replace(&mut t.beat_sync, beat_sync),
+                std::mem::replace(&mut t.timecode_start, timecode_start),
+            );
+            undoable(
+                Command::SetClipSync {
+                    deck,
+                    layer,
+                    column,
+                    beat_sync: prev.0,
+                    timecode_start: prev.1,
+                },
+                vec![],
+            )
         }
         Command::ClearAll => Ok(Applied {
             inverse: None,
@@ -2104,6 +2233,26 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetTransform {
+            target,
+            field,
+            value,
+        } => {
+            if !value.is_finite() {
+                return Err(Error::InvalidValue);
+            }
+            let slot = effects::track_mut(p, target)?.transform.field_mut(field);
+            let prev = number(&slot.value);
+            slot.set_number(value);
+            undoable(
+                Command::SetTransform {
+                    target,
+                    field,
+                    value: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetDashboardDial { dial, value } => {
             if dial as usize >= anim::DIALS || !value.is_finite() {
                 return Err(Error::InvalidValue);
@@ -2862,6 +3011,193 @@ mod tests {
             value: 0.0,
         };
         assert!(apply(&mut p, bad).is_err());
+    }
+
+    #[test]
+    fn transform_sets_clamps_coalesces_animates_and_undoes() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let targets = [
+            EffectTarget::Master,
+            EffectTarget::Layer(l),
+            EffectTarget::Clip {
+                deck: A,
+                layer: l,
+                column: 0,
+            },
+        ];
+        let read = |p: &mut Project, target, field| {
+            let tr = effects::track_mut(p, target).unwrap();
+            number(&tr.transform.field(field).value)
+        };
+        for target in targets {
+            let set = |field, value| Command::SetTransform {
+                target,
+                field,
+                value,
+            };
+            roundtrip(&mut p, set(TransformField::X, 120.0));
+            roundtrip(&mut p, set(TransformField::Rotation, 45.0));
+            assert_eq!(
+                apply(&mut p, set(TransformField::Y, f64::NAN)),
+                Err(Error::InvalidValue)
+            );
+            apply(&mut p, set(TransformField::Scale, 99.0)).unwrap();
+            assert_eq!(
+                read(&mut p, target, TransformField::Scale),
+                vjc_model::TRANSFORM_SCALE_MAX
+            );
+            let anim = |a| Command::SetAnimation {
+                target: AnimTarget::Transform {
+                    target,
+                    field: TransformField::X,
+                },
+                animation: a,
+            };
+            roundtrip(
+                &mut p,
+                anim(Some(vjc_model::Animation::Beats {
+                    beats: 4.0,
+                    curve: vjc_model::Curve::Sine,
+                })),
+            );
+        }
+        let bad = Command::SetTransform {
+            target: EffectTarget::Clip {
+                deck: A,
+                layer: l,
+                column: 3,
+            },
+            field: TransformField::X,
+            value: 0.0,
+        };
+        assert!(apply(&mut p, bad).is_err());
+        // A drag is one undo step.
+        let set = |v| Command::SetTransform {
+            target: EffectTarget::Layer(l),
+            field: TransformField::Y,
+            value: v,
+        };
+        let mut h = History::new();
+        h.exec(&mut p, set(10.0), t).unwrap();
+        h.exec(&mut p, set(30.0), t).unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(read(&mut p, EffectTarget::Layer(l), TransformField::Y), 0.0);
+    }
+
+    #[test]
+    fn in_out_validates_coalesces_and_undoes() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let before = p.clone();
+        let set = |a, b| Command::SetInOut {
+            deck: A,
+            layer: l,
+            column: 0,
+            in_point: a,
+            out_point: b,
+        };
+        let region = |p: &Project| {
+            let t = clip(p, l).unwrap().transport;
+            (t.in_point, t.out_point)
+        };
+        for (a, b) in [
+            (0.6, 0.2),
+            (0.5, 0.5),
+            (-0.1, 0.5),
+            (0.1, 1.2),
+            (f64::NAN, 0.5),
+            (0.1, f64::INFINITY),
+        ] {
+            assert_eq!(
+                apply(&mut p, set(a, b)),
+                Err(Error::InvalidValue),
+                "{a} {b}"
+            );
+        }
+        assert_eq!(region(&p), (0.0, 1.0));
+        // A marker drag is one undo step.
+        h.exec(&mut p, set(0.1, 1.0), t).unwrap();
+        h.exec(&mut p, set(0.2, 1.0), t).unwrap();
+        h.exec(&mut p, set(0.2, 0.7), t).unwrap();
+        assert_eq!(region(&p), (0.2, 0.7));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(region(&p), (0.2, 0.7));
+        let missing = Command::SetInOut {
+            deck: A,
+            layer: l,
+            column: 3,
+            in_point: 0.1,
+            out_point: 0.5,
+        };
+        assert!(apply(&mut p, missing).is_err());
+    }
+
+    #[test]
+    fn clip_sync_switches_mode_in_one_undo_step() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let before = p.clone();
+        let sync = |beat_sync, timecode_start| Command::SetClipSync {
+            deck: A,
+            layer: l,
+            column: 0,
+            beat_sync,
+            timecode_start,
+        };
+        let tc = Timecode::new(0, 1, 0, 0, vjc_model::TcFps::F25);
+        h.exec(&mut p, sync(Some(4.0), None), t).unwrap();
+        assert_eq!(clip(&p, l).unwrap().transport.beat_sync, Some(4.0));
+        h.exec(&mut p, sync(None, Some(tc)), t).unwrap();
+        let tr = clip(&p, l).unwrap().transport;
+        assert_eq!((tr.beat_sync, tr.timecode_start), (None, Some(tc)));
+        h.undo(&mut p).unwrap().unwrap();
+        let tr = clip(&p, l).unwrap().transport;
+        assert_eq!((tr.beat_sync, tr.timecode_start), (Some(4.0), None));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        // Both at once, a non positive beat count and a bad timecode are refused.
+        assert_eq!(
+            apply(&mut p, sync(Some(4.0), Some(tc))),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(
+            apply(&mut p, sync(Some(0.0), None)),
+            Err(Error::InvalidValue)
+        );
+        let bad = Timecode::new(0, 99, 0, 0, vjc_model::TcFps::F25);
+        assert_eq!(
+            apply(&mut p, sync(None, Some(bad))),
+            Err(Error::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn seek_clip_is_a_runtime_event() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let seek = |pos| Command::SeekClip {
+            deck: A,
+            layer: l,
+            column: 0,
+            pos,
+        };
+        let before = p.clone();
+        let a = apply(&mut p, seek(1.7)).unwrap();
+        assert_eq!(a.inverse, None);
+        assert!(matches!(a.events[..], [Event::Seek { pos, .. }] if pos == 1.0));
+        assert_eq!(apply(&mut p, seek(f64::NAN)), Err(Error::InvalidValue));
+        assert_eq!(p, before);
     }
 
     #[test]

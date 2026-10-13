@@ -7,7 +7,8 @@ use super::{Applied, Command, Error, number, undoable};
 use std::time::Instant;
 use uuid::Uuid;
 use vjc_model::{
-    ColumnIdx, ControlSource, DeckId, Effect, LayerId, Project, Shortcut, ShortcutMode, Value,
+    ColumnIdx, ControlSource, DeckId, Effect, LayerId, Project, Shortcut, ShortcutMode,
+    TransformField, Value,
 };
 
 /// Runtime state `resolve` needs and the project does not hold.
@@ -57,6 +58,61 @@ pub fn effect_address(
         } => (active == Some((deck, column)))
             .then(|| layer_address(p, layer, &format!("clip/effect/{}/{tail}", k + 1)))?,
     }
+}
+
+/// Transform addresses: "/comp/transform/F" (composition), "/comp/layer/N/transform/F" and
+/// "/comp/layer/N/clip/transform/F" (clip playing on the layer); F is a
+/// `TransformField::address`. Values are normalized 0..1 over the field's range.
+pub fn transform_address(
+    p: &Project,
+    target: EffectTarget,
+    field: TransformField,
+    active: Option<(DeckId, ColumnIdx)>,
+) -> Option<String> {
+    let tail = format!("transform/{}", field.address());
+    match target {
+        EffectTarget::Master => Some(format!("/comp/{tail}")),
+        EffectTarget::Layer(l) => layer_address(p, l, &tail),
+        EffectTarget::Group(_) => None,
+        EffectTarget::Clip {
+            deck,
+            layer,
+            column,
+        } => (active == Some((deck, column)))
+            .then(|| layer_address(p, layer, &format!("clip/{tail}")))?,
+    }
+}
+
+/// Outer None: not a transform address; inner None: one that points at nothing.
+fn parse_tf(
+    p: &Project,
+    ctx: &Ctx,
+    parts: &[&str],
+) -> Option<Option<(EffectTarget, TransformField)>> {
+    let (scope, f): (Option<EffectTarget>, &str) = match parts {
+        ["comp", "transform", f] => (Some(EffectTarget::Master), f),
+        ["comp", "layer", n, "transform", f] => (
+            number_of(n)
+                .and_then(|n| layer_by_number(p, n))
+                .map(EffectTarget::Layer),
+            f,
+        ),
+        ["comp", "layer", n, "clip", "transform", f] => (
+            number_of(n)
+                .and_then(|n| layer_by_number(p, n))
+                .and_then(|layer| {
+                    let (_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+                    Some(EffectTarget::Clip {
+                        deck: *deck,
+                        layer,
+                        column: *column,
+                    })
+                }),
+            f,
+        ),
+        _ => return None,
+    };
+    Some(scope.zip(TransformField::from_address(f)))
 }
 
 enum FxTail<'a> {
@@ -312,6 +368,7 @@ pub fn is_continuous(address: &str) -> bool {
     address.ends_with("/opacity")
         || address.ends_with("/speed")
         || address.ends_with("/drywet")
+        || address.contains("/transform/")
         || (address.contains("/effect/") && address.contains("/param/"))
 }
 
@@ -358,6 +415,10 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
     let parts: Vec<&str> = address.trim_start_matches('/').split('/').collect();
     if let Some(r) = fx_current(p, ctx, &parts) {
         return r;
+    }
+    if let Some(r) = parse_tf(p, ctx, &parts) {
+        let (t, f) = r?;
+        return param_norm(effects::track(p, t)?.transform.field(f));
     }
     match parts.as_slice() {
         ["comp", "layer", n, "opacity"] => {
@@ -408,6 +469,19 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
     let fire = value > 0.0;
     if let Some(r) = fx_resolve(p, ctx, &parts, value) {
         return r;
+    }
+    if let Some(r) = parse_tf(p, ctx, &parts) {
+        let (target, field) = r?;
+        let Value::Number(v) =
+            param_value(effects::track(p, target)?.transform.field(field), value)?
+        else {
+            return None;
+        };
+        return Some(Command::SetTransform {
+            target,
+            field,
+            value: v,
+        });
     }
     match parts.as_slice() {
         ["comp", "layer", n, "clip", m, "connect"] => {
@@ -783,5 +857,63 @@ mod effect_id_tests {
         };
         h.exec(&mut p, mv, Instant::now()).unwrap();
         assert_eq!(p.shortcuts[0].target, "/comp/effect/1/drywet");
+    }
+
+    #[test]
+    fn transform_addresses_resolve_and_read_back() {
+        let mut p = Project::new("t");
+        let layer = Uuid::new_v4();
+        p.composition.layers.push(vjc_model::Layer {
+            id: layer,
+            name: "L1".into(),
+            track: vjc_model::Track::new(vjc_model::BlendMode::Normal),
+            solo: false,
+            bypass: false,
+            transition: vjc_model::Transition {
+                kind: "Cut".into(),
+                duration_beats: None,
+                duration_secs: 0.0,
+            },
+            autopilot: Default::default(),
+            crossfader_bus: None,
+            group: None,
+        });
+        let ctx = Ctx::new(None, false);
+        // 0.75 over -16384..16384 px.
+        let cmd = resolve_with(&p, &ctx, "/comp/layer/1/transform/x", 0.75).unwrap();
+        let Command::SetTransform {
+            target,
+            field,
+            value,
+        } = cmd
+        else {
+            panic!("not a transform command");
+        };
+        assert_eq!(target, EffectTarget::Layer(layer));
+        assert_eq!(field, TransformField::X);
+        assert!((value - 8192.0).abs() < 1e-6);
+        crate::apply(&mut p, cmd_of(target, field, value)).unwrap();
+        let back = current(&p, &ctx, "/comp/layer/1/transform/x").unwrap();
+        assert!((back - 0.75).abs() < 1e-9);
+        assert!(matches!(
+            resolve_with(&p, &ctx, "/comp/transform/rotation", 0.5),
+            Some(Command::SetTransform {
+                target: EffectTarget::Master,
+                ..
+            })
+        ));
+        // Unknown field, unknown layer and a clip that is not playing resolve to nothing.
+        assert!(resolve_with(&p, &ctx, "/comp/transform/skew", 0.5).is_none());
+        assert!(resolve_with(&p, &ctx, "/comp/layer/9/transform/x", 0.5).is_none());
+        assert!(resolve_with(&p, &ctx, "/comp/layer/1/clip/transform/x", 0.5).is_none());
+        assert!(is_continuous("/comp/layer/1/transform/scale"));
+    }
+
+    fn cmd_of(target: EffectTarget, field: TransformField, value: f64) -> Command {
+        Command::SetTransform {
+            target,
+            field,
+            value,
+        }
     }
 }

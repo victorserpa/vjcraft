@@ -480,6 +480,33 @@ mod tests {
     }
 
     #[test]
+    fn open_project_saved_before_transform_gets_identity() {
+        use vjc_model::Transform;
+        let d = tmp("transform");
+        let f = d.join("p.vjc");
+        let mut p = Project::new("old");
+        p.composition.master.transform.x.set_number(50.0);
+        save(&p, &f).unwrap();
+        // Strip every "transform" key like a file written by an older version.
+        fn strip(v: &mut Value) {
+            match v {
+                Value::Object(m) => {
+                    m.remove("transform");
+                    m.values_mut().for_each(strip);
+                }
+                Value::Array(a) => a.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let mut raw: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        strip(&mut raw);
+        assert!(!raw.to_string().contains("\"transform\""));
+        std::fs::write(&f, raw.to_string()).unwrap();
+        let (back, _) = open(&f).unwrap();
+        assert_eq!(back.composition.master.transform, Transform::default());
+    }
+
+    #[test]
     fn open_clamps_out_of_range_composition_values_with_a_warning() {
         let d = tmp("range");
         let f = d.join("p.vjc");

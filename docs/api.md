@@ -30,6 +30,11 @@ Same space as OSC and shortcuts: `/comp/layer/1/opacity`, `/comp/master/opacity`
 columns and clips from 1. Values are normalized (0..1) except `bpm`. Changes go through the
 same commands as the UI, so they are undoable and mark the project as modified (triggers do not).
 
+Transform: `/comp/transform/F` (composition), `/comp/layer/N/transform/F` and
+`/comp/layer/N/clip/transform/F` (clip playing on the layer), with F one of `x`, `y`, `scale`,
+`scale_w`, `scale_h`, `rotation`, `anchor_x`, `anchor_y`. Values are normalized over the field's
+range (position and anchor +-16384 px, scale 0..10, rotation +-360 degrees).
+
 ## REST
 
 Errors: 4xx/5xx with `{"error": "..."}` (400 malformed, 404 unknown route/address, 405 method,

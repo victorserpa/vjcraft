@@ -56,7 +56,7 @@ pub fn param_slider(
     default: f64,
     range: (f64, f64),
 ) -> Option<f64> {
-    slider_inner(ui, id, label, value, default, range, None).0
+    slider_inner(ui, id, label, value, default, range, None, None).0
 }
 
 /// Like `param_slider` plus the "~" animation button. `value` is the effective (animated)
@@ -70,7 +70,22 @@ pub fn param_slider_anim(
     range: (f64, f64),
     anim: &Option<Animation>,
 ) -> (Option<f64>, Option<Option<Animation>>) {
-    slider_inner(ui, id, label, value, default, range, Some(anim))
+    slider_inner(ui, id, label, value, default, range, Some(anim), None)
+}
+
+/// Like `param_slider_anim`, with the -/+ buttons stepping by `step` instead of 1% of the range.
+#[allow(clippy::too_many_arguments)]
+pub fn param_slider_anim_step(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    value: f64,
+    default: f64,
+    range: (f64, f64),
+    step: f64,
+    anim: &Option<Animation>,
+) -> (Option<f64>, Option<Option<Animation>>) {
+    slider_inner(ui, id, label, value, default, range, Some(anim), Some(step))
 }
 
 /// Short name of the animation kind, "Off" for none.
@@ -209,6 +224,7 @@ fn anim_menu(
     changed.then_some(a)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slider_inner(
     ui: &mut egui::Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
@@ -217,6 +233,7 @@ fn slider_inner(
     default: f64,
     range: (f64, f64),
     anim: Option<&Option<Animation>>,
+    step: Option<f64>,
 ) -> (Option<f64>, Option<Option<Animation>>) {
     let id = ui.id().with(id);
     let mut out = None;
@@ -254,7 +271,7 @@ fn slider_inner(
                 ui.data_mut(|d| d.insert_temp(id, format_value(value)));
             }
         }
-        let step = (range.1 - range.0) / 100.0;
+        let step = step.unwrap_or((range.1 - range.0) / 100.0);
         for (txt, name, sign) in [("-", "Decrease", -1.0), ("+", "Increase", 1.0)] {
             let b = ui.small_button(txt);
             b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));

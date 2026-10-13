@@ -43,6 +43,13 @@ pub const MONITOR_BG: Color32 = Color32::BLACK;
 pub const PROP_VALUE_W: f32 = 56.0;
 pub const SECTION_HEAD: Color32 = Color32::from_rgb(150, 160, 178);
 
+/// Clip scrub bar: height, marker grab distance (px) and the shade over the part outside in..out.
+pub const SCRUB_H: f32 = 22.0;
+pub const SCRUB_GRAB: f32 = 8.0;
+/// Kept free at the right of the bar so the panel's scroll bar never covers the Out marker.
+pub const SCRUB_MARGIN: f32 = 16.0;
+pub const SCRUB_OUTSIDE: Color32 = Color32::from_black_alpha(150);
+
 /// Effect chain rows.
 pub const FX_SLIDER_W: f32 = 120.0;
 pub const FX_BTN: Vec2 = vec2(22.0, 20.0);

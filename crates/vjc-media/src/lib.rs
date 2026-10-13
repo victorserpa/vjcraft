@@ -334,6 +334,48 @@ pub(crate) fn frame_to_rgba(
     })
 }
 
+/// What a video file is, read from its container without decoding a frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceInfo {
+    /// Codec short name as FFmpeg knows it ("h264", "hap", "prores"...).
+    pub codec: String,
+    /// Frame size in px; 0 x 0 when the decoder could not be opened.
+    pub width: u32,
+    pub height: u32,
+    /// Average frame rate; 0 when the container does not say.
+    pub fps: f64,
+    /// Length of the file in seconds; 0 when unknown.
+    pub duration: f64,
+}
+
+/// Reads codec, size, frame rate and length of a video file. Blocks on file I/O: call it
+/// off the UI thread. None when the file cannot be opened or has no video stream.
+pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
+    ff::init().ok()?;
+    let ictx = ff::format::input(&path).ok()?;
+    let st = ictx.streams().best(ff::media::Type::Video)?;
+    let r = st.avg_frame_rate();
+    let fps = if r.denominator() != 0 && r.numerator() != 0 {
+        r.numerator() as f64 / r.denominator() as f64
+    } else {
+        0.0
+    };
+    let params = st.parameters();
+    let codec = params.id().name().to_string();
+    let (width, height) = ff::codec::context::Context::from_parameters(params)
+        .ok()
+        .and_then(|c| c.decoder().video().ok())
+        .map_or((0, 0), |d| (d.width(), d.height()));
+    let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
+    Some(SourceInfo {
+        codec,
+        width,
+        height,
+        fps,
+        duration,
+    })
+}
+
 /// Sequential decoder with seek, no pacing. Frames come out with their pts in seconds.
 struct Scrubber {
     ictx: ff::format::context::Input,

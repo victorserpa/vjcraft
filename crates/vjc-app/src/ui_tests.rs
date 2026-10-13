@@ -487,6 +487,12 @@ fn clip_panel_has_collapsible_sections() {
         }
     }
     assert!(has_text(&h, "Volume") && has_text(&h, "Pan"));
+    // Fold the clip panel's Transform rows (the rightmost header) so Audio stays on screen.
+    h.get_all_by_label("- Transform")
+        .max_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .unwrap()
+        .click();
+    settle(&mut h);
     click(&mut h, "- Audio");
     assert!(has_text(&h, "+ Audio"));
     assert!(!has_text(&h, "Volume"), "collapsed section hides its rows");
@@ -519,6 +525,216 @@ fn layer_audio_section_edits_volume() {
         .find(|l| l.id == lid)
         .unwrap();
     assert_eq!(l.track.volume.value, vjc_model::Value::Number(1.0));
+}
+
+#[test]
+fn transform_sections_show_values_and_follow_undo() {
+    use vjc_core::EffectTarget;
+    use vjc_model::TransformField;
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    for tab in ["Layer", "Composition"] {
+        click(&mut h, tab);
+        assert!(has_text(&h, "- Transform"), "Transform section in {tab}");
+        for row in ["Position X", "Position Y", "Scale", "Rotation", "Anchor X"] {
+            assert!(exists(&h, row), "{row} row in {tab}");
+        }
+    }
+    click(&mut h, "Layer");
+    let target = EffectTarget::Layer(lid);
+    h.state_mut().exec(Command::SetTransform {
+        target,
+        field: TransformField::X,
+        value: 321.0,
+    });
+    settle(&mut h);
+    assert!(has_text(&h, "321"), "the new position is shown");
+    h.state_mut().undo();
+    settle(&mut h);
+    assert!(!has_text(&h, "321"), "undo restores the position");
+    let tf = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, lid, 1)
+            .unwrap()
+            .track
+            .transform
+            .clone()
+    };
+    assert_eq!(tf(&h), vjc_model::Transform::default());
+    // Collapsing one of the two sections (tab and clip panel) hides its rows.
+    let rows = all(&h, "Position X");
+    assert_eq!(rows, 2);
+    h.get_all_by_label("- Transform").next().unwrap().click();
+    settle(&mut h);
+    assert_eq!(all(&h, "Position X"), 1);
+}
+
+/// A file clip (10 s, 1920x1080 h264 at 25 fps once "probed") in layer 0 / column 0, selected.
+fn file_clip(h: &mut Harness<'_, State>) -> (LayerId, DeckId) {
+    let st = h.state_mut();
+    let lid = st.project.composition.layers[0].id;
+    let deck = st.project.composition.current_deck;
+    let path = PathBuf::from("/media/loops/clip.mov");
+    let mut clip = vjc_core::clip_from_path(path.clone());
+    clip.name = "clip".into();
+    st.project.composition.decks[0]
+        .clips
+        .push(vjc_model::CellClip {
+            layer: lid,
+            column: 0,
+            clip,
+        });
+    st.src_info.set(
+        &path,
+        Some(vjc_media::SourceInfo {
+            codec: "h264".into(),
+            width: 1920,
+            height: 1080,
+            fps: 25.0,
+            duration: 10.0,
+        }),
+    );
+    st.selected = Some((lid, 0));
+    settle(h);
+    (lid, deck)
+}
+
+/// Opens the combo showing `shown` and picks `option`.
+fn pick(h: &mut Harness<'_, State>, shown: &str, option: &str) {
+    let combo = h
+        .query_all_by_role(egui::accesskit::Role::ComboBox)
+        .find(|n| n.value().as_deref() == Some(shown))
+        .unwrap_or_else(|| panic!("combo showing {shown}"));
+    combo.scroll_to_me();
+    settle(h);
+    h.query_all_by_role(egui::accesskit::Role::ComboBox)
+        .find(|n| n.value().as_deref() == Some(shown))
+        .unwrap()
+        .click();
+    settle(h);
+    click(h, option);
+}
+
+fn transport_of(h: &Harness<'_, State>, lid: LayerId, deck: DeckId) -> vjc_model::Transport {
+    vjc_core::clip_in(&h.state().project, deck, lid, 0)
+        .unwrap()
+        .transport
+        .clone()
+}
+
+fn scrub_rect(h: &mut Harness<'_, State>) -> egui::Rect {
+    h.get_by_label("Scrub bar").scroll_to_me();
+    settle(h);
+    h.get_by_label("Scrub bar").rect()
+}
+
+#[test]
+fn clip_panel_shows_file_codec_size_and_fps() {
+    let mut h = app();
+    file_clip(&mut h);
+    assert!(
+        exists(&h, "clip.mov  h264  1920x1080  25 fps"),
+        "source info line"
+    );
+}
+
+#[test]
+fn scrub_bar_drags_in_and_out_markers() {
+    let mut h = app();
+    let (lid, deck) = file_clip(&mut h);
+    let r = scrub_rect(&mut h);
+    let y = r.center().y;
+    // Grab the In marker (at the left edge) and drag it to a quarter of the bar.
+    drag(
+        &mut h,
+        egui::pos2(r.left() + 2.0, y),
+        egui::pos2(r.left() + r.width() * 0.25, y),
+    );
+    let t = transport_of(&h, lid, deck);
+    assert!((t.in_point - 0.25).abs() < 0.03, "in {}", t.in_point);
+    assert_eq!(t.out_point, 1.0);
+    // The Out marker, from the right edge to three quarters.
+    drag(
+        &mut h,
+        egui::pos2(r.right() - 2.0, y),
+        egui::pos2(r.left() + r.width() * 0.75, y),
+    );
+    let t = transport_of(&h, lid, deck);
+    assert!((t.out_point - 0.75).abs() < 0.03, "out {}", t.out_point);
+    assert!((t.in_point - 0.25).abs() < 0.03, "in kept {}", t.in_point);
+    // Dragging the In marker past Out stops short of it.
+    let r = scrub_rect(&mut h);
+    let x_in = r.left() + r.width() * t.in_point as f32;
+    drag(&mut h, egui::pos2(x_in, y), egui::pos2(r.right() - 1.0, y));
+    let t = transport_of(&h, lid, deck);
+    assert!(t.in_point < t.out_point, "{} {}", t.in_point, t.out_point);
+    // Undo restores the untouched region (drags within the coalescing window merge, so a
+    // marker drag never takes more than one step per drag).
+    let region = |h: &Harness<'_, State>| {
+        let t = transport_of(h, lid, deck);
+        (t.in_point, t.out_point)
+    };
+    for _ in 0..3 {
+        h.state_mut().undo();
+    }
+    assert_eq!(region(&h), (0.0, 1.0));
+    h.state_mut().redo();
+    assert_ne!(region(&h), (0.0, 1.0), "redo reapplies the drag");
+}
+
+#[test]
+fn duration_buttons_change_the_speed_and_undo() {
+    let mut h = app();
+    let (lid, deck) = file_clip(&mut h);
+    let speed = |h: &Harness<'_, State>| transport_of(h, lid, deck).speed;
+    assert_eq!(speed(&h), 1.0);
+    h.get_by_label("Halve duration").scroll_to_me();
+    click(&mut h, "Halve duration");
+    assert_eq!(speed(&h), 2.0, "half the duration, twice the speed");
+    click(&mut h, "Double duration");
+    assert_eq!(speed(&h), 1.0);
+    click(&mut h, "Double duration");
+    assert_eq!(speed(&h), 0.5);
+    click(&mut h, "Duration shorter");
+    assert!((speed(&h) - 10.0 / 19.9).abs() < 1e-9, "{}", speed(&h));
+    click(&mut h, "Duration longer");
+    assert!((speed(&h) - 0.5).abs() < 1e-9);
+    h.state_mut().undo();
+    h.state_mut().undo();
+    assert_eq!(speed(&h), 1.0);
+    // The in..out region counts: half the file at speed 1 lasts 5 s, so halving it doubles.
+    h.state_mut().exec(Command::SetInOut {
+        deck,
+        layer: lid,
+        column: 0,
+        in_point: 0.0,
+        out_point: 0.5,
+    });
+    settle(&mut h);
+    click(&mut h, "Halve duration");
+    assert_eq!(speed(&h), 2.0);
+}
+
+#[test]
+fn transport_mode_dropdown_drives_beat_sync_and_timecode() {
+    let mut h = app();
+    let (lid, deck) = file_clip(&mut h);
+    let t = |h: &Harness<'_, State>| transport_of(h, lid, deck);
+    assert_eq!(TransportMode::of(&t(&h)), TransportMode::Timeline);
+    assert!(!exists(&h, "Beat sync"), "beat sync only in BPM sync mode");
+    pick(&mut h, "Timeline", "BPM sync");
+    assert_eq!(t(&h).beat_sync, Some(4.0));
+    assert!(exists(&h, "Beat sync"));
+    pick(&mut h, "BPM sync", "Timecode");
+    let tr = t(&h);
+    assert_eq!((tr.beat_sync, tr.timecode_start.is_some()), (None, true));
+    assert!(exists(&h, "Start"), "timecode start row");
+    // One undo step per mode switch.
+    h.state_mut().undo();
+    assert_eq!(t(&h).beat_sync, Some(4.0));
+    assert!(t(&h).timecode_start.is_none());
+    h.state_mut().undo();
+    assert_eq!(TransportMode::of(&t(&h)), TransportMode::Timeline);
 }
 
 #[test]

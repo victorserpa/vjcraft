@@ -5,6 +5,7 @@
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use vjc_core::blend::shader_id;
+pub use vjc_core::transform::Affine;
 use vjc_model::{BlendMode, FitMode, GroupId, LayerId, SliceSource};
 
 use crate::ml_gpu::MlStore;
@@ -32,7 +33,9 @@ const SHADER: &str = r#"
 // mode = index into vjc_core::blend::COMPOSITION_MODES.
 // tkind/prog/out: layer transition (see vjc_core::transition::Kind::shader_id); out = 1 for
 // the outgoing clip, which is drawn first. tkind 0 = none.
-struct U { opacity: f32, mode: u32, scale: vec2<f32>, prog: f32, tkind: u32, out: u32, pad: u32 };
+// m/t: inverse transform, output px (centred on the frame, y down) -> picture px:
+// c = M * p + t.xy, with t.zw = frame size in px. t.z == 0 means no transform.
+struct U { opacity: f32, mode: u32, scale: vec2<f32>, prog: f32, tkind: u32, out: u32, pad: u32, m: vec4<f32>, t: vec4<f32> };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var smp: sampler;
@@ -109,6 +112,11 @@ fn channel(id: u32, cb: f32, cs: f32) -> f32 {
 fn fs(in: VO) -> @location(0) vec4<f32> {
     // Map frame uv to video uv; outside the video is letterbox (discard keeps the base).
     var q = (in.uv - vec2(0.5)) / u.scale + vec2(0.5);
+    if (u.t.z > 0.0) {
+        let p0 = (in.uv - vec2(0.5)) * u.t.zw;
+        let c = vec2(u.m.x * p0.x + u.m.y * p0.y, u.m.z * p0.x + u.m.w * p0.y) + u.t.xy;
+        q = c / (u.t.zw * u.scale) + vec2(0.5);
+    }
     var tmix = 1.0;
     var tblack = 0.0;
     let p = u.prog;
@@ -177,6 +185,23 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     return vec4((rgb * a + b.rgb * b.a * (1.0 - a)) / oa, oa);
 }
 "#;
+
+/// The 16 uniform words of a layer pass: the 8 base words, then the inverse transform
+/// (`m`, then `t.xy` and the frame size). An identity transform leaves the last four zero,
+/// which the shader reads as "no transform" (the exact pre-transform mapping).
+fn uniform_words(base: [u32; 8], xf: &Affine, size: (u32, u32)) -> [u32; 16] {
+    let mut w = [0u32; 16];
+    w[..8].copy_from_slice(&base);
+    if !xf.is_identity() {
+        let f = |v: f64| (v as f32).to_bits();
+        w[8..12].copy_from_slice(&xf.m.map(f));
+        w[12] = f(xf.t[0]);
+        w[13] = f(xf.t[1]);
+        w[14] = (size.0.max(1) as f32).to_bits();
+        w[15] = (size.1.max(1) as f32).to_bits();
+    }
+    w
+}
 
 /// Vertex stage shared by all effect fragment shaders. `uv` is ISF-style (origin bottom-left).
 const FX_VS: &str = r#"
@@ -544,6 +569,9 @@ pub struct LayerDraw<'a> {
     /// Layer transition: `(shader id, progress 0..1, outgoing)`. The outgoing source is a
     /// second `LayerDraw` (own `id`) placed right below the incoming one.
     pub transition: Option<(u32, f32, bool)>,
+    /// Clip then layer transform (output px -> picture px), applied when mapping the picture
+    /// into the frame, after the effects of the layer.
+    pub transform: Affine,
 }
 
 /// A layer group: `len` consecutive entries of the layer list (bottom to top) from `start`
@@ -598,6 +626,11 @@ pub struct Compositor {
     /// in use are kept).
     routed: HashMap<SliceSource, (wgpu::Texture, wgpu::TextureView)>,
     fx: Fx,
+    /// Copy of the composition and its uniform / bind group, for the composition transform.
+    xf: Option<(wgpu::Texture, wgpu::Buffer, wgpu::BindGroup)>,
+    /// Composition transform, applied to the finished stack before the master effects.
+    /// Set by the caller before each render.
+    pub master_transform: Affine,
     pub target: wgpu::Texture,
     pub target_view: wgpu::TextureView,
     pub size: (u32, u32),
@@ -803,7 +836,7 @@ impl Compositor {
         });
         let fade_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fade_u"),
-            size: 32,
+            size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -933,6 +966,8 @@ impl Compositor {
             group: None,
             routed: HashMap::new(),
             fx,
+            xf: None,
+            master_transform: Affine::IDENTITY,
             target,
             target_view,
             size: (w, h),
@@ -1123,7 +1158,7 @@ impl Compositor {
             gb.uniforms
                 .push(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("group_u"),
-                    size: 32,
+                    size: 64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
@@ -1313,7 +1348,7 @@ impl Compositor {
                 });
                 let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("layer_u"),
-                    size: 32,
+                    size: 64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -1377,16 +1412,20 @@ impl Compositor {
             queue.write_buffer(
                 &slot.uniform,
                 0,
-                bytemuck::bytes_of(&[
-                    l.opacity.to_bits(),
-                    shader_id(&l.blend),
-                    sx.to_bits(),
-                    sy.to_bits(),
-                    l.transition.map_or(0.0f32, |t| t.1).to_bits(),
-                    l.transition.map_or(0, |t| t.0),
-                    u32::from(l.transition.is_some_and(|t| t.2)),
-                    0u32,
-                ]),
+                bytemuck::bytes_of(&uniform_words(
+                    [
+                        l.opacity.to_bits(),
+                        shader_id(&l.blend),
+                        sx.to_bits(),
+                        sy.to_bits(),
+                        l.transition.map_or(0.0f32, |t| t.1).to_bits(),
+                        l.transition.map_or(0, |t| t.0),
+                        u32::from(l.transition.is_some_and(|t| t.2)),
+                        0u32,
+                    ],
+                    &l.transform,
+                    self.size,
+                )),
             );
         }
 
@@ -1438,6 +1477,9 @@ impl Compositor {
                 );
                 i += 1;
             }
+        }
+        if !self.master_transform.is_identity() {
+            self.transform_pass(device, queue, &mut enc, extent);
         }
         if let Some(i) = self.fx.run(
             device,
@@ -1498,6 +1540,120 @@ impl Compositor {
         self.fx.scratch.retain(|k, _| used.contains(k));
         queue.submit(Some(enc.finish()));
         self.fx.ml.dispatch(device, queue);
+    }
+
+    /// Redraws the finished composition through `master_transform` onto black.
+    fn transform_pass(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        extent: wgpu::Extent3d,
+    ) {
+        let size = (extent.width, extent.height);
+        if self
+            .xf
+            .as_ref()
+            .is_none_or(|x| (x.0.width(), x.0.height()) != size)
+        {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("composition_xf"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("composition_xf_u"),
+                size: 64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let view = tex.create_view(&Default::default());
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("composition_xf_bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.xf = Some((tex, buf, bind));
+        }
+        let (tex, buf, bind) = self.xf.as_ref().unwrap();
+        queue.write_buffer(
+            buf,
+            0,
+            bytemuck::bytes_of(&uniform_words(
+                [
+                    1.0f32.to_bits(),
+                    shader_id(&BlendMode::Normal),
+                    1.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                    0,
+                    0,
+                    0,
+                ],
+                &self.master_transform,
+                self.size,
+            )),
+        );
+        enc.copy_texture_to_texture(self.target.as_image_copy(), tex.as_image_copy(), extent);
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("xf_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        }));
+        enc.copy_texture_to_texture(
+            self.target.as_image_copy(),
+            self.base.as_image_copy(),
+            extent,
+        );
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("composition_xf"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_bind_group(1, &self.base_bind, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// Blends the black master fade (set up by `render_routed`) over the current target.
@@ -1660,6 +1816,7 @@ mod tests {
                     frame: Some((4, 4, &bd, 1)),
                     generator: None,
                     transition: None,
+                    transform: Affine::IDENTITY,
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(2),
@@ -1670,6 +1827,7 @@ mod tests {
                     frame: Some((4, 4, &sd, 1)),
                     generator: None,
                     transition: None,
+                    transform: Affine::IDENTITY,
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -1735,6 +1893,7 @@ mod tests {
             frame: Some((1, 1, px, 1)),
             generator: None,
             transition: Some((vjc_core::transition::Kind::Dissolve.shader_id(), 0.5, out)),
+            transform: Affine::IDENTITY,
         };
         let layers = [
             draw(1, &[0, 0, 0, 255], true),
@@ -1812,6 +1971,7 @@ mod tests {
                 frame: Some((1, 1, &src, 1)),
                 generator: None,
                 transition: None,
+                transform: Affine::IDENTITY,
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
             comp.render(&device, &queue, &layer, &master, 1.0);
@@ -1885,6 +2045,7 @@ mod tests {
                 ml: None,
             }),
             transition: None,
+            transform: Affine::IDENTITY,
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1958,6 +2119,7 @@ mod tests {
                 ml: None,
             }),
             transition: None,
+            transform: Affine::IDENTITY,
         }];
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots");
@@ -2072,6 +2234,7 @@ mod tests {
                 frame: Some((1, 1, &src, 1)),
                 generator: None,
                 transition: None,
+                transform: Affine::IDENTITY,
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2218,6 +2381,7 @@ mod tests {
                     frame: Some((2, 1, &green, 1)),
                     generator: None,
                     transition: None,
+                    transform: Affine::IDENTITY,
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -2234,6 +2398,7 @@ mod tests {
                     frame: Some((2, 1, &red, 1)),
                     generator: None,
                     transition: None,
+                    transform: Affine::IDENTITY,
                 },
             ];
             comp.render(&device, &queue, &layer, &[], 1.0);
@@ -2334,6 +2499,7 @@ mod tests {
                 frame: Some((1, 4, &img, 1)),
                 generator: None,
                 transition: None,
+                transform: Affine::IDENTITY,
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let col = read_col(&device, &queue, &comp, 4);
@@ -2342,6 +2508,122 @@ mod tests {
                 "dry_wet {dry_wet}: rows {col:?}, want {first} .. {last}"
             );
         }
+    }
+
+    /// Whole composition as RGBA rows (needs `w * 4 <= 256`).
+    fn read_all(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        comp: &Compositor,
+        (w, h): (u32, u32),
+    ) -> Vec<[u8; 4]> {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (y, x)))
+            .map(|(y, x)| {
+                let i = (y * 256 + x * 4) as usize;
+                [data[i], data[i + 1], data[i + 2], data[i + 3]]
+            })
+            .collect()
+    }
+
+    fn xf(r: vjc_core::transform::Resolved) -> Affine {
+        Affine::inverse_of(&r)
+    }
+
+    /// Position and scale move pixels as expected: a white 8x8 frame over black, shifted
+    /// 4 px right leaves the left half black; at scale 0.5 only the centre 4x4 stays white;
+    /// the composition transform does the same to the finished stack. Skipped without adapter.
+    #[test]
+    fn gpu_transform_position_and_scale_move_pixels() {
+        use vjc_core::transform::Resolved;
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = Compositor::new(&device, 8, 8);
+        let white = [255u8; 4];
+        let at = |img: &[[u8; 4]], x: usize, y: usize| img[y * 8 + x];
+        let render = |comp: &mut Compositor, layer: Affine, master: Affine| {
+            let mut l = solid(1, &white, 1.0);
+            l.transform = layer;
+            comp.master_transform = master;
+            comp.render(&device, &queue, &[l], &[], 1.0);
+            read_all(&device, &queue, comp, (8, 8))
+        };
+        // Identity: everything white.
+        let img = render(&mut comp, Affine::IDENTITY, Affine::IDENTITY);
+        assert!(img.iter().all(|p| *p == white), "identity changed pixels");
+        // Position x = +4: right half white, left half black, every row.
+        let moved = Resolved {
+            x: 4.0,
+            ..Resolved::IDENTITY
+        };
+        let img = render(&mut comp, xf(moved), Affine::IDENTITY);
+        for y in 0..8 {
+            assert_eq!(at(&img, 1, y), [0, 0, 0, 255], "left half, row {y}");
+            assert_eq!(at(&img, 6, y), white, "right half, row {y}");
+        }
+        // Position y = +4 (down): bottom half white.
+        let down = Resolved {
+            y: 4.0,
+            ..Resolved::IDENTITY
+        };
+        let img = render(&mut comp, xf(down), Affine::IDENTITY);
+        assert_eq!(at(&img, 3, 1), [0, 0, 0, 255]);
+        assert_eq!(at(&img, 3, 6), white);
+        // Scale 0.5: centre white, border black.
+        let half = Resolved {
+            scale: (0.5, 0.5),
+            ..Resolved::IDENTITY
+        };
+        let img = render(&mut comp, xf(half), Affine::IDENTITY);
+        assert_eq!(at(&img, 3, 3), white);
+        assert_eq!(at(&img, 4, 4), white);
+        assert_eq!(at(&img, 0, 0), [0, 0, 0, 255]);
+        assert_eq!(at(&img, 7, 3), [0, 0, 0, 255]);
+        assert_eq!(at(&img, 1, 4), [0, 0, 0, 255]);
+        // Rotation 45 degrees: centre stays, the frame corner leaves the picture.
+        let rot = Resolved {
+            rotation: 45.0,
+            ..Resolved::IDENTITY
+        };
+        let img = render(&mut comp, xf(rot), Affine::IDENTITY);
+        assert_eq!(at(&img, 3, 3), white);
+        assert_eq!(at(&img, 0, 0), [0, 0, 0, 255]);
+        // The composition transform moves the finished stack the same way.
+        let img = render(&mut comp, Affine::IDENTITY, xf(moved));
+        assert_eq!(at(&img, 1, 2), [0, 0, 0, 255]);
+        assert_eq!(at(&img, 6, 2), white);
+        let img = render(&mut comp, Affine::IDENTITY, xf(half));
+        assert_eq!(at(&img, 3, 3), white);
+        assert_eq!(at(&img, 0, 0), [0, 0, 0, 255]);
     }
 
     /// A mask with the top half 0 and the bottom half 255 clears the top half. Skipped
@@ -2370,6 +2652,7 @@ mod tests {
                     frame: Some((1, 4, &green, 1)),
                     generator: None,
                     transition: None,
+                    transform: Affine::IDENTITY,
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -2385,6 +2668,7 @@ mod tests {
                     frame: Some((1, 4, &red, 1)),
                     generator: None,
                     transition: None,
+                    transform: Affine::IDENTITY,
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -2411,6 +2695,7 @@ mod tests {
             frame: Some((1, 1, px, 1)),
             generator: None,
             transition: None,
+            transform: Affine::IDENTITY,
         }
     }
 

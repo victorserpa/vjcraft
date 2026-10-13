@@ -5,7 +5,7 @@ use super::{Applied, Command, Error, check_cell, deck_mut, layer_idx, undoable};
 use vjc_model::{ColumnIdx, DeckId, Effect, EffectId, GroupId, LayerId, Project, Track, Value};
 
 /// Whose chain a command edits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EffectTarget {
     Clip {
         deck: DeckId,
@@ -42,6 +42,25 @@ pub fn track_mut(p: &mut Project, t: EffectTarget) -> Result<&mut Track, Error> 
                 .map(|k| &mut k.clip.track)
                 .ok_or(Error::NoClip)
         }
+    }
+}
+
+/// The track of a target, read-only (None if the target does not exist).
+pub fn track(p: &Project, t: EffectTarget) -> Option<&Track> {
+    match t {
+        EffectTarget::Master => Some(&p.composition.master),
+        EffectTarget::Group(g) => p.composition.group(g).map(|x| &x.track),
+        EffectTarget::Layer(l) => p
+            .composition
+            .layers
+            .iter()
+            .find(|x| x.id == l)
+            .map(|x| &x.track),
+        EffectTarget::Clip {
+            deck,
+            layer,
+            column,
+        } => crate::clip_in(p, deck, layer, column).map(|c| &c.track),
     }
 }
 

@@ -22,6 +22,7 @@ mod params;
 mod prefs_ui;
 mod slice_inspector;
 mod slice_render;
+mod source_info;
 mod theme;
 mod timecode_io;
 
@@ -34,6 +35,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vjc_core::clock::{Clock, LinkSync, beat_sync_rate};
 use vjc_core::effects::EffectTarget;
+use vjc_core::playback::TransportMode;
 use vjc_core::playhead::Playhead;
 use vjc_core::{AudioParam, AudioTarget, Command, Event, History};
 use vjc_io::prefs::{Layout, Prefs};
@@ -42,8 +44,11 @@ use vjc_media::{Frame, Player};
 use vjc_model::Screen;
 use vjc_model::{
     Autopilot, AutopilotMode, BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId,
-    OutputDevice, PlayMode, Project, Track, Transition, Value,
+    OutputDevice, PlayMode, Project, Track, TransformField, Transition, Value,
 };
+
+/// Seconds a duration -/+ click moves the region length.
+const DURATION_STEP: f64 = 0.1;
 
 /// GPU target of one output screen with slices.
 struct ScreenRt {
@@ -84,6 +89,8 @@ struct State {
     renaming: Option<(DeckId, String)>,
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
     heads: HashMap<LayerId, Playhead>,
+    /// Codec / size / fps of file clips, probed on demand.
+    src_info: source_info::SourceInfos,
     last_head_tick: std::time::Instant,
     /// Runtime-only playback flow per layer (transitions, loop counts, beat loops).
     flow: Flow,
@@ -538,6 +545,21 @@ fn generator_menu(
     });
 }
 
+/// Slider range and -/+ step of a transform field in the panel (a few frames wide, not the
+/// whole model range, so a drag is usable).
+fn transform_ui_range(field: TransformField, (w, h): (f64, f64)) -> ((f64, f64), f64) {
+    match field {
+        TransformField::X => ((-2.0 * w, 2.0 * w), 1.0),
+        TransformField::Y => ((-2.0 * h, 2.0 * h), 1.0),
+        TransformField::AnchorX => ((-w, w), 1.0),
+        TransformField::AnchorY => ((-h, h), 1.0),
+        TransformField::Scale | TransformField::ScaleW | TransformField::ScaleH => {
+            ((0.0, 4.0), 0.01)
+        }
+        TransformField::Rotation => ((-360.0, 360.0), 1.0),
+    }
+}
+
 fn labeled<T: Copy>(v: &[(T, &str)]) -> Vec<(T, String)> {
     v.iter().map(|(a, n)| (*a, n.to_string())).collect()
 }
@@ -837,6 +859,7 @@ impl State {
             metro: None,
             gens: HashMap::new(),
             heads: HashMap::new(),
+            src_info: Default::default(),
             flow: Flow::default(),
             last_head_tick: std::time::Instant::now(),
             comp: None,
@@ -1600,8 +1623,9 @@ impl State {
                     if self.active(layer) == Some((deck, column)) {
                         // A cue jump ends an active beat loop and is not a completed loop.
                         self.flow.beat_loops.remove(&layer);
+                        let local = vjc_core::playback::to_local(pos, self.region_of(layer));
                         if let Some(c) = self.flow.loops.get_mut(&layer) {
-                            c.rebase(pos);
+                            c.rebase(local);
                         }
                         self.seek(layer, pos);
                     }
@@ -1686,10 +1710,19 @@ impl State {
         }
     }
 
+    /// In..out region of the clip playing on the layer (the whole clip when none).
+    fn region_of(&self, layer: LayerId) -> (f64, f64) {
+        self.players
+            .get(&layer)
+            .and_then(|(d, c, _)| vjc_core::clip_in(&self.project, *d, layer, *c))
+            .map_or((0.0, 1.0), |k| vjc_core::playback::region(&k.transport))
+    }
+
     /// Jumps the layer's playhead and player to a normalised position.
     fn seek(&mut self, layer: LayerId, pos: f64) {
+        let reg = self.region_of(layer);
         if let Some(h) = self.heads.get_mut(&layer) {
-            h.seek(pos);
+            h.seek(vjc_core::playback::to_local(pos, reg));
         }
         if let Some((_, _, p)) = self.players.get(&layer) {
             p.set_position(pos);
@@ -1835,12 +1868,19 @@ impl State {
             };
             let tr = &clip.transport;
             let sync = match (tr.beat_sync, player.duration()) {
-                (Some(n), Some(d)) => beat_sync_rate(d, n, bpm),
+                (Some(n), Some(d)) => {
+                    let reg = vjc_core::playback::region(tr);
+                    beat_sync_rate(d * (reg.1 - reg.0), n, bpm)
+                }
                 _ => 1.0,
             };
             let rate = vjc_core::playback_rate(tr.speed, sync, speed_of(layer));
             // Play modes: the playhead picks the position, the player serves the frame.
-            if let (Some(d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
+            if let (Some(file_d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
+                // The playhead runs over the in..out region only; `position` below is the
+                // matching place in the file.
+                let reg = vjc_core::playback::region(tr);
+                let d = file_d * (reg.1 - reg.0);
                 // Timecode clips: position = timecode - start (random access, muted); without
                 // signal they freeze or run free from where they were, per the prefs.
                 let by_tc = tc_on && tr.timecode_start.is_some();
@@ -1864,12 +1904,12 @@ impl State {
                 };
                 // Forward playback streams; everything else needs random access.
                 player.set_sequential(!by_tc && is_sequential(tr.play_mode, tr.direction, rate));
-                let mut position = t.position;
+                let mut position = vjc_core::playback::to_actual(t.position, reg);
                 if let Some((_, w)) = self.flow.beat_loops.get(layer)
                     && !t.finished
                     && let Some(np) = vjc_core::playback::loop_wrap(position, *w)
                 {
-                    head.seek(np);
+                    head.seek(vjc_core::playback::to_local(np, reg));
                     position = np;
                 }
                 player.set_position(position);
@@ -1895,7 +1935,7 @@ impl State {
                     && l.autopilot.mode != vjc_model::AutopilotMode::Off
                 {
                     let c = self.flow.loops.entry(*layer).or_default();
-                    if c.observe(position, tr.direction)
+                    if c.observe(t.position, tr.direction)
                         && vjc_core::playback::loops_reached(c.count, l.autopilot.every_loops)
                     {
                         autopilot.push(*layer);
@@ -2232,6 +2272,15 @@ impl State {
                 size,
                 &actx,
             ));
+            // Clip transform first, then the layer's (see vjc_core::transform).
+            let layer_xf = vjc_core::transform::Affine::inverse_of(
+                &vjc_core::transform::Resolved::of(&l.track.transform, &actx),
+            );
+            let xf = clip.map_or(layer_xf, |k| {
+                layer_xf.through(&vjc_core::transform::Affine::inverse_of(
+                    &vjc_core::transform::Resolved::of(&k.track.transform, &actx),
+                ))
+            });
             let cross = self
                 .flow
                 .outgoing
@@ -2263,6 +2312,7 @@ impl State {
                     effects: fx,
                     generator: None,
                     transition: Some((kind.shader_id(), prog, true)),
+                    transform: layer_xf,
                     frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
                 });
             }
@@ -2275,6 +2325,7 @@ impl State {
                 fit: fit_of(l).unwrap_or_default(),
                 effects,
                 generator,
+                transform: xf,
                 frame: f
                     .as_ref()
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
@@ -2326,6 +2377,9 @@ impl State {
             }
             i += len;
         }
+        comp.master_transform = vjc_core::transform::Affine::inverse_of(
+            &vjc_core::transform::Resolved::of(&c.master.transform, &actx),
+        );
         comp.render_routed(
             &rs.device,
             &rs.queue,
@@ -4054,6 +4108,9 @@ impl State {
                     });
             });
         }
+        if params::section(ui, "sec-transform", "Transform") {
+            self.transform_rows(ui, EffectTarget::Master, cmds);
+        }
         if params::section(ui, "sec-cues", "Cues") {
             self.cue_list(ui, cmds);
         }
@@ -4303,6 +4360,9 @@ impl State {
         if params::section(ui, "sec-layer-audio", "Audio") {
             self.audio_rows(ui, AudioTarget::Layer(lid), &l.track, cmds);
         }
+        if params::section(ui, "sec-layer-transform", "Transform") {
+            self.transform_rows(ui, EffectTarget::Layer(lid), cmds);
+        }
         if params::section(ui, "sec-layer-effects", "Effects") {
             self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
         }
@@ -4402,9 +4462,26 @@ impl State {
                 name,
             });
         }
+        // Length of the file, once its probe has landed.
+        let file_secs = match &k.source {
+            vjc_model::Source::File { path } => self
+                .src_info
+                .get(path)
+                .flatten()
+                .map(|i| i.duration)
+                .filter(|d| *d > 0.0),
+            _ => None,
+        };
         match &k.source {
             vjc_model::Source::File { path } => {
-                ui.label(format!("Source: file {}", path.display()));
+                let info = self.src_info.get(path);
+                if info.is_none() {
+                    // The probe runs on a thread; look again shortly.
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                let line = source_info::describe(path, info);
+                ui.label(line).on_hover_text(path.display().to_string());
             }
             vjc_model::Source::Generator { kind, params } => {
                 ui.strong(format!("Source: generator {}", fx_label(kind)));
@@ -4504,36 +4581,43 @@ impl State {
                     speed,
                 });
             }
-            let syncs: Vec<(Option<f64>, String)> =
-                [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0), Some(16.0)]
-                    .into_iter()
-                    .map(|b| (b, b.map_or("off".into(), |n| format!("{n} beats"))))
-                    .collect();
-            if let Some(beats) = params::combo(ui, "sync", "Beat sync", &t.beat_sync, &syncs) {
-                cmds.push(Command::SetBeatSync {
+            let tmode = TransportMode::of(t);
+            let tmodes: Vec<(TransportMode, String)> = TransportMode::ALL
+                .iter()
+                .map(|m| (*m, m.label().to_string()))
+                .collect();
+            if let Some(m) = params::combo(ui, "tmode", "Mode", &tmode, &tmodes) {
+                let seed = self.tc.last.unwrap_or(vjc_model::Timecode::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    vjc_model::TcFps::F25,
+                ));
+                let (beat_sync, timecode_start) = m.sync_for(t, seed);
+                cmds.push(Command::SetClipSync {
                     deck,
                     layer,
                     column,
-                    beats,
+                    beat_sync,
+                    timecode_start,
                 });
             }
-            ui.separator();
-            ui.strong("Timecode sync");
-            let mut on = t.timecode_start.is_some();
-            let seed =
-                self.tc
-                    .last
-                    .unwrap_or(vjc_model::Timecode::new(0, 0, 0, 0, vjc_model::TcFps::F25));
-            if ui
-                .checkbox(&mut on, "Follow timecode (position = timecode - start)")
-                .changed()
-            {
-                cmds.push(Command::SetTimecodeStart {
-                    deck,
-                    layer,
-                    column,
-                    start: on.then_some(seed),
-                });
+            if tmode == TransportMode::BpmSync {
+                let syncs: Vec<(Option<f64>, String)> =
+                    [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0), Some(16.0)]
+                        .into_iter()
+                        .map(|b| (b, b.map_or("off".into(), |n| format!("{n} beats"))))
+                        .collect();
+                if let Some(beats) = params::combo(ui, "sync", "Beat sync", &t.beat_sync, &syncs) {
+                    cmds.push(Command::SetClipSync {
+                        deck,
+                        layer,
+                        column,
+                        beat_sync: beats,
+                        timecode_start: None,
+                    });
+                }
             }
             if let Some(mut start) = t.timecode_start {
                 ui.horizontal(|ui| {
@@ -4569,34 +4653,18 @@ impl State {
             ui.separator();
             let playing = self.active(layer) == Some((deck, column));
             let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width().min(400.0), 14.0),
-                egui::Sense::hover(),
-            );
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-            let x_at = |p: f64| rect.left() + rect.width() * p as f32;
-            for c in &t.cue_points {
-                painter.line_segment(
-                    [
-                        egui::pos2(x_at(*c), rect.top()),
-                        egui::pos2(x_at(*c), rect.bottom()),
-                    ],
-                    egui::Stroke::new(2.0, ui.visuals().warn_fg_color),
-                );
-            }
-            if let Some((_, (a, b))) = self.flow.beat_loops.get(&layer).filter(|_| playing) {
-                let r = egui::Rect::from_x_y_ranges(x_at(*a)..=x_at(*b), rect.y_range());
-                painter.rect_filled(r, 0.0, ui.visuals().selection.bg_fill.linear_multiply(0.5));
-            }
-            if playing {
-                painter.line_segment(
-                    [
-                        egui::pos2(x_at(pos), rect.top()),
-                        egui::pos2(x_at(pos), rect.bottom()),
-                    ],
-                    egui::Stroke::new(1.0, ui.visuals().text_color()),
-                );
+            let reg = vjc_core::playback::region(t);
+            self.scrub_bar(ui, (deck, layer, column), &k, (playing, pos), cmds);
+            if let Some(fs) = file_secs {
+                let at = |p: f64| format!("{:.2} s", fs * p);
+                ui.weak(format!("In {}   Out {}", at(reg.0), at(reg.1)));
+                self.duration_row(ui, (deck, layer, column), t, fs, tmode, cmds);
+            } else {
+                ui.weak(format!(
+                    "In {:.1}%   Out {:.1}%",
+                    reg.0 * 100.0,
+                    reg.1 * 100.0
+                ));
             }
             ui.horizontal(|ui| {
                 ui.label("Cues");
@@ -4662,6 +4730,17 @@ impl State {
                 });
             }
         }
+        if params::section(ui, "sec-clip-transform", "Transform") {
+            self.transform_rows(
+                ui,
+                EffectTarget::Clip {
+                    deck,
+                    layer,
+                    column,
+                },
+                cmds,
+            );
+        }
         if params::section(ui, "sec-clip-audio", "Audio") {
             self.audio_rows(ui, AudioTarget::Clip(deck, layer, column), &k.track, cmds);
         }
@@ -4675,6 +4754,247 @@ impl State {
                 },
                 cmds,
             );
+        }
+    }
+
+    /// Scrub bar of a clip: playhead, cue points, beat loop and draggable in / out markers.
+    /// Dragging a marker edits the region (`SetInOut`, undoable); pressing anywhere else
+    /// moves the playhead (`SeekClip`, runtime only).
+    fn scrub_bar(
+        &self,
+        ui: &mut egui::Ui,
+        (deck, layer, column): (DeckId, LayerId, u32),
+        k: &vjc_model::Clip,
+        (playing, pos): (bool, f64),
+        cmds: &mut Vec<Command>,
+    ) {
+        use vjc_core::playback::{ScrubHit, drag_marker, region, scrub_hit};
+        let t = &k.transport;
+        let reg = region(t);
+        let (rect, bar) = ui.allocate_exact_size(
+            egui::vec2(
+                (ui.available_width() - theme::SCRUB_MARGIN).clamp(80.0, 400.0),
+                theme::SCRUB_H,
+            ),
+            egui::Sense::click_and_drag(),
+        );
+        bar.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Scrub bar"));
+        let frac = |x: f32| f64::from((x - rect.left()) / rect.width().max(1.0));
+        let tol = f64::from(theme::SCRUB_GRAB / rect.width().max(1.0));
+        let grab = bar.id.with("grab");
+        if bar.drag_started() {
+            let p0 = ui
+                .input(|i| i.pointer.press_origin())
+                .map_or(0.0, |o| frac(o.x));
+            ui.data_mut(|d| d.insert_temp(grab, scrub_hit(p0, reg, tol)));
+        }
+        if bar.dragged()
+            && let Some(at) = bar.interact_pointer_pos()
+        {
+            let p = frac(at.x);
+            match ui.data(|d| d.get_temp::<ScrubHit>(grab)) {
+                Some(ScrubHit::Seek) | None => cmds.push(Command::SeekClip {
+                    deck,
+                    layer,
+                    column,
+                    pos: p.clamp(0.0, 1.0),
+                }),
+                Some(hit) => {
+                    let (in_point, out_point) = drag_marker(hit, p, reg);
+                    if (in_point, out_point) != reg {
+                        cmds.push(Command::SetInOut {
+                            deck,
+                            layer,
+                            column,
+                            in_point,
+                            out_point,
+                        });
+                    }
+                }
+            }
+        }
+        if bar.clicked()
+            && let Some(at) = bar.interact_pointer_pos()
+            && scrub_hit(frac(at.x), reg, tol) == ScrubHit::Seek
+        {
+            cmds.push(Command::SeekClip {
+                deck,
+                layer,
+                column,
+                pos: frac(at.x).clamp(0.0, 1.0),
+            });
+        }
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+        let x_at = |p: f64| rect.left() + rect.width() * p as f32;
+        let span = |a: f64, b: f64| egui::Rect::from_x_y_ranges(x_at(a)..=x_at(b), rect.y_range());
+        for (a, b) in [(0.0, reg.0), (reg.1, 1.0)] {
+            painter.rect_filled(span(a, b), 0.0, theme::SCRUB_OUTSIDE);
+        }
+        for c in &t.cue_points {
+            painter.line_segment(
+                [
+                    egui::pos2(x_at(*c), rect.top()),
+                    egui::pos2(x_at(*c), rect.bottom()),
+                ],
+                egui::Stroke::new(2.0, ui.visuals().warn_fg_color),
+            );
+        }
+        if let Some((_, (a, b))) = self.flow.beat_loops.get(&layer).filter(|_| playing) {
+            painter.rect_filled(
+                span(*a, *b),
+                0.0,
+                ui.visuals().selection.bg_fill.linear_multiply(0.5),
+            );
+        }
+        if playing {
+            painter.line_segment(
+                [
+                    egui::pos2(x_at(pos), rect.top()),
+                    egui::pos2(x_at(pos), rect.bottom()),
+                ],
+                egui::Stroke::new(1.0, ui.visuals().text_color()),
+            );
+        }
+        for (p, dir) in [(reg.0, 1.0f32), (reg.1, -1.0)] {
+            let x = x_at(p);
+            let stroke = egui::Stroke::new(2.0, theme::ACCENT);
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                stroke,
+            );
+            let w = theme::SCRUB_GRAB * 0.6;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(x, rect.top()),
+                    egui::pos2(x + dir * w, rect.top()),
+                    egui::pos2(x, rect.top() + w),
+                ],
+                theme::ACCENT,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+
+    /// Duration of the in..out region with -/+ and halve / double. Every edit becomes a
+    /// clip speed (`SetSpeed`) that makes the region last that long.
+    fn duration_row(
+        &self,
+        ui: &mut egui::Ui,
+        (deck, layer, column): (DeckId, LayerId, u32),
+        t: &vjc_model::Transport,
+        file_secs: f64,
+        mode: TransportMode,
+        cmds: &mut Vec<Command>,
+    ) {
+        let reg = vjc_core::playback::region(t);
+        let secs = vjc_core::playback::region_secs(file_secs, reg, t.speed);
+        let mut target = None;
+        ui.horizontal(|ui| {
+            ui.label("Duration");
+            ui.add_enabled_ui(mode == TransportMode::Timeline, |ui| {
+                let mut v = if secs.is_finite() { secs } else { 0.0 };
+                let btn = |ui: &mut egui::Ui, text: &str, name: &str| {
+                    let b = ui.small_button(text);
+                    b.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name)
+                    });
+                    b.clicked()
+                };
+                if btn(ui, "-", "Duration shorter") {
+                    target = Some(v - DURATION_STEP);
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v)
+                            .speed(0.0)
+                            .range(0.05..=3600.0)
+                            .max_decimals(2)
+                            .suffix(" s"),
+                    )
+                    .changed()
+                {
+                    target = Some(v);
+                }
+                if btn(ui, "+", "Duration longer") {
+                    target = Some(v + DURATION_STEP);
+                }
+                if btn(ui, "\u{f7}2", "Halve duration") {
+                    target = Some(v / 2.0);
+                }
+                if btn(ui, "\u{d7}2", "Double duration") {
+                    target = Some(v * 2.0);
+                }
+            });
+        });
+        if let Some(speed) = target
+            .and_then(|d| vjc_core::playback::speed_for_duration(file_secs, reg, d))
+            .filter(|s| (*s - t.speed).abs() > 1e-9)
+        {
+            cmds.push(Command::SetSpeed {
+                deck,
+                layer,
+                column,
+                speed,
+            });
+        }
+    }
+
+    /// Position, scale, rotation and anchor sliders of a track's transform; each row is a
+    /// mappable target (`/comp/.../transform/...`) and animatable like the other params.
+    fn transform_rows(&mut self, ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
+        let Some(tf) = vjc_core::effects::track(&self.project, target).map(|t| t.transform.clone())
+        else {
+            return;
+        };
+        let dials = self.dials();
+        let actx = self.anim_ctx(&dials);
+        let (cw, ch) = {
+            let c = &self.project.composition;
+            (f64::from(c.width), f64::from(c.height))
+        };
+        let active = match target {
+            EffectTarget::Clip { layer, .. } => active_of(&self.players, &self.gens, layer),
+            _ => None,
+        };
+        for field in TransformField::ALL {
+            let prm = tf.field(field);
+            let Value::Number(default) = prm.default else {
+                continue;
+            };
+            let (range, step) = transform_ui_range(field, (cw, ch));
+            let shown = vjc_core::anim::effective_number(prm, &actx);
+            let r = ui.scope(|ui| {
+                params::param_slider_anim_step(
+                    ui,
+                    ("tf", target, field.address()),
+                    &prm.name,
+                    shown,
+                    default,
+                    range,
+                    step,
+                    &prm.animation,
+                )
+            });
+            let (value, anim) = r.inner;
+            if let Some(value) = value {
+                cmds.push(Command::SetTransform {
+                    target,
+                    field,
+                    value,
+                });
+            }
+            if let Some(animation) = anim {
+                cmds.push(Command::SetAnimation {
+                    target: vjc_core::AnimTarget::Transform { target, field },
+                    animation,
+                });
+            }
+            if let Some(a) =
+                vjc_core::shortcuts::transform_address(&self.project, target, field, active)
+            {
+                self.targets.push((r.response.rect, a));
+            }
         }
     }
 

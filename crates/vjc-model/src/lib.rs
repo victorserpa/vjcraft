@@ -282,6 +282,126 @@ pub struct Track {
     pub effects: Vec<Effect>,
     pub volume: Param,
     pub pan: Param,
+    /// Reframing of the picture; projects saved before it existed open with identity.
+    #[serde(default)]
+    pub transform: Transform,
+}
+
+/// Position, scale, rotation and anchor of a picture, all animatable params.
+/// Pixels are composition pixels; (0, 0) is the frame centre, y grows downwards.
+/// Effective scale on each axis is `scale * scale_w` (x) and `scale * scale_h` (y).
+/// `anchor` is the pivot of scale and rotation, relative to the picture centre; it does
+/// not move the picture by itself. `rotation` is in degrees, clockwise on screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transform {
+    pub x: Param,
+    pub y: Param,
+    pub scale: Param,
+    pub scale_w: Param,
+    pub scale_h: Param,
+    pub rotation: Param,
+    pub anchor_x: Param,
+    pub anchor_y: Param,
+}
+
+/// Largest position / anchor offset in px (the composition size limit).
+pub const TRANSFORM_PX_MAX: f64 = 16384.0;
+/// Largest scale factor.
+pub const TRANSFORM_SCALE_MAX: f64 = 10.0;
+/// Rotation limit in degrees (both signs).
+pub const TRANSFORM_ROT_MAX: f64 = 360.0;
+
+impl Default for Transform {
+    fn default() -> Self {
+        let px = Some((-TRANSFORM_PX_MAX, TRANSFORM_PX_MAX));
+        let sc = Some((0.0, TRANSFORM_SCALE_MAX));
+        Transform {
+            x: Param::number("Position X", 0.0, px),
+            y: Param::number("Position Y", 0.0, px),
+            scale: Param::number("Scale", 1.0, sc),
+            scale_w: Param::number("Scale W", 1.0, sc),
+            scale_h: Param::number("Scale H", 1.0, sc),
+            rotation: Param::number(
+                "Rotation",
+                0.0,
+                Some((-TRANSFORM_ROT_MAX, TRANSFORM_ROT_MAX)),
+            ),
+            anchor_x: Param::number("Anchor X", 0.0, px),
+            anchor_y: Param::number("Anchor Y", 0.0, px),
+        }
+    }
+}
+
+/// One field of a `Transform`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransformField {
+    X,
+    Y,
+    Scale,
+    ScaleW,
+    ScaleH,
+    Rotation,
+    AnchorX,
+    AnchorY,
+}
+
+impl TransformField {
+    pub const ALL: [TransformField; 8] = [
+        TransformField::X,
+        TransformField::Y,
+        TransformField::Scale,
+        TransformField::ScaleW,
+        TransformField::ScaleH,
+        TransformField::Rotation,
+        TransformField::AnchorX,
+        TransformField::AnchorY,
+    ];
+
+    /// Last segment of the `/comp/.../transform/<name>` address.
+    pub fn address(self) -> &'static str {
+        match self {
+            TransformField::X => "x",
+            TransformField::Y => "y",
+            TransformField::Scale => "scale",
+            TransformField::ScaleW => "scale_w",
+            TransformField::ScaleH => "scale_h",
+            TransformField::Rotation => "rotation",
+            TransformField::AnchorX => "anchor_x",
+            TransformField::AnchorY => "anchor_y",
+        }
+    }
+
+    pub fn from_address(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.address() == s)
+    }
+}
+
+impl Transform {
+    pub fn field(&self, f: TransformField) -> &Param {
+        match f {
+            TransformField::X => &self.x,
+            TransformField::Y => &self.y,
+            TransformField::Scale => &self.scale,
+            TransformField::ScaleW => &self.scale_w,
+            TransformField::ScaleH => &self.scale_h,
+            TransformField::Rotation => &self.rotation,
+            TransformField::AnchorX => &self.anchor_x,
+            TransformField::AnchorY => &self.anchor_y,
+        }
+    }
+
+    pub fn field_mut(&mut self, f: TransformField) -> &mut Param {
+        match f {
+            TransformField::X => &mut self.x,
+            TransformField::Y => &mut self.y,
+            TransformField::Scale => &mut self.scale,
+            TransformField::ScaleW => &mut self.scale_w,
+            TransformField::ScaleH => &mut self.scale_h,
+            TransformField::Rotation => &mut self.rotation,
+            TransformField::AnchorX => &mut self.anchor_x,
+            TransformField::AnchorY => &mut self.anchor_y,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -674,6 +794,7 @@ impl Track {
             effects: vec![],
             volume: Param::number("Volume", 1.0, Some((0.0, 1.0))),
             pan: Param::number("Pan", 0.0, Some((-1.0, 1.0))),
+            transform: Transform::default(),
         }
     }
 }

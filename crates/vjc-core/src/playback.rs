@@ -95,9 +95,230 @@ pub fn loop_wrap(pos: f64, window: (f64, f64)) -> Option<f64> {
     }
 }
 
+/// Smallest in..out span (normalised), so the region never collapses.
+pub const MIN_REGION: f64 = 0.001;
+
+/// The (in, out) region a clip plays, normalised. A damaged pair (not finite, outside 0..=1
+/// or narrower than `MIN_REGION`) plays the whole clip.
+pub fn region(t: &vjc_model::Transport) -> (f64, f64) {
+    let (a, b) = (t.in_point, t.out_point);
+    if a.is_finite() && b.is_finite() && a >= 0.0 && b <= 1.0 && b - a >= MIN_REGION {
+        (a, b)
+    } else {
+        (0.0, 1.0)
+    }
+}
+
+/// Position inside the file for a playhead position local to the region (0..=1).
+pub fn to_actual(local: f64, region: (f64, f64)) -> f64 {
+    region.0 + local.clamp(0.0, 1.0) * (region.1 - region.0)
+}
+
+/// Playhead position local to the region for a position inside the file.
+pub fn to_local(pos: f64, region: (f64, f64)) -> f64 {
+    ((pos - region.0) / (region.1 - region.0)).clamp(0.0, 1.0)
+}
+
+/// Seconds the in..out region lasts at clip speed `speed` (infinite when paused by speed 0).
+pub fn region_secs(file_secs: f64, region: (f64, f64), speed: f64) -> f64 {
+    if speed > 0.0 {
+        file_secs * (region.1 - region.0) / speed
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Clip speed (0.01..=4, the range `SetSpeed` accepts) that makes the region last
+/// `target_secs`; None for a target that is not a positive finite number.
+pub fn speed_for_duration(file_secs: f64, region: (f64, f64), target_secs: f64) -> Option<f64> {
+    if !(target_secs.is_finite() && target_secs > 0.0 && file_secs > 0.0) {
+        return None;
+    }
+    Some((file_secs * (region.1 - region.0) / target_secs).clamp(0.01, 4.0))
+}
+
+/// What a press on the scrub bar grabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubHit {
+    In,
+    Out,
+    /// Neither marker: the press moves the playhead.
+    Seek,
+}
+
+/// Which marker a press at normalised bar position `p` grabs, within `tol` (bar fractions).
+/// Overlapping markers split at their midpoint, so both stay reachable.
+pub fn scrub_hit(p: f64, region: (f64, f64), tol: f64) -> ScrubHit {
+    let (di, d_o) = ((p - region.0).abs(), (p - region.1).abs());
+    match (di <= tol, d_o <= tol) {
+        (true, true) => {
+            if p < (region.0 + region.1) / 2.0 {
+                ScrubHit::In
+            } else {
+                ScrubHit::Out
+            }
+        }
+        (true, false) => ScrubHit::In,
+        (false, true) => ScrubHit::Out,
+        _ => ScrubHit::Seek,
+    }
+}
+
+/// The region after dragging `hit` to bar position `p`: the marker follows the pointer but
+/// never crosses the other one (keeps `MIN_REGION`) or leaves 0..=1.
+pub fn drag_marker(hit: ScrubHit, p: f64, region: (f64, f64)) -> (f64, f64) {
+    let p = if p.is_finite() { p } else { 0.0 };
+    match hit {
+        ScrubHit::In => (p.clamp(0.0, region.1 - MIN_REGION), region.1),
+        ScrubHit::Out => (region.0, p.clamp(region.0 + MIN_REGION, 1.0)),
+        ScrubHit::Seek => region,
+    }
+}
+
+/// How a clip's time is driven, the three modes of the transport dropdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Free running at the clip speed.
+    Timeline,
+    /// Stretched to a number of beats of the app clock.
+    BpmSync,
+    /// Follows the external timecode.
+    Timecode,
+}
+
+/// Beats a clip gets when switched to BPM sync.
+pub const DEFAULT_SYNC_BEATS: f64 = 4.0;
+
+impl TransportMode {
+    pub const ALL: [TransportMode; 3] = [
+        TransportMode::Timeline,
+        TransportMode::BpmSync,
+        TransportMode::Timecode,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TransportMode::Timeline => "Timeline",
+            TransportMode::BpmSync => "BPM sync",
+            TransportMode::Timecode => "Timecode",
+        }
+    }
+
+    /// Timecode wins over BPM sync, as in the player.
+    pub fn of(t: &vjc_model::Transport) -> Self {
+        if t.timecode_start.is_some() {
+            TransportMode::Timecode
+        } else if t.beat_sync.is_some() {
+            TransportMode::BpmSync
+        } else {
+            TransportMode::Timeline
+        }
+    }
+
+    /// `(beat_sync, timecode_start)` after switching `t` to this mode; `seed` is the start
+    /// a fresh Timecode mode begins with.
+    pub fn sync_for(
+        self,
+        t: &vjc_model::Transport,
+        seed: vjc_model::Timecode,
+    ) -> (Option<f64>, Option<vjc_model::Timecode>) {
+        match self {
+            TransportMode::Timeline => (None, None),
+            TransportMode::BpmSync => (Some(t.beat_sync.unwrap_or(DEFAULT_SYNC_BEATS)), None),
+            TransportMode::Timecode => (None, Some(t.timecode_start.unwrap_or(seed))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_press_grabs_the_nearest_marker_or_seeks() {
+        let r = (0.2, 0.8);
+        assert_eq!(scrub_hit(0.21, r, 0.02), ScrubHit::In);
+        assert_eq!(scrub_hit(0.79, r, 0.02), ScrubHit::Out);
+        assert_eq!(scrub_hit(0.5, r, 0.02), ScrubHit::Seek);
+        // Markers on top of each other: left half grabs In, right half Out.
+        let narrow = (0.50, 0.51);
+        assert_eq!(scrub_hit(0.499, narrow, 0.02), ScrubHit::In);
+        assert_eq!(scrub_hit(0.512, narrow, 0.02), ScrubHit::Out);
+    }
+
+    #[test]
+    fn dragging_a_marker_never_crosses_the_other() {
+        let r = (0.2, 0.8);
+        assert_eq!(drag_marker(ScrubHit::In, 0.5, r), (0.5, 0.8));
+        assert_eq!(drag_marker(ScrubHit::In, -3.0, r), (0.0, 0.8));
+        assert_eq!(drag_marker(ScrubHit::In, 0.95, r), (0.8 - MIN_REGION, 0.8));
+        assert_eq!(drag_marker(ScrubHit::Out, 0.5, r), (0.2, 0.5));
+        assert_eq!(drag_marker(ScrubHit::Out, 7.0, r), (0.2, 1.0));
+        assert_eq!(drag_marker(ScrubHit::Out, 0.0, r), (0.2, 0.2 + MIN_REGION));
+        assert_eq!(drag_marker(ScrubHit::Seek, 0.5, r), r);
+        let (a, b) = drag_marker(ScrubHit::Out, f64::NAN, r);
+        assert!(b - a >= MIN_REGION - 1e-12);
+    }
+
+    #[test]
+    fn transport_mode_follows_the_transport_fields() {
+        let tc = vjc_model::Timecode::new(0, 0, 10, 0, vjc_model::TcFps::F25);
+        let mut t = vjc_model::Transport::default();
+        assert_eq!(TransportMode::of(&t), TransportMode::Timeline);
+        assert_eq!(TransportMode::BpmSync.sync_for(&t, tc), (Some(4.0), None));
+        t.beat_sync = Some(8.0);
+        assert_eq!(TransportMode::of(&t), TransportMode::BpmSync);
+        // Keeps the beats it already had; leaving it clears them.
+        assert_eq!(TransportMode::BpmSync.sync_for(&t, tc), (Some(8.0), None));
+        assert_eq!(TransportMode::Timecode.sync_for(&t, tc), (None, Some(tc)));
+        assert_eq!(TransportMode::Timeline.sync_for(&t, tc), (None, None));
+        t.timecode_start = Some(tc);
+        assert_eq!(TransportMode::of(&t), TransportMode::Timecode);
+    }
+
+    #[test]
+    fn region_maps_local_and_actual_positions() {
+        let r = (0.25, 0.75);
+        assert_eq!(to_actual(0.0, r), 0.25);
+        assert_eq!(to_actual(1.0, r), 0.75);
+        assert_eq!(to_actual(0.5, r), 0.5);
+        assert_eq!(to_local(0.5, r), 0.5);
+        assert_eq!(to_local(0.1, r), 0.0);
+        assert_eq!(to_local(0.9, r), 1.0);
+        let mut t = vjc_model::Transport::default();
+        assert_eq!(region(&t), (0.0, 1.0));
+        t.in_point = 0.2;
+        t.out_point = 0.6;
+        assert_eq!(region(&t), (0.2, 0.6));
+        for (a, b) in [
+            (0.6, 0.2),
+            (0.5, 0.5),
+            (-0.1, 1.0),
+            (0.0, 1.5),
+            (f64::NAN, 1.0),
+        ] {
+            t.in_point = a;
+            t.out_point = b;
+            assert_eq!(region(&t), (0.0, 1.0), "{a} {b}");
+        }
+    }
+
+    #[test]
+    fn duration_halves_and_doubles_through_speed() {
+        // 10 s file, whole clip at speed 1 lasts 10 s; 5 s needs speed 2, 20 s speed 0.5.
+        assert_eq!(speed_for_duration(10.0, (0.0, 1.0), 5.0), Some(2.0));
+        assert_eq!(speed_for_duration(10.0, (0.0, 1.0), 20.0), Some(0.5));
+        // Half the file (in/out) at speed 1 lasts 5 s.
+        assert_eq!(region_secs(10.0, (0.25, 0.75), 1.0), 5.0);
+        assert_eq!(speed_for_duration(10.0, (0.25, 0.75), 5.0), Some(1.0));
+        // Clamped to what SetSpeed accepts; bad targets give nothing.
+        assert_eq!(speed_for_duration(10.0, (0.0, 1.0), 0.5), Some(4.0));
+        assert_eq!(speed_for_duration(10.0, (0.0, 1.0), 1e9), Some(0.01));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(speed_for_duration(10.0, (0.0, 1.0), bad), None);
+        }
+        assert!(region_secs(10.0, (0.0, 1.0), 0.0).is_infinite());
+    }
 
     #[test]
     fn loop_wrap_both_directions() {
