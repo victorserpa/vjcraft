@@ -1,17 +1,33 @@
 name: CI
 
+# Only on main (and by hand): a private repository pays for every runner
+# minute. Linux, not macOS: a macOS minute costs ten Linux minutes, and
+# the macOS-only code is behind cfg(target_os = "macos").
 on:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
+    env:
+      # Without debug info the test binaries link in less memory and time.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: brew install ffmpeg pkg-config
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config clang libclang-dev cmake \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+            libavdevice-dev libswscale-dev libswresample-dev libasound2-dev \
+            libudev-dev libxkbcommon-dev libwayland-dev libx11-dev
       - name: Install Rust components
         run: |
           rustup toolchain install stable --profile minimal
