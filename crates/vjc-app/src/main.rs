@@ -2,9 +2,11 @@ mod api_io;
 mod artnet_out;
 mod browser;
 mod capture;
+mod clip_thumbs;
 mod compositor;
 mod dmx_io;
 mod fx;
+mod grid_ui;
 mod help;
 mod link_io;
 mod midi_io;
@@ -17,6 +19,7 @@ mod output_ui;
 mod params;
 mod prefs_ui;
 mod slice_render;
+mod theme;
 mod timecode_io;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
@@ -102,6 +105,7 @@ struct State {
     grid_rect: egui::Rect,
     master_rect: Option<egui::Rect>,
     browser: browser::Browser,
+    thumbs: clip_thumbs::ClipThumbs,
     last_pointer: Option<egui::Pos2>,
     /// Cell selected by click; fallback target for drops.
     selected: Option<(LayerId, u32)>,
@@ -176,6 +180,8 @@ struct State {
     win_size: egui::Vec2,
     /// Height of the top bars last frame (reserved when capping the bottom panel).
     topbars_h: f32,
+    /// Height of the transport bar last frame (also reserved under the grid).
+    transport_h: f32,
     /// Name being typed in the "Save layout as..." window.
     save_layout: Option<String>,
     /// Name of an existing custom layout waiting for overwrite confirmation.
@@ -824,6 +830,7 @@ impl State {
             grid_rect: egui::Rect::NOTHING,
             master_rect: None,
             browser: browser::Browser::new(browser_start(None, &prefs.general)),
+            thumbs: clip_thumbs::ClipThumbs::new(),
             last_pointer: None,
             selected: None,
             sel_group: None,
@@ -890,6 +897,7 @@ impl State {
             force_panels: false,
             win_size: egui::Vec2::ZERO,
             topbars_h: 0.0,
+            transport_h: 0.0,
             save_layout: None,
             overwrite_layout: None,
             help_shown: None,
@@ -2836,7 +2844,25 @@ impl State {
     fn time_bar(&mut self, ui: &mut egui::Ui) {
         let now = std::time::Instant::now();
         let mut cmds = vec![];
-        ui.horizontal(|ui| {
+        let (mut undo, mut redo) = (false, false);
+        ui.horizontal_wrapped(|ui| {
+            let play = ui
+                .button("\u{25b6}")
+                .on_hover_text("Play the selected clip");
+            if help(play, "transport-play").clicked()
+                && let Some((layer, column)) = self.selected
+            {
+                cmds.push(Command::TriggerClip {
+                    deck: self.project.composition.current_deck,
+                    layer,
+                    column,
+                });
+            }
+            let stop = ui.button("\u{25a0}").on_hover_text("Stop all layers");
+            if help(stop, "transport-stop").clicked() {
+                cmds.push(Command::ClearAll);
+            }
+            ui.separator();
             ui.label("BPM");
             let mut bpm = self.clock.bpm();
             let bpm_r = ui.add(
@@ -2846,6 +2872,14 @@ impl State {
             );
             if help(bpm_r, "bpm").changed() {
                 cmds.push(Command::SetBpm { bpm });
+            }
+            for (txt, delta) in [("-1", -1.0), ("+1", 1.0)] {
+                if help(ui.button(txt), "bpm-step").clicked() {
+                    cmds.push(Command::SetBpm {
+                        bpm: (self.clock.bpm() + delta)
+                            .clamp(vjc_core::clock::MIN_BPM, vjc_core::clock::MAX_BPM),
+                    });
+                }
             }
             let tap = help(ui.button("Tap"), "tap");
             self.targets.push((tap.rect, "/comp/tempo/tap".into()));
@@ -2893,9 +2927,9 @@ impl State {
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 let col = if i == on {
                     let base = if i == 0 {
-                        egui::Color32::YELLOW
+                        theme::BEAT_DOWN
                     } else {
-                        egui::Color32::LIGHT_BLUE
+                        theme::BEAT_OTHER
                     };
                     base.gamma_multiply(0.35 + 0.65 * fade)
                 } else {
@@ -2907,6 +2941,21 @@ impl State {
                 ui.toggle_value(&mut self.metronome, "Metronome"),
                 "metronome",
             );
+            ui.separator();
+            let (can_undo, can_redo) = (self.history.can_undo(), self.history.can_redo());
+            undo = help(
+                ui.add_enabled(can_undo, egui::Button::new("\u{21b6}"))
+                    .on_hover_text("Undo"),
+                "transport-undo",
+            )
+            .clicked();
+            redo = help(
+                ui.add_enabled(can_redo, egui::Button::new("\u{21b7}"))
+                    .on_hover_text("Redo"),
+                "transport-redo",
+            )
+            .clicked();
+            ui.separator();
             let mut link = self.project.composition.tempo.link_enabled;
             let label = if link {
                 format!("Link ({})", self.link_sync.peers)
@@ -2949,6 +2998,12 @@ impl State {
         for c in cmds {
             self.exec(c);
         }
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -2964,6 +3019,9 @@ impl State {
     fn ui_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.help_shown = help::take_hovered(&ctx);
+        if self.thumbs.poll(&ctx) || self.thumbs.is_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui
@@ -3098,12 +3156,45 @@ impl State {
         self.win_size = win;
         let force = std::mem::take(&mut self.force_panels);
         let resizing = |id: &str| ctx.is_being_dragged(egui::Id::new(id).with("__resize"));
+        // Status bar: version on the left, status text, local clock on the right.
+        egui::Panel::bottom("status_bar")
+            .exact_size(theme::STATUS_H)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.weak(format!("VJCraft {}", env!("CARGO_PKG_VERSION")));
+                    ui.separator();
+                    ui.label(&self.status);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(local_clock())
+                                .monospace()
+                                .color(theme::CLOCK_TEXT),
+                        );
+                    });
+                });
+            });
+        if self.persist {
+            // Live app only: keeps the clock ticking while idle.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let help_shown = self.help_shown.and_then(help::text).unwrap_or(help::IDLE);
+        let help_on = self.prefs.layouts.help;
         if lay.browser {
             let mut p = egui::Panel::right("browser").default_size(lay.browser_w);
             if force {
                 p = p.exact_size(lay.browser_w);
             }
-            let r = p.show(ui, |ui| opened = self.browser.show(ui, &fxs));
+            let r = p.show(ui, |ui| {
+                if help_on {
+                    // Contextual help box under the browser.
+                    egui::Panel::bottom("help_box")
+                        .resizable(false)
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(help_shown).wrap());
+                        });
+                }
+                opened = self.browser.show(ui, &fxs)
+            });
             self.track_size(
                 |l| &mut l.browser_w,
                 r.response.rect.width(),
@@ -3114,14 +3205,19 @@ impl State {
         // Only the grid's minimum is guaranteed (80 px + deck tabs + top bars); the rest
         // is up to the user. The real window height bounds what the ui reports.
         let win_h = ctx.content_rect().height();
-        if self.prefs.layouts.help {
+        if self.prefs.layouts.help && !lay.browser {
             self.help_bar(ui);
         }
         // 40 px for the deck tabs + add buttons, 40 for the status line and separator.
         let room = ui.available_height().min(win_h) - GRID_MIN - 80.0;
-        if lay.params {
-            let max = (room - self.topbars_h).max(40.0);
-            let h = lay.params_h.min(max);
+        if lay.params || lay.monitors {
+            let max = (room - self.topbars_h - self.transport_h).max(40.0);
+            let want = if lay.monitors {
+                lay.params_h.max(lay.monitors_h)
+            } else {
+                lay.params_h
+            };
+            let h = want.min(max);
             let mut p = egui::Panel::bottom("params")
                 .default_size(h)
                 .resizable(true)
@@ -3129,16 +3225,32 @@ impl State {
             if force {
                 p = p.exact_size(h);
             }
-            let r = p.show(ui, |ui| self.params_panel(ui, &mut pcmds));
-            self.track_size(
-                |l| &mut l.params_h,
-                r.response.rect.height(),
-                resizing("params"),
-            );
+            let r = p.show(ui, |ui| {
+                if lay.monitors {
+                    egui::Panel::left("monitor_col")
+                        .resizable(true)
+                        .default_size(theme::MONITOR_COL_W)
+                        .size_range(theme::MONITOR_MIN_W..=ui.available_width() * 0.5)
+                        .show(ui, |ui| self.monitor_column(ui));
+                }
+                if lay.params {
+                    self.params_panel(ui, &mut pcmds);
+                }
+            });
+            let bottom = r.response.rect.height();
+            self.track_size(|l| &mut l.params_h, bottom, resizing("params"));
+            if lay.monitors {
+                // One shared bottom panel: keep both heights in step so a preset with
+                // monitors restores what the user dragged to.
+                self.track_size(|l| &mut l.monitors_h, bottom, resizing("params"));
+            }
         }
         for c in pcmds {
             self.exec(c);
         }
+        // Transport bar: under the grid, above the property panels.
+        let r = egui::Panel::bottom("transport").show(ui, |ui| self.time_bar(ui));
+        self.transport_h = r.response.rect.height();
         if let Some(path) = opened {
             match self.selected {
                 Some((l, c)) => self.drop_file(l, c, path),
@@ -3154,7 +3266,6 @@ impl State {
         self.layer_rects.clear();
         self.targets.clear();
         let r = egui::Panel::top("topbars").show(ui, |ui| {
-            self.time_bar(ui);
             self.master_bar(ui);
         });
         self.topbars_h = r.response.rect.height();
@@ -3240,7 +3351,6 @@ impl State {
         };
         let mut pick: Option<(LayerId, u32)> = None;
 
-        ui.label(&self.status);
         if !self.warnings.is_empty() {
             ui.collapsing(format!("{} import warnings", self.warnings.len()), |ui| {
                 for w in &self.warnings {
@@ -3250,10 +3360,7 @@ impl State {
         }
         for (_, _, p) in self.players.values() {
             if let Some(e) = p.error() {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!("{}: {e}", p.path.display()),
-                );
+                ui.colored_label(theme::ERROR_TEXT, format!("{}: {e}", p.path.display()));
             }
         }
         ui.separator();
@@ -3276,65 +3383,6 @@ impl State {
                 });
             }
         });
-
-        // Monitors: preview and output side by side, each letterboxed to the comp aspect.
-        // Keep >= 80 px for the grid (+ deck tabs); monitors take only what is left.
-        let mon_max = ui.available_height().min(win_h) - GRID_MIN - 40.0;
-        if !lay.monitors || mon_max < 40.0 {
-            // Hidden, or too short for monitors: collapse them entirely.
-        } else if let Some(id) = self.comp_tex {
-            let h = lay.monitors_h.min(mon_max);
-            let mut p = egui::Panel::top("monitors_tex")
-                .resizable(true)
-                .default_size(h)
-                .size_range(40.0..=mon_max);
-            if force {
-                p = p.exact_size(h);
-            }
-            let r = p.show(ui, |ui| {
-                let c = &self.project.composition;
-                let aspect = c.width as f32 / c.height.max(1) as f32;
-                let avail = ui.available_size();
-                let label_h = ui.text_style_height(&egui::TextStyle::Body);
-                let w = ((avail.x - ui.spacing().item_spacing.x) / 2.0).max(0.0);
-                ui.horizontal(|ui| {
-                    for name in ["Preview", "Output"] {
-                        ui.vertical(|ui| {
-                            ui.set_width(w);
-                            ui.label(name);
-                            let h = (avail.y - label_h - ui.spacing().item_spacing.y).max(0.0);
-                            let size = egui::vec2(w, h);
-                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                            let mut fit = egui::vec2(size.x, size.x / aspect);
-                            if fit.y > size.y {
-                                fit = egui::vec2(size.y * aspect, size.y);
-                            }
-                            ui.painter().image(
-                                id,
-                                egui::Rect::from_center_size(rect.center(), fit),
-                                egui::Rect::from_min_max(
-                                    egui::pos2(0.0, 0.0),
-                                    egui::pos2(1.0, 1.0),
-                                ),
-                                egui::Color32::WHITE,
-                            );
-                        });
-                    }
-                });
-            });
-            self.track_size(
-                |l| &mut l.monitors_h,
-                r.response.rect.height(),
-                resizing("monitors_tex"),
-            );
-        } else {
-            egui::Panel::top("monitors")
-                .resizable(false)
-                .show(ui, |ui| {
-                    ui.weak("No signal");
-                });
-        }
 
         let mut cmds: Vec<Command> = vec![];
         if lay.grid {
@@ -3370,10 +3418,10 @@ impl State {
                 .show(ui, |ui| {
                     egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
                         ui.label("");
-                        ui.label("Opacity");
                         for (ci, n) in names.iter().enumerate() {
                             let b = egui::Button::new(format!("\u{25b6} {n}"))
-                                .selected(self.col_sel == Some(ci as u32));
+                                .selected(self.col_sel == Some(ci as u32))
+                                .min_size(egui::vec2(theme::CELL_W, theme::COLUMN_HEAD_H));
                             let r = help(ui.add(b), "column");
                             self.targets
                                 .push((r.rect, vjc_core::shortcuts::column_address(ci as u32)));
@@ -3384,9 +3432,7 @@ impl State {
                                 });
                             }
                         }
-                        ui.label("A/B");
                         ui.label("Blend");
-                        ui.label("");
                         ui.end_row();
                         for li in 0..comp.layers.len() {
                             let lid = comp.layers[li].id;
@@ -3405,71 +3451,155 @@ impl State {
                                 );
                             }
                             let in_group = comp.layers[li].group.is_some();
-                            let name = ui.add(
-                                egui::Label::new(if in_group {
-                                    format!("  \u{2502} {}", comp.layers[li].name)
-                                } else {
-                                    comp.layers[li].name.clone()
-                                })
-                                .sense(egui::Sense::click()),
-                            );
-                            let name = help(name, "layer-name");
-                            self.layer_rects.push((name.rect, lid));
-                            if name.clicked() || name.secondary_clicked() {
-                                self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
-                            }
-                            name.context_menu(|ui| {
-                                let from = active_of(&self.players, &self.gens, lid)
-                                    .filter(|(d, _)| *d == cur)
-                                    .map(|(_, c)| c);
-                                for (label, delta) in [("Previous clip", -1), ("Next clip", 1)] {
-                                    if ui.button(label).clicked() {
-                                        cmds.push(Command::StepClip {
-                                            deck: cur,
-                                            layer: lid,
-                                            from,
-                                            delta,
-                                        });
-                                        ui.close();
-                                    }
+                            ui.vertical(|ui| {
+                                ui.set_min_width(theme::LAYER_HEAD_W);
+                                ui.spacing_mut().slider_width = theme::LAYER_FADER_W;
+                                let layer = &comp.layers[li];
+                                let name = ui.add(
+                                    egui::Label::new(if in_group {
+                                        format!("\u{2502} {}", layer.name)
+                                    } else {
+                                        layer.name.clone()
+                                    })
+                                    .sense(egui::Sense::click()),
+                                );
+                                let name = help(name, "layer-name");
+                                self.layer_rects.push((name.rect, lid));
+                                if name.clicked() || name.secondary_clicked() {
+                                    self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
                                 }
-                                ui.separator();
-                                group_menu(ui, comp, li, &mut cmds);
-                                ui.separator();
-                                add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
-                            });
-                            let layer = &comp.layers[li];
-                            let mut op = match layer.track.opacity.value {
-                                vjc_model::Value::Number(n) => n as f32,
-                                _ => 1.0,
-                            };
-                            let op_r =
-                                ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
-                            let op_r = help(op_r, "layer-opacity");
-                            if let Some(a) =
-                                vjc_core::shortcuts::layer_address(&self.project, lid, "opacity")
-                            {
-                                self.targets.push((op_r.rect, a));
-                            }
-                            if op_r.changed() {
-                                cmds.push(Command::SetOpacity {
-                                    layer: lid,
-                                    value: op as f64,
+                                name.context_menu(|ui| {
+                                    let from = active_of(&self.players, &self.gens, lid)
+                                        .filter(|(d, _)| *d == cur)
+                                        .map(|(_, c)| c);
+                                    for (label, delta) in [("Previous clip", -1), ("Next clip", 1)]
+                                    {
+                                        if ui.button(label).clicked() {
+                                            cmds.push(Command::StepClip {
+                                                deck: cur,
+                                                layer: lid,
+                                                from,
+                                                delta,
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    group_menu(ui, comp, li, &mut cmds);
+                                    ui.separator();
+                                    add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
                                 });
-                            }
+                                ui.horizontal(|ui| {
+                                    let sq = egui::vec2(theme::LAYER_BTN, theme::LAYER_BTN);
+                                    if help(
+                                        ui.add(egui::Button::new("X").min_size(sq))
+                                            .on_hover_text("Clear layer"),
+                                        "layer-clear",
+                                    )
+                                    .clicked()
+                                    {
+                                        cmds.push(Command::ClearLayer { layer: lid });
+                                    }
+                                    let by = ui.add(egui::Button::new("B").min_size(sq).fill(
+                                        if layer.bypass {
+                                            theme::LAYER_ON
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        },
+                                    ));
+                                    if help(by.on_hover_text("Bypass layer"), "layer-bypass")
+                                        .clicked()
+                                    {
+                                        cmds.push(Command::SetLayerBypass {
+                                            layer: lid,
+                                            bypass: !layer.bypass,
+                                        });
+                                    }
+                                    let so = ui.add(egui::Button::new("S").min_size(sq).fill(
+                                        if layer.solo {
+                                            theme::LAYER_SOLO_ON
+                                        } else {
+                                            egui::Color32::TRANSPARENT
+                                        },
+                                    ));
+                                    if help(so.on_hover_text("Solo layer"), "layer-solo").clicked()
+                                    {
+                                        cmds.push(Command::SetLayerSolo {
+                                            layer: lid,
+                                            solo: !layer.solo,
+                                        });
+                                    }
+                                    let bus_row = ui.horizontal(|ui| {
+                                        for (txt, bus) in [
+                                            ("A", Some(vjc_model::Bus::A)),
+                                            ("-", None),
+                                            ("B", Some(vjc_model::Bus::B)),
+                                        ] {
+                                            if ui
+                                                .selectable_label(layer.crossfader_bus == bus, txt)
+                                                .clicked()
+                                            {
+                                                cmds.push(Command::SetLayerBus { layer: lid, bus });
+                                            }
+                                        }
+                                    });
+                                    help(bus_row.response, "layer-bus");
+                                    let mut op = match layer.track.opacity.value {
+                                        vjc_model::Value::Number(n) => n as f32,
+                                        _ => 1.0,
+                                    };
+                                    let op_r = ui.add(
+                                        egui::Slider::new(&mut op, 0.0..=1.0)
+                                            .show_value(false)
+                                            .trailing_fill(true),
+                                    );
+                                    let op_r = help(op_r, "layer-opacity");
+                                    if let Some(a) = vjc_core::shortcuts::layer_address(
+                                        &self.project,
+                                        lid,
+                                        "opacity",
+                                    ) {
+                                        self.targets.push((op_r.rect, a));
+                                    }
+                                    if op_r.changed() {
+                                        cmds.push(Command::SetOpacity {
+                                            layer: lid,
+                                            value: op as f64,
+                                        });
+                                    }
+                                });
+                            });
                             for ci in 0..ncols {
                                 let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
                                 // Highlight only when playing from the deck being shown.
                                 let on =
                                     active_of(&self.players, &self.gens, lid) == Some((cur, ci));
-                                let text = clip
+                                let label = clip
                                     .map(|k| k.name.as_str())
                                     .unwrap_or("(drop / right-click)");
-                                let btn = egui::Button::new(text)
-                                    .selected(on)
-                                    .min_size(egui::vec2(90.0, 24.0));
+                                let tile = match clip.map(|k| (k.id, &k.source)) {
+                                    None => grid_ui::Tile::Empty,
+                                    Some((id, vjc_model::Source::File { path })) => {
+                                        match self.thumbs.texture(id, path) {
+                                            Some(t) => grid_ui::Tile::Thumb(t),
+                                            None => grid_ui::Tile::Pending,
+                                        }
+                                    }
+                                    Some((_, vjc_model::Source::Generator { kind, .. })) => {
+                                        grid_ui::Tile::Color(kind)
+                                    }
+                                    Some((_, vjc_model::Source::Capture { .. })) => {
+                                        grid_ui::Tile::Color("capture")
+                                    }
+                                    Some((_, vjc_model::Source::Network { name, .. })) => {
+                                        grid_ui::Tile::Color(name)
+                                    }
+                                    Some((_, vjc_model::Source::LayerRouter { .. })) => {
+                                        grid_ui::Tile::Color("router")
+                                    }
+                                };
                                 let r = help(
-                                    ui.add(btn),
+                                    grid_ui::cell(ui, label, label, tile, on),
                                     if clip.is_some() { "cell" } else { "cell-empty" },
                                 );
                                 if clip.is_some() {
@@ -3506,14 +3636,14 @@ impl State {
                                     ui.painter().rect_stroke(
                                         r.rect,
                                         3.0,
-                                        egui::Stroke::new(2.5, egui::Color32::YELLOW),
+                                        egui::Stroke::new(2.5, theme::CELL_DROP),
                                         egui::StrokeKind::Outside,
                                     );
                                 } else if self.selected == Some((lid, ci)) {
                                     ui.painter().rect_stroke(
                                         r.rect,
                                         3.0,
-                                        egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE),
+                                        egui::Stroke::new(1.5, theme::CELL_SELECTED),
                                         egui::StrokeKind::Inside,
                                     );
                                 }
@@ -3532,21 +3662,6 @@ impl State {
                                 }
                             }
                             let layer = &comp.layers[li];
-                            let bus_row = ui.horizontal(|ui| {
-                                for (txt, bus) in [
-                                    ("A", Some(vjc_model::Bus::A)),
-                                    ("-", None),
-                                    ("B", Some(vjc_model::Bus::B)),
-                                ] {
-                                    if ui
-                                        .selectable_label(layer.crossfader_bus == bus, txt)
-                                        .clicked()
-                                    {
-                                        cmds.push(Command::SetLayerBus { layer: lid, bus });
-                                    }
-                                }
-                            });
-                            help(bus_row.response, "layer-bus");
                             let label = vjc_core::blend::COMPOSITION_MODES
                                 .iter()
                                 .find(|(m, _)| *m == layer.track.blend)
@@ -3568,9 +3683,6 @@ impl State {
                                     }
                                 });
                             help(blend.response, "layer-blend");
-                            if help(ui.button("Clear"), "layer-clear").clicked() {
-                                cmds.push(Command::ClearLayer { layer: lid });
-                            }
                             ui.end_row();
                         }
                     });
@@ -3603,6 +3715,45 @@ impl State {
         }
     }
 
+    /// Left column of the bottom area: Composition monitor over Preview monitor, each
+    /// letterboxed to the composition aspect.
+    fn monitor_column(&mut self, ui: &mut egui::Ui) {
+        let c = &self.project.composition;
+        let aspect = c.width as f32 / c.height.max(1) as f32;
+        let label_h = ui.text_style_height(&egui::TextStyle::Body);
+        let gap = ui.spacing().item_spacing.y;
+        let each = ((ui.available_height() - 2.0 * (label_h + gap) - gap) / 2.0).max(0.0);
+        let w = ui.available_width();
+        for name in ["Composition monitor", "Preview monitor"] {
+            ui.label(name);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, each), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 0.0, theme::MONITOR_BG);
+            match self.comp_tex {
+                Some(id) => {
+                    let mut fit = egui::vec2(w, w / aspect);
+                    if fit.y > each {
+                        fit = egui::vec2(each * aspect, each);
+                    }
+                    ui.painter().image(
+                        id,
+                        egui::Rect::from_center_size(rect.center(), fit),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                None => {
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "No signal",
+                        egui::FontId::proportional(12.0),
+                        ui.visuals().weak_text_color(),
+                    );
+                }
+            }
+        }
+    }
+
     /// Bottom panel: Composition / Layer / Clip parameters of the selection.
     fn params_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         ui.horizontal(|ui| {
@@ -3629,131 +3780,138 @@ impl State {
         let dials = self.dials();
         let actx = self.anim_ctx(&dials);
         let c = &self.project.composition;
-        if let Some(name) = params::text_field(ui, "cname", "Name", &c.name) {
-            cmds.push(Command::SetCompositionName { name });
-        }
-        let (mut w, mut h, mut fps) = (c.width, c.height, c.fps);
-        let mut size_changed = false;
-        let size_row = ui.horizontal(|ui| {
-            ui.label("Size");
-            // speed 0: typed only, so a drag does not resize the output every frame.
-            size_changed |= ui
-                .add(egui::DragValue::new(&mut w).speed(0.0).range(1..=16384))
-                .changed();
-            ui.label("x");
-            size_changed |= ui
-                .add(egui::DragValue::new(&mut h).speed(0.0).range(1..=16384))
-                .changed();
-            ui.label("fps");
-            size_changed |= ui
-                .add(
-                    egui::DragValue::new(&mut fps)
-                        .speed(0.0)
-                        .range(1.0..=240.0)
-                        .max_decimals(3),
-                )
-                .changed();
-        });
-        help(size_row.response, "comp-size");
-        if size_changed {
-            cmds.push(Command::SetCompositionSize {
-                width: w,
-                height: h,
-                fps,
-            });
-        }
-        let op = &c.master.opacity;
-        if let Value::Number(d) = &op.default {
-            let shown = vjc_core::anim::effective_number(op, &actx);
-            let (v, a) = params::param_slider_anim(
-                ui,
-                "mop",
-                "Opacity",
-                shown,
-                *d,
-                (0.0, 1.0),
-                &op.animation,
-            );
-            if let Some(value) = v {
-                cmds.push(Command::SetMasterOpacity { value });
+        if params::section(ui, "sec-video", "Video") {
+            if let Some(name) = params::text_field(ui, "cname", "Name", &c.name) {
+                cmds.push(Command::SetCompositionName { name });
             }
-            if let Some(animation) = a {
-                cmds.push(Command::SetAnimation {
-                    target: vjc_core::AnimTarget::MasterOpacity,
-                    animation,
+            let (mut w, mut h, mut fps) = (c.width, c.height, c.fps);
+            let mut size_changed = false;
+            let size_row = ui.horizontal(|ui| {
+                ui.label("Size");
+                // speed 0: typed only, so a drag does not resize the output every frame.
+                size_changed |= ui
+                    .add(egui::DragValue::new(&mut w).speed(0.0).range(1..=16384))
+                    .changed();
+                ui.label("x");
+                size_changed |= ui
+                    .add(egui::DragValue::new(&mut h).speed(0.0).range(1..=16384))
+                    .changed();
+                ui.label("fps");
+                size_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut fps)
+                            .speed(0.0)
+                            .range(1.0..=240.0)
+                            .max_decimals(3),
+                    )
+                    .changed();
+            });
+            help(size_row.response, "comp-size");
+            if size_changed {
+                cmds.push(Command::SetCompositionSize {
+                    width: w,
+                    height: h,
+                    fps,
                 });
             }
+            let op = &c.master.opacity;
+            if let Value::Number(d) = &op.default {
+                let shown = vjc_core::anim::effective_number(op, &actx);
+                let (v, a) = params::param_slider_anim(
+                    ui,
+                    "mop",
+                    "Opacity",
+                    shown,
+                    *d,
+                    (0.0, 1.0),
+                    &op.animation,
+                );
+                if let Some(value) = v {
+                    cmds.push(Command::SetMasterOpacity { value });
+                }
+                if let Some(animation) = a {
+                    cmds.push(Command::SetAnimation {
+                        target: vjc_core::AnimTarget::MasterOpacity,
+                        animation,
+                    });
+                }
+            }
         }
-        if let Some(value) =
-            params::param_slider(ui, "msp", "Speed", c.master_speed, 1.0, (0.0, 4.0))
+        if params::section(ui, "sec-transport", "Transport")
+            && let Some(value) =
+                params::param_slider(ui, "msp", "Speed", c.master_speed, 1.0, (0.0, 4.0))
         {
             cmds.push(Command::SetMasterSpeed { value });
         }
-        let (cf_val, cf_anim, cf_curve) = match &c.crossfader {
-            Some(x) => (
-                vjc_core::anim::effective_number(&x.position, &actx),
-                x.position.animation.clone(),
-                vjc_core::crossfader::CrossfadeCurve::from_name(&x.curve),
-            ),
-            None => (
+        if params::section(ui, "sec-crossfader", "Crossfader") {
+            let (cf_val, cf_anim, cf_curve) = match &c.crossfader {
+                Some(x) => (
+                    vjc_core::anim::effective_number(&x.position, &actx),
+                    x.position.animation.clone(),
+                    vjc_core::crossfader::CrossfadeCurve::from_name(&x.curve),
+                ),
+                None => (
+                    vjc_core::crossfader::CENTER,
+                    None,
+                    vjc_core::crossfader::CrossfadeCurve::default(),
+                ),
+            };
+            let (v, a) = params::param_slider_anim(
+                ui,
+                "cfp",
+                "Crossfader A-B",
+                cf_val,
                 vjc_core::crossfader::CENTER,
-                None,
-                vjc_core::crossfader::CrossfadeCurve::default(),
-            ),
-        };
-        let (v, a) = params::param_slider_anim(
-            ui,
-            "cfp",
-            "Crossfader A-B",
-            cf_val,
-            vjc_core::crossfader::CENTER,
-            (0.0, 1.0),
-            &cf_anim,
-        );
-        if let Some(value) = v {
-            cmds.push(Command::SetCrossfader { value });
-        }
-        if let Some(animation) = a {
-            cmds.push(Command::SetAnimation {
-                target: vjc_core::AnimTarget::Crossfader,
-                animation,
-            });
-        }
-        ui.horizontal(|ui| {
-            ui.label("Crossfader curve");
-            egui::ComboBox::from_id_salt("cfcurve")
-                .selected_text(cf_curve.label())
-                .show_ui(ui, |ui| {
-                    for curve in vjc_core::crossfader::CrossfadeCurve::ALL {
-                        if ui
-                            .selectable_label(cf_curve == curve, curve.label())
-                            .clicked()
-                        {
-                            cmds.push(Command::SetCrossfaderCurve { curve });
-                        }
-                    }
-                });
-        });
-        ui.separator();
-        self.cue_list(ui, cmds);
-        ui.separator();
-        ui.strong("Dashboard");
-        for (i, v) in dials.iter().enumerate() {
-            let n = i + 1;
-            let r = ui.horizontal(|ui| {
-                params::param_slider(ui, ("dial", i), &format!("Dial {n}"), *v, 0.0, (0.0, 1.0))
-            });
-            if let Some(value) = r.inner {
-                cmds.push(Command::SetDashboardDial {
-                    dial: i as u32,
-                    value,
+                (0.0, 1.0),
+                &cf_anim,
+            );
+            if let Some(value) = v {
+                cmds.push(Command::SetCrossfader { value });
+            }
+            if let Some(animation) = a {
+                cmds.push(Command::SetAnimation {
+                    target: vjc_core::AnimTarget::Crossfader,
+                    animation,
                 });
             }
-            self.targets
-                .push((r.response.rect, format!("/comp/dashboard/{n}")));
+            ui.horizontal(|ui| {
+                ui.label("Crossfader curve");
+                egui::ComboBox::from_id_salt("cfcurve")
+                    .selected_text(cf_curve.label())
+                    .show_ui(ui, |ui| {
+                        for curve in vjc_core::crossfader::CrossfadeCurve::ALL {
+                            if ui
+                                .selectable_label(cf_curve == curve, curve.label())
+                                .clicked()
+                            {
+                                cmds.push(Command::SetCrossfaderCurve { curve });
+                            }
+                        }
+                    });
+            });
         }
-        ui.separator();
-        self.chain_ui(ui, EffectTarget::Master, cmds);
+        if params::section(ui, "sec-cues", "Cues") {
+            self.cue_list(ui, cmds);
+        }
+        if params::section(ui, "sec-dashboard", "Dashboard") {
+            for (i, v) in dials.iter().enumerate() {
+                let n = i + 1;
+                let r = ui.horizontal(|ui| {
+                    params::param_slider(ui, ("dial", i), &format!("Dial {n}"), *v, 0.0, (0.0, 1.0))
+                });
+                if let Some(value) = r.inner {
+                    cmds.push(Command::SetDashboardDial {
+                        dial: i as u32,
+                        value,
+                    });
+                }
+                self.targets
+                    .push((r.response.rect, format!("/comp/dashboard/{n}")));
+            }
+        }
+        if params::section(ui, "sec-effects", "Effects") {
+            self.chain_ui(ui, EffectTarget::Master, cmds);
+        }
     }
 
     /// Timecode cues: (time, column, layer) rows; edits send the whole list as one command.
@@ -3840,140 +3998,147 @@ impl State {
         let Some(l) = self.project.composition.layers.iter().find(|l| l.id == lid) else {
             return;
         };
-        if let Some(name) = params::text_field(ui, ("lname", lid), "Name", &l.name) {
-            cmds.push(Command::RenameLayer { layer: lid, name });
-        }
-        let op = &l.track.opacity;
-        if let Value::Number(d) = &op.default {
-            let shown = vjc_core::anim::effective_number(op, &actx);
-            let (v, a) = params::param_slider_anim(
-                ui,
-                ("lop", lid),
-                "Opacity",
-                shown,
-                *d,
-                (0.0, 1.0),
-                &op.animation,
-            );
-            if let Some(value) = v {
-                cmds.push(Command::SetOpacity { layer: lid, value });
+        if params::section(ui, "sec-layer", "Layer") {
+            if let Some(name) = params::text_field(ui, ("lname", lid), "Name", &l.name) {
+                cmds.push(Command::RenameLayer { layer: lid, name });
             }
-            if let Some(animation) = a {
-                cmds.push(Command::SetAnimation {
-                    target: vjc_core::AnimTarget::LayerOpacity(lid),
-                    animation,
+            let op = &l.track.opacity;
+            if let Value::Number(d) = &op.default {
+                let shown = vjc_core::anim::effective_number(op, &actx);
+                let (v, a) = params::param_slider_anim(
+                    ui,
+                    ("lop", lid),
+                    "Opacity",
+                    shown,
+                    *d,
+                    (0.0, 1.0),
+                    &op.animation,
+                );
+                if let Some(value) = v {
+                    cmds.push(Command::SetOpacity { layer: lid, value });
+                }
+                if let Some(animation) = a {
+                    cmds.push(Command::SetAnimation {
+                        target: vjc_core::AnimTarget::LayerOpacity(lid),
+                        animation,
+                    });
+                }
+            }
+            let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
+                .iter()
+                .map(|(m, n)| (m.clone(), n.to_string()))
+                .collect();
+            if let Some(blend) = params::combo(ui, ("lbl", lid), "Blend", &l.track.blend, &modes) {
+                cmds.push(Command::SetBlend { layer: lid, blend });
+            }
+            let (mut solo, mut bypass) = (l.solo, l.bypass);
+            ui.horizontal(|ui| {
+                if ui.toggle_value(&mut solo, "Solo").changed() {
+                    cmds.push(Command::SetLayerSolo { layer: lid, solo });
+                }
+                if ui.toggle_value(&mut bypass, "Bypass").changed() {
+                    cmds.push(Command::SetLayerBypass { layer: lid, bypass });
+                }
+            });
+        }
+        if params::section(ui, "sec-transition", "Transition") {
+            let kinds: Vec<(String, String)> = [
+                "Cut",
+                "Dissolve",
+                "ToBlack",
+                "PushLeft",
+                "PushRight",
+                "ZoomIn",
+                "WipeEllipse",
+            ]
+            .iter()
+            .map(|k| (k.to_string(), k.to_string()))
+            .collect();
+            let tr = l.transition.clone();
+            if let Some(kind) = params::combo(ui, ("ltk", lid), "Transition", &tr.kind, &kinds) {
+                let transition = Transition { kind, ..tr.clone() };
+                cmds.push(Command::SetLayerTransition {
+                    layer: lid,
+                    transition,
+                });
+            }
+            if let Some(secs) = params::param_slider(
+                ui,
+                ("ltd", lid),
+                "Duration (s)",
+                tr.duration_secs,
+                0.0,
+                (0.0, 8.0),
+            ) {
+                let transition = Transition {
+                    duration_secs: secs,
+                    ..tr.clone()
+                };
+                cmds.push(Command::SetLayerTransition {
+                    layer: lid,
+                    transition,
+                });
+            }
+            let beats: Vec<(Option<f64>, String)> =
+                [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0)]
+                    .into_iter()
+                    .map(|b| {
+                        (
+                            b,
+                            b.map_or("off (use seconds)".into(), |n| format!("{n} beats")),
+                        )
+                    })
+                    .collect();
+            if let Some(duration_beats) = params::combo(
+                ui,
+                ("ltb", lid),
+                "Duration (beats)",
+                &tr.duration_beats,
+                &beats,
+            ) {
+                let transition = Transition {
+                    duration_beats,
+                    ..tr.clone()
+                };
+                cmds.push(Command::SetLayerTransition {
+                    layer: lid,
+                    transition,
                 });
             }
         }
-        let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
-            .iter()
-            .map(|(m, n)| (m.clone(), n.to_string()))
-            .collect();
-        if let Some(blend) = params::combo(ui, ("lbl", lid), "Blend", &l.track.blend, &modes) {
-            cmds.push(Command::SetBlend { layer: lid, blend });
-        }
-        let (mut solo, mut bypass) = (l.solo, l.bypass);
-        ui.horizontal(|ui| {
-            if ui.toggle_value(&mut solo, "Solo").changed() {
-                cmds.push(Command::SetLayerSolo { layer: lid, solo });
+        if params::section(ui, "sec-autopilot", "Autopilot") {
+            let ap = l.autopilot.clone();
+            let modes = labeled(&[
+                (AutopilotMode::Off, "Off"),
+                (AutopilotMode::Next, "Next"),
+                (AutopilotMode::Random, "Random"),
+            ]);
+            if let Some(mode) = params::combo(ui, ("lap", lid), "Autopilot", &ap.mode, &modes) {
+                cmds.push(Command::SetLayerAutopilot {
+                    layer: lid,
+                    autopilot: Autopilot { mode, ..ap.clone() },
+                });
             }
-            if ui.toggle_value(&mut bypass, "Bypass").changed() {
-                cmds.push(Command::SetLayerBypass { layer: lid, bypass });
+            if let Some(n) = params::param_slider(
+                ui,
+                ("lapn", lid),
+                "Autopilot every N loops",
+                f64::from(ap.every_loops),
+                1.0,
+                (1.0, 16.0),
+            ) {
+                cmds.push(Command::SetLayerAutopilot {
+                    layer: lid,
+                    autopilot: Autopilot {
+                        every_loops: n.round() as u32,
+                        ..ap
+                    },
+                });
             }
-        });
-        ui.separator();
-        let kinds: Vec<(String, String)> = [
-            "Cut",
-            "Dissolve",
-            "ToBlack",
-            "PushLeft",
-            "PushRight",
-            "ZoomIn",
-            "WipeEllipse",
-        ]
-        .iter()
-        .map(|k| (k.to_string(), k.to_string()))
-        .collect();
-        let tr = l.transition.clone();
-        if let Some(kind) = params::combo(ui, ("ltk", lid), "Transition", &tr.kind, &kinds) {
-            let transition = Transition { kind, ..tr.clone() };
-            cmds.push(Command::SetLayerTransition {
-                layer: lid,
-                transition,
-            });
         }
-        if let Some(secs) = params::param_slider(
-            ui,
-            ("ltd", lid),
-            "Duration (s)",
-            tr.duration_secs,
-            0.0,
-            (0.0, 8.0),
-        ) {
-            let transition = Transition {
-                duration_secs: secs,
-                ..tr.clone()
-            };
-            cmds.push(Command::SetLayerTransition {
-                layer: lid,
-                transition,
-            });
+        if params::section(ui, "sec-layer-effects", "Effects") {
+            self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
         }
-        let beats: Vec<(Option<f64>, String)> = [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0)]
-            .into_iter()
-            .map(|b| {
-                (
-                    b,
-                    b.map_or("off (use seconds)".into(), |n| format!("{n} beats")),
-                )
-            })
-            .collect();
-        if let Some(duration_beats) = params::combo(
-            ui,
-            ("ltb", lid),
-            "Duration (beats)",
-            &tr.duration_beats,
-            &beats,
-        ) {
-            let transition = Transition {
-                duration_beats,
-                ..tr.clone()
-            };
-            cmds.push(Command::SetLayerTransition {
-                layer: lid,
-                transition,
-            });
-        }
-        let ap = l.autopilot.clone();
-        let modes = labeled(&[
-            (AutopilotMode::Off, "Off"),
-            (AutopilotMode::Next, "Next"),
-            (AutopilotMode::Random, "Random"),
-        ]);
-        if let Some(mode) = params::combo(ui, ("lap", lid), "Autopilot", &ap.mode, &modes) {
-            cmds.push(Command::SetLayerAutopilot {
-                layer: lid,
-                autopilot: Autopilot { mode, ..ap.clone() },
-            });
-        }
-        if let Some(n) = params::param_slider(
-            ui,
-            ("lapn", lid),
-            "Autopilot every N loops",
-            f64::from(ap.every_loops),
-            1.0,
-            (1.0, 16.0),
-        ) {
-            cmds.push(Command::SetLayerAutopilot {
-                layer: lid,
-                autopilot: Autopilot {
-                    every_loops: n.round() as u32,
-                    ..ap
-                },
-            });
-        }
-        ui.separator();
-        self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
     }
 
     fn group_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
@@ -4360,63 +4525,106 @@ impl State {
                 Some(fx::Status::Failed(why)) => Some(why.clone()),
                 _ => self.ml.problem(&e.kind, e.id),
             };
-            ui.horizontal(|ui| {
-                let mut on = !e.bypass;
-                let en = ui.checkbox(&mut on, "").on_hover_text("Enabled");
-                self.fx_target(en.rect, target, i, "bypass");
-                if en.changed() {
-                    cmds.push(Command::SetEffectBypass {
-                        target,
-                        effect: e.id,
-                        bypass: !on,
-                    });
-                }
-                ui.strong(fx_label(&e.kind));
-                if ui.add_enabled(i > 0, egui::Button::new("Up")).clicked() {
-                    cmds.push(Command::MoveEffect {
-                        target,
-                        effect: e.id,
-                        index: i - 1,
-                    });
-                }
-                if ui
-                    .add_enabled(i + 1 < n, egui::Button::new("Down"))
-                    .clicked()
-                {
-                    cmds.push(Command::MoveEffect {
-                        target,
-                        effect: e.id,
-                        index: i + 1,
-                    });
-                }
-                if ui.button("Remove").clicked() {
-                    cmds.push(Command::RemoveEffect {
-                        target,
-                        effect: e.id,
-                    });
-                }
-                if let Some(why) = failure {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("disabled: {why}"));
-                }
-            });
+            let open_id = ui.id().with(("fx-open", e.id));
+            let open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
+            let mut toggle_open = false;
             let (dw, dw_rect) = ui
-                .push_id((e.id, "dry_wet"), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_space(24.0);
-                        ui.label("Dry/Wet");
-                        let v = params::param_slider(
-                            ui,
-                            "dry_wet",
-                            "",
-                            e.dry_wet as f64,
-                            1.0,
-                            (0.0, 1.0),
-                        );
-                        (v, ui.min_rect())
-                    })
-                    .inner
+                .horizontal(|ui| {
+                    let name = ui.strong(fx_label(&e.kind));
+                    name.context_menu(|ui| {
+                        if ui
+                            .add_enabled(i > 0, egui::Button::new("Move up"))
+                            .clicked()
+                        {
+                            cmds.push(Command::MoveEffect {
+                                target,
+                                effect: e.id,
+                                index: i - 1,
+                            });
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(i + 1 < n, egui::Button::new("Move down"))
+                            .clicked()
+                        {
+                            cmds.push(Command::MoveEffect {
+                                target,
+                                effect: e.id,
+                                index: i + 1,
+                            });
+                            ui.close();
+                        }
+                    });
+                    let dw = ui
+                        .push_id((e.id, "dry_wet"), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().slider_width = theme::FX_SLIDER_W;
+                                let v = params::param_slider(
+                                    ui,
+                                    "dry_wet",
+                                    "Dry/Wet",
+                                    e.dry_wet as f64,
+                                    1.0,
+                                    (0.0, 1.0),
+                                );
+                                (v, ui.min_rect())
+                            })
+                            .inner
+                        })
+                        .inner;
+                    let by = ui.add(
+                        egui::Button::new("B")
+                            .min_size(theme::FX_BTN)
+                            .selected(e.bypass),
+                    );
+                    let by = by.on_hover_text("Bypass effect");
+                    by.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Bypass effect")
+                    });
+                    self.fx_target(by.rect, target, i, "bypass");
+                    if by.clicked() {
+                        cmds.push(Command::SetEffectBypass {
+                            target,
+                            effect: e.id,
+                            bypass: !e.bypass,
+                        });
+                    }
+                    let pr = ui
+                        .add(
+                            egui::Button::new("P")
+                                .min_size(theme::FX_BTN)
+                                .selected(open),
+                        )
+                        .on_hover_text("Show or hide parameters");
+                    pr.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            "Effect parameters",
+                        )
+                    });
+                    toggle_open = pr.clicked();
+                    let rm = ui
+                        .add(egui::Button::new("X").min_size(theme::FX_BTN))
+                        .on_hover_text("Remove effect");
+                    rm.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Remove effect")
+                    });
+                    if rm.clicked() {
+                        cmds.push(Command::RemoveEffect {
+                            target,
+                            effect: e.id,
+                        });
+                    }
+                    if let Some(why) = &failure {
+                        ui.colored_label(theme::ERROR_TEXT, format!("disabled: {why}"));
+                    }
+                    dw
                 })
                 .inner;
+            if toggle_open {
+                ui.data_mut(|d| d.insert_temp(open_id, !open));
+            }
             self.fx_target(dw_rect, target, i, "drywet");
             if let Some(v) = dw {
                 cmds.push(Command::SetEffectDryWet {
@@ -4424,6 +4632,9 @@ impl State {
                     effect: e.id,
                     dry_wet: v as f32,
                 });
+            }
+            if !open {
+                continue;
             }
             for (pi, p) in e.params.iter().enumerate() {
                 let Some(kind) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
@@ -4678,6 +4889,11 @@ fn main() -> eframe::Result {
         None => (Prefs::default(), None),
     };
     let mut options = eframe::NativeOptions::default();
+    // Open at 1600x1000, or maximized when the screen is smaller than that.
+    let small = monitors::main_size_points().is_some_and(|(w, h)| w < 1600.0 || h < 1000.0);
+    options.viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1600.0, 1000.0])
+        .with_maximized(small);
     if !prefs.video.vsync {
         options.wgpu_options.surface.present_mode = wgpu::PresentMode::AutoNoVsync;
     }
@@ -4749,6 +4965,30 @@ fn main() -> eframe::Result {
             Ok(Box::new(s))
         }),
     )
+}
+
+/// Local time of day as HH:MM:SS (the status bar clock).
+#[cfg(unix)]
+fn local_clock() -> String {
+    // SAFETY: `time` and `localtime_r` only write into the locals passed to them.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return "--:--:--".into();
+        }
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
+/// UTC time of day where the local zone is not read (non-Unix targets).
+#[cfg(not(unix))]
+fn local_clock() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let t = secs % 86_400;
+    format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60)
 }
 
 /// Autopilot targets: files (advance by loops or at the end) and generators (advance by

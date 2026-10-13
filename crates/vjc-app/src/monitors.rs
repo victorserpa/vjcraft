@@ -94,6 +94,18 @@ pub fn find(monitors: &[MonitorInfo], id: u32) -> Option<usize> {
     monitors.iter().position(|m| m.id == id)
 }
 
+/// Size in points of the main display, when the platform can tell.
+#[cfg(target_os = "macos")]
+pub fn main_size_points() -> Option<(f32, f32)> {
+    let b = core_graphics::display::CGDisplay::main().bounds();
+    Some((b.size.width as f32, b.size.height as f32))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn main_size_points() -> Option<(f32, f32)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

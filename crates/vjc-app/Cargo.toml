@@ -42,3 +42,6 @@ link = ["dep:rusty_link"]
 syphon = ["vjc-net/syphon"]
 # NDI in/out; needs libndi at runtime, otherwise reported as unavailable.
 ndi = ["vjc-net/ndi"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

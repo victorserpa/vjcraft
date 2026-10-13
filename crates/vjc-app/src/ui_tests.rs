@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 fn prefs() -> Prefs {
     let mut p = Prefs::default();
     p.control.offer_shortcuts = false;
+    p.layouts.help = false;
     p.general.open_last_project = false;
     p.general.autosave = false;
     p
@@ -600,7 +601,7 @@ fn output_setup_soft_edge_and_mask() {
 fn panel_tabs_switch() {
     let mut h = app();
     assert!(matches!(h.state().panel_tab, PanelTab::Composition));
-    assert!(has_text(&h, "Dashboard"));
+    assert!(has_text(&h, "- Dashboard"));
     click(&mut h, "Layer");
     assert!(matches!(h.state().panel_tab, PanelTab::Layer));
     assert!(has_text(&h, "Select a layer (click its name or a cell)."));
@@ -928,16 +929,16 @@ fn app_with_tex(w: f32, hgt: f32) -> Harness<'static, State> {
 fn mapping_preset_is_not_cut_by_a_fixed_ceiling_and_is_not_rewritten() {
     let mut h = app_with_tex(1280.0, 900.0);
     pick_layout(&mut h, "Mapping");
-    let mon = panel_h(&h, "monitors_tex");
+    let mon = panel_h(&h, "params");
     assert!(
         (mon - 420.0).abs() < 2.0,
-        "monitors {mon} (35% of 900 would be 315)"
+        "bottom area {mon} (35% of 900 would be 315)"
     );
     snap(&mut h, "layout_mapping_tex");
     // Small window: the panel shrinks to leave the grid room, the layout keeps 420.
     let mut s = app_with_tex(1280.0, 520.0);
     pick_layout(&mut s, "Mapping");
-    assert!(panel_h(&s, "monitors_tex") < 420.0);
+    assert!(panel_h(&s, "params") < 420.0);
     assert_eq!(s.state().prefs.layouts.current.monitors_h, 420.0);
     assert_eq!(s.state().prefs.layouts.current.params_h, 140.0);
     let row = s.state().layer_rects.first().map(|r| r.0);
@@ -1012,7 +1013,7 @@ fn switching_layouts_reapplies_sizes_with_stable_panel_ids() {
     pick_layout(&mut h, "Performance");
     pick_layout(&mut h, "Default");
     assert!((panel_w(&h, "browser") - 260.0).abs() < 2.0);
-    assert!((panel_h(&h, "params") - 220.0).abs() < 2.0);
+    assert!((panel_h(&h, "params") - 400.0).abs() < 2.0);
 }
 
 #[test]
@@ -1154,4 +1155,133 @@ fn duplicate_monitor_keeps_screen_closed_and_reports() {
         device: mon("2"),
     }]);
     assert!(!st.closed_screens.contains(&ids[1]));
+}
+
+// Work layout (#136)
+#[test]
+fn layout_has_monitor_column_status_bar_and_transport() {
+    let mut h = app();
+    assert!(exists(&h, "Composition monitor") && exists(&h, "Preview monitor"));
+    let version = format!("VJCraft {}", env!("CARGO_PKG_VERSION"));
+    assert!(
+        has_text(&h, &version) || exists(&h, &version),
+        "status bar version"
+    );
+    // Transport sits under the grid and above the property panels.
+    let play = h.get_by_label("\u{25b6}").rect();
+    let add = h.get_by_label("Add layer").rect();
+    let tabs = h.get_by_label("Composition").rect();
+    assert!(add.max.y < play.min.y && play.max.y < tabs.min.y);
+    // Monitors left, properties right of them.
+    let mon = h.get_by_label("Composition monitor").rect();
+    assert!(mon.max.x < tabs.min.x);
+    snap(&mut h, "136-layout");
+}
+
+#[test]
+fn transport_stop_and_undo_redo_buttons_work() {
+    let mut h = app();
+    let lid = h.state().project.composition.layers[0].id;
+    let name = |h: &Harness<'_, State>| h.state().project.composition.layers[0].name.clone();
+    let old = name(&h);
+    h.state_mut().exec(Command::RenameLayer {
+        layer: lid,
+        name: "Renamed".into(),
+    });
+    settle(&mut h);
+    click(&mut h, "\u{21b6}");
+    assert_eq!(name(&h), old);
+    click(&mut h, "\u{21b7}");
+    assert_eq!(name(&h), "Renamed");
+    click(&mut h, "\u{25a0}");
+    assert!(h.state().players.is_empty());
+}
+
+#[test]
+fn layer_header_buttons_toggle_solo_and_bypass() {
+    let mut h = app();
+    let first = |h: &Harness<'_, State>| h.state().project.composition.layers[0].clone();
+    h.query_all_by_label("S").next().unwrap().click();
+    settle(&mut h);
+    assert!(first(&h).solo);
+    // The master bar's crossfader "B" comes first.
+    h.query_all_by_label("B").nth(1).unwrap().click();
+    settle(&mut h);
+    assert!(first(&h).bypass);
+    let n = layers_cols(&h).0;
+    h.query_all_by_label("X").next().unwrap().click();
+    settle(&mut h);
+    assert_eq!(layers_cols(&h).0, n, "clear keeps the layer");
+}
+
+#[test]
+fn property_sections_collapse() {
+    // Tall bottom area so the Dashboard header is on screen and clickable.
+    let mut h = app_sized(1400.0, 1500.0);
+    h.state_mut().apply_layout(Layout {
+        params_h: 900.0,
+        ..Layout::default()
+    });
+    settle(&mut h);
+    assert!(has_text(&h, "- Dashboard"));
+    assert!(exists(&h, "Dial 1") || has_text(&h, "Dial 1"));
+    click(&mut h, "- Dashboard");
+    assert!(has_text(&h, "+ Dashboard") || exists(&h, "+ Dashboard"));
+    assert!(!exists(&h, "Dial 1") && !has_text(&h, "Dial 1"));
+}
+
+#[test]
+fn file_clip_gets_a_thumbnail_off_the_ui_thread() {
+    let Some(video) = test_video("thumb.mp4") else {
+        return; // no ffmpeg here
+    };
+    let mut h = app();
+    let lid = drop_video_on_cell(&mut h, 0, 0, &video);
+    let id = h.state().project.composition.decks[0]
+        .clip_at(lid, 0)
+        .expect("clip")
+        .id;
+    for _ in 0..100 {
+        if h.state().thumbs.ready(id) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h.run_steps(2);
+    }
+    assert!(h.state().thumbs.ready(id), "thumbnail never arrived");
+}
+
+#[test]
+fn help_box_is_on_by_default_under_the_browser() {
+    assert!(Prefs::default().layouts.help);
+    let mut p = prefs();
+    p.layouts.help = true;
+    let h = app_with(State::headless(p), egui::vec2(1280.0, 800.0));
+    assert!(exists(&h, help::IDLE) || has_text(&h, help::IDLE));
+}
+
+#[test]
+fn dragging_shared_bottom_panel_updates_monitor_height_too() {
+    let mut h = app_with_tex(1280.0, 800.0);
+    let l = Layout {
+        monitors: true,
+        monitors_h: 220.0,
+        params_h: 220.0,
+        ..Layout::default()
+    };
+    h.state_mut().apply_layout(l);
+    settle(&mut h);
+    let r = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("params"))
+        .expect("params panel")
+        .outer_rect;
+    let top = egui::pos2(r.center().x, r.top() + 1.0);
+    drag(&mut h, top, top - egui::vec2(0.0, 80.0));
+    let cur = &h.state().prefs.layouts.current;
+    assert!(cur.params_h > 260.0, "params_h {}", cur.params_h);
+    assert!(
+        (cur.monitors_h - cur.params_h).abs() < 1.0,
+        "monitors_h {} params_h {}",
+        cur.monitors_h,
+        cur.params_h
+    );
 }

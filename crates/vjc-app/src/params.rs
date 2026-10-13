@@ -27,6 +27,25 @@ pub fn reset_to(current: &Value, default: &Value) -> Option<Value> {
     (current != default).then(|| default.clone())
 }
 
+/// Collapsible section header ("- Title" open, "+ Title" closed). The open state lives in
+/// egui memory under `id`, sections start open. Returns whether the body should be drawn.
+pub fn section(ui: &mut egui::Ui, id: &'static str, title: &str) -> bool {
+    let key = ui.id().with(("section", id));
+    let mut open = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(true);
+    let arrow = if open { "-" } else { "+" };
+    let text = egui::RichText::new(format!("{arrow} {title}"))
+        .strong()
+        .color(crate::theme::SECTION_HEAD);
+    if ui
+        .add(egui::Label::new(text).sense(egui::Sense::click()))
+        .clicked()
+    {
+        open = !open;
+        ui.data_mut(|d| d.insert_temp(key, open));
+    }
+    open
+}
+
 /// Slider with value label (double click to type, Enter commits, Esc cancels) and a reset
 /// button. Returns the new value when the user changed it; always inside `range`.
 pub fn param_slider(
@@ -211,7 +230,9 @@ fn slider_inner(
         }
         let editing: Option<String> = ui.data(|d| d.get_temp(id));
         if let Some(mut buf) = editing {
-            let e = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(56.0));
+            let e = ui.add(
+                egui::TextEdit::singleline(&mut buf).desired_width(crate::theme::PROP_VALUE_W),
+            );
             e.request_focus();
             if e.lost_focus() {
                 if ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -227,6 +248,14 @@ fn slider_inner(
             let r = ui.add(egui::Label::new(format_value(value)).sense(egui::Sense::click()));
             if r.double_clicked() {
                 ui.data_mut(|d| d.insert_temp(id, format_value(value)));
+            }
+        }
+        let step = (range.1 - range.0) / 100.0;
+        for (txt, name, sign) in [("-", "Decrease", -1.0), ("+", "Increase", 1.0)] {
+            let b = ui.small_button(txt);
+            b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+            if b.clicked() {
+                out = Some((value + sign * step).clamp(range.0, range.1));
             }
         }
         let reset = reset_to(&Value::Number(value), &Value::Number(default));

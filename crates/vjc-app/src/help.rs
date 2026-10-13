@@ -46,6 +46,11 @@ pub fn text(key: &str) -> Option<&'static str> {
         "resync" => {
             "Restarts the bar on the next beat, keeping the tempo, so the downbeat lines up with the music."
         }
+        "transport-play" => "Plays the selected clip from its start.",
+        "transport-stop" => "Stops every layer.",
+        "transport-undo" => "Undoes the last edit.",
+        "transport-redo" => "Redoes the edit you just undid.",
+        "bpm-step" => "Changes the tempo by one beat per minute.",
         "half-tempo" => "Halves the tempo.",
         "double-tempo" => "Doubles the tempo.",
         "metronome" => {
@@ -86,6 +91,8 @@ pub fn text(key: &str) -> Option<&'static str> {
             "Assigns the layer to crossfader side A or B, or to neither (-) so it ignores the crossfader."
         }
         "layer-blend" => "How this layer is combined with the layers below it.",
+        "layer-bypass" => "Skips this layer in the mix without losing its clip or settings.",
+        "layer-solo" => "Plays only the soloed layers; every other layer is muted.",
         "layer-clear" => "Stops the clip playing on this layer.",
         "deck-tab" => "Switches the clip grid to this deck. Decks keep separate sets of clips.",
         "group-header" => {

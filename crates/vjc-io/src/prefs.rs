@@ -211,7 +211,7 @@ impl Default for Layout {
             monitors: true,
             monitors_h: 220.0,
             params: true,
-            params_h: 220.0,
+            params_h: 400.0,
             grid: true,
         }
     }
@@ -261,12 +261,22 @@ impl Layout {
 }
 
 /// The layout in use (restored on start), the user's named layouts and the help toggle.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layouts {
     pub current: Layout,
     pub custom: Vec<Layout>,
     pub help: bool,
+}
+
+impl Default for Layouts {
+    fn default() -> Self {
+        Layouts {
+            current: Layout::default(),
+            custom: vec![],
+            help: true,
+        }
+    }
 }
 
 impl Layouts {
