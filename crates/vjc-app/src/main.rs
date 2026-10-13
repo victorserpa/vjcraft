@@ -20,9 +20,50 @@ struct State {
     /// Output window monitor index (0-based) while open.
     output: Option<usize>,
     /// Cell rects from the last frame, for hit-testing file drops.
-    cells: Vec<(egui::Rect, LayerId, u32)>,
+    cells: Vec<CellInfo>,
     last_pointer: Option<egui::Pos2>,
+    /// Cell selected by click; fallback target for drops.
+    selected: Option<(LayerId, u32)>,
 }
+
+/// Grid cell geometry for hit-testing.
+#[derive(Clone, Copy)]
+struct CellInfo {
+    rect: egui::Rect,
+    layer: LayerId,
+    col: u32,
+    empty: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DropWhere {
+    Pointer,
+    Selected,
+    FirstEmpty,
+    FirstCell,
+}
+
+/// Picks the cell receiving a drop: cell under pointer, else selected cell,
+/// else first empty cell of the bottom layer (last in `cells`), else its first cell.
+fn resolve_drop(cells: &[CellInfo], pointer: Option<egui::Pos2>, selected: Option<(LayerId, u32)>) -> Option<(LayerId, u32, DropWhere)> {
+    if let Some(p) = pointer {
+        if let Some(c) = cells.iter().find(|c| c.rect.contains(p)) {
+            return Some((c.layer, c.col, DropWhere::Pointer));
+        }
+    }
+    if let Some((l, col)) = selected {
+        if cells.iter().any(|c| c.layer == l && c.col == col) {
+            return Some((l, col, DropWhere::Selected));
+        }
+    }
+    let bottom = cells.last()?.layer;
+    let mut row = cells.iter().filter(|c| c.layer == bottom);
+    if let Some(c) = row.clone().find(|c| c.empty) {
+        return Some((c.layer, c.col, DropWhere::FirstEmpty));
+    }
+    row.next().map(|c| (c.layer, c.col, DropWhere::FirstCell))
+}
+
 
 fn new_layer(n: usize) -> Layer {
     Layer {
@@ -41,7 +82,8 @@ impl State {
     fn new() -> Self {
         let mut project = Project::new("Untitled");
         let c = &mut project.composition;
-        for i in 1..=2 {
+        // Layers are listed top to bottom; the bottom one is "Layer 1".
+        for i in (1..=2).rev() {
             c.layers.push(new_layer(i));
         }
         for i in 1..=4 {
@@ -57,6 +99,7 @@ impl State {
             output: None,
             cells: vec![],
             last_pointer: None,
+            selected: None,
         }
     }
 
@@ -178,15 +221,27 @@ impl State {
         });
 
         // File drops onto grid cells.
-        self.last_pointer = ctx.input(|i| i.pointer.latest_pos()).or(self.last_pointer);
+        self.last_pointer = ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos())).or(self.last_pointer);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for path in dropped {
-            let hit = self.last_pointer.and_then(|p| self.cells.iter().find(|(r, _, _)| r.contains(p)).map(|(_, l, c)| (*l, *c)));
-            match hit {
-                Some((l, c)) => self.drop_file(l, c, path),
-                None => self.status = "Drop the file on a grid cell".into(),
+            match resolve_drop(&self.cells, self.last_pointer, self.selected) {
+                Some((l, c, w)) => {
+                    let how = match w {
+                        DropWhere::Pointer => "under pointer",
+                        DropWhere::Selected => "selected cell (no pointer position)",
+                        DropWhere::FirstEmpty => "first empty cell of bottom layer",
+                        DropWhere::FirstCell => "first cell of bottom layer",
+                    };
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.drop_file(l, c, path);
+                    self.status = format!("Dropped {name} on column {} ({how})", c + 1);
+                }
+                None => self.status = "No grid cells to drop on".into(),
             }
         }
+        let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let drag_target = if dragging { resolve_drop(&self.cells, self.last_pointer, self.selected).map(|(l, c, _)| (l, c)) } else { None };
+        let mut pick: Option<(LayerId, u32)> = None;
 
         ui.label(&self.status);
         if !self.warnings.is_empty() {
@@ -233,7 +288,7 @@ impl State {
         let names: Vec<String> = self.project.composition.columns.iter().map(|c| c.name.clone()).collect();
         let deck_idx = self.project.composition.decks.iter().position(|d| d.id == cur);
         let comp = &mut self.project.composition;
-        egui::ScrollArea::both().show(ui, |ui| {
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
             egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
                 ui.label("");
                 for n in &names {
@@ -249,12 +304,23 @@ impl State {
                     for ci in 0..ncols {
                         let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
                         let on = self.players.get(&lid).map(|(c, _)| *c) == Some(ci);
-                        let text = clip.map(|k| k.name.as_str()).unwrap_or("(drop)");
+                        let text = clip.map(|k| k.name.as_str()).unwrap_or("(drop / right-click)");
                         let btn = egui::Button::new(text).selected(on).min_size(egui::vec2(90.0, 24.0));
                         let r = ui.add(btn);
-                        cells.push((r.rect, lid, ci));
+                        cells.push(CellInfo { rect: r.rect, layer: lid, col: ci, empty: clip.is_none() });
+                        if drag_target == Some((lid, ci)) {
+                            ui.painter().rect_stroke(r.rect, 3.0, egui::Stroke::new(2.5, egui::Color32::YELLOW), egui::StrokeKind::Outside);
+                        } else if self.selected == Some((lid, ci)) {
+                            ui.painter().rect_stroke(r.rect, 3.0, egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE), egui::StrokeKind::Inside);
+                        }
+                        if r.clicked() || r.secondary_clicked() {
+                            self.selected = Some((lid, ci));
+                        }
                         if r.clicked() && clip.is_some() {
                             trigger = Some((lid, ci));
+                        }
+                        if clip.is_none() && (r.secondary_clicked() || r.double_clicked()) {
+                            pick = Some((lid, ci));
                         }
                     }
                     let layer = &mut comp.layers[li];
@@ -262,7 +328,7 @@ impl State {
                         vjc_model::Value::Number(n) => n as f32,
                         _ => 1.0,
                     };
-                    if ui.add(egui::Slider::new(&mut op, 0.0..=1.0)).changed() {
+                    if ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2)).changed() {
                         layer.track.opacity.set_number(op as f64);
                     }
                     let label = if layer.track.blend == BlendMode::Add { "Add" } else { "Normal" };
@@ -278,6 +344,11 @@ impl State {
             });
         });
         self.cells = cells;
+        if let Some((l, c)) = pick {
+            if let Some(path) = rfd::FileDialog::new().add_filter("Video / image", &["mov", "mp4", "m4v", "mkv", "avi", "webm", "png", "jpg", "jpeg", "webp"]).pick_file() {
+                self.drop_file(l, c, path);
+            }
+        }
         if let Some(l) = clear {
             self.players.remove(&l);
         }
@@ -315,6 +386,29 @@ impl eframe::App for State {
         self.output_window(&ctx);
         // Video is live: keep repainting.
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(x: f32, layer: LayerId, col: u32, empty: bool) -> CellInfo {
+        CellInfo { rect: egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(10.0, 10.0)), layer, col, empty }
+    }
+
+    #[test]
+    fn hit_test_and_fallbacks() {
+        let (top, bot) = (Uuid::new_v4(), Uuid::new_v4());
+        let cells = [cell(0.0, top, 0, true), cell(20.0, top, 1, true), cell(0.0, bot, 0, false), cell(20.0, bot, 1, true)];
+        let hit = resolve_drop(&cells, Some(egui::pos2(22.0, 5.0)), None);
+        assert_eq!(hit, Some((top, 1, DropWhere::Pointer)));
+        let miss = Some(egui::pos2(500.0, 500.0));
+        assert_eq!(resolve_drop(&cells, miss, Some((bot, 0))), Some((bot, 0, DropWhere::Selected)));
+        assert_eq!(resolve_drop(&cells, None, None), Some((bot, 1, DropWhere::FirstEmpty)));
+        let full = [cell(0.0, bot, 0, false), cell(20.0, bot, 1, false)];
+        assert_eq!(resolve_drop(&full, None, None), Some((bot, 0, DropWhere::FirstCell)));
+        assert_eq!(resolve_drop(&[], None, None), None);
     }
 }
 

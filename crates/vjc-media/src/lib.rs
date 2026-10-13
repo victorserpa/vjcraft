@@ -40,6 +40,13 @@ impl Player {
         let thread = std::thread::Builder::new()
             .name("vjc-decode".into())
             .spawn(move || {
+                if is_image(&p) {
+                    match load_image(&p) {
+                        Ok(f) => *s.latest.lock().unwrap() = Some(f),
+                        Err(e) => *s.error.lock().unwrap() = Some(e),
+                    }
+                    return;
+                }
                 if let Err(e) = run(&p, &s, true) {
                     *s.error.lock().unwrap() = Some(e.to_string());
                 }
@@ -68,6 +75,17 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn is_image(path: &Path) -> bool {
+    path.extension().map(|e| e.to_string_lossy().to_lowercase()).is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp"))
+}
+
+/// Decodes a still image into a single RGBA frame.
+fn load_image(path: &Path) -> Result<Frame, String> {
+    let img = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Ok(Frame { width, height, data: Arc::new(img.into_raw()), seq: 1 })
 }
 
 /// Small pool of frame buffers; a buffer is reused once the consumer dropped its `Arc`.
