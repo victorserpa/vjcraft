@@ -35,7 +35,11 @@ impl Player {
     /// Starts decoding `path` in a background thread. Open errors are reported via `error()`.
     pub fn open(path: impl AsRef<Path>) -> Player {
         let path = path.as_ref().to_path_buf();
-        let shared = Arc::new(Shared { latest: Mutex::new(None), stop: AtomicBool::new(false), error: Mutex::new(None) });
+        let shared = Arc::new(Shared {
+            latest: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            error: Mutex::new(None),
+        });
         let (s, p) = (shared.clone(), path.clone());
         let thread = std::thread::Builder::new()
             .name("vjc-decode".into())
@@ -52,7 +56,11 @@ impl Player {
                 }
             })
             .ok();
-        Player { shared, thread, path }
+        Player {
+            shared,
+            thread,
+            path,
+        }
     }
 
     pub fn latest_frame(&self) -> Option<Frame> {
@@ -78,14 +86,21 @@ impl Drop for Player {
 }
 
 fn is_image(path: &Path) -> bool {
-    path.extension().map(|e| e.to_string_lossy().to_lowercase()).is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp"))
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp"))
 }
 
 /// Decodes a still image into a single RGBA frame.
 fn load_image(path: &Path) -> Result<Frame, String> {
     let img = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
     let (width, height) = img.dimensions();
-    Ok(Frame { width, height, data: Arc::new(img.into_raw()), seq: 1 })
+    Ok(Frame {
+        width,
+        height,
+        data: Arc::new(img.into_raw()),
+        seq: 1,
+    })
 }
 
 /// Small pool of frame buffers; a buffer is reused once the consumer dropped its `Arc`.
@@ -93,7 +108,11 @@ struct Pool(Vec<Arc<Vec<u8>>>);
 
 impl Pool {
     fn take(&mut self, len: usize) -> &mut Arc<Vec<u8>> {
-        let idx = match self.0.iter().position(|a| Arc::strong_count(a) == 1 && a.len() == len) {
+        let idx = match self
+            .0
+            .iter()
+            .position(|a| Arc::strong_count(a) == 1 && a.len() == len)
+        {
             Some(i) => i,
             None => {
                 if self.0.len() >= 4 {
@@ -127,16 +146,29 @@ fn run(path: &Path, shared: &Shared, looping: bool) -> Result<(), ff::Error> {
     })
 }
 
-fn decode_loop(path: &Path, looping: bool, sink: &mut dyn FnMut(Frame, Instant) -> bool) -> Result<(), ff::Error> {
+fn decode_loop(
+    path: &Path,
+    looping: bool,
+    sink: &mut dyn FnMut(Frame, Instant) -> bool,
+) -> Result<(), ff::Error> {
     ff::init()?;
     let mut ictx = ff::format::input(&path)?;
     let (stream_idx, tb, avg_fps, params) = {
-        let st = ictx.streams().best(ff::media::Type::Video).ok_or(ff::Error::StreamNotFound)?;
+        let st = ictx
+            .streams()
+            .best(ff::media::Type::Video)
+            .ok_or(ff::Error::StreamNotFound)?;
         let r = st.avg_frame_rate();
-        let fps = if r.denominator() != 0 && r.numerator() != 0 { r.numerator() as f64 / r.denominator() as f64 } else { 30.0 };
+        let fps = if r.denominator() != 0 && r.numerator() != 0 {
+            r.numerator() as f64 / r.denominator() as f64
+        } else {
+            30.0
+        };
         (st.index(), f64::from(st.time_base()), fps, st.parameters())
     };
-    let mut decoder = ff::codec::context::Context::from_parameters(params)?.decoder().video()?;
+    let mut decoder = ff::codec::context::Context::from_parameters(params)?
+        .decoder()
+        .video()?;
     let (w, h) = (decoder.width(), decoder.height());
     let mut scaler: Option<ff::software::scaling::Context> = None;
     let mut decoded = ff::frame::Video::empty();
@@ -153,8 +185,12 @@ fn decode_loop(path: &Path, looping: bool, sink: &mut dyn FnMut(Frame, Instant) 
             while decoder.receive_frame(&mut decoded).is_ok() {
                 if scaler.is_none() {
                     scaler = Some(ff::software::scaling::Context::get(
-                        decoded.format(), decoded.width(), decoded.height(),
-                        ff::format::Pixel::RGBA, decoded.width(), decoded.height(),
+                        decoded.format(),
+                        decoded.width(),
+                        decoded.height(),
+                        ff::format::Pixel::RGBA,
+                        decoded.width(),
+                        decoded.height(),
                         ff::software::scaling::Flags::BILINEAR,
                     )?);
                 }
@@ -168,13 +204,21 @@ fn decode_loop(path: &Path, looping: bool, sink: &mut dyn FnMut(Frame, Instant) 
                 for y in 0..fh as usize {
                     dst[y * row..(y + 1) * row].copy_from_slice(&src[y * stride..y * stride + row]);
                 }
-                let t = decoded.timestamp().map(|p| p as f64 * tb).unwrap_or(count as f64 / avg_fps);
+                let t = decoded
+                    .timestamp()
+                    .map(|p| p as f64 * tb)
+                    .unwrap_or(count as f64 / avg_fps);
                 let first = *first_pts.get_or_insert(t);
                 let due = base + Duration::from_secs_f64((t - first).max(0.0));
                 count += 1;
                 emitted_this_pass += 1;
                 seq += 1;
-                let f = Frame { width: fw, height: fh, data: slot.clone(), seq };
+                let f = Frame {
+                    width: fw,
+                    height: fh,
+                    data: slot.clone(),
+                    seq,
+                };
                 if !sink(f, due) {
                     return Ok(());
                 }
@@ -213,7 +257,10 @@ fn decode_loop(path: &Path, looping: bool, sink: &mut dyn FnMut(Frame, Instant) 
 pub fn decode_n(path: &Path, n: usize) -> Result<Vec<Frame>, ff::Error> {
     let mut out = vec![];
     decode_loop(path, false, &mut |f, _| {
-        out.push(Frame { data: Arc::new((*f.data).clone()), ..f });
+        out.push(Frame {
+            data: Arc::new((*f.data).clone()),
+            ..f
+        });
         out.len() < n
     })?;
     Ok(out)
@@ -267,7 +314,15 @@ mod tests {
         for (name, args) in cases {
             let out = dir.join(name);
             let ok = std::process::Command::new("ffmpeg")
-                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=1"])
+                .args([
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=320x240:rate=25:duration=1",
+                ])
                 .args(args)
                 .arg(&out)
                 .status()

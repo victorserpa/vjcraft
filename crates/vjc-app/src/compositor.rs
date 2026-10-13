@@ -7,7 +7,12 @@ use vjc_model::{BlendMode, FitMode, LayerId};
 
 /// Fraction of the destination frame (x, y) covered by a `src` video for the given mode.
 pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) {
-    let (sw, sh, dw, dh) = (src.0.max(1) as f32, src.1.max(1) as f32, dst.0.max(1) as f32, dst.1.max(1) as f32);
+    let (sw, sh, dw, dh) = (
+        src.0.max(1) as f32,
+        src.1.max(1) as f32,
+        dst.0.max(1) as f32,
+        dst.1.max(1) as f32,
+    );
     let (rw, rh) = (dw / sw, dh / sh);
     let k = match mode {
         FitMode::Stretch => return (1.0, 1.0),
@@ -81,7 +86,11 @@ pub struct Compositor {
 fn make_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let t = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("composition"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -105,7 +114,11 @@ impl Compositor {
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -135,7 +148,12 @@ impl Compositor {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("compositor_pipe"),
                 layout: Some(&layout),
-                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
@@ -145,8 +163,16 @@ impl Compositor {
                     targets: &[Some(wgpu::ColorTargetState {
                         format: FORMAT,
                         blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: dst, operation: wgpu::BlendOperation::Add },
-                            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max },
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: dst,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Max,
+                            },
                         }),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -164,7 +190,16 @@ impl Compositor {
             ..Default::default()
         });
         let (target, target_view) = make_target(device, w, h);
-        Compositor { normal, add, bgl, sampler, slots: HashMap::new(), target, target_view, size: (w, h) }
+        Compositor {
+            normal,
+            add,
+            bgl,
+            sampler,
+            slots: HashMap::new(),
+            target,
+            target_view,
+            size: (w, h),
+        }
     }
 
     /// Recreates the target if the composition resolution changed. Returns true when recreated
@@ -178,16 +213,31 @@ impl Compositor {
         true
     }
 
-    pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layers_bottom_to_top: &[LayerDraw]) {
-        let live: Vec<LayerId> = layers_bottom_to_top.iter().filter(|l| l.frame.is_some()).map(|l| l.id).collect();
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers_bottom_to_top: &[LayerDraw],
+    ) {
+        let live: Vec<LayerId> = layers_bottom_to_top
+            .iter()
+            .filter(|l| l.frame.is_some())
+            .map(|l| l.id)
+            .collect();
         self.slots.retain(|k, _| live.contains(k));
         for l in layers_bottom_to_top {
-            let Some((w, h, data, seq)) = l.frame else { continue };
+            let Some((w, h, data, seq)) = l.frame else {
+                continue;
+            };
             let recreate = self.slots.get(&l.id).is_none_or(|s| s.size != (w, h));
             if recreate {
                 let tex = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("layer"),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -206,28 +256,65 @@ impl Compositor {
                     label: Some("layer_bg"),
                     layout: &self.bgl,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
                     ],
                 });
-                self.slots.insert(l.id, Slot { tex, size: (w, h), uniform, bind, seq: u64::MAX });
+                self.slots.insert(
+                    l.id,
+                    Slot {
+                        tex,
+                        size: (w, h),
+                        uniform,
+                        bind,
+                        seq: u64::MAX,
+                    },
+                );
             }
             let slot = self.slots.get_mut(&l.id).unwrap();
             if slot.seq != seq {
                 queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture: &slot.tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &slot.tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
                     data,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * w),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                 );
                 slot.seq = seq;
             }
             let (sx, sy) = fit_scale((w, h), self.size, l.fit);
-            queue.write_buffer(&slot.uniform, 0, bytemuck::bytes_of(&[l.opacity, 0.0f32, sx, sy]));
+            queue.write_buffer(
+                &slot.uniform,
+                0,
+                bytemuck::bytes_of(&[l.opacity, 0.0f32, sx, sy]),
+            );
         }
 
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("compose") });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compose"),
+        });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("compose"),
@@ -235,7 +322,10 @@ impl Compositor {
                     view: &self.target_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -243,9 +333,15 @@ impl Compositor {
                 multiview_mask: None,
             });
             for l in layers_bottom_to_top {
-                let Some(slot) = self.slots.get(&l.id) else { continue };
+                let Some(slot) = self.slots.get(&l.id) else {
+                    continue;
+                };
                 // TODO: remaining BlendModes (Multiply, Screen, ...) fall back to Normal.
-                pass.set_pipeline(if l.blend == BlendMode::Add { &self.add } else { &self.normal });
+                pass.set_pipeline(if l.blend == BlendMode::Add {
+                    &self.add
+                } else {
+                    &self.normal
+                });
                 pass.set_bind_group(0, &slot.bind, &[]);
                 pass.draw(0..3, 0..1);
             }

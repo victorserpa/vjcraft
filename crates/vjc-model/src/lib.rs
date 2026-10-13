@@ -119,7 +119,11 @@ pub enum Source {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum NetProtocol { Syphon, Spout, Ndi }
+pub enum NetProtocol {
+    Syphon,
+    Spout,
+    Ndi,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transport {
@@ -135,13 +139,31 @@ pub struct Transport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum PlayMode { Loop, Bounce, Once, OnceHold, #[serde(other)] Unknown }
+pub enum PlayMode {
+    Loop,
+    Bounce,
+    Once,
+    OnceHold,
+    #[serde(other)]
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum TriggerMode { Restart, Continue, Relative, #[serde(other)] Unknown }
+pub enum TriggerMode {
+    Restart,
+    Continue,
+    Relative,
+    #[serde(other)]
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Direction { Forward, Backward, Pause, Random }
+pub enum Direction {
+    Forward,
+    Backward,
+    Pause,
+    Random,
+}
 
 /// Shared by composition, layer and clip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,8 +178,43 @@ pub struct Track {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BlendMode {
     // Generic compositing and transition modes; see docs/03-catalogo.md.
-    Normal, Add, Burn, Darken, Difference, Dodge, Exclusion, HardLight, Lighten, Multiply, Overlay, Screen, SoftLight, Subtract, Dissolve, Cut, LumaKey, LumaIsAlpha, ToBlack, ToWhite, ToColor, PushUp, PushDown, PushLeft, PushRight, ZoomIn, ZoomOut, WipeEllipse, RotateX, RotateY, SideBySide, PictureInPicture, Rgb, BlackWhite, Alpha,
-    #[serde(other)] Unknown,
+    Normal,
+    Add,
+    Burn,
+    Darken,
+    Difference,
+    Dodge,
+    Exclusion,
+    HardLight,
+    Lighten,
+    Multiply,
+    Overlay,
+    Screen,
+    SoftLight,
+    Subtract,
+    Dissolve,
+    Cut,
+    LumaKey,
+    LumaIsAlpha,
+    ToBlack,
+    ToWhite,
+    ToColor,
+    PushUp,
+    PushDown,
+    PushLeft,
+    PushRight,
+    ZoomIn,
+    ZoomOut,
+    WipeEllipse,
+    RotateX,
+    RotateY,
+    SideBySide,
+    PictureInPicture,
+    Rgb,
+    BlackWhite,
+    Alpha,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,7 +235,10 @@ pub struct Transition {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Bus { A, B }
+pub enum Bus {
+    A,
+    B,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Crossfader {
@@ -207,18 +267,45 @@ pub enum Value {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Animation {
-    Timeline { duration_secs: f64, curve: Curve },
-    Beats { beats: f64, curve: Curve },
-    Audio { band: FftBand, gain: f32, threshold: f32 },
-    Envelope { points: Vec<(f64, f64)>, beats: f64 },
-    Dashboard { dial: u32 },
+    Timeline {
+        duration_secs: f64,
+        curve: Curve,
+    },
+    Beats {
+        beats: f64,
+        curve: Curve,
+    },
+    Audio {
+        band: FftBand,
+        gain: f32,
+        threshold: f32,
+    },
+    Envelope {
+        points: Vec<(f64, f64)>,
+        beats: f64,
+    },
+    Dashboard {
+        dial: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Curve { Linear, Sine, Saw, Square, Random }
+pub enum Curve {
+    Linear,
+    Sine,
+    Saw,
+    Square,
+    Random,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum FftBand { Low, LowMid, Mid, High, Bin(u32) }
+pub enum FftBand {
+    Low,
+    LowMid,
+    Mid,
+    High,
+    Bin(u32),
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputSetup {
@@ -236,7 +323,13 @@ pub struct Screen {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum OutputDevice { Monitor { name: String }, Window, Syphon, Ndi, ArtNet { ip: String } }
+pub enum OutputDevice {
+    Monitor { name: String },
+    Window,
+    Syphon,
+    Ndi,
+    ArtNet { ip: String },
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Slice {
@@ -251,7 +344,13 @@ pub struct Slice {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SoftEdge { pub left: f32, pub right: f32, pub top: f32, pub bottom: f32, pub gamma: f32 }
+pub struct SoftEdge {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+    pub gamma: f32,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shortcut {
@@ -266,15 +365,35 @@ pub struct Shortcut {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlSource {
-    Key { code: String },
-    MidiNote { device: String, channel: u8, note: u8 },
-    MidiCc { device: String, channel: u8, cc: u8 },
-    Osc { address: String },
-    Dmx { universe: u16, channel: u16 },
+    Key {
+        code: String,
+    },
+    MidiNote {
+        device: String,
+        channel: u8,
+        note: u8,
+    },
+    MidiCc {
+        device: String,
+        channel: u8,
+        cc: u8,
+    },
+    Osc {
+        address: String,
+    },
+    Dmx {
+        universe: u16,
+        channel: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ShortcutMode { Trigger, Toggle, Absolute, Relative }
+pub enum ShortcutMode {
+    Trigger,
+    Toggle,
+    Absolute,
+    Relative,
+}
 
 /// A clip placed in a grid cell. Replaces the tuple-keyed map entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,13 +405,21 @@ pub struct CellClip {
 
 impl Deck {
     pub fn clip_at(&self, layer: LayerId, column: ColumnIdx) -> Option<&Clip> {
-        self.clips.iter().find(|c| c.layer == layer && c.column == column).map(|c| &c.clip)
+        self.clips
+            .iter()
+            .find(|c| c.layer == layer && c.column == column)
+            .map(|c| &c.clip)
     }
 
     /// Inserts or replaces the clip in a cell, keeping the one-clip-per-cell invariant.
     pub fn set_clip(&mut self, layer: LayerId, column: ColumnIdx, clip: Clip) {
-        self.clips.retain(|c| !(c.layer == layer && c.column == column));
-        self.clips.push(CellClip { layer, column, clip });
+        self.clips
+            .retain(|c| !(c.layer == layer && c.column == column));
+        self.clips.push(CellClip {
+            layer,
+            column,
+            clip,
+        });
     }
 }
 
@@ -347,7 +474,11 @@ impl Default for Transport {
 impl Project {
     /// Minimal empty project with one deck.
     pub fn new(name: &str) -> Self {
-        let deck = Deck { id: Uuid::new_v4(), name: "Deck".into(), clips: vec![] };
+        let deck = Deck {
+            id: Uuid::new_v4(),
+            name: "Deck".into(),
+            clips: vec![],
+        };
         Project {
             format_version: 1,
             composition: Composition {
@@ -356,7 +487,11 @@ impl Project {
                 width: 1920,
                 height: 1080,
                 fps: 60.0,
-                tempo: Tempo { bpm: 120.0, link_enabled: false, metronome: false },
+                tempo: Tempo {
+                    bpm: 120.0,
+                    link_enabled: false,
+                    metronome: false,
+                },
                 layers: vec![],
                 columns: vec![],
                 current_deck: deck.id,
@@ -385,7 +520,11 @@ mod tests {
             track: Track::new(BlendMode::Add),
             solo: false,
             bypass: false,
-            transition: Transition { kind: "Alpha".into(), duration_beats: None, duration_secs: 0.0 },
+            transition: Transition {
+                kind: "Alpha".into(),
+                duration_beats: None,
+                duration_secs: 0.0,
+            },
             crossfader_bus: None,
             group: None,
         });
@@ -395,7 +534,9 @@ mod tests {
             Clip {
                 id: Uuid::new_v4(),
                 name: "c".into(),
-                source: Source::File { path: "a.mov".into() },
+                source: Source::File {
+                    path: "a.mov".into(),
+                },
                 transport: Transport::default(),
                 track: Track::new(BlendMode::Normal),
                 fit: FitMode::default(),

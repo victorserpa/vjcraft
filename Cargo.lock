@@ -3426,6 +3426,7 @@ name = "vjc-app"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "core-graphics",
  "eframe",
  "rfd",
  "uuid",

@@ -1,8 +1,8 @@
 //! Importer for third-party `.avc` composition files (XML), clean-room, based on
 //! `docs/02-formato-avc.md`. Pipeline: quick-xml -> generic tree -> `vjc_model::Project`.
 
-use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -18,7 +18,10 @@ pub struct Node {
 
 impl Node {
     pub fn attr(&self, k: &str) -> Option<&str> {
-        self.attrs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.as_str())
     }
     pub fn num(&self, k: &str) -> Option<f64> {
         self.attr(k)?.parse().ok()
@@ -77,11 +80,19 @@ pub struct Import {
 }
 
 fn node_from(e: &BytesStart) -> Result<Node, AvcError> {
-    let mut n = Node { tag: String::from_utf8_lossy(e.name().as_ref()).into_owned(), ..Default::default() };
+    let mut n = Node {
+        tag: String::from_utf8_lossy(e.name().as_ref()).into_owned(),
+        ..Default::default()
+    };
     for a in e.attributes() {
         let a = a.map_err(|e| AvcError::Xml(e.to_string()))?;
-        let v = a.unescape_value().map_err(|e| AvcError::Xml(e.to_string()))?;
-        n.attrs.push((String::from_utf8_lossy(a.key.as_ref()).into_owned(), v.into_owned()));
+        let v = a
+            .unescape_value()
+            .map_err(|e| AvcError::Xml(e.to_string()))?;
+        n.attrs.push((
+            String::from_utf8_lossy(a.key.as_ref()).into_owned(),
+            v.into_owned(),
+        ));
     }
     Ok(n)
 }
@@ -102,7 +113,9 @@ pub fn parse_tree(xml: &str) -> Result<Node, AvcError> {
                 }
             }
             Event::End(_) => {
-                let n = stack.pop().ok_or_else(|| AvcError::Xml("unbalanced tags".into()))?;
+                let n = stack
+                    .pop()
+                    .ok_or_else(|| AvcError::Xml("unbalanced tags".into()))?;
                 match stack.last_mut() {
                     Some(p) => p.children.push(n),
                     None => root = Some(n),
@@ -129,7 +142,10 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     collect_unsupported(&root, &mut warnings);
 
     let info = root.child("CompositionInfo");
-    let name = info.and_then(|i| i.attr("name")).or(root.attr("name")).unwrap_or("Composition");
+    let name = info
+        .and_then(|i| i.attr("name"))
+        .or(root.attr("name"))
+        .unwrap_or("Composition");
     let mut project = Project::new(name);
     let comp = &mut project.composition;
     if let Some(i) = info {
@@ -139,7 +155,10 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     if let Some(t) = root
         .child("TempoController")
         .and_then(|t| t.child("Params"))
-        .and_then(|p| p.kids("ParamRange").find(|p| p.attr("name") == Some("Tempo")))
+        .and_then(|p| {
+            p.kids("ParamRange")
+                .find(|p| p.attr("name") == Some("Tempo"))
+        })
         .and_then(|p| p.num("value"))
     {
         comp.tempo.bpm = t;
@@ -169,7 +188,11 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
             track,
             solo: false,
             bypass: false,
-            transition: Transition { kind: "Alpha".into(), duration_beats: None, duration_secs: 0.0 },
+            transition: Transition {
+                kind: "Alpha".into(),
+                duration_beats: None,
+                duration_secs: 0.0,
+            },
             crossfader_bus: None,
             group: None,
         });
@@ -196,25 +219,40 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     comp.columns = (0..ncols)
         .map(|i| Column {
             id: Uuid::new_v4(),
-            name: col_names.get(&i).cloned().unwrap_or_else(|| format!("{}", i + 1)),
+            name: col_names
+                .get(&i)
+                .cloned()
+                .unwrap_or_else(|| format!("{}", i + 1)),
         })
         .collect();
 
     // Decks and clips.
-    let deck_infos: Vec<&Node> =
-        info.map(|i| i.kids("DeckInfo").collect()).unwrap_or_default();
+    let deck_infos: Vec<&Node> = info
+        .map(|i| i.kids("DeckInfo").collect())
+        .unwrap_or_default();
     let mut decks = vec![];
     let mut skipped_routers = 0;
     for (di, d) in root.kids("Deck").enumerate() {
         let name = param_text(d, "Name")
-            .or_else(|| deck_infos.get(di).and_then(|x| x.attr("name")).map(String::from))
+            .or_else(|| {
+                deck_infos
+                    .get(di)
+                    .and_then(|x| x.attr("name"))
+                    .map(String::from)
+            })
             .unwrap_or_else(|| format!("Deck {}", di + 1));
-        let mut deck = Deck { id: Uuid::new_v4(), name, clips: vec![] };
+        let mut deck = Deck {
+            id: Uuid::new_v4(),
+            name,
+            clips: vec![],
+        };
         for c in d.kids("Clip") {
             let li = c.num("layerIndex").unwrap_or(0.0) as u32;
             let ci = c.num("columnIndex").unwrap_or(0.0) as u32;
             let Some(&layer) = layer_ids.get(&li) else {
-                warnings.push(format!("clip at layer {li} column {ci} refers to a missing layer; skipped"));
+                warnings.push(format!(
+                    "clip at layer {li} column {ci} refers to a missing layer; skipped"
+                ));
                 continue;
             };
             match import_clip(c) {
@@ -225,7 +263,9 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
         decks.push(deck);
     }
     if skipped_routers > 0 {
-        warnings.push(format!("{skipped_routers} clip(s) with unsupported source (router/other) skipped"));
+        warnings.push(format!(
+            "{skipped_routers} clip(s) with unsupported source (router/other) skipped"
+        ));
     }
     if !decks.is_empty() {
         let cur = root.num("currentDeckIndex").unwrap_or(0.0) as usize;
@@ -245,8 +285,11 @@ fn param_text(n: &Node, name: &str) -> Option<String> {
 }
 
 fn find_opacity(vt: &Node) -> Option<f64> {
-    vt.find(&|n| n.tag == "ParamRange" && n.attr("name") == Some("Opacity"), &["PrimarySource"])
-        .and_then(|p| p.num("value"))
+    vt.find(
+        &|n| n.tag == "ParamRange" && n.attr("name") == Some("Opacity"),
+        &["PrimarySource"],
+    )
+    .and_then(|p| p.num("value"))
 }
 
 /// Blend from the mixer's RenderPass type. Unknown names map to `BlendMode::Unknown`;
@@ -302,11 +345,22 @@ fn import_clip(c: &Node) -> Option<Clip> {
     let vt = c.child("VideoTrack")?;
     let vs = vt.child("PrimarySource")?.child("VideoSource")?;
     let source = if let Some(f) = vs.child("VideoFormatReaderSource") {
-        Source::File { path: PathBuf::from(f.attr("fileName")?) }
+        Source::File {
+            path: PathBuf::from(f.attr("fileName")?),
+        }
     } else if vs.attr("type") == Some("GeneratorVideoSource") {
-        let rp = vs.find(&|n| n.tag == "RenderPass" && n.attr("baseType") == Some("Generator"), &[]);
-        let kind = rp.and_then(|r| r.attr("type").or(r.attr("name"))).unwrap_or("Generator").to_string();
-        let params = rp.and_then(|r| r.child("Params")).map(generator_params).unwrap_or_default();
+        let rp = vs.find(
+            &|n| n.tag == "RenderPass" && n.attr("baseType") == Some("Generator"),
+            &[],
+        );
+        let kind = rp
+            .and_then(|r| r.attr("type").or(r.attr("name")))
+            .unwrap_or("Generator")
+            .to_string();
+        let params = rp
+            .and_then(|r| r.child("Params"))
+            .map(generator_params)
+            .unwrap_or_default();
         Source::Generator { kind, params }
     } else {
         return None;
@@ -326,7 +380,15 @@ fn import_clip(c: &Node) -> Option<Clip> {
             }
         }
     }
-    Some(Clip { id: Uuid::new_v4(), name, source, transport, track, blend_override: None, fit: Default::default() })
+    Some(Clip {
+        id: Uuid::new_v4(),
+        name,
+        source,
+        transport,
+        track,
+        blend_override: None,
+        fit: Default::default(),
+    })
 }
 
 fn generator_params(p: &Node) -> Vec<Param> {
@@ -371,7 +433,9 @@ fn collect_unsupported(root: &Node, w: &mut Vec<String>) {
             "ModifierEnvelope" => Some("envelopes ignored"),
             "WireRenderPass" => Some("output wiring ignored"),
             "AudioFileSource" => Some("audio sources ignored"),
-            "PhaseSourceTimeline" | "PhaseSourceDashboardLink" => Some("param animation/dashboard links ignored"),
+            "PhaseSourceTimeline" | "PhaseSourceDashboardLink" => {
+                Some("param animation/dashboard links ignored")
+            }
             _ => None,
         };
         if let Some(k) = key {
@@ -389,7 +453,10 @@ fn collect_unsupported(root: &Node, w: &mut Vec<String>) {
         w.push(format!("{c}x {k}"));
     }
     if !effects.is_empty() {
-        w.push(format!("effect types not imported: {}", effects.into_iter().collect::<Vec<_>>().join(", ")));
+        w.push(format!(
+            "effect types not imported: {}",
+            effects.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
 }
 
@@ -411,7 +478,15 @@ mod tests {
         let i = import_file(p).unwrap();
         let c = &i.project.composition;
         let clips: usize = c.decks.iter().map(|d| d.clips.len()).sum();
-        eprintln!("{}: layers={} cols={} decks={} clips={} warnings={:?}", p.display(), c.layers.len(), c.columns.len(), c.decks.len(), clips, i.warnings);
+        eprintln!(
+            "{}: layers={} cols={} decks={} clips={} warnings={:?}",
+            p.display(),
+            c.layers.len(),
+            c.columns.len(),
+            c.decks.len(),
+            clips,
+            i.warnings
+        );
         Some((c.layers.len(), c.columns.len(), clips, i.warnings))
     }
 
@@ -436,7 +511,10 @@ mod tests {
         assert_eq!(c.layers.len(), 3);
         assert_eq!(c.layers[0].track.blend, BlendMode::Add);
         let d = &c.decks[0];
-        assert!(matches!(d.clip_at(c.layers[0].id, 0).unwrap().source, Source::File { .. }));
+        assert!(matches!(
+            d.clip_at(c.layers[0].id, 0).unwrap().source,
+            Source::File { .. }
+        ));
     }
 
     #[test]
