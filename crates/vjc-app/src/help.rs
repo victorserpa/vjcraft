@@ -47,6 +47,9 @@ pub fn text(key: &str) -> Option<&'static str> {
             "Restarts the bar on the next beat, keeping the tempo, so the downbeat lines up with the music."
         }
         "transport-play" => "Plays the selected clip from its start.",
+        "transport-pause" => {
+            "Pauses or resumes the clip playing on the selected layer (all layers if none is selected). Undoable."
+        }
         "transport-stop" => "Stops every layer.",
         "transport-undo" => "Undoes the last edit.",
         "transport-redo" => "Redoes the edit you just undid.",
@@ -110,7 +113,7 @@ pub fn text(key: &str) -> Option<&'static str> {
             "Settings of the selected layer group: opacity, blend mode and group effects."
         }
         "tab-clip" => {
-            "Settings of the selected clip: source, transport (speed, direction, loop), opacity and clip effects."
+            "Panel of the selected clip: source, transport (speed, direction, loop), video fit, audio and clip effects."
         }
         "comp-name" => "Name of the composition.",
         "comp-size" => {

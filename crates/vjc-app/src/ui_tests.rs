@@ -381,7 +381,6 @@ fn effect_dropped_on_clip_and_param_edit() {
         .name
         .clone();
     click(&mut h, &name);
-    click(&mut h, "Clip");
     let before = effects(&h)[0].params.clone();
     let n = slider_rects(&h).len();
     assert!(n > 0);
@@ -433,7 +432,6 @@ fn effect_dry_wet_slider_changes_chain() {
         .name
         .clone();
     click(&mut h, &name);
-    click(&mut h, "Clip");
     assert!(exists(&h, "Dry/Wet"));
     let n = slider_rects(&h).len();
     for i in 0..n {
@@ -464,6 +462,88 @@ fn generator_from_tab_on_empty_cell() {
     assert!(matches!(clip.source, vjc_model::Source::Generator { .. }));
     assert!(st.gens.contains_key(&lid), "generator is running");
     snap(&mut h, "07-generator");
+}
+
+/// Generator clip selected and playing on layer `lid`, column 1.
+fn playing_generator(h: &mut Harness<'_, State>) -> LayerId {
+    let (lid, pos) = cell_center(h, 0, 1);
+    let (gen_id, _) = vjc_fx::GENERATORS[0];
+    browser_drag(h, "Generators", &fx_label(gen_id), pos);
+    h.state_mut().selected = Some((lid, 1));
+    settle(h);
+    assert!(h.state().gens.contains_key(&lid));
+    lid
+}
+
+#[test]
+fn clip_panel_has_collapsible_sections() {
+    let mut h = app();
+    playing_generator(&mut h);
+    // Own panel beside the tabs: visible whatever tab is open.
+    for tab in ["Layer", "Group", "Composition"] {
+        click(&mut h, tab);
+        for sec in ["- Transport", "- Video", "- Audio", "- Effects"] {
+            assert!(has_text(&h, sec), "{sec} under tab {tab}");
+        }
+    }
+    assert!(has_text(&h, "Volume") && has_text(&h, "Pan"));
+    click(&mut h, "- Audio");
+    assert!(has_text(&h, "+ Audio"));
+    assert!(!has_text(&h, "Volume"), "collapsed section hides its rows");
+    click(&mut h, "+ Audio");
+    assert!(has_text(&h, "Volume"));
+    snap(&mut h, "clip-panel-sections");
+}
+
+#[test]
+fn layer_audio_section_edits_volume() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    click(&mut h, "Layer");
+    assert!(
+        has_text(&h, "- Audio") && all(&h, "Volume") == 2,
+        "layer + clip"
+    );
+    h.state_mut().exec(Command::SetAudio {
+        target: vjc_core::AudioTarget::Layer(lid),
+        param: vjc_core::AudioParam::Volume,
+        value: 0.5,
+    });
+    h.state_mut().undo();
+    let l = h
+        .state()
+        .project
+        .composition
+        .layers
+        .iter()
+        .find(|l| l.id == lid)
+        .unwrap();
+    assert_eq!(l.track.volume.value, vjc_model::Value::Number(1.0));
+}
+
+#[test]
+fn pause_button_toggles_selected_layer_and_undoes() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let dir = |h: &Harness<'_, State>| {
+        let st = h.state();
+        let deck = st.project.composition.current_deck;
+        vjc_core::clip_in(&st.project, deck, lid, 1)
+            .unwrap()
+            .transport
+            .direction
+    };
+    assert_eq!(dir(&h), vjc_model::Direction::Forward);
+    click(&mut h, "\u{23f8}");
+    assert_eq!(dir(&h), vjc_model::Direction::Pause);
+    click(&mut h, "\u{23f8}");
+    assert_eq!(
+        dir(&h),
+        vjc_model::Direction::Forward,
+        "second press resumes"
+    );
+    h.state_mut().undo();
+    assert_eq!(dir(&h), vjc_model::Direction::Pause, "undo steps back");
 }
 
 // 8
@@ -610,9 +690,10 @@ fn panel_tabs_switch() {
     settle(&mut h);
     assert!(has_text(&h, "Blend"));
     snap(&mut h, "11-layer-tab");
-    click(&mut h, "Clip");
-    assert!(matches!(h.state().panel_tab, PanelTab::Clip));
-    snap(&mut h, "11-clip-tab");
+    // The Clip is its own panel: always there, no tab switch.
+    assert!(has_text(&h, "Select a cell with a clip."));
+    assert!(matches!(h.state().panel_tab, PanelTab::Layer));
+    snap(&mut h, "11-clip-panel");
     click(&mut h, "Composition");
     assert!(matches!(h.state().panel_tab, PanelTab::Composition));
 }
@@ -644,7 +725,7 @@ fn small_window_no_panic_no_overlap() {
         }
         // Real rects: the grid's last column header and first layer row must not
         // touch the bottom panel's tabs.
-        let tabs = ["Composition", "Layer", "Clip"]
+        let tabs = ["Composition", "Layer", "Group"]
             .iter()
             .map(|l| h.get_by_label(l).rect())
             .fold(egui::Rect::NOTHING, |a, r| a.union(r));

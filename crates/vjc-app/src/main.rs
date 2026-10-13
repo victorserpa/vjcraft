@@ -32,7 +32,7 @@ use uuid::Uuid;
 use vjc_core::clock::{Clock, LinkSync, beat_sync_rate};
 use vjc_core::effects::EffectTarget;
 use vjc_core::playhead::Playhead;
-use vjc_core::{Command, Event, History};
+use vjc_core::{AudioParam, AudioTarget, Command, Event, History};
 use vjc_io::prefs::{Layout, Prefs};
 use vjc_media::audio::AudioEngine;
 use vjc_media::{Frame, Player};
@@ -235,7 +235,6 @@ enum PanelTab {
     Composition,
     Layer,
     Group,
-    Clip,
 }
 
 /// Active effects of a chain with this frame's uniforms. Effects still compiling or that
@@ -2858,6 +2857,19 @@ impl State {
                     column,
                 });
             }
+            let pause = ui
+                .button("\u{23f8}")
+                .on_hover_text("Pause or resume the clip playing on the selected layer (all layers when none is selected)");
+            if help(pause, "transport-pause").clicked() {
+                let layer = self.selected.map(|s| s.0);
+                let active = self.rt_ctx().active;
+                let scoped = layer.filter(|l| active.iter().any(|a| a.0 == *l));
+                if let Some(c) =
+                    vjc_core::shortcuts::toggle_pause(&self.project, &active, scoped)
+                {
+                    cmds.push(c);
+                }
+            }
             let stop = ui.button("\u{25a0}").on_hover_text("Stop all layers");
             if help(stop, "transport-stop").clicked() {
                 cmds.push(Command::ClearAll);
@@ -3234,6 +3246,11 @@ impl State {
                         .show(ui, |ui| self.monitor_column(ui));
                 }
                 if lay.params {
+                    egui::Panel::right("clip_panel")
+                        .resizable(true)
+                        .default_size(theme::CLIP_PANEL_W)
+                        .size_range(theme::CLIP_PANEL_MIN_W..=ui.available_width() * 0.7)
+                        .show(ui, |ui| self.clip_panel(ui, &mut pcmds));
                     self.params_panel(ui, &mut pcmds);
                 }
             });
@@ -3724,7 +3741,10 @@ impl State {
         let gap = ui.spacing().item_spacing.y;
         let each = ((ui.available_height() - 2.0 * (label_h + gap) - gap) / 2.0).max(0.0);
         let w = ui.available_width();
-        for name in ["Composition monitor", "Preview monitor"] {
+        for (name, note) in [
+            ("Composition monitor", None),
+            ("Preview monitor", Some("Preview = Output")),
+        ] {
             ui.label(name);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(w, each), egui::Sense::hover());
             ui.painter().rect_filled(rect, 0.0, theme::MONITOR_BG);
@@ -3751,17 +3771,25 @@ impl State {
                     );
                 }
             }
+            if let Some(note) = note {
+                ui.painter().text(
+                    rect.left_top() + egui::vec2(4.0, 2.0),
+                    egui::Align2::LEFT_TOP,
+                    note,
+                    egui::FontId::proportional(11.0),
+                    theme::SECTION_HEAD,
+                );
+            }
         }
     }
 
-    /// Bottom panel: Composition / Layer / Clip parameters of the selection.
+    /// Bottom panel: Composition / Layer / Group parameters of the selection.
     fn params_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         ui.horizontal(|ui| {
             for (t, label, key) in [
                 (PanelTab::Composition, "Composition", "tab-composition"),
                 (PanelTab::Layer, "Layer", "tab-layer"),
                 (PanelTab::Group, "Group", "tab-group"),
-                (PanelTab::Clip, "Clip", "tab-clip"),
             ] {
                 let r = ui.selectable_value(&mut self.panel_tab, t, label);
                 help(r, key);
@@ -3772,8 +3800,15 @@ impl State {
             PanelTab::Composition => self.composition_tab(ui, cmds),
             PanelTab::Layer => self.layer_tab(ui, cmds),
             PanelTab::Group => self.group_tab(ui, cmds),
-            PanelTab::Clip => self.clip_tab(ui, cmds),
         });
+    }
+
+    /// Panel of the selected clip, next to the tabbed panel.
+    fn clip_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let r = ui.strong("Clip");
+        help(r, "tab-clip");
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| self.clip_tab(ui, cmds));
     }
 
     fn composition_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
@@ -4136,6 +4171,9 @@ impl State {
                 });
             }
         }
+        if params::section(ui, "sec-layer-audio", "Audio") {
+            self.audio_rows(ui, AudioTarget::Layer(lid), &l.track, cmds);
+        }
         if params::section(ui, "sec-layer-effects", "Effects") {
             self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
         }
@@ -4151,48 +4189,51 @@ impl State {
             return;
         };
         let gid = g.id;
-        if let Some(name) = params::text_field(ui, ("gname", gid), "Name", &g.name) {
-            cmds.push(Command::RenameGroup { group: gid, name });
-        }
-        if let Some(value) = params::param_slider(
-            ui,
-            ("gop", gid),
-            "Opacity",
-            match g.track.opacity.value {
-                Value::Number(n) => n,
-                _ => 1.0,
-            },
-            1.0,
-            (0.0, 1.0),
-        ) {
-            cmds.push(Command::SetGroupOpacity { group: gid, value });
-        }
-        let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
-            .iter()
-            .map(|(m, n)| (m.clone(), n.to_string()))
-            .collect();
-        if let Some(blend) = params::combo(ui, ("gbl", gid), "Blend", &g.track.blend, &modes) {
-            cmds.push(Command::SetGroupBlend { group: gid, blend });
-        }
-        if let Some(value) =
-            params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
-        {
-            cmds.push(Command::SetGroupSpeed { group: gid, value });
-        }
-        let (mut solo, mut bypass) = (g.solo, g.bypass);
-        ui.horizontal(|ui| {
-            if ui.toggle_value(&mut solo, "Solo").changed() {
-                cmds.push(Command::SetGroupSolo { group: gid, solo });
+        if params::section(ui, "sec-group", "Group") {
+            if let Some(name) = params::text_field(ui, ("gname", gid), "Name", &g.name) {
+                cmds.push(Command::RenameGroup { group: gid, name });
             }
-            if ui.toggle_value(&mut bypass, "Bypass").changed() {
-                cmds.push(Command::SetGroupBypass { group: gid, bypass });
+            if let Some(value) = params::param_slider(
+                ui,
+                ("gop", gid),
+                "Opacity",
+                match g.track.opacity.value {
+                    Value::Number(n) => n,
+                    _ => 1.0,
+                },
+                1.0,
+                (0.0, 1.0),
+            ) {
+                cmds.push(Command::SetGroupOpacity { group: gid, value });
             }
-            if ui.button("Ungroup").clicked() {
-                cmds.push(Command::Ungroup { group: gid });
+            let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
+                .iter()
+                .map(|(m, n)| (m.clone(), n.to_string()))
+                .collect();
+            if let Some(blend) = params::combo(ui, ("gbl", gid), "Blend", &g.track.blend, &modes) {
+                cmds.push(Command::SetGroupBlend { group: gid, blend });
             }
-        });
-        ui.separator();
-        self.chain_ui(ui, EffectTarget::Group(gid), cmds);
+            if let Some(value) =
+                params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
+            {
+                cmds.push(Command::SetGroupSpeed { group: gid, value });
+            }
+            let (mut solo, mut bypass) = (g.solo, g.bypass);
+            ui.horizontal(|ui| {
+                if ui.toggle_value(&mut solo, "Solo").changed() {
+                    cmds.push(Command::SetGroupSolo { group: gid, solo });
+                }
+                if ui.toggle_value(&mut bypass, "Bypass").changed() {
+                    cmds.push(Command::SetGroupBypass { group: gid, bypass });
+                }
+                if ui.button("Ungroup").clicked() {
+                    cmds.push(Command::Ungroup { group: gid });
+                }
+            });
+        }
+        if params::section(ui, "sec-group-effects", "Effects") {
+            self.chain_ui(ui, EffectTarget::Group(gid), cmds);
+        }
     }
 
     /// Deck the Clip tab shows: the current one, or, when that deck has no clip in the
@@ -4295,207 +4336,257 @@ impl State {
             }
         }
         ui.separator();
-        let modes = labeled(&[
-            (PlayMode::Loop, "Loop"),
-            (PlayMode::Bounce, "Bounce"),
-            (PlayMode::Once, "Once"),
-            (PlayMode::OnceHold, "Once, hold last frame"),
-        ]);
-        if let Some(mode) = params::combo(ui, "pm", "Play mode", &t.play_mode, &modes) {
-            cmds.push(Command::SetPlayMode {
-                deck,
-                layer,
-                column,
-                mode,
-            });
-        }
-        let dirs = labeled(&[
-            (Direction::Forward, "Forward"),
-            (Direction::Backward, "Backward"),
-            (Direction::Pause, "Pause"),
-            (Direction::Random, "Random"),
-        ]);
-        if let Some(direction) = params::combo(ui, "dir", "Direction", &t.direction, &dirs) {
-            cmds.push(Command::SetDirection {
-                deck,
-                layer,
-                column,
-                direction,
-            });
-        }
-        if let Some(speed) = params::param_slider(ui, "spd", "Speed", t.speed, 1.0, (0.0, 4.0)) {
-            cmds.push(Command::SetSpeed {
-                deck,
-                layer,
-                column,
-                speed,
-            });
-        }
-        let syncs: Vec<(Option<f64>, String)> =
-            [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0), Some(16.0)]
-                .into_iter()
-                .map(|b| (b, b.map_or("off".into(), |n| format!("{n} beats"))))
-                .collect();
-        if let Some(beats) = params::combo(ui, "sync", "Beat sync", &t.beat_sync, &syncs) {
-            cmds.push(Command::SetBeatSync {
-                deck,
-                layer,
-                column,
-                beats,
-            });
-        }
-        ui.separator();
-        ui.strong("Timecode sync");
-        let mut on = t.timecode_start.is_some();
-        let seed =
-            self.tc
-                .last
-                .unwrap_or(vjc_model::Timecode::new(0, 0, 0, 0, vjc_model::TcFps::F25));
-        if ui
-            .checkbox(&mut on, "Follow timecode (position = timecode - start)")
-            .changed()
-        {
-            cmds.push(Command::SetTimecodeStart {
-                deck,
-                layer,
-                column,
-                start: on.then_some(seed),
-            });
-        }
-        if let Some(mut start) = t.timecode_start {
-            ui.horizontal(|ui| {
-                ui.label("Start");
-                if timecode_io::tc_editor(ui, ("tcstart", layer, column), &mut start) {
-                    cmds.push(Command::SetTimecodeStart {
-                        deck,
-                        layer,
-                        column,
-                        start: Some(start),
-                    });
-                }
-                if ui
-                    .add_enabled(
-                        self.tc.last.is_some(),
-                        egui::Button::new("Set from current"),
-                    )
-                    .clicked()
-                    && let Some(cur) = self.tc.last
-                {
-                    cmds.push(Command::SetTimecodeStart {
-                        deck,
-                        layer,
-                        column,
-                        start: Some(cur),
-                    });
-                }
-            });
-            if self.prefs.timecode.source == vjc_io::prefs::TcSource::Off {
-                ui.weak("Choose a timecode source in Preferences > Timecode.");
-            }
-        }
-        ui.separator();
-        let playing = self.active(layer) == Some((deck, column));
-        let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width().min(400.0), 14.0),
-            egui::Sense::hover(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-        let x_at = |p: f64| rect.left() + rect.width() * p as f32;
-        for c in &t.cue_points {
-            painter.line_segment(
-                [
-                    egui::pos2(x_at(*c), rect.top()),
-                    egui::pos2(x_at(*c), rect.bottom()),
-                ],
-                egui::Stroke::new(2.0, ui.visuals().warn_fg_color),
-            );
-        }
-        if let Some((_, (a, b))) = self.flow.beat_loops.get(&layer).filter(|_| playing) {
-            let r = egui::Rect::from_x_y_ranges(x_at(*a)..=x_at(*b), rect.y_range());
-            painter.rect_filled(r, 0.0, ui.visuals().selection.bg_fill.linear_multiply(0.5));
-        }
-        if playing {
-            painter.line_segment(
-                [
-                    egui::pos2(x_at(pos), rect.top()),
-                    egui::pos2(x_at(pos), rect.bottom()),
-                ],
-                egui::Stroke::new(1.0, ui.visuals().text_color()),
-            );
-        }
-        ui.horizontal(|ui| {
-            ui.label("Cues");
-            if ui.add_enabled(playing, egui::Button::new("Set")).clicked() {
-                cmds.push(Command::AddCue {
+        let transport_open = params::section(ui, "sec-clip-transport", "Transport");
+        if transport_open {
+            let modes = labeled(&[
+                (PlayMode::Loop, "Loop"),
+                (PlayMode::Bounce, "Bounce"),
+                (PlayMode::Once, "Once"),
+                (PlayMode::OnceHold, "Once, hold last frame"),
+            ]);
+            if let Some(mode) = params::combo(ui, "pm", "Play mode", &t.play_mode, &modes) {
+                cmds.push(Command::SetPlayMode {
                     deck,
                     layer,
                     column,
-                    pos,
+                    mode,
                 });
             }
-            for (i, c) in t.cue_points.iter().enumerate() {
-                if ui
-                    .add_enabled(playing, egui::Button::new(format!("Jump {}", i + 1)))
-                    .clicked()
-                {
-                    cmds.push(Command::JumpToCue {
+            let dirs = labeled(&[
+                (Direction::Forward, "Forward"),
+                (Direction::Backward, "Backward"),
+                (Direction::Pause, "Pause"),
+                (Direction::Random, "Random"),
+            ]);
+            if let Some(direction) = params::combo(ui, "dir", "Direction", &t.direction, &dirs) {
+                cmds.push(Command::SetDirection {
+                    deck,
+                    layer,
+                    column,
+                    direction,
+                });
+            }
+            if let Some(speed) = params::param_slider(ui, "spd", "Speed", t.speed, 1.0, (0.0, 4.0))
+            {
+                cmds.push(Command::SetSpeed {
+                    deck,
+                    layer,
+                    column,
+                    speed,
+                });
+            }
+            let syncs: Vec<(Option<f64>, String)> =
+                [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0), Some(16.0)]
+                    .into_iter()
+                    .map(|b| (b, b.map_or("off".into(), |n| format!("{n} beats"))))
+                    .collect();
+            if let Some(beats) = params::combo(ui, "sync", "Beat sync", &t.beat_sync, &syncs) {
+                cmds.push(Command::SetBeatSync {
+                    deck,
+                    layer,
+                    column,
+                    beats,
+                });
+            }
+            ui.separator();
+            ui.strong("Timecode sync");
+            let mut on = t.timecode_start.is_some();
+            let seed =
+                self.tc
+                    .last
+                    .unwrap_or(vjc_model::Timecode::new(0, 0, 0, 0, vjc_model::TcFps::F25));
+            if ui
+                .checkbox(&mut on, "Follow timecode (position = timecode - start)")
+                .changed()
+            {
+                cmds.push(Command::SetTimecodeStart {
+                    deck,
+                    layer,
+                    column,
+                    start: on.then_some(seed),
+                });
+            }
+            if let Some(mut start) = t.timecode_start {
+                ui.horizontal(|ui| {
+                    ui.label("Start");
+                    if timecode_io::tc_editor(ui, ("tcstart", layer, column), &mut start) {
+                        cmds.push(Command::SetTimecodeStart {
+                            deck,
+                            layer,
+                            column,
+                            start: Some(start),
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            self.tc.last.is_some(),
+                            egui::Button::new("Set from current"),
+                        )
+                        .clicked()
+                        && let Some(cur) = self.tc.last
+                    {
+                        cmds.push(Command::SetTimecodeStart {
+                            deck,
+                            layer,
+                            column,
+                            start: Some(cur),
+                        });
+                    }
+                });
+                if self.prefs.timecode.source == vjc_io::prefs::TcSource::Off {
+                    ui.weak("Choose a timecode source in Preferences > Timecode.");
+                }
+            }
+            ui.separator();
+            let playing = self.active(layer) == Some((deck, column));
+            let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().min(400.0), 14.0),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+            let x_at = |p: f64| rect.left() + rect.width() * p as f32;
+            for c in &t.cue_points {
+                painter.line_segment(
+                    [
+                        egui::pos2(x_at(*c), rect.top()),
+                        egui::pos2(x_at(*c), rect.bottom()),
+                    ],
+                    egui::Stroke::new(2.0, ui.visuals().warn_fg_color),
+                );
+            }
+            if let Some((_, (a, b))) = self.flow.beat_loops.get(&layer).filter(|_| playing) {
+                let r = egui::Rect::from_x_y_ranges(x_at(*a)..=x_at(*b), rect.y_range());
+                painter.rect_filled(r, 0.0, ui.visuals().selection.bg_fill.linear_multiply(0.5));
+            }
+            if playing {
+                painter.line_segment(
+                    [
+                        egui::pos2(x_at(pos), rect.top()),
+                        egui::pos2(x_at(pos), rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.0, ui.visuals().text_color()),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label("Cues");
+                if ui.add_enabled(playing, egui::Button::new("Set")).clicked() {
+                    cmds.push(Command::AddCue {
                         deck,
                         layer,
                         column,
-                        index: i,
+                        pos,
                     });
                 }
-                if ui.small_button("x").on_hover_text("Remove cue").clicked() {
-                    cmds.push(Command::RemoveCue {
-                        deck,
-                        layer,
-                        column,
-                        pos: *c,
-                    });
+                for (i, c) in t.cue_points.iter().enumerate() {
+                    if ui
+                        .add_enabled(playing, egui::Button::new(format!("Jump {}", i + 1)))
+                        .clicked()
+                    {
+                        cmds.push(Command::JumpToCue {
+                            deck,
+                            layer,
+                            column,
+                            index: i,
+                        });
+                    }
+                    if ui.small_button("x").on_hover_text("Remove cue").clicked() {
+                        cmds.push(Command::RemoveCue {
+                            deck,
+                            layer,
+                            column,
+                            pos: *c,
+                        });
+                    }
                 }
-            }
-        });
-        let active_loop = self.flow.beat_loops.get(&layer).map(|l| l.0);
-        let mut loop_pick = None;
-        ui.horizontal(|ui| {
-            ui.label("Beat loop");
-            for b in [1.0, 2.0, 4.0, 8.0] {
-                let on = playing && active_loop == Some(b);
-                if ui
-                    .add_enabled(playing, egui::Button::selectable(on, format!("{b}")))
-                    .clicked()
-                {
-                    loop_pick = Some(if on { None } else { Some(b) });
-                }
-            }
-        });
-        if let Some(b) = loop_pick {
-            self.set_beat_loop(layer, b);
-        }
-        let fits: Vec<(FitMode, String)> = FitMode::ALL
-            .iter()
-            .map(|m| (*m, m.label().to_string()))
-            .collect();
-        if let Some(fit) = params::combo(ui, "fit", "Fit", &k.fit, &fits) {
-            cmds.push(Command::SetFit {
-                deck,
-                layer,
-                column,
-                fit,
             });
+            let active_loop = self.flow.beat_loops.get(&layer).map(|l| l.0);
+            let mut loop_pick = None;
+            ui.horizontal(|ui| {
+                ui.label("Beat loop");
+                for b in [1.0, 2.0, 4.0, 8.0] {
+                    let on = playing && active_loop == Some(b);
+                    if ui
+                        .add_enabled(playing, egui::Button::selectable(on, format!("{b}")))
+                        .clicked()
+                    {
+                        loop_pick = Some(if on { None } else { Some(b) });
+                    }
+                }
+            });
+            if let Some(b) = loop_pick {
+                self.set_beat_loop(layer, b);
+            }
         }
-        ui.separator();
-        self.chain_ui(
-            ui,
-            EffectTarget::Clip {
-                deck,
-                layer,
-                column,
-            },
-            cmds,
-        );
+        if params::section(ui, "sec-clip-video", "Video") {
+            let fits: Vec<(FitMode, String)> = FitMode::ALL
+                .iter()
+                .map(|m| (*m, m.label().to_string()))
+                .collect();
+            if let Some(fit) = params::combo(ui, "fit", "Fit", &k.fit, &fits) {
+                cmds.push(Command::SetFit {
+                    deck,
+                    layer,
+                    column,
+                    fit,
+                });
+            }
+        }
+        if params::section(ui, "sec-clip-audio", "Audio") {
+            self.audio_rows(ui, AudioTarget::Clip(deck, layer, column), &k.track, cmds);
+        }
+        if params::section(ui, "sec-clip-effects", "Effects") {
+            self.chain_ui(
+                ui,
+                EffectTarget::Clip {
+                    deck,
+                    layer,
+                    column,
+                },
+                cmds,
+            );
+        }
+    }
+
+    /// Volume and pan sliders of a layer or clip track.
+    fn audio_rows(
+        &self,
+        ui: &mut egui::Ui,
+        target: AudioTarget,
+        track: &vjc_model::Track,
+        cmds: &mut Vec<Command>,
+    ) {
+        let num = |p: &vjc_model::Param, d: f64| match p.value {
+            Value::Number(n) => n,
+            _ => d,
+        };
+        for (param, label, v, default, range) in [
+            (
+                AudioParam::Volume,
+                "Volume",
+                num(&track.volume, 1.0),
+                1.0,
+                (0.0, 1.0),
+            ),
+            (
+                AudioParam::Pan,
+                "Pan",
+                num(&track.pan, 0.0),
+                0.0,
+                (-1.0, 1.0),
+            ),
+        ] {
+            if let Some(value) =
+                params::param_slider(ui, ("audio", target, label), label, v, default, range)
+            {
+                cmds.push(Command::SetAudio {
+                    target,
+                    param,
+                    value,
+                });
+            }
+        }
     }
 
     /// Registers an effect control as a mappable (learn) target.

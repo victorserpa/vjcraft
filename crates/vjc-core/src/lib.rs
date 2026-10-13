@@ -404,6 +404,22 @@ pub enum Command {
         column: ColumnIdx,
         direction: Direction,
     },
+    /// Pauses (direction Pause) or resumes (Forward) the transport of each clip. Clips already
+    /// in the requested state are untouched; none changed is `InvalidValue`. Undoable.
+    SetPaused {
+        clips: Vec<(DeckId, LayerId, ColumnIdx)>,
+        paused: bool,
+    },
+    /// Sets each clip's direction at once (the inverse of `SetPaused`).
+    RestoreDirections {
+        items: Vec<(DeckId, LayerId, ColumnIdx, Direction)>,
+    },
+    /// Sets a track's volume (0..=1) or pan (-1..=1) on a layer or a clip (coalesces).
+    SetAudio {
+        target: AudioTarget,
+        param: AudioParam,
+        value: f64,
+    },
     /// Clip speed multiplier, 0..=4 (coalesces: slider drags are one undo step).
     SetSpeed {
         deck: DeckId,
@@ -486,10 +502,24 @@ pub enum AnimTarget {
     },
 }
 
+/// Whose track `SetAudio` edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AudioTarget {
+    Layer(LayerId),
+    Clip(DeckId, LayerId, ColumnIdx),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioParam {
+    Volume,
+    Pan,
+}
+
 /// What a coalescible command targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     Opacity(LayerId),
+    Audio(AudioTarget, AudioParam),
     Speed(DeckId, LayerId, ColumnIdx),
     Bpm,
     TimecodeCues,
@@ -516,6 +546,7 @@ impl Command {
     fn target(&self) -> Option<Target> {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
+            Command::SetAudio { target, param, .. } => Some(Target::Audio(*target, *param)),
             Command::SetBpm { .. } => Some(Target::Bpm),
             // Dragging a timecode field emits one command per frame.
             Command::SetTimecodeCues { .. } => Some(Target::TimecodeCues),
@@ -1771,6 +1802,90 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetAudio {
+            target,
+            param,
+            value,
+        } => {
+            if !value.is_finite() {
+                return Err(Error::InvalidValue);
+            }
+            let track = match target {
+                AudioTarget::Layer(l) => {
+                    let i = layer_idx(p, l)?;
+                    &mut p.composition.layers[i].track
+                }
+                AudioTarget::Clip(deck, layer, column) => {
+                    check_cell(p, layer, column)?;
+                    &mut deck_mut(p, deck)?
+                        .clips
+                        .iter_mut()
+                        .find(|k| k.layer == layer && k.column == column)
+                        .ok_or(Error::NoClip)?
+                        .clip
+                        .track
+                }
+            };
+            let slot = match param {
+                AudioParam::Volume => &mut track.volume,
+                AudioParam::Pan => &mut track.pan,
+            };
+            let prev = number(&slot.value);
+            slot.set_number(value);
+            undoable(
+                Command::SetAudio {
+                    target,
+                    param,
+                    value: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetPaused { clips, paused } => {
+            let (from, to) = if paused {
+                (Direction::Forward, Direction::Pause)
+            } else {
+                (Direction::Pause, Direction::Forward)
+            };
+            // Validate every target first so a missing clip changes nothing.
+            for &(deck, layer, column) in &clips {
+                transport_mut(p, deck, layer, column)?;
+            }
+            let mut prev = vec![];
+            for (deck, layer, column) in clips {
+                let t = transport_mut(p, deck, layer, column)?;
+                // Pausing stops any direction; a resume only leaves Pause, back to Forward.
+                let hit = if paused {
+                    t.direction != Direction::Pause
+                } else {
+                    t.direction == from
+                };
+                if hit {
+                    prev.push((deck, layer, column, t.direction));
+                    t.direction = to;
+                }
+            }
+            if prev.is_empty() {
+                return Err(Error::InvalidValue);
+            }
+            undoable(Command::RestoreDirections { items: prev }, vec![])
+        }
+        Command::RestoreDirections { items } => {
+            for &(deck, layer, column, _) in &items {
+                transport_mut(p, deck, layer, column)?;
+            }
+            let mut prev = vec![];
+            for (deck, layer, column, direction) in items {
+                let t = transport_mut(p, deck, layer, column)?;
+                prev.push((
+                    deck,
+                    layer,
+                    column,
+                    std::mem::replace(&mut t.direction, direction),
+                ));
+            }
+            undoable(Command::RestoreDirections { items: prev }, vec![])
+        }
         Command::SetSpeed {
             deck,
             layer,
@@ -2601,6 +2716,101 @@ mod tests {
             direction: Direction::Pause,
         };
         assert!(apply(&mut p, missing).is_err());
+    }
+
+    #[test]
+    fn audio_sets_clamps_coalesces_and_undoes() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        for target in [AudioTarget::Layer(l), AudioTarget::Clip(A, l, 0)] {
+            let set = |param, value| Command::SetAudio {
+                target,
+                param,
+                value,
+            };
+            roundtrip(&mut p, set(AudioParam::Volume, 0.25));
+            roundtrip(&mut p, set(AudioParam::Pan, -0.5));
+            assert_eq!(
+                apply(&mut p, set(AudioParam::Pan, f64::NAN)),
+                Err(Error::InvalidValue)
+            );
+            apply(&mut p, set(AudioParam::Volume, 9.0)).unwrap();
+            let vol = |p: &Project| match target {
+                AudioTarget::Layer(_) => p.composition.layers[0].track.volume.clone(),
+                AudioTarget::Clip(..) => clip(p, l).unwrap().track.volume,
+            };
+            assert_eq!(vol(&p).value, Value::Number(1.0));
+        }
+        let mut h = History::new();
+        let set = |v| Command::SetAudio {
+            target: AudioTarget::Layer(l),
+            param: AudioParam::Volume,
+            value: v,
+        };
+        h.exec(&mut p, set(0.5), t).unwrap();
+        h.exec(&mut p, set(0.2), t).unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(
+            p.composition.layers[0].track.volume.value,
+            Value::Number(1.0)
+        );
+        let bad = Command::SetAudio {
+            target: AudioTarget::Clip(A, l, 3),
+            param: AudioParam::Pan,
+            value: 0.0,
+        };
+        assert!(apply(&mut p, bad).is_err());
+    }
+
+    #[test]
+    fn pause_toggles_direction_and_undoes() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let dir = |p: &Project| clip(p, l).unwrap().transport.direction;
+        let cmd = |paused| Command::SetPaused {
+            clips: vec![(A, l, 0)],
+            paused,
+        };
+        assert_eq!(apply(&mut p, cmd(false)), Err(Error::InvalidValue));
+        h.exec(&mut p, cmd(true), t).unwrap();
+        assert_eq!(dir(&p), Direction::Pause);
+        assert_eq!(apply(&mut p, cmd(true)), Err(Error::InvalidValue));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(dir(&p), Direction::Forward);
+        h.redo(&mut p).unwrap().unwrap();
+        h.exec(&mut p, cmd(false), t).unwrap();
+        assert_eq!(dir(&p), Direction::Forward);
+        assert!(
+            apply(
+                &mut p,
+                Command::SetPaused {
+                    clips: vec![(A, l, 5)],
+                    paused: true
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pause_with_a_missing_clip_changes_nothing() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let r = apply(
+            &mut p,
+            Command::SetPaused {
+                clips: vec![(A, l, 0), (A, l, 5)],
+                paused: true,
+            },
+        );
+        assert!(r.is_err());
+        assert_eq!(clip(&p, l).unwrap().transport.direction, Direction::Forward);
     }
 
     #[test]
@@ -3814,6 +4024,32 @@ mod tests {
             .effects
             .push(c);
         (p, ids.0, ids.1, ids.2)
+    }
+
+    #[test]
+    fn pause_addresses_toggle_active_clip() {
+        let (mut p, _, _, _) = fx_project();
+        let l2 = p.composition.layers.last().unwrap().id;
+        let ctx = Ctx::new(None, false).with_active(vec![(l2, A, 0)]);
+        let mut h = History::new();
+        for addr in ["/comp/layer/1/pause", "/comp/pause"] {
+            let cmd = sc::resolve_with(&p, &ctx, addr, 1.0).unwrap();
+            assert!(
+                matches!(&cmd, Command::SetPaused { paused: true, .. }),
+                "{addr}"
+            );
+            h.exec(&mut p, cmd, Instant::now()).unwrap();
+            let cmd = sc::resolve_with(&p, &ctx, addr, 1.0).unwrap();
+            assert!(
+                matches!(&cmd, Command::SetPaused { paused: false, .. }),
+                "{addr}"
+            );
+            h.exec(&mut p, cmd, Instant::now()).unwrap();
+            assert_eq!(sc::resolve_with(&p, &ctx, addr, 0.0), None);
+        }
+        // Nothing playing: no command.
+        assert_eq!(sc::resolve(&p, "/comp/pause", 1.0), None);
+        assert_eq!(sc::resolve_with(&p, &ctx, "/comp/layer/9/pause", 1.0), None);
     }
 
     #[test]

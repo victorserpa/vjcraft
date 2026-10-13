@@ -448,6 +448,11 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
         ["comp", "layer", n, "clear"] => fire.then_some(Command::ClearLayer {
             layer: layer_by_number(p, number_of(n)?)?,
         }),
+        ["comp", "layer", n, "pause"] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            fire.then(|| toggle_pause(p, &ctx.active, Some(layer)))?
+        }
+        ["comp", "pause"] => fire.then(|| toggle_pause(p, &ctx.active, None))?,
         ["comp", "column", "next"] => fire.then_some(Command::StepColumn {
             deck,
             from: ctx.col_sel,
@@ -491,6 +496,33 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
         ["comp", "clear"] => fire.then_some(Command::ClearAll),
         _ => None,
     }
+}
+
+/// Pause toggle for the clip playing on `layer` (None = every playing clip): resumes when
+/// they are all paused, pauses otherwise. None when nothing is playing there.
+pub fn toggle_pause(
+    p: &Project,
+    active: &[(LayerId, DeckId, ColumnIdx)],
+    layer: Option<LayerId>,
+) -> Option<Command> {
+    let clips: Vec<_> = active
+        .iter()
+        .filter(|a| layer.is_none_or(|l| a.0 == l))
+        .map(|&(l, d, c)| (d, l, c))
+        .collect();
+    let paused = |&(d, l, c): &(DeckId, LayerId, ColumnIdx)| {
+        p.composition
+            .decks
+            .iter()
+            .find(|k| k.id == d)
+            .and_then(|k| k.clips.iter().find(|k| k.layer == l && k.column == c))
+            .is_some_and(|k| k.clip.transport.direction == vjc_model::Direction::Pause)
+    };
+    let all_paused = !clips.is_empty() && clips.iter().all(paused);
+    (!clips.is_empty()).then_some(Command::SetPaused {
+        clips,
+        paused: !all_paused,
+    })
 }
 
 pub fn resolve(p: &Project, address: &str, value: f64) -> Option<Command> {

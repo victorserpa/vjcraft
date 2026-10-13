@@ -31,6 +31,9 @@ pub const COLUMN_HEAD_H: f32 = 22.0;
 /// Bottom area.
 pub const MONITOR_COL_W: f32 = 240.0;
 pub const MONITOR_MIN_W: f32 = 160.0;
+/// Clip panel beside the tabbed parameter panel.
+pub const CLIP_PANEL_W: f32 = 340.0;
+pub const CLIP_PANEL_MIN_W: f32 = 200.0;
 pub const MONITOR_BG: Color32 = Color32::BLACK;
 
 /// Property sections.
