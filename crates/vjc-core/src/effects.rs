@@ -124,6 +124,26 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetEffectDryWet {
+            target,
+            effect,
+            dry_wet,
+        } => {
+            if !dry_wet.is_finite() {
+                return Err(Error::InvalidValue);
+            }
+            let fx = &mut track_mut(p, target)?.effects;
+            let i = pos(fx, effect)?;
+            let prev = std::mem::replace(&mut fx[i].dry_wet, dry_wet.clamp(0.0, 1.0));
+            undoable(
+                Command::SetEffectDryWet {
+                    target,
+                    effect,
+                    dry_wet: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetEffectParam {
             target,
             effect,

@@ -359,6 +359,12 @@ pub enum Command {
         effect: EffectId,
         bypass: bool,
     },
+    /// Dry/wet of the effect, 0..=1 (coalesces: slider drags are one undo step).
+    SetEffectDryWet {
+        target: EffectTarget,
+        effect: EffectId,
+        dry_wet: f32,
+    },
     /// Sets param number `param` of the effect (coalesces: slider drags are one undo step).
     SetEffectParam {
         target: EffectTarget,
@@ -417,6 +423,7 @@ enum Target {
     MasterSpeed,
     Crossfader,
     EffectParam(EffectId, usize),
+    EffectDryWet(EffectId),
     GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
     Dial(u32),
     Anim(AnimTarget),
@@ -441,6 +448,7 @@ impl Command {
             Command::SetMasterOpacity { .. } => Some(Target::MasterOpacity),
             Command::SetMasterSpeed { .. } => Some(Target::MasterSpeed),
             Command::SetCrossfader { .. } => Some(Target::Crossfader),
+            Command::SetEffectDryWet { effect, .. } => Some(Target::EffectDryWet(*effect)),
             Command::SetEffectParam { effect, param, .. } => {
                 Some(Target::EffectParam(*effect, *param))
             }
@@ -1664,6 +1672,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::RemoveEffect { .. }
         | Command::MoveEffect { .. }
         | Command::SetEffectBypass { .. }
+        | Command::SetEffectDryWet { .. }
         | Command::SetEffectParam { .. } => effects::apply(p, cmd),
         Command::AddShortcut { .. } | Command::RemoveShortcut { .. } => shortcuts::apply(p, cmd),
         Command::SetBpm { bpm } => {
@@ -2888,6 +2897,26 @@ mod tests {
                     effect: ia,
                     bypass: true,
                 },
+            );
+            roundtrip(
+                &mut p,
+                Command::SetEffectDryWet {
+                    target: t,
+                    effect: ia,
+                    dry_wet: 0.25,
+                },
+            );
+            assert_eq!(
+                apply(
+                    &mut p,
+                    Command::SetEffectDryWet {
+                        target: t,
+                        effect: ia,
+                        dry_wet: f32::NAN,
+                    }
+                )
+                .err(),
+                Some(Error::InvalidValue)
             );
             roundtrip(
                 &mut p,

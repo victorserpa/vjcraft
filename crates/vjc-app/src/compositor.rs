@@ -186,9 +186,46 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 pub struct EffectDraw {
     pub kind: String,
     pub uniforms: vjc_fx::Uniforms,
+    /// 1 = effect only, 0 = input only (effect skipped), between = mix(in, out, dry_wet).
+    pub dry_wet: f32,
 }
 
-type Scratch = [(wgpu::Texture, wgpu::TextureView); 2];
+/// What an effect with this dry/wet costs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MixPlan {
+    /// Dry only: the effect is not run.
+    Skip,
+    /// Wet only: the effect output is used as is (no extra pass).
+    Wet,
+    /// Run the effect, then one mix pass with this amount.
+    Blend(f32),
+}
+
+fn mix_plan(dry_wet: f32) -> MixPlan {
+    if dry_wet.is_nan() || dry_wet <= 0.0 {
+        MixPlan::Skip
+    } else if dry_wet >= 1.0 {
+        MixPlan::Wet
+    } else {
+        MixPlan::Blend(dry_wet)
+    }
+}
+
+/// Mixes the effect input (`a`, dry) with its output (`b`, wet) by `t.x`.
+const MIX_FS: &str = r#"
+struct U { t: vec4<f32> };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var dry: texture_2d<f32>;
+@group(0) @binding(2) var wet: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+@fragment
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return mix(textureSample(dry, samp, uv), textureSample(wet, samp, uv), u.t.x);
+}
+"#;
+
+/// Two effect-sized textures to ping-pong plus a third for the mix result.
+type Scratch = [(wgpu::Texture, wgpu::TextureView); 3];
 
 /// Effect pipelines and the ping-pong textures the chains render through.
 struct Fx {
@@ -199,6 +236,10 @@ struct Fx {
     next: usize,
     scratch: HashMap<(u32, u32), Scratch>,
     used: Vec<(u32, u32)>,
+    mix_bgl: wgpu::BindGroupLayout,
+    mix_pipe: wgpu::RenderPipeline,
+    mix_bufs: Vec<wgpu::Buffer>,
+    mix_next: usize,
 }
 
 fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
@@ -222,7 +263,7 @@ fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
         let v = t.create_view(&Default::default());
         (t, v)
     };
-    [mk(), mk()]
+    [mk(), mk(), mk()]
 }
 
 /// One fullscreen fragment pass of an effect or generator shader: `src` is bound as
@@ -345,6 +386,10 @@ impl Fx {
         let size = (size.0.max(1), size.1.max(1));
         let mut cur: Option<usize> = None;
         for e in effects {
+            let plan = mix_plan(e.dry_wet);
+            if plan == MixPlan::Skip {
+                continue;
+            }
             let Some(pipe) = self.pipes.get(&e.kind) else {
                 continue;
             };
@@ -367,13 +412,71 @@ impl Fx {
             let buf = &self.bufs[self.next];
             self.next += 1;
             queue.write_buffer(buf, 0, bytemuck::cast_slice(&e.uniforms));
-            let out = cur.map_or(0, |i| 1 - i);
+            let out = (0..3).find(|&i| Some(i) != cur).unwrap_or(0);
             let src = match cur {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
             draw_pass(device, enc, bgl, sampler, pipe, buf, src, &scratch[out].1);
-            cur = Some(out);
+            if let MixPlan::Blend(t) = plan {
+                if self.mix_bufs.len() <= self.mix_next {
+                    self.mix_bufs
+                        .push(device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("mix_u"),
+                            size: 16,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        }));
+                }
+                let mbuf = &self.mix_bufs[self.mix_next];
+                self.mix_next += 1;
+                queue.write_buffer(mbuf, 0, bytemuck::cast_slice(&[t, 0.0, 0.0, 0.0]));
+                let dst = (0..3).find(|&i| Some(i) != cur && i != out).unwrap_or(0);
+                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("mix_bg"),
+                    layout: &self.mix_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: mbuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(src),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&scratch[out].1),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                });
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("fx_mix"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &scratch[dst].1,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.mix_pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw(0..3, 0..1);
+                cur = Some(dst);
+            } else {
+                cur = Some(out);
+            }
         }
         cur
     }
@@ -618,11 +721,79 @@ impl Compositor {
                 },
             ],
         });
-        let fx = Fx {
-            vs: device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("fx_vs"),
-                source: wgpu::ShaderSource::Wgsl(FX_VS.into()),
+        let fx_vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fx_vs"),
+            source: wgpu::ShaderSource::Wgsl(FX_VS.into()),
+        });
+        let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let mix_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mix_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex_entry(1),
+                tex_entry(2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mix_fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mix_fs"),
+            source: wgpu::ShaderSource::Wgsl(MIX_FS.into()),
+        });
+        let mix_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mix_pl"),
+            bind_group_layouts: &[Some(&mix_bgl)],
+            immediate_size: 0,
+        });
+        let mix_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mix"),
+            layout: Some(&mix_pl),
+            vertex: wgpu::VertexState {
+                module: &fx_vs,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &mix_fs,
+                entry_point: Some("main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
             }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let fx = Fx {
+            vs: fx_vs,
             layout: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("fx_pl"),
                 bind_group_layouts: &[Some(&bgl)],
@@ -633,6 +804,10 @@ impl Compositor {
             next: 0,
             scratch: HashMap::new(),
             used: vec![],
+            mix_bgl,
+            mix_pipe,
+            mix_bufs: vec![],
+            mix_next: 0,
         };
         let (target, target_view) = make_target(device, w, h);
         let (base, base_bind) = make_base(device, &base_bgl, w, h);
@@ -723,6 +898,7 @@ impl Compositor {
         master_opacity: f32,
     ) {
         self.fx.next = 0;
+        self.fx.mix_next = 0;
         self.fx.used.clear();
         let live: Vec<LayerId> = layers_bottom_to_top
             .iter()
@@ -1201,6 +1377,7 @@ mod tests {
         let fx = EffectDraw {
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
+            dry_wet: 1.0,
         };
         let src = [51u8, 102, 204, 255];
         for on_master in [false, true] {
@@ -1282,6 +1459,7 @@ mod tests {
             generator: Some(EffectDraw {
                 kind: "solid_color".into(),
                 uniforms: isf.pack(&params, 0.0, (1, 1)),
+                dry_wet: 1.0,
             }),
             transition: None,
         }];
@@ -1318,6 +1496,97 @@ mod tests {
         buf.unmap();
         for (g, w) in got.iter().zip([51u8, 102, 204, 255]) {
             assert!(g.abs_diff(w) <= 2, "{got:?}");
+        }
+    }
+
+    #[test]
+    fn mix_plan_cases() {
+        assert_eq!(mix_plan(0.0), MixPlan::Skip);
+        assert_eq!(mix_plan(-1.0), MixPlan::Skip);
+        assert_eq!(mix_plan(f32::NAN), MixPlan::Skip);
+        assert_eq!(mix_plan(1.0), MixPlan::Wet);
+        assert_eq!(mix_plan(2.0), MixPlan::Wet);
+        assert_eq!(mix_plan(0.5), MixPlan::Blend(0.5));
+    }
+
+    /// Invert on a white pixel at several dry/wet values, in a two-effect chain too.
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_dry_wet_mixes_effect_with_input() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("invert").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.add_effect(&device, "invert", &wgsl).unwrap();
+        let fx = |dry_wet| EffectDraw {
+            kind: "invert".into(),
+            uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
+            dry_wet,
+        };
+        let src = [255u8, 255, 255, 255];
+        // (chain, expected red)
+        let cases: [(Vec<EffectDraw>, u8); 5] = [
+            (vec![fx(0.5)], 128),
+            (vec![fx(1.0)], 0),
+            (vec![fx(0.0)], 255),
+            (vec![fx(0.25)], 191),
+            // 0.5 -> 128 grey; second invert at 0.5 -> mix(128, 127, 0.5) = ~128
+            (vec![fx(0.5), fx(0.5)], 128),
+        ];
+        for (effects, want) in cases {
+            let layer = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects,
+                frame: Some((1, 1, &src, 1)),
+                generator: None,
+                transition: None,
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_texture_to_buffer(
+                comp.target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            let got: Vec<u8> = buf.slice(..).get_mapped_range().expect("map")[..4].to_vec();
+            buf.unmap();
+            for g in &got[..3] {
+                assert!(g.abs_diff(want) <= 3, "want {want}, got {got:?}");
+            }
         }
     }
 }

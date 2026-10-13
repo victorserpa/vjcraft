@@ -197,6 +197,7 @@ fn draw_chain(
             out.push(EffectDraw {
                 kind: e.kind.clone(),
                 uniforms: isf.pack(&vjc_core::anim::resolve(&e.params, ctx), time, size),
+                dry_wet: e.dry_wet,
             });
         }
     }
@@ -1542,6 +1543,7 @@ impl State {
                             *t as f32,
                             (w, h),
                         ),
+                        dry_wet: 1.0,
                     })
                 }
                 _ => None,
@@ -3253,6 +3255,23 @@ impl State {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("disabled: {why}"));
                 }
             });
+            let dw = ui
+                .push_id((e.id, "dry_wet"), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(24.0);
+                        ui.label("Dry/Wet");
+                        params::param_slider(ui, "dry_wet", "", e.dry_wet as f64, 1.0, (0.0, 1.0))
+                    })
+                    .inner
+                })
+                .inner;
+            if let Some(v) = dw {
+                cmds.push(Command::SetEffectDryWet {
+                    target,
+                    effect: e.id,
+                    dry_wet: v as f32,
+                });
+            }
             for (pi, p) in e.params.iter().enumerate() {
                 let Some(kind) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
                     continue;

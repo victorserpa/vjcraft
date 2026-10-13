@@ -407,6 +407,49 @@ fn effect_dropped_on_clip_and_param_edit() {
     snap(&mut h, "06-effect");
 }
 
+#[test]
+fn effect_dry_wet_slider_changes_chain() {
+    let Some(video) = test_video("fx.mp4") else {
+        return;
+    };
+    let mut h = app();
+    let lid = drop_video_on_cell(&mut h, 1, 0, &video);
+    let (_, pos) = cell_center(&h, 1, 0);
+    let (fx_id, _) = vjc_fx::BUILTIN[0];
+    browser_drag(&mut h, "Effects", &fx_label(fx_id), pos);
+    let deck = h.state().project.composition.current_deck;
+    let dry_wet = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, lid, 0)
+            .unwrap()
+            .track
+            .effects[0]
+            .dry_wet
+    };
+    assert_eq!(dry_wet(&h), 1.0);
+    let name = h.state().project.composition.decks[0]
+        .clip_at(lid, 0)
+        .unwrap()
+        .name
+        .clone();
+    click(&mut h, &name);
+    click(&mut h, "Clip");
+    assert!(exists(&h, "Dry/Wet"));
+    let n = slider_rects(&h).len();
+    for i in 0..n {
+        h.query_all_by_role(egui::accesskit::Role::Slider)
+            .nth(i)
+            .unwrap()
+            .scroll_to_me();
+        settle(&mut h);
+        let r = slider_rects(&h)[i];
+        drag_to_slider_pct(&mut h, r, 0.3);
+        if dry_wet(&h) != 1.0 {
+            break;
+        }
+    }
+    assert!(dry_wet(&h) < 1.0, "dry/wet moved: {}", dry_wet(&h));
+}
+
 // 7
 #[test]
 fn generator_from_tab_on_empty_cell() {
