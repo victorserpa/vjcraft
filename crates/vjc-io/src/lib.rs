@@ -171,6 +171,12 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
     let mut project: Project = serde_json::from_value(value)?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut warnings = vec![];
+    let n = project.normalize_screens();
+    if n > 0 {
+        warnings.push(format!(
+            "{n} screen(s) shared a monitor with another screen and were set to a window"
+        ));
+    }
     for m in media_paths(&mut project) {
         let joined = dir.join(&*m);
         if joined.exists() {
@@ -202,6 +208,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn open_normalizes_screens_sharing_a_monitor() {
+        let d = tmp("dupmon");
+        let mut p = Project::new("T");
+        for n in ["A", "B"] {
+            let mut s = vjc_core::mapping::new_screen(n, 100, 100);
+            s.device = vjc_model::OutputDevice::Monitor { name: "1".into() };
+            p.output.screens.push(s);
+        }
+        let f = d.join("p.vjc");
+        save(&p, &f).unwrap();
+        let (q, warns) = open(&f).unwrap();
+        assert_eq!(q.output.screens[1].device, vjc_model::OutputDevice::Window);
+        assert!(warns.iter().any(|w| w.contains("share")), "{warns:?}");
     }
 
     fn with_media(path: PathBuf) -> Project {

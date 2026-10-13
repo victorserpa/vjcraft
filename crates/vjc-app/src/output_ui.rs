@@ -140,12 +140,35 @@ impl State {
                 });
             });
         self.output_setup_open = open;
+        self.run_output_cmds(cmds);
+    }
+
+    /// Runs the commands of the setup window. A screen reopens only if its device change
+    /// was accepted; a monitor already used by another screen is reported.
+    pub(crate) fn run_output_cmds(&mut self, cmds: Vec<Command>) {
         for c in cmds {
-            if let Command::SetScreenDevice { screen, .. } = &c {
-                // Only the edited screen reopens; other closed screens stay closed.
-                self.closed_screens.remove(screen);
+            let reopen = match &c {
+                Command::SetScreenDevice { screen, .. } => Some(*screen),
+                _ => None,
+            };
+            let monitor_dup = matches!(
+                &c,
+                Command::SetScreenDevice {
+                    device: OutputDevice::Monitor { .. },
+                    ..
+                }
+            );
+            let ok = self.exec_ok(c);
+            match reopen {
+                // Only the edited screen reopens, and only if the change took effect.
+                Some(screen) if ok => {
+                    self.closed_screens.remove(&screen);
+                }
+                Some(_) if monitor_dup => {
+                    self.status = "That monitor already shows another screen".into();
+                }
+                _ => {}
             }
-            self.exec(c);
         }
     }
 

@@ -57,6 +57,12 @@ struct State {
     /// Audio output, opened on the first clip start (None until then or when unavailable).
     audio: Option<AudioEngine>,
     audio_failed: bool,
+    /// Output device `audio` was (or will be) opened on.
+    audio_device: Option<String>,
+    /// `audio_failed` came from a real open error (not from the UI-test setup).
+    audio_error: bool,
+    /// Names of the audio output devices listed in Preferences > Audio.
+    audio_outputs: Option<Vec<String>>,
     /// Writes prefs and the recovery file (false in UI tests).
     persist: bool,
     /// Playing generator clip per layer: (deck, column, own TIME in seconds). The time
@@ -197,6 +203,8 @@ struct Flow {
     beat_loops: HashMap<LayerId, (f64, (f64, f64))>,
     /// Last playhead position per layer.
     pos: HashMap<LayerId, f64>,
+    /// Autopilot on generators: (last bar seen, bars completed) per layer.
+    gen_bars: HashMap<LayerId, (i64, u32)>,
 }
 
 /// Outgoing draws use this id mask so they get their own compositor slot.
@@ -806,6 +814,9 @@ impl State {
             monitors_polled: (!live).then(std::time::Instant::now),
             persist: live,
             audio_failed: !live,
+            audio_device: prefs.audio.output_device.clone(),
+            audio_error: false,
+            audio_outputs: None,
             cells: vec![],
             layer_rects: vec![],
             grid_rect: egui::Rect::NOTHING,
@@ -886,10 +897,11 @@ impl State {
     /// Audio output, opened lazily; a failure is reported once in the status line.
     fn audio_engine(&mut self) -> Option<AudioEngine> {
         if self.audio.is_none() && !self.audio_failed {
-            match AudioEngine::start() {
+            match AudioEngine::start_on(self.prefs.audio.output_device.as_deref()) {
                 Ok(e) => self.audio = Some(e),
                 Err(e) => {
                     self.audio_failed = true;
+                    self.audio_error = true;
                     self.status = format!("Audio off: {e}");
                 }
             }
@@ -1159,6 +1171,15 @@ impl State {
     }
 
     fn save_prefs(&mut self) {
+        // A new output device takes effect for clips started from now on.
+        if self.audio_device != self.prefs.audio.output_device {
+            self.audio_device = self.prefs.audio.output_device.clone();
+            // Retry only if audio was live (open, or failed on a real error).
+            if self.audio.take().is_some() || self.audio_error {
+                self.audio_failed = false;
+                self.audio_error = false;
+            }
+        }
         let Some(p) = self.persist.then(prefs_path).flatten() else {
             self.prefs_dirty = false;
             return;
@@ -1334,7 +1355,13 @@ impl State {
     }
 
     /// Sends a command through the bus and reacts to the resulting events.
+    /// Runs a command; a rejection is reported in the status line.
     fn exec(&mut self, cmd: Command) {
+        self.exec_ok(cmd);
+    }
+
+    /// Like `exec`, but says whether the command was accepted.
+    fn exec_ok(&mut self, cmd: Command) -> bool {
         // Clock inputs and triggers do not change the saved project.
         let runtime = matches!(
             cmd,
@@ -1391,8 +1418,12 @@ impl State {
                     self.dirty = true;
                 }
                 self.handle(events);
+                true
             }
-            Err(e) => self.status = format!("Command failed: {e}"),
+            Err(e) => {
+                self.status = format!("Command failed: {e}");
+                false
+            }
         }
     }
 
@@ -1498,6 +1529,7 @@ impl State {
                     self.flow.outgoing.remove(&layer);
                     self.flow.loops.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
+                    self.flow.gen_bars.remove(&layer);
                     self.gens.insert(layer, (deck, column, 0.0));
                 }
                 Event::Seek {
@@ -1800,6 +1832,26 @@ impl State {
                         autopilot.push(*layer);
                     }
                 }
+            }
+        }
+        // Autopilot on generators: they never finish, so a bar of the app clock counts as a loop.
+        let bar = (self.clock.phase(std::time::Instant::now()) / 4.0).floor() as i64;
+        for layer in self.gens.keys() {
+            let Some(l) = self
+                .project
+                .composition
+                .layers
+                .iter()
+                .find(|l| l.id == *layer)
+                .filter(|l| l.autopilot.mode != vjc_model::AutopilotMode::Off)
+            else {
+                continue;
+            };
+            let st = vjc_core::playback::gen_bars(self.flow.gen_bars.get(layer).copied(), bar);
+            self.flow.gen_bars.insert(*layer, st);
+            if vjc_core::playback::loops_reached(st.1, l.autopilot.every_loops) {
+                autopilot.push(*layer);
+                self.flow.gen_bars.remove(layer);
             }
         }
         // Generator TIME runs on the app clock, scaled by the clip transport.
@@ -2536,10 +2588,8 @@ impl State {
                     && let Some(target) = self.learn_target.clone()
                     && let Some(src) = m::source_of(&device, msg)
                 {
-                    self.status = format!("{device} -> {target}");
-                    for c in m::learn(&self.project, &target, src) {
-                        self.exec(c);
-                    }
+                    let cmds = m::learn(&self.project, &target, src);
+                    self.learned(format!("{device} -> {target}"), cmds);
                 }
                 continue;
             }
@@ -2580,10 +2630,8 @@ impl State {
                     && o::learnable(&ev)
                     && let Some(target) = self.learn_target.clone()
                 {
-                    self.status = format!("{} -> {target}", ev.address);
-                    for c in o::learn(&self.project, &target, o::source_of(&ev)) {
-                        self.exec(c);
-                    }
+                    let cmds = o::learn(&self.project, &target, o::source_of(&ev));
+                    self.learned(format!("{} -> {target}", ev.address), cmds);
                 }
                 continue;
             }
@@ -2680,8 +2728,21 @@ impl State {
     }
 
     /// Delete in MIDI/OSC learn: unmaps the picked target's MIDI and OSC controls.
+    /// Runs the commands of an external-control learn. A controller that keeps streaming
+    /// after the mapping exists yields no commands and must not rewrite the status line.
+    fn learned(&mut self, label: String, cmds: Vec<Command>) {
+        if cmds.is_empty() {
+            return;
+        }
+        self.status = label;
+        for c in cmds {
+            self.exec(c);
+        }
+    }
+
     fn unlearn_midi_osc(&mut self) {
         let Some(target) = self.learn_target.clone() else {
+            self.status = "Pick a target first (click a control), then Delete".into();
             return;
         };
         self.status = format!("Unmapped {target}");
@@ -2705,6 +2766,9 @@ impl State {
             return;
         }
         let Some(target) = self.learn_target.clone() else {
+            if matches!(key, Key::Delete | Key::Backspace) {
+                self.status = "Pick a target first (click a control), then Delete".into();
+            }
             return;
         };
         let cmds = if matches!(key, Key::Delete | Key::Backspace) {
@@ -3956,9 +4020,25 @@ impl State {
         self.chain_ui(ui, EffectTarget::Group(gid), cmds);
     }
 
+    /// Deck the Clip tab shows: the current one, or, when that deck has no clip in the
+    /// selected cell, the deck of the clip playing in this very cell.
+    fn clip_tab_deck(&self, sel: Option<(LayerId, u32)>) -> DeckId {
+        let cur = self.project.composition.current_deck;
+        let Some((layer, column)) = sel else {
+            return cur;
+        };
+        if vjc_core::clip_in(&self.project, cur, layer, column).is_some() {
+            return cur;
+        }
+        match self.players.get(&layer) {
+            Some((d, c, _)) if *c == column => *d,
+            _ => cur,
+        }
+    }
+
     fn clip_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-        let deck = self.project.composition.current_deck;
         let sel = self.selected;
+        let deck = self.clip_tab_deck(sel);
         let Some((layer, column, k)) =
             sel.and_then(|(l, c)| Some((l, c, vjc_core::clip_in(&self.project, deck, l, c)?)))
         else {
@@ -4661,16 +4741,19 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Only clips with an end can be autopilot targets: generators and live
-/// sources never finish or loop, so the layer would stop advancing on them.
+/// Autopilot targets: files (advance by loops or at the end) and generators (advance by
+/// bars). Live sources never finish or loop, so the layer would stop advancing on them.
 fn autopilot_playable(source: &vjc_model::Source) -> bool {
-    matches!(source, vjc_model::Source::File { .. })
+    matches!(
+        source,
+        vjc_model::Source::File { .. } | vjc_model::Source::Generator { .. }
+    )
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn autopilot_skips_generators_and_live() {
+    fn autopilot_takes_files_and_generators_not_live() {
         use vjc_model::Source;
         let f = Source::File {
             path: "a.mp4".into(),
@@ -4680,7 +4763,12 @@ mod tests {
             kind: "Plasma".into(),
             params: Default::default(),
         };
-        assert!(!super::autopilot_playable(&g));
+        assert!(super::autopilot_playable(&g));
+        let live = Source::Network {
+            protocol: vjc_model::NetProtocol::Syphon,
+            name: "x".into(),
+        };
+        assert!(!super::autopilot_playable(&live));
     }
 
     use super::*;

@@ -87,8 +87,8 @@ pub struct Import {
 #[derive(Default)]
 struct Warns {
     kinds: BTreeMap<String, (usize, BTreeSet<String>)>,
-    /// Effect passes that import_chain looked at (imported or warned about).
-    chain_effects: usize,
+    /// Effect nodes import_chain looked at (imported or warned about), by identity.
+    chain_effects: BTreeSet<usize>,
 }
 
 impl Warns {
@@ -325,16 +325,16 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
         comp.decks = decks;
     }
     // Effects the track chains never reached (e.g. inside a source) would vanish silently.
-    let mut total = 0;
+    let mut stray = 0;
     root.walk(&mut |n| {
         if n.tag == "RenderPass" && n.attr("baseType") == Some("Effect") {
             let name = n.attr("type").or(n.attr("name")).unwrap_or("?");
-            if name != "TransformEffect" {
-                total += 1;
+            if name != "TransformEffect" && !warnings.chain_effects.contains(&node_id(n)) {
+                stray += 1;
             }
         }
     });
-    for _ in warnings.chain_effects..total {
+    for _ in 0..stray {
         warnings.add("effect outside layer/clip/master chains not imported", "");
     }
     Ok(Import {
@@ -406,6 +406,11 @@ fn map_effect(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Identity of a node within the parsed tree (stable while the tree is alive).
+fn node_id(n: &Node) -> usize {
+    std::ptr::from_ref(n) as usize
+}
+
 /// Effects of a track's own RenderPassChain (not the source's chain).
 fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
     let Some(chain) = vt
@@ -432,7 +437,7 @@ fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
         if name == "TransformEffect" {
             continue;
         }
-        w.chain_effects += 1;
+        w.chain_effects.insert(node_id(inner));
         let Some(mut fx) = map_effect(name).and_then(vjc_fx::new_effect) else {
             w.add("effect not imported", name);
             continue;
@@ -728,6 +733,15 @@ mod tests {
             i.warning_counts
                 .contains_key("effect outside layer/clip/master chains not imported")
         );
+    }
+
+    #[test]
+    fn stray_effect_warns_by_identity_next_to_chain_effects() {
+        let xml = r#"<Composition name="x" numColumns="1"><VideoTrack><RenderPass baseType="RenderPassChain"><RenderPass baseType="Effect" type="Blur"/></RenderPass></VideoTrack><Layer layerIndex="0"/><Deck><Clip layerIndex="0" columnIndex="0"><VideoTrack><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/a.mov"/><RenderPass baseType="Effect" type="Blur"/></VideoSource></PrimarySource></VideoTrack></Clip></Deck></Composition>"#;
+        let i = super::import_str(xml).unwrap();
+        let k = "effect outside layer/clip/master chains not imported";
+        assert_eq!(i.warning_counts.get(k), Some(&1));
+        assert_eq!(i.effects_imported, 1);
     }
 
     #[test]

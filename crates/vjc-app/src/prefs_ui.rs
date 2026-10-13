@@ -93,16 +93,22 @@ impl State {
                         );
                     }
                     PrefsTab::Audio => {
-                        // TODO(#19): list output devices with cpal (not a dependency yet).
-                        ui.horizontal(|ui| {
-                            ui.label("Output device");
-                            let mut t = p.audio.output_device.clone().unwrap_or_default();
-                            if ui.text_edit_singleline(&mut t).changed() {
-                                p.audio.output_device =
-                                    (!t.trim().is_empty()).then(|| t.trim().into());
-                            }
-                        });
-                        ui.weak("Placeholder: saved, not used by the engine yet.");
+                        let outputs = self
+                            .audio_outputs
+                            .get_or_insert_with(vjc_media::audio::output_devices);
+                        let cur = p.audio.output_device.clone();
+                        egui::ComboBox::from_label("Output device")
+                            .selected_text(cur.as_deref().unwrap_or("(default)"))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut p.audio.output_device, None, "(default)");
+                                for n in outputs.iter() {
+                                    ui.selectable_value(&mut p.audio.output_device, Some(n.clone()), n);
+                                }
+                            });
+                        if ui.button("Refresh devices").clicked() {
+                            self.audio_outputs = None;
+                        }
+                        ui.weak("Applies to clips started after the change.");
                     }
                     PrefsTab::Video => {
                         ui.label("New composition");

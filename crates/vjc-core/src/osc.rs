@@ -163,6 +163,7 @@ pub fn learn(p: &Project, target: &str, source: ControlSource) -> Vec<Command> {
             mode,
             range,
             invert: false,
+            effect: None,
         },
         index: p.shortcuts.len(),
     });

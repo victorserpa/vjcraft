@@ -555,6 +555,11 @@ pub struct Shortcut {
     pub mode: ShortcutMode,
     pub range: (f64, f64),
     pub invert: bool,
+    /// Stable id of the effect an effect address points at; the positional `target` is
+    /// recomputed from it when the chain is reordered, and the shortcut is orphaned when
+    /// the effect goes away.
+    #[serde(default)]
+    pub effect: Option<EffectId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -667,6 +672,22 @@ impl Default for Transport {
 }
 
 impl Project {
+    /// Enforces one monitor per screen: a screen that names a monitor an earlier screen
+    /// already uses falls back to a window. Returns how many screens were changed.
+    pub fn normalize_screens(&mut self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut changed = 0;
+        for s in &mut self.output.screens {
+            if let OutputDevice::Monitor { name } = &s.device
+                && !seen.insert(name.clone())
+            {
+                s.device = OutputDevice::Window;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     /// Minimal empty project with one deck.
     pub fn new(name: &str) -> Self {
         let deck = Deck {

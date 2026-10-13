@@ -406,8 +406,7 @@ impl Prefs {
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         {
-            let known = serde_json::to_value(Prefs::default()).map_err(std::io::Error::other)?;
-            merge_unknown(&mut new, &old, &known);
+            merge_old::<Prefs>(&mut new, &old);
             if let Some(v) = old.get("version").and_then(|v| v.as_u64())
                 && v > u64::from(PREFS_VERSION)
             {
@@ -416,6 +415,22 @@ impl Prefs {
         }
         let json = serde_json::to_vec_pretty(&new).map_err(std::io::Error::other)?;
         crate::write_atomic(path, &json)
+    }
+}
+
+/// Keeps what this build does not know from `old`. The known shape is `old` as `T` would
+/// re-serialize it (not `T::default()`, whose maps are empty and whose `None` structs have no
+/// fields, which would make every map key / inner field look unknown and resurrect it).
+fn merge_old<T>(new: &mut serde_json::Value, old: &serde_json::Value)
+where
+    T: Serialize + serde::de::DeserializeOwned + Default,
+{
+    let known = serde_json::from_value::<T>(old.clone())
+        .ok()
+        .and_then(|t| serde_json::to_value(t).ok())
+        .or_else(|| serde_json::to_value(T::default()).ok());
+    if let Some(known) = known {
+        merge_unknown(new, old, &known);
     }
 }
 
@@ -438,6 +453,31 @@ fn merge_unknown(new: &mut serde_json::Value, old: &serde_json::Value, known: &s
 
 #[cfg(test)]
 mod tests {
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    #[serde(default)]
+    struct Inner {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        a: Option<u32>,
+        b: u32,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    #[serde(default)]
+    struct Future {
+        map: std::collections::BTreeMap<String, u32>,
+        inner: Option<Inner>,
+    }
+
+    #[test]
+    fn merge_does_not_resurrect_map_keys_or_inner_fields() {
+        let old = serde_json::json!({"map":{"a":1,"b":2},"inner":{"a":1,"b":2},"future":5});
+        let mut new = serde_json::json!({"map":{"a":1},"inner":{"b":2}});
+        super::merge_old::<Future>(&mut new, &old);
+        assert_eq!(new["map"], serde_json::json!({"a":1}));
+        assert_eq!(new["inner"], serde_json::json!({"b":2}));
+        assert_eq!(new["future"], 5);
+    }
+
     #[test]
     fn save_keeps_unknown_fields_of_newer_file() {
         let d = std::env::temp_dir().join(format!("vjc-prefs-new-{}", std::process::id()));

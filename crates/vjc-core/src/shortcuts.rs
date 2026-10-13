@@ -190,6 +190,105 @@ fn fx_resolve(p: &Project, ctx: &Ctx, parts: &[&str], value: f64) -> Option<Opti
     }))
 }
 
+/// Prefix of the target of a shortcut whose effect was removed; resolves to nothing, and
+/// goes back to a real address if the effect returns (undo).
+const ORPHAN: &str = "/orphan/";
+
+pub fn is_orphan(s: &Shortcut) -> bool {
+    s.effect.is_some() && s.target.starts_with(ORPHAN)
+}
+
+/// Scope prefix ("/comp", "/comp/layer/N", ...) and tail of an effect address.
+fn split_fx_target(target: &str) -> Option<(&str, &str)> {
+    if let Some(tail) = target.strip_prefix(ORPHAN) {
+        return Some(("", tail));
+    }
+    let i = target.find("/effect/")?;
+    let rest = &target[i + "/effect/".len()..];
+    let (k, tail) = rest.split_once('/')?;
+    k.parse::<usize>().ok()?;
+    Some((&target[..i], tail))
+}
+
+/// The effect a positional effect address points at right now. Clip addresses pick the first
+/// clip of that layer (current deck) that has an effect there.
+fn effect_of_target(p: &Project, target: &str) -> Option<vjc_model::EffectId> {
+    let parts: Vec<&str> = target.trim_start_matches('/').split('/').collect();
+    let mut ctx = Ctx::new(None, false);
+    if let ["comp", "layer", n, "clip", ..] = parts.as_slice() {
+        let layer = layer_by_number(p, number_of(n)?)?;
+        let deck = p
+            .composition
+            .decks
+            .iter()
+            .find(|d| d.id == p.composition.current_deck)?;
+        ctx.active = deck
+            .clips
+            .iter()
+            .filter(|c| c.layer == layer)
+            .map(|c| (layer, deck.id, c.column))
+            .collect();
+    }
+    // `active` may list several clips; parse_fx takes the first, so try each in turn.
+    let tries = if ctx.active.is_empty() {
+        vec![vec![]]
+    } else {
+        ctx.active.iter().map(|a| vec![*a]).collect()
+    };
+    tries.into_iter().find_map(|a| {
+        ctx.active = a;
+        parse_fx(p, &ctx, &parts)?.map(|(_, e, _)| e.id)
+    })
+}
+
+/// Where effect `id` sits now: its scope prefix and 1-based chain position.
+fn locate_effect(p: &Project, id: vjc_model::EffectId) -> Option<(String, usize)> {
+    let c = &p.composition;
+    let at = |fx: &[Effect]| fx.iter().position(|e| e.id == id).map(|i| i + 1);
+    if let Some(k) = at(&c.master.effects) {
+        return Some(("/comp".into(), k));
+    }
+    for l in &c.layers {
+        if let Some(k) = at(&l.track.effects) {
+            return layer_address(p, l.id, "").map(|a| (a.trim_end_matches('/').into(), k));
+        }
+    }
+    for g in &c.groups {
+        if let Some(k) = at(&g.track.effects) {
+            return group_address(p, g.id, "").map(|a| (a.trim_end_matches('/').into(), k));
+        }
+    }
+    for d in &c.decks {
+        for cl in &d.clips {
+            if let Some(k) = at(&cl.clip.track.effects) {
+                return layer_address(p, cl.layer, "clip")
+                    .map(|a| (a.trim_end_matches('/').into(), k));
+            }
+        }
+    }
+    None
+}
+
+/// Re-points every effect shortcut at its effect's current address, or orphans it when the
+/// effect is gone. Idempotent; called after each applied command.
+pub fn rebind(p: &mut Project) {
+    for i in 0..p.shortcuts.len() {
+        let Some(id) = p.shortcuts[i].effect else {
+            continue;
+        };
+        let Some((_, tail)) = split_fx_target(&p.shortcuts[i].target) else {
+            continue;
+        };
+        let target = match locate_effect(p, id) {
+            Some((scope, k)) => format!("{scope}/effect/{k}/{tail}"),
+            None => format!("{ORPHAN}{tail}"),
+        };
+        if p.shortcuts[i].target != target {
+            p.shortcuts[i].target = target;
+        }
+    }
+}
+
 /// True for targets a knob sweeps (opacity and effect params / dry-wet) rather than flips.
 pub fn is_continuous(address: &str) -> bool {
     address.ends_with("/opacity")
@@ -423,6 +522,7 @@ pub fn key_shortcut(key: &str, target: &str, mode: ShortcutMode, range: (f64, f6
         mode,
         range,
         invert: false,
+        effect: None,
     }
 }
 
@@ -501,6 +601,10 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 return Err(Error::InvalidValue);
             }
             let id = shortcut.id;
+            let mut shortcut = shortcut;
+            if shortcut.effect.is_none() {
+                shortcut.effect = effect_of_target(p, &shortcut.target);
+            }
             p.shortcuts.insert(index.min(p.shortcuts.len()), shortcut);
             undoable(Command::RemoveShortcut { id }, vec![])
         }
@@ -533,5 +637,86 @@ mod relative_tests {
         let on = activate(&p, &Ctx::new(None, true), &s);
         let off = activate(&p, &Ctx::new(None, false), &s);
         assert_ne!(format!("{on:?}"), format!("{off:?}"));
+    }
+}
+
+#[cfg(test)]
+mod effect_id_tests {
+    use super::*;
+    use crate::{History, effects};
+    use std::time::Instant;
+
+    fn fx(kind: &str) -> Effect {
+        Effect {
+            id: Uuid::new_v4(),
+            kind: kind.into(),
+            bypass: false,
+            dry_wet: 1.0,
+            params: vec![],
+        }
+    }
+
+    fn setup() -> (Project, History, Effect, Effect) {
+        let mut p = Project::new("t");
+        let mut h = History::new();
+        let (a, b) = (fx("a"), fx("b"));
+        for (i, e) in [&a, &b].into_iter().enumerate() {
+            let cmd = Command::AddEffect {
+                target: EffectTarget::Master,
+                effect: e.clone(),
+                index: i,
+            };
+            h.exec(&mut p, cmd, Instant::now()).unwrap();
+        }
+        // Learned positionally: the 2nd effect's dry/wet.
+        let s = key_shortcut(
+            "Q",
+            "/comp/effect/2/drywet",
+            ShortcutMode::Toggle,
+            (0.0, 1.0),
+        );
+        let cmd = Command::AddShortcut {
+            shortcut: s,
+            index: 0,
+        };
+        h.exec(&mut p, cmd, Instant::now()).unwrap();
+        (p, h, a, b)
+    }
+
+    #[test]
+    fn shortcut_follows_effect_on_reorder() {
+        let (mut p, mut h, _a, b) = setup();
+        assert_eq!(p.shortcuts[0].effect, Some(b.id));
+        let mv = Command::MoveEffect {
+            target: EffectTarget::Master,
+            effect: b.id,
+            index: 0,
+        };
+        h.exec(&mut p, mv, Instant::now()).unwrap();
+        assert_eq!(p.shortcuts[0].target, "/comp/effect/1/drywet");
+        let cmd = activate(&p, &Ctx::new(None, false), &p.shortcuts[0]).unwrap();
+        assert!(matches!(cmd, Command::SetEffectDryWet { effect, .. } if effect == b.id));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.shortcuts[0].target, "/comp/effect/2/drywet");
+    }
+
+    #[test]
+    fn removing_the_effect_orphans_instead_of_retargeting() {
+        let (mut p, mut h, a, b) = setup();
+        let rm = Command::RemoveEffect {
+            target: EffectTarget::Master,
+            effect: b.id,
+        };
+        h.exec(&mut p, rm, Instant::now()).unwrap();
+        assert!(is_orphan(&p.shortcuts[0]));
+        assert_eq!(activate(&p, &Ctx::new(None, false), &p.shortcuts[0]), None);
+        // The surviving effect is never picked up, even once it shifts into the slot.
+        assert_eq!(
+            effects::chain(&p, EffectTarget::Master).unwrap()[0].id,
+            a.id
+        );
+        h.undo(&mut p).unwrap().unwrap();
+        assert!(!is_orphan(&p.shortcuts[0]));
+        assert_eq!(p.shortcuts[0].target, "/comp/effect/2/drywet");
     }
 }

@@ -362,6 +362,7 @@ mod tests {
             mode: ShortcutMode::Absolute,
             range: (0.0, 1.0),
             invert: false,
+            effect: None,
         });
         let cmd = p
             .shortcuts

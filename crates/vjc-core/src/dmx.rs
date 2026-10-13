@@ -468,6 +468,7 @@ pub fn learn(p: &Project, target: &str, source: ControlSource) -> Vec<Command> {
             mode,
             range,
             invert: false,
+            effect: None,
         },
         index: p.shortcuts.len(),
     });
@@ -794,6 +795,7 @@ mod tests {
             mode: ShortcutMode::Absolute,
             range: (0.0, 1.0),
             invert: false,
+            effect: None,
         };
         (p, s)
     }

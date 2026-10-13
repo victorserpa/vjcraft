@@ -58,6 +58,16 @@ impl LoopCounter {
 }
 
 /// True once `count` loops reached the autopilot threshold (min 1).
+/// Generators have no end: for autopilot one "loop" is one bar (4 beats). Advances the
+/// `(last bar, bars completed)` state to `bar`; the first call only records the bar.
+pub fn gen_bars(prev: Option<(i64, u32)>, bar: i64) -> (i64, u32) {
+    match prev {
+        Some((last, n)) if last != bar => (bar, n + 1),
+        Some(p) => p,
+        None => (bar, 0),
+    }
+}
+
 pub fn loops_reached(count: u32, every: u32) -> bool {
     count >= every.max(1)
 }
@@ -150,5 +160,18 @@ mod tests {
         assert_eq!(beat_window(0.0, 4.0, 0.0, 10.0), None);
         assert_eq!(loop_wrap(0.69, (0.5, 0.7)), None);
         assert_eq!(loop_wrap(0.7, (0.5, 0.7)), Some(0.5));
+    }
+}
+
+#[cfg(test)]
+mod gen_bar_tests {
+    use super::*;
+
+    #[test]
+    fn counts_bar_changes_only() {
+        let a = gen_bars(None, 7);
+        assert_eq!(a, (7, 0));
+        assert_eq!(gen_bars(Some(a), 7), (7, 0));
+        assert_eq!(gen_bars(Some(a), 8), (8, 1));
     }
 }

@@ -1067,3 +1067,91 @@ fn help_asks_for_a_repaint_when_hover_changes_or_ends() {
     settle(&mut h);
     assert_eq!(h.state().help_shown, Some("tap"));
 }
+
+#[test]
+fn clip_tab_follows_the_deck_of_the_playing_clip() {
+    let mut h = app();
+    let st = h.state_mut();
+    let lid = st.project.composition.layers[0].id;
+    let (a, b) = (st.project.composition.decks[0].id, uuid::Uuid::new_v4());
+    st.project.composition.decks.push(vjc_model::Deck {
+        id: b,
+        name: "B".into(),
+        clips: vec![vjc_model::CellClip {
+            layer: lid,
+            column: 0,
+            clip: vjc_core::clip_from_path("/x/b.mov".into()),
+        }],
+    });
+    st.project.composition.current_deck = a;
+    st.selected = Some((lid, 0));
+    // Nothing playing: stays on the current deck (no clip there).
+    assert_eq!(st.clip_tab_deck(st.selected), a);
+    st.players
+        .insert(lid, (b, 0, vjc_media::Player::open_scrub("/x/b.mov")));
+    assert_eq!(st.clip_tab_deck(st.selected), b);
+    // A clip in the current deck's cell wins over the player's deck.
+    st.project.composition.decks[0]
+        .clips
+        .push(vjc_model::CellClip {
+            layer: lid,
+            column: 0,
+            clip: vjc_core::clip_from_path("/x/a.mov".into()),
+        });
+    assert_eq!(st.clip_tab_deck(st.selected), a);
+}
+
+#[test]
+fn learn_delete_without_target_says_so_and_streaming_keeps_status() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.learn = true;
+    st.learn_target = None;
+    st.learn_key(egui::Key::Delete);
+    assert!(st.status.contains("Pick a target"), "{}", st.status);
+    st.learn_midi = true;
+    st.status = "other".into();
+    st.unlearn_midi_osc();
+    assert!(st.status.contains("Pick a target"), "{}", st.status);
+    // Already-mapped stream: no commands, status untouched.
+    st.status = "other".into();
+    st.learned("x -> y".into(), vec![]);
+    assert_eq!(st.status, "other");
+    st.learned("x -> y".into(), vec![Command::SetBpm { bpm: 100.0 }]);
+    assert_eq!(st.status, "x -> y");
+}
+
+#[test]
+fn duplicate_monitor_keeps_screen_closed_and_reports() {
+    let mut h = app();
+    let st = h.state_mut();
+    let mut ids = vec![];
+    for (i, n) in ["A", "B"].into_iter().enumerate() {
+        let s = vjc_core::mapping::new_screen(n, 100, 100);
+        ids.push(s.id);
+        st.exec(Command::AddScreen {
+            screen: s,
+            index: i,
+        });
+    }
+    let mon = |n: &str| vjc_model::OutputDevice::Monitor { name: n.into() };
+    st.run_output_cmds(vec![Command::SetScreenDevice {
+        screen: ids[0],
+        device: mon("1"),
+    }]);
+    st.closed_screens.insert(ids[1]);
+    st.run_output_cmds(vec![Command::SetScreenDevice {
+        screen: ids[1],
+        device: mon("1"),
+    }]);
+    assert!(
+        st.closed_screens.contains(&ids[1]),
+        "reopened despite error"
+    );
+    assert!(st.status.contains("already shows"), "{}", st.status);
+    st.run_output_cmds(vec![Command::SetScreenDevice {
+        screen: ids[1],
+        device: mon("2"),
+    }]);
+    assert!(!st.closed_screens.contains(&ids[1]));
+}

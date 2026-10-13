@@ -220,6 +220,12 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// Opens the default output device. Needs a real audio device (not covered by CI tests).
     pub fn start() -> Result<AudioEngine, String> {
+        Self::start_on(None)
+    }
+
+    /// Opens the output device called `device` (the default one if None or not found).
+    pub fn start_on(device: Option<&str>) -> Result<AudioEngine, String> {
+        let device = device.map(str::to_owned);
         let voices: VoiceList = Arc::new(Mutex::new(Vec::new()));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -231,7 +237,7 @@ impl AudioEngine {
             .spawn(move || {
                 // The cpal stream is not Send: it lives and dies on this thread.
                 let failed = Arc::new(AtomicBool::new(false));
-                let open = || open_stream(v.clone(), failed.clone());
+                let open = || open_stream(v.clone(), failed.clone(), device.as_deref());
                 match open() {
                     Ok((stream, rate)) => {
                         sr.store(rate, Ordering::Release);
@@ -317,10 +323,32 @@ fn supervise<S>(
     }
 }
 
-fn open_stream(voices: VoiceList, failed: Arc<AtomicBool>) -> Result<(cpal::Stream, u32), String> {
-    let device = cpal::default_host()
-        .default_output_device()
-        .ok_or("No audio output device")?;
+/// Names of the audio output devices.
+pub fn output_devices() -> Vec<String> {
+    let Ok(devs) = cpal::default_host().output_devices() else {
+        return vec![];
+    };
+    devs.filter_map(|d| d.description().ok().map(|d| d.name().to_owned()))
+        .collect()
+}
+
+/// The output device named `name`, else the default one.
+fn pick_output(name: Option<&str>) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    name.and_then(|n| {
+        host.output_devices()
+            .ok()?
+            .find(|d| d.description().map(|d| d.name() == n).unwrap_or(false))
+    })
+    .or_else(|| host.default_output_device())
+}
+
+fn open_stream(
+    voices: VoiceList,
+    failed: Arc<AtomicBool>,
+    device: Option<&str>,
+) -> Result<(cpal::Stream, u32), String> {
+    let device = pick_output(device).ok_or("No audio output device")?;
     let supported = device
         .default_output_config()
         .map_err(|e| format!("Audio output config: {e}"))?;
@@ -993,5 +1021,16 @@ mod tests {
     fn engine_opens_default_device() {
         let e = AudioEngine::start().unwrap();
         assert!(e.sample_rate() > 0);
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    #[test]
+    fn listing_and_unknown_device_do_not_panic() {
+        // No device on CI: the list is empty, and an unknown name falls back to the default.
+        let names = super::output_devices();
+        assert!(names.iter().all(|n| !n.is_empty()) || names.is_empty());
+        let _ = super::pick_output(Some("no such device \u{1}"));
     }
 }

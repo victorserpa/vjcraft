@@ -949,8 +949,30 @@ pub fn playback_rate(clip_speed: f64, sync: f64, master_speed: f64) -> f64 {
     clip_speed * sync * master_speed
 }
 
-/// Applies a command to the project. Pure: no I/O, no UI, no players.
+/// Applies a command to the project. Pure: no I/O, no UI, no players. Effect shortcuts are
+/// re-pointed afterwards so they keep following their effect (see `shortcuts::rebind`).
 pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
+    // Empty names are rejected for every user edit; undo/redo go through `restore` because
+    // a name that was already empty must be restorable.
+    if let Command::RenameLayer { name, .. }
+    | Command::RenameClip { name, .. }
+    | Command::RenameDeck { name, .. }
+    | Command::RenameGroup { name, .. } = &cmd
+        && name.trim().is_empty()
+    {
+        return Err(Error::InvalidValue);
+    }
+    restore(p, cmd)
+}
+
+/// `apply` without the user-input checks: for undo/redo replays.
+fn restore(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
+    let r = apply_raw(p, cmd)?;
+    shortcuts::rebind(p);
+    Ok(r)
+}
+
+fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
     match cmd {
         Command::ImportMedia {
             deck,
@@ -1281,6 +1303,16 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let id = screen.id;
             let at = index.min(p.output.screens.len());
             p.output.screens.insert(at, screen);
+            // One monitor drives one screen only (also when undoing a RemoveScreen after
+            // the monitor was given to another screen): the newcomer falls back to a window.
+            if let vjc_model::OutputDevice::Monitor { name } = &p.output.screens[at].device
+                && p.output.screens.iter().enumerate().any(|(i, o)| {
+                    i != at
+                        && matches!(&o.device, vjc_model::OutputDevice::Monitor { name: n } if n == name)
+                })
+            {
+                p.output.screens[at].device = vjc_model::OutputDevice::Window;
+            }
             undoable(Command::RemoveScreen { screen: id }, vec![])
         }
         Command::RemoveScreen { screen } => {
@@ -1955,16 +1987,6 @@ impl History {
             },
             c => c,
         };
-        // Empty names are rejected for user edits only: undo/redo go through
-        // `apply` because a name that was already empty must be restorable.
-        if let Command::RenameLayer { name, .. }
-        | Command::RenameClip { name, .. }
-        | Command::RenameDeck { name, .. }
-        | Command::RenameGroup { name, .. } = &cmd
-            && name.trim().is_empty()
-        {
-            return Err(Error::InvalidValue);
-        }
         let target = cmd.target();
         let Applied { inverse, events } = apply(p, cmd.clone())?;
         let Some(undo) = inverse else {
@@ -1993,7 +2015,7 @@ impl History {
     /// Returns None when there is nothing to undo.
     pub fn undo(&mut self, p: &mut Project) -> Option<Result<Vec<Event>, Error>> {
         let mut e = self.done.pop()?;
-        let r = apply(p, e.undo.clone());
+        let r = restore(p, e.undo.clone());
         if r.is_ok() {
             e.sealed = true;
             self.undone.push(e);
@@ -2007,7 +2029,7 @@ impl History {
     /// Returns None when there is nothing to redo.
     pub fn redo(&mut self, p: &mut Project) -> Option<Result<Vec<Event>, Error>> {
         let mut e = self.undone.pop()?;
-        let r = apply(p, e.redo.clone());
+        let r = restore(p, e.redo.clone());
         if r.is_ok() {
             e.sealed = true;
             self.done.push(e);
@@ -2274,6 +2296,18 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(r, Err(Error::InvalidValue));
+        assert_eq!(p.composition.decks[0].name, "Deck");
+    }
+
+    #[test]
+    fn empty_names_rejected_by_apply_too() {
+        let mut p = Project::new("t");
+        let d = p.composition.decks[0].id;
+        let c = Command::RenameDeck {
+            deck: d,
+            name: " ".into(),
+        };
+        assert_eq!(apply(&mut p, c), Err(Error::InvalidValue));
         assert_eq!(p.composition.decks[0].name, "Deck");
     }
 
@@ -4099,6 +4133,89 @@ mod tests {
         // A playable clip after the gap is still reached.
         let a = step(&mut p, l1, Some(0)).unwrap();
         assert!(matches!(&a.events[0], Event::ClipStarted { column: 2, .. }));
+    }
+
+    #[test]
+    fn one_monitor_per_screen_in_add_and_undo_remove() {
+        let mut p = Project::new("t");
+        let on = |name: &str, mon: &str| {
+            let mut s = mapping::new_screen(name, 1920, 1080);
+            s.device = vjc_model::OutputDevice::Monitor { name: mon.into() };
+            s
+        };
+        let (a, b) = (on("A", "2"), on("B", "3"));
+        let (aid, bid) = (a.id, b.id);
+        apply(
+            &mut p,
+            Command::AddScreen {
+                screen: a,
+                index: 0,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut p,
+            Command::AddScreen {
+                screen: b,
+                index: 1,
+            },
+        )
+        .unwrap();
+        // Adding a third screen on monitor 2 does not duplicate it.
+        let c = on("C", "2");
+        let cid = c.id;
+        apply(
+            &mut p,
+            Command::AddScreen {
+                screen: c,
+                index: 2,
+            },
+        )
+        .unwrap();
+        let dev = |p: &Project, id| {
+            p.output
+                .screens
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .device
+                .clone()
+        };
+        assert_eq!(dev(&p, cid), vjc_model::OutputDevice::Window);
+        // Remove A, give its monitor to B-less C, then undo the removal: still one owner.
+        let undo = apply(&mut p, Command::RemoveScreen { screen: aid })
+            .unwrap()
+            .inverse
+            .unwrap();
+        let mon2 = vjc_model::OutputDevice::Monitor { name: "2".into() };
+        apply(
+            &mut p,
+            Command::SetScreenDevice {
+                screen: cid,
+                device: mon2.clone(),
+            },
+        )
+        .unwrap();
+        apply(&mut p, undo).unwrap();
+        let owners = p.output.screens.iter().filter(|s| s.device == mon2).count();
+        assert_eq!(owners, 1);
+        assert_eq!(
+            dev(&p, bid),
+            vjc_model::OutputDevice::Monitor { name: "3".into() }
+        );
+    }
+
+    #[test]
+    fn load_normalizes_shared_monitor() {
+        let mut p = Project::new("t");
+        for n in ["A", "B"] {
+            let mut s = mapping::new_screen(n, 100, 100);
+            s.device = vjc_model::OutputDevice::Monitor { name: "1".into() };
+            p.output.screens.push(s);
+        }
+        assert_eq!(p.normalize_screens(), 1);
+        assert_eq!(p.output.screens[1].device, vjc_model::OutputDevice::Window);
+        assert_eq!(p.normalize_screens(), 0);
     }
 
     #[test]
