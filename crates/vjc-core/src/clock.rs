@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub const MIN_BPM: f64 = 20.0;
-pub const MAX_BPM: f64 = 300.0;
+pub const MAX_BPM: f64 = 999.0;
 /// Taps further apart than this start a new measurement.
 pub const TAP_RESET: Duration = Duration::from_secs(2);
 /// Intervals averaged by `tap` (so up to 5 taps are remembered).
@@ -167,55 +167,133 @@ impl Clock {
 }
 
 /// Per-frame glue between the project BPM, the clock and a `LinkSource`.
+///
+/// Tempo model: the project BPM is what the user edits (undoable). With Link on, a
+/// tempo pulled from the session lives only in the clock (runtime state): it never
+/// touches the project, history or dirty flag. The app writes `clock.bpm()` into the
+/// project when saving. An explicit local edit of the project BPM (drag, tap, or
+/// undo/redo of a `SetBpm`) is pushed to the session and wins over it; that includes
+/// undoing an old `SetBpm`, which is a deliberate user action.
+///
+/// Phase: with Link on, nudge/resync act on a local `offset` (beats) added to the
+/// session beat, so `follow_phase` keeps them instead of undoing them.
 #[derive(Debug, Default)]
 pub struct LinkSync {
     enabled: bool,
-    /// BPM both sides last agreed on.
-    last_bpm: Option<f64>,
+    /// A local BPM edit is waiting to be applied to the clock/Link. Set by
+    /// `note_bpm_edit`, consumed only when actually applied (never while Link
+    /// has no state), so an edit to a value equal to the old project BPM still counts.
+    pending_edit: bool,
+    /// The first update already ran (the first frame adopts the project BPM).
+    synced: bool,
+    /// Raw session tempo seen on the previous frame (while joined).
+    last_link: Option<f64>,
+    joined: bool,
     pub peers: u64,
+    /// Local phase offset (beats) relative to the session beat.
+    offset: f64,
+    nudge: i8,
+    last_beat: f64,
+    last_update: Option<Instant>,
 }
 
 impl LinkSync {
-    /// Call once per frame. `bpm` is the project BPM (updated in place when Link
-    /// changes tempo). A local change of `bpm` is pushed to Link; otherwise a changed
-    /// Link tempo is pulled. With Link on, phase follows the session beat.
+    /// Signals an explicit local BPM edit (applied `SetBpm`, undo/redo of one, tap,
+    /// or a replaced project). Detection is by event, not by comparing values.
+    pub fn note_bpm_edit(&mut self) {
+        self.pending_edit = true;
+    }
+
+    /// Nudge while held. With Link on it shifts the local offset; otherwise the clock.
+    pub fn nudge(&mut self, dir: i8, clock: &mut Clock, now: Instant) {
+        if self.enabled {
+            self.nudge = dir.signum();
+        } else {
+            clock.nudge(dir, now);
+        }
+    }
+
+    /// Puts `now` on beat 0. With Link on, the offset is chosen so the local phase is 0.
+    pub fn resync(&mut self, clock: &mut Clock, now: Instant) {
+        clock.resync(now);
+        if self.enabled {
+            self.offset = -self.last_beat;
+        }
+    }
+
+    /// Call once per frame with the project BPM. The effective tempo is `clock.bpm()`.
+    /// A pending edit (`note_bpm_edit`) is pushed to Link; otherwise a changed Link
+    /// tempo is pulled into the clock. With Link on, phase follows the session beat.
     pub fn update(
         &mut self,
         src: &mut dyn LinkSource,
         on: bool,
-        bpm: &mut f64,
+        project_bpm: f64,
         clock: &mut Clock,
         now: Instant,
     ) {
+        let project = project_bpm.clamp(MIN_BPM, MAX_BPM);
+        let project_changed = self.pending_edit || !self.synced;
         if on != self.enabled {
             self.enabled = on;
             src.set_enabled(on);
-            self.last_bpm = None;
-            self.peers = 0;
+            self.joined = false;
+            self.last_link = None;
+            self.offset = 0.0;
+            self.last_update = None;
+            clock.nudge(0, now);
+            self.nudge = 0;
+            if !on {
+                self.peers = 0;
+            }
         }
         if !on {
+            if project_changed && clock.bpm() != project {
+                clock.set_bpm(project, now);
+            }
+            self.pending_edit = false;
+            self.synced = true;
             return;
         }
-        let Some(s) = src.state() else { return };
+        let Some(s) = src.state() else {
+            // No session state: keep the edit pending and do not integrate nudge
+            // over the gap.
+            self.last_update = None;
+            return;
+        };
+        self.pending_edit = false;
+        self.synced = true;
         self.peers = s.peers;
-        match self.last_bpm {
-            None => {
-                // Just joined: the session tempo wins if there are peers, else ours.
-                if s.peers > 0 {
-                    *bpm = s.bpm.clamp(MIN_BPM, MAX_BPM);
-                } else {
-                    src.set_bpm(*bpm);
-                }
+        let mut eff = clock.bpm();
+        if !self.joined {
+            // Just joined: the session tempo wins if there are peers, else ours.
+            if s.peers > 0 {
+                eff = s.bpm.clamp(MIN_BPM, MAX_BPM);
+                self.last_link = Some(s.bpm);
+            } else {
+                eff = project;
+                src.set_bpm(eff);
+                self.last_link = Some(eff);
             }
-            Some(last) if (*bpm - last).abs() > 1e-9 => src.set_bpm(*bpm),
-            Some(last) if (s.bpm - last).abs() > 1e-6 => *bpm = s.bpm.clamp(MIN_BPM, MAX_BPM),
-            _ => {}
+            self.joined = true;
+        } else if project_changed {
+            eff = project;
+            src.set_bpm(eff);
+            self.last_link = Some(eff);
+        } else if self.last_link.is_none_or(|l| (s.bpm - l).abs() > 1e-6) {
+            eff = s.bpm.clamp(MIN_BPM, MAX_BPM);
+            self.last_link = Some(s.bpm);
         }
-        self.last_bpm = Some(*bpm);
-        if clock.bpm() != *bpm {
-            clock.set_bpm(*bpm, now);
+        if clock.bpm() != eff {
+            clock.set_bpm(eff, now);
         }
-        clock.follow_phase(s.beat, now);
+        if let Some(prev) = self.last_update {
+            let dt = now.saturating_duration_since(prev).as_secs_f64();
+            self.offset += f64::from(self.nudge) * NUDGE_RATE * eff / 60.0 * dt;
+        }
+        self.last_update = Some(now);
+        self.last_beat = s.beat;
+        clock.follow_phase(s.beat + self.offset, now);
     }
 }
 
@@ -318,6 +396,8 @@ mod tests {
         assert_eq!(c.halve(t0), 60.0);
         assert_eq!(c.double(t0), 120.0);
         assert_eq!(c.double(t0), 240.0);
+        assert_eq!(c.double(t0), 480.0);
+        assert_eq!(c.double(t0), 960.0);
         assert_eq!(c.double(t0), MAX_BPM);
         let mut c = Clock::new(30.0, t0);
         assert_eq!(c.halve(t0), MIN_BPM);
@@ -361,27 +441,27 @@ mod tests {
     }
 
     #[test]
-    fn link_pulls_tempo_and_adopts_far_beat() {
+    fn link_pulls_tempo_at_runtime_and_adopts_far_beat() {
         let t0 = Instant::now();
         let mut c = Clock::new(120.0, t0);
-        let (mut f, mut ls, mut bpm) = (fake(140.0, 10.0, 1), LinkSync::default(), 120.0);
-        ls.update(&mut f, true, &mut bpm, &mut c, t0);
-        assert_eq!(bpm, 140.0);
-        assert_eq!(c.bpm(), 140.0);
+        let (mut f, mut ls) = (fake(140.0, 10.0, 1), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        assert_eq!(c.bpm(), 140.0); // project stays 120: runtime only
         assert!((c.phase(t0) - 10.0).abs() < 1e-9);
         assert_eq!(ls.peers, 1);
         assert!(f.sets.is_empty());
         f.st.bpm = 100.0; // peer changes tempo
-        ls.update(&mut f, true, &mut bpm, &mut c, ms(t0, 16));
-        assert_eq!(bpm, 100.0);
+        ls.update(&mut f, true, 120.0, &mut c, ms(t0, 16));
+        assert_eq!(c.bpm(), 100.0);
+        assert!(f.sets.is_empty()); // not echoed back
     }
 
     #[test]
     fn link_slews_small_phase_error() {
         let t0 = Instant::now();
         let mut c = Clock::new(120.0, t0);
-        let (mut f, mut ls, mut bpm) = (fake(120.0, 0.2, 1), LinkSync::default(), 120.0);
-        ls.update(&mut f, true, &mut bpm, &mut c, t0);
+        let (mut f, mut ls) = (fake(120.0, 0.2, 1), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
         let p = c.phase(t0);
         assert!((p - 0.04).abs() < 1e-9, "{p}");
     }
@@ -390,19 +470,117 @@ mod tests {
     fn link_pushes_local_bpm_and_toggle() {
         let t0 = Instant::now();
         let mut c = Clock::new(120.0, t0);
-        let (mut f, mut ls, mut bpm) = (fake(120.0, 0.0, 0), LinkSync::default(), 120.0);
-        ls.update(&mut f, true, &mut bpm, &mut c, t0);
+        let (mut f, mut ls) = (fake(120.0, 0.0, 0), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
         assert_eq!(f.sets, vec![120.0]); // alone: our tempo seeds the session
-        bpm = 90.0; // tap / edit
-        ls.update(&mut f, true, &mut bpm, &mut c, ms(t0, 16));
+        ls.note_bpm_edit();
+        ls.update(&mut f, true, 90.0, &mut c, ms(t0, 16)); // tap / edit
         assert_eq!(f.sets, vec![120.0, 90.0]);
-        assert_eq!(bpm, 90.0);
-        ls.update(&mut f, false, &mut bpm, &mut c, ms(t0, 32));
+        assert_eq!(c.bpm(), 90.0);
+        ls.update(&mut f, false, 90.0, &mut c, ms(t0, 32));
         assert!(!f.on);
         let phase = c.phase(ms(t0, 40));
         f.st.beat = 99.0;
-        ls.update(&mut f, false, &mut bpm, &mut c, ms(t0, 40));
+        ls.update(&mut f, false, 90.0, &mut c, ms(t0, 40));
         assert_eq!(c.phase(ms(t0, 40)), phase); // off: Link ignored
+    }
+
+    #[test]
+    fn link_clamps_bpm_and_does_not_reanchor_every_frame() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(120.0, 0.0, 0), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        ls.note_bpm_edit();
+        ls.update(&mut f, true, 5000.0, &mut c, ms(t0, 16));
+        assert_eq!(f.sets.last(), Some(&MAX_BPM));
+        assert_eq!(c.bpm(), MAX_BPM);
+        let n = f.sets.len();
+        ls.update(&mut f, true, 5000.0, &mut c, ms(t0, 32));
+        ls.update(&mut f, true, 5000.0, &mut c, ms(t0, 48));
+        assert_eq!(f.sets.len(), n);
+    }
+
+    #[test]
+    fn link_nudge_shifts_phase_and_is_not_reverted() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(120.0, 0.0, 1), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        ls.nudge(1, &mut c, t0);
+        // Session beat advances at 2 beats/s; hold nudge for 1 s in 16 ms frames.
+        let mut t = t0;
+        for i in 1..=62 {
+            t = ms(t0, 16 * i);
+            f.st.beat = 2.0 * 0.016 * i as f64;
+            ls.update(&mut f, true, 120.0, &mut c, t);
+        }
+        ls.nudge(0, &mut c, t);
+        for i in 63..=200 {
+            t = ms(t0, 16 * i);
+            f.st.beat = 2.0 * 0.016 * i as f64;
+            ls.update(&mut f, true, 120.0, &mut c, t);
+        }
+        let ahead = c.phase(t) - f.st.beat;
+        // 62 frames * 16 ms * 2 beats/s * 10 % = 0.1984 beats, kept after release.
+        assert!((ahead - 0.1984).abs() < 0.02, "{ahead}");
+    }
+
+    #[test]
+    fn link_resync_zeroes_local_phase() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(120.0, 7.3, 1), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        ls.resync(&mut c, t0);
+        let mut t = t0;
+        for i in 1..=50 {
+            t = ms(t0, 16 * i);
+            f.st.beat = 7.3 + 2.0 * 0.016 * i as f64;
+            ls.update(&mut f, true, 120.0, &mut c, t);
+        }
+        let p = c.phase(t);
+        assert!((p - 1.6).abs() < 0.1, "{p}"); // 0.8 s at 2 beats/s, not ~8.9
+    }
+
+    #[test]
+    fn local_edit_to_old_project_value_reaches_link() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(140.0, 0.0, 1), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        assert_eq!(c.bpm(), 140.0); // peer wins at join, project stays 120
+        ls.note_bpm_edit(); // user types 120 again
+        ls.update(&mut f, true, 120.0, &mut c, ms(t0, 16));
+        assert_eq!(f.sets, vec![120.0]);
+        assert_eq!(c.bpm(), 120.0);
+    }
+
+    #[test]
+    fn edit_during_missing_state_applies_next_frame() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(140.0, 0.0, 1), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        f.on = false; // state() None while still on in the app
+        ls.note_bpm_edit();
+        ls.update(&mut f, true, 90.0, &mut c, ms(t0, 16));
+        assert!(f.sets.is_empty());
+        f.on = true;
+        ls.update(&mut f, true, 90.0, &mut c, ms(t0, 32));
+        assert_eq!(f.sets, vec![90.0]);
+        assert_eq!(c.bpm(), 90.0);
+    }
+
+    #[test]
+    fn link_peers_survive_missing_state() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(120.0, 0.0, 2), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        f.on = false; // state() now None while still "on" in the app
+        ls.update(&mut f, true, 120.0, &mut c, ms(t0, 16));
+        assert_eq!(ls.peers, 2);
     }
 
     #[test]

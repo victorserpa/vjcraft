@@ -1670,6 +1670,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             if !bpm.is_finite() || bpm <= 0.0 {
                 return Err(Error::InvalidValue);
             }
+            let bpm = bpm.clamp(clock::MIN_BPM, clock::MAX_BPM);
             let prev = std::mem::replace(&mut p.composition.tempo.bpm, bpm);
             undoable(Command::SetBpm { bpm: prev }, vec![])
         }
@@ -1946,6 +1947,15 @@ mod tests {
         for bad in [f64::NAN, 0.0, -1.0, f64::INFINITY] {
             assert!(super::apply(&mut p, super::Command::SetBpm { bpm: bad }).is_err());
         }
+    }
+
+    #[test]
+    fn bpm_is_clamped() {
+        let mut p = vjc_model::Project::new("t");
+        super::apply(&mut p, super::Command::SetBpm { bpm: 5000.0 }).unwrap();
+        assert_eq!(p.composition.tempo.bpm, clock::MAX_BPM);
+        super::apply(&mut p, super::Command::SetBpm { bpm: 1.0 }).unwrap();
+        assert_eq!(p.composition.tempo.bpm, clock::MIN_BPM);
     }
 
     use super::*;

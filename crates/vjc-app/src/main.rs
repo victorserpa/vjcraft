@@ -676,6 +676,7 @@ impl State {
             return;
         }
         self.project = fresh_project(&self.prefs);
+        self.link_sync.note_bpm_edit();
         self.file = None;
         self.dirty = false;
         self.warnings.clear();
@@ -729,6 +730,7 @@ impl State {
             Ok((mut project, warnings)) => {
                 vjc_core::mapping::normalize_output(&mut project.output);
                 self.project = project;
+                self.link_sync.note_bpm_edit();
                 self.warnings = warnings;
                 self.status = format!("Opened {}", path.display());
                 self.prefs.general.last_project = Some(path.clone());
@@ -768,7 +770,14 @@ impl State {
         self.save_to(path)
     }
 
+    /// Writes the effective tempo (possibly from Link) into the project before saving.
+    fn store_effective_bpm(&mut self) {
+        let bpm = self.clock.bpm();
+        self.project.composition.tempo.bpm = bpm;
+    }
+
     fn save_to(&mut self, path: PathBuf) -> bool {
+        self.store_effective_bpm();
         match vjc_io::save(&self.project, &path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
@@ -797,6 +806,7 @@ impl State {
             if let Some(d) = r.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
+            self.store_effective_bpm();
             if let Err(e) = vjc_io::save(&self.project, &r) {
                 self.status = format!("Autosave failed: {e}");
             }
@@ -832,6 +842,7 @@ impl State {
                 self.status = format!("Imported {}", path.display());
                 self.warnings = i.warnings;
                 self.project = i.project;
+                self.link_sync.note_bpm_edit();
                 self.history.clear();
                 self.flow = Flow::default();
                 self.players.clear();
@@ -874,11 +885,15 @@ impl State {
             _ => None,
         };
         let is_step = matches!(cmd, Command::StepClip { .. });
+        let is_set_bpm = matches!(cmd, Command::SetBpm { .. });
         match self
             .history
             .exec(&mut self.project, cmd, std::time::Instant::now())
         {
             Ok(events) => {
+                if is_set_bpm {
+                    self.link_sync.note_bpm_edit();
+                }
                 if col_after.is_some() {
                     self.col_sel = col_after;
                 }
@@ -903,8 +918,12 @@ impl State {
     }
 
     fn undo(&mut self) {
+        let before = self.project.composition.tempo.bpm;
         match self.history.undo(&mut self.project) {
             Some(Ok(ev)) => {
+                if self.project.composition.tempo.bpm != before {
+                    self.link_sync.note_bpm_edit();
+                }
                 self.dirty = true;
                 self.handle(ev);
             }
@@ -914,8 +933,12 @@ impl State {
     }
 
     fn redo(&mut self) {
+        let before = self.project.composition.tempo.bpm;
         match self.history.redo(&mut self.project) {
             Some(Ok(ev)) => {
+                if self.project.composition.tempo.bpm != before {
+                    self.link_sync.note_bpm_edit();
+                }
                 self.dirty = true;
                 self.handle(ev);
             }
@@ -1032,8 +1055,8 @@ impl State {
                         self.exec(Command::SetBpm { bpm });
                     }
                 }
-                Event::Nudge { dir, at } => self.clock.nudge(dir, at),
-                Event::Resync { at } => self.clock.resync(at),
+                Event::Nudge { dir, at } => self.link_sync.nudge(dir, &mut self.clock, at),
+                Event::Resync { at } => self.link_sync.resync(&mut self.clock, at),
                 Event::CellChanged {
                     deck,
                     layer,
@@ -1073,10 +1096,7 @@ impl State {
             .iter()
             .find(|l| l.id == layer)
             .map_or(vjc_core::transition::State::Idle, |l| {
-                vjc_core::transition::State::start(
-                    &l.transition,
-                    self.project.composition.tempo.bpm,
-                )
+                vjc_core::transition::State::start(&l.transition, self.clock.bpm())
             });
         if state != vjc_core::transition::State::Idle {
             self.flow.outgoing.insert(
@@ -1107,8 +1127,7 @@ impl State {
         let dur = self.players.get(&layer).and_then(|(_, _, p)| p.duration());
         let win = beats.and_then(|b| {
             let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
-            vjc_core::playback::beat_window(pos, b, self.project.composition.tempo.bpm, dur?)
-                .map(|w| (b, w))
+            vjc_core::playback::beat_window(pos, b, self.clock.bpm(), dur?).map(|w| (b, w))
         });
         match win {
             Some(w) => self.flow.beat_loops.insert(layer, w),
@@ -1163,14 +1182,16 @@ impl State {
     /// Effective speed = `speed` x beat-sync factor (clip length = n beats).
     fn tick_clock(&mut self) {
         let now = std::time::Instant::now();
-        let mut bpm = self.project.composition.tempo.bpm;
         let on = self.project.composition.tempo.link_enabled;
-        self.link_sync
-            .update(&mut self.link, on, &mut bpm, &mut self.clock, now);
-        self.project.composition.tempo.bpm = bpm;
-        if self.clock.bpm() != bpm.clamp(vjc_core::clock::MIN_BPM, vjc_core::clock::MAX_BPM) {
-            self.clock.set_bpm(bpm, now);
-        }
+        self.link_sync.update(
+            &mut self.link,
+            on,
+            self.project.composition.tempo.bpm,
+            &mut self.clock,
+            now,
+        );
+        // Effective tempo (may come from the Link session, runtime only).
+        let bpm = self.clock.bpm();
         let t = self.clock.tick(now);
         self.phase = t.phase;
         if let Some(b) = t.beat {
@@ -2003,11 +2024,11 @@ impl State {
         let mut cmds = vec![];
         ui.horizontal(|ui| {
             ui.label("BPM");
-            let mut bpm = self.project.composition.tempo.bpm;
+            let mut bpm = self.clock.bpm();
             if ui
                 .add(
                     egui::DragValue::new(&mut bpm)
-                        .range(20.0..=300.0)
+                        .range(vjc_core::clock::MIN_BPM..=vjc_core::clock::MAX_BPM)
                         .speed(0.1),
                 )
                 .changed()
@@ -2035,7 +2056,7 @@ impl State {
             if ui.button("Resync").clicked() {
                 cmds.push(Command::Resync { at: now });
             }
-            let bpm = self.project.composition.tempo.bpm;
+            let bpm = self.clock.bpm();
             if ui.button("\u{00f7}2").clicked() {
                 cmds.push(Command::SetBpm {
                     bpm: (bpm / 2.0).max(vjc_core::clock::MIN_BPM),
@@ -3357,6 +3378,7 @@ impl State {
     fn output_window(&mut self, ctx: &egui::Context) {
         let Some(comp_id) = self.comp_tex else { return };
         let mut wins: Vec<(Uuid, usize, egui::TextureId)> = vec![];
+        let ids: Vec<u32> = self.monitors.iter().map(|m| m.id).collect();
         if self.project.output.screens.is_empty() {
             if let Some(mon) = self
                 .output
@@ -3378,7 +3400,7 @@ impl State {
             builder.monitor = Some(mon);
             let mut close = false;
             ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of(("vjc-output", sid)),
+                egui::ViewportId::from_hash_of(monitors::viewport_key(sid, ids[mon])),
                 builder,
                 |ui, _class| {
                     let ctx = ui.ctx().clone();
