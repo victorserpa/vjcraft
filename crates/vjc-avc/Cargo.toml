@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 quick-xml = "0.37"
 vjc-model = { path = "../vjc-model" }
+vjc-fx = { path = "../vjc-fx" }
 uuid.workspace = true

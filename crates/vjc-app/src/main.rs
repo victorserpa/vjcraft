@@ -26,6 +26,10 @@ struct State {
     /// Playing clip per layer: (deck it was triggered from, column, player). One clip per
     /// layer. Lookups of the playing clip use this deck, never `current_deck`.
     players: HashMap<LayerId, (DeckId, u32, Player)>,
+    /// Playing generator clip per layer: (deck, column, own TIME in seconds). The time
+    /// follows the clip transport (speed, direction, pause); a layer has a player or a
+    /// generator, never both.
+    gens: HashMap<LayerId, (DeckId, u32, f64)>,
     /// Deck tab being renamed, with its edit buffer.
     renaming: Option<(DeckId, String)>,
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
@@ -119,6 +123,48 @@ fn add_effect_menu(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Comma
                     target,
                     effect,
                     index: usize::MAX,
+                });
+                ui.close();
+            }
+        }
+    });
+}
+
+type Gens = HashMap<LayerId, (DeckId, u32, f64)>;
+
+/// Deck and column of the clip playing on a layer (video or generator).
+fn active_of(
+    players: &HashMap<LayerId, (DeckId, u32, Player)>,
+    gens: &Gens,
+    layer: LayerId,
+) -> Option<(DeckId, u32)> {
+    let video = players.get(&layer).map(|(d, c, _)| (*d, *c));
+    video.or_else(|| gens.get(&layer).map(|(d, c, _)| (*d, *c)))
+}
+
+/// "New generator" submenu: creates the clip in the cell and plays it.
+fn generator_menu(
+    ui: &mut egui::Ui,
+    deck: DeckId,
+    layer: LayerId,
+    column: u32,
+    cmds: &mut Vec<Command>,
+) {
+    ui.menu_button("New generator", |ui| {
+        for (id, _) in vjc_fx::GENERATORS {
+            if ui.button(fx_label(id)).clicked() {
+                cmds.push(Command::SetGenerator {
+                    deck,
+                    layer,
+                    column,
+                    kind: id.to_string(),
+                    name: fx_label(id),
+                    params: vjc_fx::generator_params(id).unwrap_or_default(),
+                });
+                cmds.push(Command::TriggerClip {
+                    deck,
+                    layer,
+                    column,
                 });
                 ui.close();
             }
@@ -310,6 +356,7 @@ impl State {
             warnings: vec![],
             status: "Drop video files on the grid cells.".into(),
             players: HashMap::new(),
+            gens: HashMap::new(),
             heads: HashMap::new(),
             last_head_tick: std::time::Instant::now(),
             comp: None,
@@ -338,6 +385,7 @@ impl State {
 
     fn reset_players(&mut self) {
         self.players.clear();
+        self.gens.clear();
         self.history.clear();
         self.selected = None;
     }
@@ -499,6 +547,7 @@ impl State {
                 self.project = i.project;
                 self.history.clear();
                 self.players.clear();
+                self.gens.clear();
                 self.file = None;
                 self.dirty = true;
             }
@@ -564,6 +613,7 @@ impl State {
                     path,
                 } => {
                     if path.exists() {
+                        self.gens.remove(&layer);
                         self.players.remove(&layer); // joins the old decode thread
                         self.players
                             .insert(layer, (deck, column, Player::open_scrub(&path)));
@@ -577,8 +627,17 @@ impl State {
                         self.status = format!("File not found: {}", path.display());
                     }
                 }
+                Event::GeneratorStarted {
+                    deck,
+                    layer,
+                    column,
+                } => {
+                    self.players.remove(&layer);
+                    self.gens.insert(layer, (deck, column, 0.0));
+                }
                 Event::LayerCleared { layer } => {
                     self.players.remove(&layer);
+                    self.gens.remove(&layer);
                 }
                 Event::Tap { at } => {
                     if let Some(bpm) = self.clock.tap(at) {
@@ -592,13 +651,22 @@ impl State {
                     layer,
                     column,
                 } => {
-                    if self.players.get(&layer).map(|(d, c, _)| (*d, *c)) == Some((deck, column)) {
+                    if self.active(layer) == Some((deck, column)) {
                         self.players.remove(&layer);
+                        self.gens.remove(&layer);
                     }
                 }
-                Event::DeckRemoved { deck } => self.players.retain(|_, (d, _, _)| *d != deck),
+                Event::DeckRemoved { deck } => {
+                    self.players.retain(|_, (d, _, _)| *d != deck);
+                    self.gens.retain(|_, (d, _, _)| *d != deck);
+                }
             }
         }
+    }
+
+    /// Deck and column of the clip playing on the layer (video or generator).
+    fn active(&self, layer: LayerId) -> Option<(DeckId, u32)> {
+        active_of(&self.players, &self.gens, layer)
     }
 
     fn transport(&self, deck: DeckId, layer: LayerId, column: u32) -> Option<vjc_model::Transport> {
@@ -643,6 +711,19 @@ impl State {
                 if t.finished {
                     finished.push(*layer);
                 }
+            }
+        }
+        // Generator TIME runs on the app clock, scaled by the clip transport.
+        for (layer, (deck, col, t)) in self.gens.iter_mut() {
+            if let Some(tr) =
+                vjc_core::clip_in(&self.project, *deck, *layer, *col).map(|k| &k.transport)
+            {
+                let dir = match tr.direction {
+                    Direction::Backward => -1.0,
+                    Direction::Pause => 0.0,
+                    _ => 1.0,
+                };
+                *t += dt * tr.speed * dir;
             }
         }
         // Once: clear the layer after the last frame.
@@ -711,9 +792,10 @@ impl State {
             })
             .collect();
         // Fit comes from the deck the clip was triggered from, not the visible one.
+        let (players, gens) = (&self.players, &self.gens);
         let fit_of = |l: &Layer| {
-            let (deck, col, _) = self.players.get(&l.id)?;
-            Some(vjc_core::clip_in(&self.project, *deck, l.id, *col)?.fit)
+            let (deck, col) = active_of(players, gens, l.id)?;
+            Some(vjc_core::clip_in(&self.project, deck, l.id, col)?.fit)
         };
         // Shaders compile on worker threads; install the ones that finished.
         for done in self.fx.poll() {
@@ -731,9 +813,22 @@ impl State {
         for (l, f) in &frames {
             // Clip chain first, then the layer chain.
             let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
-            let clip_fx = self.players.get(&l.id).and_then(|(d, col, _)| {
-                vjc_core::clip_in(&self.project, *d, l.id, *col).map(|k| k.track.effects.as_slice())
-            });
+            let clip = active_of(players, gens, l.id)
+                .and_then(|(d, col)| vjc_core::clip_in(&self.project, d, l.id, col));
+            let clip_fx = clip.map(|k| k.track.effects.as_slice());
+            let generator = match (clip.map(|k| &k.source), gens.get(&l.id)) {
+                (Some(vjc_model::Source::Generator { kind, params }), Some((_, _, t)))
+                    if !l.bypass =>
+                {
+                    self.fx.request(kind);
+                    let ready = self.fx.status(kind) == Some(&fx::Status::Ready);
+                    self.fx.isf(kind).filter(|_| ready).map(|isf| EffectDraw {
+                        kind: kind.clone(),
+                        uniforms: isf.pack(params, *t as f32, (w, h)),
+                    })
+                }
+                _ => None,
+            };
             let mut effects = draw_chain(&mut self.fx, clip_fx.unwrap_or_default(), time, size);
             effects.extend(draw_chain(&mut self.fx, &l.track.effects, time, size));
             draws.push(LayerDraw {
@@ -745,6 +840,7 @@ impl State {
                 blend: l.track.blend.clone(),
                 fit: fit_of(l).unwrap_or_default(),
                 effects,
+                generator,
                 frame: f
                     .as_ref()
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
@@ -1074,8 +1170,7 @@ impl State {
                         for ci in 0..ncols {
                             let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
                             // Highlight only when playing from the deck being shown.
-                            let on =
-                                self.players.get(&lid).map(|(d, c, _)| (*d, *c)) == Some((cur, ci));
+                            let on = active_of(&self.players, &self.gens, lid) == Some((cur, ci));
                             let text = clip
                                 .map(|k| k.name.as_str())
                                 .unwrap_or("(drop / right-click)");
@@ -1173,6 +1268,15 @@ impl State {
                                     add_effect_menu(ui, t, &mut cmds);
                                 });
                             }
+                            if clip.is_none() {
+                                r.context_menu(|ui| {
+                                    if ui.button("Import file...").clicked() {
+                                        pick = Some((lid, ci));
+                                        ui.close();
+                                    }
+                                    generator_menu(ui, cur, lid, ci, &mut cmds);
+                                });
+                            }
                             cells.push(CellInfo {
                                 rect: r.rect,
                                 layer: lid,
@@ -1204,7 +1308,7 @@ impl State {
                                     column: ci,
                                 });
                             }
-                            if clip.is_none() && (r.secondary_clicked() || r.double_clicked()) {
+                            if clip.is_none() && r.double_clicked() {
                                 pick = Some((lid, ci));
                             }
                         }
@@ -1243,7 +1347,7 @@ impl State {
                                 }
                             });
                         // Speed of the clip playing on this layer (from its own deck).
-                        let active = self.players.get(&lid).map(|(d, c, _)| (*d, *c));
+                        let active = active_of(&self.players, &self.gens, lid);
                         match active.and_then(|(d, c)| {
                             Some((d, c, vjc_core::clip_in(&self.project, d, lid, c)?))
                         }) {
@@ -1317,11 +1421,11 @@ impl State {
             FxScope::Master => Some(EffectTarget::Master),
             FxScope::Layer => sel.map(EffectTarget::Layer),
             FxScope::Clip => sel.and_then(|l| {
-                let (deck, column, _) = self.players.get(&l)?;
+                let (deck, column) = self.active(l)?;
                 Some(EffectTarget::Clip {
-                    deck: *deck,
+                    deck,
                     layer: l,
-                    column: *column,
+                    column,
                 })
             }),
         };
@@ -1330,6 +1434,35 @@ impl State {
             return;
         };
         ui.menu_button("Add effect", |ui| add_effect_menu(ui, target, cmds));
+        if let EffectTarget::Clip {
+            deck,
+            layer,
+            column,
+        } = target
+            && let Some(vjc_model::Source::Generator { kind, params }) =
+                vjc_core::clip_in(&self.project, deck, layer, column).map(|k| k.source.clone())
+        {
+            ui.strong(format!("Generator: {}", fx_label(&kind)));
+            let inputs = self.fx.isf(&kind).map(|f| f.inputs.clone());
+            if inputs.is_none() {
+                ui.colored_label(egui::Color32::LIGHT_RED, "unknown generator (not rendered)");
+            }
+            for (pi, p) in params.iter().enumerate() {
+                let Some(ik) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
+                    continue;
+                };
+                if let Some(value) = param_widget(ui, &p.name, ik, &p.value) {
+                    cmds.push(Command::SetGeneratorParam {
+                        deck,
+                        layer,
+                        column,
+                        param: pi,
+                        value,
+                    });
+                }
+            }
+            ui.separator();
+        }
         let chain = vjc_core::effects::chain(&self.project, target)
             .unwrap_or_default()
             .to_vec();

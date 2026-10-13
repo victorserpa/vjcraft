@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vjc_model::{
     BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId, FitMode, Layer,
-    LayerId, PlayMode, Project, Source, Track, Transport, Value,
+    LayerId, Param, PlayMode, Project, Source, Track, Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -34,6 +34,23 @@ pub enum Command {
         layer: LayerId,
         column: ColumnIdx,
         clip: Clip,
+    },
+    /// Puts a generator clip (no file; rendered at composition size) in the cell.
+    SetGenerator {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        kind: String,
+        name: String,
+        params: Vec<Param>,
+    },
+    /// Sets param number `param` of the cell's generator (coalesces like effect params).
+    SetGeneratorParam {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        param: usize,
+        value: Value,
     },
     ClearCell {
         deck: DeckId,
@@ -184,6 +201,7 @@ enum Target {
     Speed(DeckId, LayerId, ColumnIdx),
     Bpm,
     EffectParam(EffectId, usize),
+    GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
 }
 
 impl Command {
@@ -194,6 +212,13 @@ impl Command {
             Command::SetEffectParam { effect, param, .. } => {
                 Some(Target::EffectParam(*effect, *param))
             }
+            Command::SetGeneratorParam {
+                deck,
+                layer,
+                column,
+                param,
+                ..
+            } => Some(Target::GeneratorParam(*deck, *layer, *column, *param)),
             Command::SetSpeed {
                 deck,
                 layer,
@@ -213,6 +238,12 @@ pub enum Event {
         layer: LayerId,
         column: ColumnIdx,
         path: PathBuf,
+    },
+    /// A generator clip started on the layer (no player; the app renders it).
+    GeneratorStarted {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
     },
     LayerCleared {
         layer: LayerId,
@@ -460,8 +491,80 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                         path,
                     }],
                 }),
+                // Imported generators with no bundled equivalent are placeholders.
+                Source::Generator { kind, .. }
+                    if !vjc_fx::GENERATORS.iter().any(|(id, _)| *id == kind) =>
+                {
+                    Err(Error::NotPlayable)
+                }
+                Source::Generator { .. } => Ok(Applied {
+                    inverse: None,
+                    events: vec![Event::GeneratorStarted {
+                        deck: deck_id,
+                        layer,
+                        column,
+                    }],
+                }),
                 _ => Err(Error::NotPlayable),
             }
+        }
+        Command::SetGenerator {
+            deck,
+            layer,
+            column,
+            kind,
+            name,
+            params,
+        } => {
+            let mut clip = clip_from_path(PathBuf::new());
+            clip.name = name;
+            clip.source = Source::Generator { kind, params };
+            set_clip(p, deck, layer, column, clip)
+        }
+        Command::SetGeneratorParam {
+            deck,
+            layer,
+            column,
+            param,
+            value,
+        } => {
+            check_cell(p, layer, column)?;
+            let clip = deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .map(|k| &mut k.clip)
+                .ok_or(Error::NoClip)?;
+            let Source::Generator { params, .. } = &mut clip.source else {
+                return Err(Error::NotPlayable);
+            };
+            let prm = params.get_mut(param).ok_or(Error::InvalidValue)?;
+            if std::mem::discriminant(&prm.value) != std::mem::discriminant(&value) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = prm.value.clone();
+            match value {
+                Value::Number(n) if n.is_finite() => prm.set_number(n),
+                Value::Number(_) => return Err(Error::InvalidValue),
+                Value::Choice { selected, .. } => match &mut prm.value {
+                    Value::Choice {
+                        selected: s,
+                        options,
+                    } if (selected as usize) < options.len() => *s = selected,
+                    _ => return Err(Error::InvalidValue),
+                },
+                v => prm.value = v,
+            }
+            undoable(
+                Command::SetGeneratorParam {
+                    deck,
+                    layer,
+                    column,
+                    param,
+                    value: prev,
+                },
+                vec![],
+            )
         }
         Command::ClearLayer { layer } => {
             layer_idx(p, layer)?;
@@ -1807,5 +1910,97 @@ mod tests {
         );
         h.undo(&mut p).unwrap().unwrap();
         assert!(effects::chain(&p, t).unwrap().is_empty());
+    }
+
+    #[test]
+    fn placeholder_generator_is_not_playable() {
+        let (mut p, l) = setup();
+        apply(
+            &mut p,
+            Command::SetGenerator {
+                deck: A,
+                layer: l,
+                column: 0,
+                kind: "plasma_unbundled".into(),
+                name: "Plasma".into(),
+                params: vec![],
+            },
+        )
+        .unwrap();
+        let r = apply(
+            &mut p,
+            Command::TriggerClip {
+                deck: A,
+                layer: l,
+                column: 0,
+            },
+        );
+        assert!(matches!(r, Err(Error::NotPlayable)));
+    }
+
+    #[test]
+    fn generator_commands_undo_redo_and_coalesce() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t0 = Instant::now();
+        let at = |c, o: u64| (c, t0 + Duration::from_millis(o));
+        let set = Command::SetGenerator {
+            deck: A,
+            layer: l,
+            column: 0,
+            kind: "solid_color".into(),
+            name: "Solid Color".into(),
+            params: vec![Param::number("level", 0.5, Some((0.0, 1.0)))],
+        };
+        let (c, t) = at(set, 0);
+        h.exec(&mut p, c, t).unwrap();
+        let get = |p: &Project| match &clip_in(p, A, l, 0).unwrap().source {
+            Source::Generator { params, .. } => params[0].value.clone(),
+            _ => panic!("not a generator"),
+        };
+        assert_eq!(get(&p), Value::Number(0.5));
+        let ev = apply(
+            &mut p,
+            Command::TriggerClip {
+                deck: A,
+                layer: l,
+                column: 0,
+            },
+        )
+        .unwrap()
+        .events;
+        assert_eq!(
+            ev,
+            vec![Event::GeneratorStarted {
+                deck: A,
+                layer: l,
+                column: 0
+            }]
+        );
+        let param = |v| Command::SetGeneratorParam {
+            deck: A,
+            layer: l,
+            column: 0,
+            param: 0,
+            value: v,
+        };
+        for (i, v) in [0.6, 0.7, 9.0].into_iter().enumerate() {
+            let (c, t) = at(param(Value::Number(v)), 100 * (i as u64 + 1));
+            h.exec(&mut p, c, t).unwrap();
+        }
+        assert_eq!(get(&p), Value::Number(1.0));
+        assert_eq!(
+            apply(&mut p, param(Value::Bool(true))),
+            Err(Error::InvalidValue)
+        );
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(get(&p), Value::Number(0.5));
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(get(&p), Value::Number(1.0));
+        h.undo(&mut p).unwrap().unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert!(clip_in(&p, A, l, 0).is_none());
+        h.redo(&mut p).unwrap().unwrap();
+        assert!(clip_in(&p, A, l, 0).is_some());
     }
 }

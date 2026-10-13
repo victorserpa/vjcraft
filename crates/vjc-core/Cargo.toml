@@ -5,5 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+vjc-fx = { path = "../vjc-fx" }
 vjc-model = { path = "../vjc-model" }
 uuid.workspace = true

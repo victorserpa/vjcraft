@@ -192,7 +192,91 @@ fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
     [mk(), mk()]
 }
 
+/// One fullscreen fragment pass of an effect or generator shader: `src` is bound as
+/// `inputImage`, the result replaces `dst`.
+#[allow(clippy::too_many_arguments)]
+fn draw_pass(
+    device: &wgpu::Device,
+    enc: &mut wgpu::CommandEncoder,
+    bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    pipe: &wgpu::RenderPipeline,
+    buf: &wgpu::Buffer,
+    src: &wgpu::TextureView,
+    dst: &wgpu::TextureView,
+) {
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fx_bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(src),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("fx"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: dst,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.draw(0..3, 0..1);
+}
+
 impl Fx {
+    /// Renders a generator shader into `dst`; `blank` stands in for the unused input image.
+    /// Skipped while the shader is not compiled.
+    #[allow(clippy::too_many_arguments)]
+    fn generate(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        blank: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        g: &EffectDraw,
+    ) {
+        let Some(pipe) = self.pipes.get(&g.kind) else {
+            return;
+        };
+        if self.bufs.len() <= self.next {
+            self.bufs
+                .push(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fx_u"),
+                    size: std::mem::size_of::<vjc_fx::Uniforms>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+        }
+        let buf = &self.bufs[self.next];
+        self.next += 1;
+        queue.write_buffer(buf, 0, bytemuck::cast_slice(&g.uniforms));
+        draw_pass(device, enc, bgl, sampler, pipe, buf, blank, dst);
+    }
+
     /// Runs `effects` in order, ping-ponging between two scratch textures of `size`.
     /// Returns the scratch index holding the result, or None if no effect ran (effects
     /// whose shader is not compiled yet are skipped).
@@ -237,44 +321,7 @@ impl Fx {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fx_bg"),
-                layout: bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(src),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    },
-                ],
-            });
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("fx"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &scratch[out].1,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-            drop(pass);
+            draw_pass(device, enc, bgl, sampler, pipe, buf, src, &scratch[out].1);
             cur = Some(out);
         }
         cur
@@ -290,6 +337,9 @@ pub struct LayerDraw<'a> {
     pub effects: Vec<EffectDraw>,
     /// `(width, height, rgba, seq)`; `None` = nothing playing (layer skipped).
     pub frame: Option<(u32, u32, &'a [u8], u64)>,
+    /// A generator clip: rendered at composition size instead of uploading a frame.
+    /// `frame` must be `None` when this is set.
+    pub generator: Option<EffectDraw>,
 }
 
 struct Slot {
@@ -308,6 +358,8 @@ pub struct Compositor {
     base: wgpu::Texture,
     base_bind: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    /// 1x1 texture bound as the (unused) input image of generators.
+    blank: wgpu::TextureView,
     slots: HashMap<LayerId, Slot>,
     fx: Fx,
     pub target: wgpu::Texture,
@@ -455,6 +507,22 @@ impl Compositor {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let blank = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("blank"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
         let fx = Fx {
             vs: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fx_vs"),
@@ -480,6 +548,7 @@ impl Compositor {
             base,
             base_bind,
             sampler,
+            blank,
             slots: HashMap::new(),
             fx,
             target,
@@ -559,13 +628,15 @@ impl Compositor {
         self.fx.used.clear();
         let live: Vec<LayerId> = layers_bottom_to_top
             .iter()
-            .filter(|l| l.frame.is_some())
+            .filter(|l| l.frame.is_some() || l.generator.is_some())
             .map(|l| l.id)
             .collect();
         self.slots.retain(|k, _| live.contains(k));
         for l in layers_bottom_to_top {
-            let Some((w, h, data, seq)) = l.frame else {
-                continue;
+            let (w, h, data, seq) = match (&l.frame, &l.generator) {
+                (Some((w, h, data, seq)), _) => (*w, *h, Some(*data), *seq),
+                (None, Some(_)) => (self.size.0.max(1), self.size.1.max(1), None, u64::MAX),
+                (None, None) => continue,
             };
             let recreate = self.slots.get(&l.id).is_none_or(|s| s.size != (w, h));
             if recreate {
@@ -580,7 +651,9 @@ impl Compositor {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
                 let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -621,7 +694,9 @@ impl Compositor {
                 );
             }
             let slot = self.slots.get_mut(&l.id).unwrap();
-            if slot.seq != seq {
+            if let Some(data) = data
+                && slot.seq != seq
+            {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &slot.tex,
@@ -685,6 +760,18 @@ impl Compositor {
             let Some(slot) = self.slots.get(&l.id) else {
                 continue;
             };
+            if let Some(g) = &l.generator {
+                self.fx.generate(
+                    device,
+                    queue,
+                    &mut enc,
+                    &self.bgl,
+                    &self.sampler,
+                    &self.blank,
+                    &slot.view,
+                    g,
+                );
+            }
             let out = self.fx.run(
                 device,
                 queue,
@@ -820,6 +907,7 @@ mod tests {
                     fit: FitMode::Stretch,
                     effects: vec![],
                     frame: Some((4, 4, &bd, 1)),
+                    generator: None,
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(2),
@@ -828,6 +916,7 @@ mod tests {
                     fit: FitMode::Stretch,
                     effects: vec![],
                     frame: Some((4, 4, &sd, 1)),
+                    generator: None,
                 },
             ];
             comp.render(&device, &queue, &layers, &[]);
@@ -900,6 +989,7 @@ mod tests {
                 fit: FitMode::Stretch,
                 effects: if on_master { vec![] } else { vec![fx.clone()] },
                 frame: Some((1, 1, &src, 1)),
+                generator: None,
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
             comp.render(&device, &queue, &layer, &master);
@@ -936,6 +1026,74 @@ mod tests {
             for (g, w) in got.iter().zip([204u8, 153, 51]) {
                 assert!(g.abs_diff(w) <= 2, "master={on_master}: {got:?}");
             }
+        }
+    }
+
+    /// Solid Color generator on one pixel: params -> uniforms -> shader -> composition.
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_solid_color_one_pixel() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("solid_color").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.add_effect(&device, "solid_color", &wgsl).unwrap();
+        let mut params = isf.default_params();
+        params[0].value = vjc_model::Value::Color([0.2, 0.4, 0.8, 1.0]);
+        let layer = [LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![],
+            frame: None,
+            generator: Some(EffectDraw {
+                kind: "solid_color".into(),
+                uniforms: isf.pack(&params, 0.0, (1, 1)),
+            }),
+        }];
+        comp.render(&device, &queue, &layer, &[]);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got: Vec<u8> = buf.slice(..).get_mapped_range().expect("map")[..4].to_vec();
+        buf.unmap();
+        for (g, w) in got.iter().zip([51u8, 102, 204, 255]) {
+            assert!(g.abs_diff(w) <= 2, "{got:?}");
         }
     }
 }

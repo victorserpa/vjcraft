@@ -45,9 +45,41 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ),
 ];
 
-/// Source of a bundled effect.
+/// Bundled generators: ISF without an image input, rendered at composition size.
+pub const GENERATORS: &[(&str, &str)] = &[
+    (
+        "solid_color",
+        include_str!("../../../assets/generators/solid_color.fs"),
+    ),
+    (
+        "linear_gradient",
+        include_str!("../../../assets/generators/linear_gradient.fs"),
+    ),
+    (
+        "radial_gradient",
+        include_str!("../../../assets/generators/radial_gradient.fs"),
+    ),
+    (
+        "checker",
+        include_str!("../../../assets/generators/checker.fs"),
+    ),
+    ("noise", include_str!("../../../assets/generators/noise.fs")),
+    ("bars", include_str!("../../../assets/generators/bars.fs")),
+];
+
+/// Source of a bundled effect or generator.
 pub fn builtin_source(id: &str) -> Option<&'static str> {
-    BUILTIN.iter().find(|(k, _)| *k == id).map(|(_, s)| *s)
+    BUILTIN
+        .iter()
+        .chain(GENERATORS)
+        .find(|(k, _)| *k == id)
+        .map(|(_, s)| *s)
+}
+
+/// Default params of a bundled generator (None if `id` is not one).
+pub fn generator_params(id: &str) -> Option<Vec<Param>> {
+    let (_, src) = GENERATORS.iter().find(|(k, _)| *k == id)?;
+    parse(src).ok().map(|i| i.default_params())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -459,5 +491,23 @@ mod tests {
             .validate(&m)
             .unwrap_or_else(|e| panic!("{id}: {e:?}"));
         }
+    }
+
+    #[test]
+    fn all_generators_compile() {
+        assert_eq!(GENERATORS.len(), 6);
+        for (id, src) in GENERATORS {
+            let (isf, wgsl) = compile(src).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(wgsl.contains("fn main"), "{id}");
+            assert_eq!(generator_params(id).unwrap().len(), isf.inputs.len());
+            let m = naga::front::wgsl::parse_str(&wgsl).unwrap_or_else(|e| panic!("{id}: {e:?}"));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&m)
+            .unwrap_or_else(|e| panic!("{id}: {e:?}"));
+        }
+        assert!(generator_params("invert").is_none());
     }
 }

@@ -3461,6 +3461,7 @@ version = "0.1.0"
 dependencies = [
  "quick-xml 0.37.5",
  "uuid",
+ "vjc-fx",
  "vjc-model",
 ]
 
@@ -3469,6 +3470,7 @@ name = "vjc-core"
 version = "0.1.0"
 dependencies = [
  "uuid",
+ "vjc-fx",
  "vjc-model",
 ]
 

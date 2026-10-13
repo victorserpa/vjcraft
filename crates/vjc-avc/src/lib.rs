@@ -255,7 +255,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
                 ));
                 continue;
             };
-            match import_clip(c) {
+            match import_clip(c, &mut warnings) {
                 Some(clip) => deck.set_clip(layer, ci, clip),
                 None => skipped_routers += 1,
             }
@@ -347,7 +347,7 @@ fn blend_from_name(name: &str) -> BlendMode {
     }
 }
 
-fn import_clip(c: &Node) -> Option<Clip> {
+fn import_clip(c: &Node, warnings: &mut Vec<String>) -> Option<Clip> {
     let vt = c.child("VideoTrack")?;
     let vs = vt.child("PrimarySource")?.child("VideoSource")?;
     let source = if let Some(f) = vs.child("VideoFormatReaderSource") {
@@ -359,15 +359,27 @@ fn import_clip(c: &Node) -> Option<Clip> {
             &|n| n.tag == "RenderPass" && n.attr("baseType") == Some("Generator"),
             &[],
         );
-        let kind = rp
+        let avc_name = rp
             .and_then(|r| r.attr("type").or(r.attr("name")))
-            .unwrap_or("Generator")
-            .to_string();
-        let params = rp
-            .and_then(|r| r.child("Params"))
-            .map(generator_params)
-            .unwrap_or_default();
-        Source::Generator { kind, params }
+            .unwrap_or("Generator");
+        match map_generator(avc_name) {
+            // Resolume params do not map one to one: the equivalent starts from defaults.
+            Some(kind) => Source::Generator {
+                kind: kind.into(),
+                params: vjc_fx::generator_params(kind).unwrap_or_default(),
+            },
+            // Kept as a placeholder so the grid layout survives; it renders nothing.
+            None => {
+                warnings.push(format!("generator not imported: {avc_name}"));
+                Source::Generator {
+                    kind: avc_name.to_string(),
+                    params: rp
+                        .and_then(|r| r.child("Params"))
+                        .map(generator_params)
+                        .unwrap_or_default(),
+                }
+            }
+        }
     } else {
         return None;
     };
@@ -393,6 +405,24 @@ fn import_clip(c: &Node) -> Option<Clip> {
         track,
         blend_override: None,
         fit: Default::default(),
+    })
+}
+
+/// Our generator for a Resolume one, by name (case and spaces ignored).
+fn map_generator(name: &str) -> Option<&'static str> {
+    let key: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    Some(match key.as_str() {
+        "solidcolor" | "solid" | "color" | "colorgenerator" => "solid_color",
+        "gradient" | "lineargradient" => "linear_gradient",
+        "radialgradient" => "radial_gradient",
+        "checkered" | "checker" | "checkerboard" => "checker",
+        "noise" => "noise",
+        "bars" => "bars",
+        _ => return None,
     })
 }
 
@@ -546,5 +576,33 @@ mod tests {
     fn rejects_non_composition() {
         assert!(import_str("<Foo/>").is_err());
         assert!(import_str("<a><b></a>").is_err());
+    }
+
+    #[test]
+    fn generators_map_or_warn() {
+        let clip = |t: &str, col: u32| {
+            format!(
+                r#"<Clip layerIndex="0" columnIndex="{col}"><VideoTrack><PrimarySource><VideoSource type="GeneratorVideoSource"><RenderPass baseType="Generator" type="{t}"/></VideoSource></PrimarySource></VideoTrack></Clip>"#
+            )
+        };
+        let xml = format!(
+            r#"<Composition name="x" numColumns="2"><Layer layerIndex="0"><VideoTrack/></Layer><Deck>{}{}</Deck></Composition>"#,
+            clip("Solid Color", 0),
+            clip("Plasma", 1)
+        );
+        let i = import_str(&xml).unwrap();
+        let c = &i.project.composition;
+        let d = &c.decks[0];
+        let Source::Generator { kind, params } = &d.clip_at(c.layers[0].id, 0).unwrap().source
+        else {
+            panic!("not a generator")
+        };
+        assert_eq!(kind, "solid_color");
+        assert_eq!(params.len(), 1);
+        // Unknown generator: placeholder clip plus a warning.
+        assert!(d.clip_at(c.layers[0].id, 1).is_some());
+        assert!(i.warnings.iter().any(|w| w.contains("Plasma")));
+        assert_eq!(map_generator("Checkered"), Some("checker"));
+        assert_eq!(map_generator("Gradient"), Some("linear_gradient"));
     }
 }
