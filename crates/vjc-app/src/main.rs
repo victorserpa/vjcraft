@@ -1305,7 +1305,8 @@ impl State {
                     Direction::Pause => 0.0,
                     _ => 1.0,
                 };
-                *t += dt * vjc_core::playback_rate(tr.speed, 1.0, master_speed) * dir;
+                let sync = vjc_core::clock::generator_sync_rate(tr.beat_sync, bpm);
+                *t += dt * vjc_core::playback_rate(tr.speed, sync, master_speed) * dir;
             }
         }
         // Once: clear the layer after the last frame.

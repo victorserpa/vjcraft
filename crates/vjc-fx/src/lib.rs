@@ -247,6 +247,10 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
         };
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             || name.starts_with(|c: char| c.is_ascii_digit())
+            || RESERVED.contains(&name.as_str())
+            || name.starts_with("isf_")
+            || name.starts_with("vjc_u_")
+            || name.starts_with("gl_")
         {
             return err(format!("invalid input name {name}"));
         }
@@ -261,6 +265,116 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
         inputs,
         body: src[end + 2..].to_string(),
     })
+}
+
+/// Names an input must not take. Inputs are declared as `#define vjc_u_<name> expr` and
+/// the shader body is rewritten (see `rename_inputs`), so ordinary function names such as
+/// `mix` or `length` are fine as input names. Only ISF builtins, names the generator
+/// declares, and GLSL keywords/types (which cannot be variable names) are rejected.
+const RESERVED: &[&str] = &[
+    "TIME",
+    "RENDERSIZE",
+    "PASSINDEX",
+    "FRAMEINDEX",
+    "TIMEDELTA",
+    "DATE",
+    "IMG_PIXEL",
+    "IMG_NORM_PIXEL",
+    "IMG_THIS_PIXEL",
+    "IMG_SIZE",
+    "inputImage",
+    "main",
+    "void",
+    "float",
+    "int",
+    "uint",
+    "bool",
+    "vec2",
+    "vec3",
+    "vec4",
+    "ivec2",
+    "ivec3",
+    "ivec4",
+    "mat2",
+    "mat3",
+    "mat4",
+    "sampler2D",
+    "sampler",
+    "uniform",
+    "layout",
+    "in",
+    "out",
+    "inout",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "return",
+    "const",
+    "struct",
+    "discard",
+    "break",
+    "continue",
+    "true",
+    "false",
+];
+
+/// Rewrites whole-identifier uses of each input name in `body` to `vjc_u_<name>`.
+/// Skips comments, swizzles/members (`.name`) and calls (`name(`), so a float input
+/// called `mix` leaves the `mix()` builtin alone.
+fn rename_inputs(body: &str, names: &[&str]) -> String {
+    let c: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut i = 0;
+    let mut prev = ' ';
+    while i < c.len() {
+        let ch = c[i];
+        if ch == '/' && c.get(i + 1) == Some(&'/') {
+            while i < c.len() && c[i] != '\n' {
+                out.push(c[i]);
+                i += 1;
+            }
+        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
+            let mut j = i + 2;
+            while j < c.len() && !(c[j] == '*' && c.get(j + 1) == Some(&'/')) {
+                j += 1;
+            }
+            let j = (j + 2).min(c.len());
+            out.extend(&c[i..j]);
+            i = j;
+        } else if ch.is_ascii_digit() {
+            while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') {
+                out.push(c[i]);
+                i += 1;
+            }
+            prev = '0';
+        } else if ch.is_ascii_alphabetic() || ch == '_' {
+            let st = i;
+            while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') {
+                i += 1;
+            }
+            let id: String = c[st..i].iter().collect();
+            let next = c[i..].iter().find(|x| !x.is_whitespace());
+            if names.contains(&id.as_str()) && prev != '.' && next != Some(&'(') {
+                out.push_str("vjc_u_");
+            }
+            out.push_str(&id);
+            prev = 'a';
+        } else {
+            out.push(ch);
+            if !ch.is_whitespace() {
+                prev = ch;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Finite floats only: NaN/inf in a uniform turns the whole frame black.
+fn finite(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 impl Isf {
@@ -321,7 +435,8 @@ impl Isf {
                     [values[i] as f32, 0.0, 0.0, 0.0]
                 }
                 _ => pack_default(&def.value),
-            };
+            }
+            .map(finite);
         }
         u
     }
@@ -374,9 +489,10 @@ pub fn glsl_source(isf: &Isf) -> String {
             InputKind::Point2D { .. } => format!("{slot}.xy"),
             InputKind::Long { .. } => format!("int(floor({slot}.x + 0.5))"),
         };
-        s.push_str(&format!("#define {} {}\n", i.name, expr));
+        s.push_str(&format!("#define vjc_u_{} {}\n", i.name, expr));
     }
-    s.push_str(&isf.body);
+    let names: Vec<&str> = isf.inputs.iter().map(|i| i.name.as_str()).collect();
+    s.push_str(&rename_inputs(&isf.body, &names));
     s
 }
 
@@ -509,5 +625,42 @@ mod tests {
             .unwrap_or_else(|e| panic!("{id}: {e:?}"));
         }
         assert!(generator_params("invert").is_none());
+    }
+
+    #[test]
+    fn input_names_cannot_shadow_builtins() {
+        for n in ["TIME", "main", "vec4", "isf_u", "gl_Position"] {
+            let src = format!(
+                r#"/*{{"INPUTS":[{{"NAME":"{n}","TYPE":"float"}}]}}*/ void main() {{ gl_FragColor = vec4(1.0); }}"#
+            );
+            assert!(parse(&src).is_err(), "{n} accepted");
+        }
+    }
+
+    #[test]
+    fn input_named_like_glsl_function_works() {
+        let src = r#"/*{"INPUTS":[{"NAME":"mix","TYPE":"float"},{"NAME":"length","TYPE":"float"}]}*/
+          // mix in a comment
+          void main() { float a = mix(0.0, 1.0, mix) * length; gl_FragColor = vec4(vec3(a + length(vec2(1.0))), 1.0); }"#;
+        let isf = parse(src).unwrap();
+        let g = glsl_source(&isf);
+        assert!(g.contains("mix(0.0, 1.0, vjc_u_mix) * vjc_u_length"));
+        assert!(g.contains("// mix in a comment"));
+        translate(&isf).unwrap();
+        let src = r#"/*{"INPUTS":[{"NAME":"TIME","TYPE":"float"}]}*/ void main() {}"#;
+        assert!(parse(src).is_err());
+    }
+
+    #[test]
+    fn non_finite_params_pack_as_zero() {
+        let src = r#"/*{"INPUTS":[{"NAME":"c","TYPE":"color"},{"NAME":"x","TYPE":"float"}]}*/
+          void main() { gl_FragColor = c; }"#;
+        let isf = parse(src).unwrap();
+        let mut p = isf.default_params();
+        p[0].value = Value::Color([f32::NAN, f32::INFINITY, 0.5, 1.0]);
+        p[1].value = Value::Number(f64::NAN);
+        let u = isf.pack(&p, 0.0, (1, 1));
+        assert_eq!(u[1], [0.0, 0.0, 0.5, 1.0]);
+        assert_eq!(u[2], [0.0; 4]);
     }
 }

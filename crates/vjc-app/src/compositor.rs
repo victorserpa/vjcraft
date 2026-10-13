@@ -293,6 +293,23 @@ impl Fx {
         g: &EffectDraw,
     ) {
         let Some(pipe) = self.pipes.get(&g.kind) else {
+            // Not compiled or failed: clear, so the layer never shows the previous clip.
+            drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gen_clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            }));
             return;
         };
         if self.bufs.len() <= self.next {
@@ -325,6 +342,7 @@ impl Fx {
         size: (u32, u32),
         effects: &[EffectDraw],
     ) -> Option<usize> {
+        let size = (size.0.max(1), size.1.max(1));
         let mut cur: Option<usize> = None;
         for e in effects {
             let Some(pipe) = self.pipes.get(&e.kind) else {

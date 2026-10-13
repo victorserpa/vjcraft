@@ -306,8 +306,21 @@ pub fn beat_sync_rate(duration: f64, beats: f64, bpm: f64) -> f64 {
     (duration * bpm / (60.0 * beats)).clamp(0.05, 20.0)
 }
 
+/// TIME rate of a generator clip. Generators have no length, so a beat sync of `n` beats
+/// means one second of TIME per `n` beats; without sync, TIME runs at 1x.
+pub fn generator_sync_rate(beats: Option<f64>, bpm: f64) -> f64 {
+    beats.map_or(1.0, |n| beat_sync_rate(1.0, n, bpm))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generator_time_follows_beat_sync() {
+        assert_eq!(super::generator_sync_rate(None, 120.0), 1.0);
+        // 120 bpm = 2 beats/s; 4 beats per TIME second -> half speed.
+        assert!((super::generator_sync_rate(Some(4.0), 120.0) - 0.5).abs() < 1e-9);
+    }
+
     use super::*;
 
     fn ms(t0: Instant, n: u64) -> Instant {

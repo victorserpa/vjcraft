@@ -64,7 +64,10 @@ impl FxLib {
         self.status.insert(kind.to_string(), Status::Compiling);
         let (tx, kind) = (self.tx.clone(), kind.to_string());
         std::thread::spawn(move || {
-            let result = vjc_fx::translate(&isf).map_err(|e| e.to_string());
+            // A panic inside naga must not leave the effect stuck on Compiling.
+            let result = std::panic::catch_unwind(|| vjc_fx::translate(&isf))
+                .unwrap_or_else(|_| Err(vjc_fx::FxError("shader translation panicked".into())))
+                .map_err(|e| e.to_string());
             let _ = tx.send(Compiled { kind, result });
         });
     }
