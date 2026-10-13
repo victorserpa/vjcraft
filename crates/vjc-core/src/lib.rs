@@ -3,13 +3,14 @@
 //! reacts to the returned `Event`s. See replica/architecture.md section 3.
 
 pub mod clock;
+pub mod playhead;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vjc_model::{
-    BlendMode, Clip, Column, ColumnIdx, FitMode, Layer, LayerId, Project, Source, Track, Transport,
-    Value,
+    BlendMode, Clip, Column, ColumnIdx, Direction, FitMode, Layer, LayerId, PlayMode, Project,
+    Source, Track, Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -80,6 +81,22 @@ pub enum Command {
         column: ColumnIdx,
         beats: Option<f64>,
     },
+    SetPlayMode {
+        layer: LayerId,
+        column: ColumnIdx,
+        mode: PlayMode,
+    },
+    SetDirection {
+        layer: LayerId,
+        column: ColumnIdx,
+        direction: Direction,
+    },
+    /// Clip speed multiplier, 0..=4 (coalesces: slider drags are one undo step).
+    SetSpeed {
+        layer: LayerId,
+        column: ColumnIdx,
+        speed: f64,
+    },
     /// Clock input (not undoable, not in history): the app forwards these to its `Clock`.
     Tap {
         at: Instant,
@@ -98,6 +115,7 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     Opacity(LayerId),
+    Speed(LayerId, ColumnIdx),
     Bpm,
 }
 
@@ -106,6 +124,7 @@ impl Command {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
             Command::SetBpm { .. } => Some(Target::Bpm),
+            Command::SetSpeed { layer, column, .. } => Some(Target::Speed(*layer, *column)),
             _ => None,
         }
     }
@@ -207,6 +226,20 @@ fn check_cell(p: &Project, layer: LayerId, column: ColumnIdx) -> Result<(), Erro
     } else {
         Err(Error::NoColumn)
     }
+}
+
+fn transport_mut(
+    p: &mut Project,
+    layer: LayerId,
+    column: ColumnIdx,
+) -> Result<&mut Transport, Error> {
+    check_cell(p, layer, column)?;
+    deck_mut(p)?
+        .clips
+        .iter_mut()
+        .find(|k| k.layer == layer && k.column == column)
+        .map(|k| &mut k.clip.transport)
+        .ok_or(Error::NoClip)
 }
 
 fn number(v: &Value) -> f64 {
@@ -403,6 +436,55 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     layer,
                     column,
                     beats: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetPlayMode {
+            layer,
+            column,
+            mode,
+        } => {
+            let prev = std::mem::replace(&mut transport_mut(p, layer, column)?.play_mode, mode);
+            undoable(
+                Command::SetPlayMode {
+                    layer,
+                    column,
+                    mode: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetDirection {
+            layer,
+            column,
+            direction,
+        } => {
+            let t = transport_mut(p, layer, column)?;
+            let prev = std::mem::replace(&mut t.direction, direction);
+            undoable(
+                Command::SetDirection {
+                    layer,
+                    column,
+                    direction: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSpeed {
+            layer,
+            column,
+            speed,
+        } => {
+            if !speed.is_finite() || !(0.0..=4.0).contains(&speed) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = std::mem::replace(&mut transport_mut(p, layer, column)?.speed, speed);
+            undoable(
+                Command::SetSpeed {
+                    layer,
+                    column,
+                    speed: prev,
                 },
                 vec![],
             )
@@ -768,6 +850,71 @@ mod tests {
                 fit: FitMode::Fill,
             },
         );
+    }
+
+    #[test]
+    fn play_mode_and_direction_roundtrip() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        for mode in [PlayMode::Bounce, PlayMode::Once, PlayMode::OnceHold] {
+            roundtrip(
+                &mut p,
+                Command::SetPlayMode {
+                    layer: l,
+                    column: 0,
+                    mode,
+                },
+            );
+        }
+        for direction in [Direction::Backward, Direction::Pause, Direction::Random] {
+            roundtrip(
+                &mut p,
+                Command::SetDirection {
+                    layer: l,
+                    column: 0,
+                    direction,
+                },
+            );
+        }
+        let missing = Command::SetDirection {
+            layer: l,
+            column: 1,
+            direction: Direction::Pause,
+        };
+        assert!(apply(&mut p, missing).is_err());
+    }
+
+    #[test]
+    fn speed_validates_and_coalesces() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let set = |speed| Command::SetSpeed {
+            layer: l,
+            column: 0,
+            speed,
+        };
+        for bad in [-0.1, 4.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(apply(&mut p, set(bad)), Err(Error::InvalidValue));
+        }
+        roundtrip(&mut p, set(2.5));
+        for (i, v) in [0.5, 1.5, 3.0].into_iter().enumerate() {
+            h.exec(&mut p, set(v), t + Duration::from_millis(100 * i as u64))
+                .unwrap();
+        }
+        assert_eq!(clip(&p, l).unwrap().transport.speed, 3.0);
+        // One undo step undoes the whole drag; the import is the next one.
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(clip(&p, l).unwrap().transport.speed, 2.5);
+        // Outside the window a new step starts.
+        let t2 = t + Duration::from_secs(5);
+        h.exec(&mut p, set(2.0), t2).unwrap();
+        h.exec(&mut p, set(2.0 + 1.0), t2 + COALESCE_WINDOW * 2)
+            .unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(clip(&p, l).unwrap().transport.speed, 2.0);
     }
 
     #[test]

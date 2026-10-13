@@ -1,5 +1,7 @@
-//! Video decoding for VJCraft: one decode thread per `Player`, RGBA frames,
-//! loop at EOF, pacing from the monotonic clock using the file timestamps.
+//! Video decoding for VJCraft: one decode thread per `Player`, RGBA frames.
+//! Two modes: `Player::open` streams paced by the file timestamps and loops at EOF;
+//! `Player::open_scrub` serves the frame nearest to a position (0..1) set by the caller,
+//! which is what play modes and directions need (see replica/build-log.md, #8).
 //! FFmpeg decodes H264, ProRes, MJPEG and HAP.
 
 use ffmpeg_next as ff;
@@ -27,6 +29,8 @@ struct Shared {
     rate: AtomicU64,
     /// File duration in seconds (f64 bits); 0 = unknown.
     duration: AtomicU64,
+    /// Scrub mode: wanted position 0..1 (f64 bits).
+    position: AtomicU64,
 }
 
 impl Shared {
@@ -37,6 +41,7 @@ impl Shared {
             error: Mutex::new(None),
             rate: AtomicU64::new(1.0f64.to_bits()),
             duration: AtomicU64::new(0),
+            position: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
@@ -54,7 +59,28 @@ pub struct Player {
 impl Player {
     /// Starts decoding `path` in a background thread. Open errors are reported via `error()`.
     pub fn open(path: impl AsRef<Path>) -> Player {
-        let path = path.as_ref().to_path_buf();
+        Self::spawn(path.as_ref(), false)
+    }
+
+    /// Like `open`, but the frame shown follows `set_position` instead of the clock.
+    /// Clips that fit `CACHE_BYTES` are decoded once into memory; longer ones seek to the
+    /// previous keyframe and decode forward on demand.
+    pub fn open_scrub(path: impl AsRef<Path>) -> Player {
+        Self::spawn(path.as_ref(), true)
+    }
+
+    /// Scrub mode: sets the wanted position (0..1, clamped).
+    pub fn set_position(&self, pos: f64) {
+        let p = if pos.is_finite() {
+            pos.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.shared.position.store(p.to_bits(), Ordering::Relaxed);
+    }
+
+    fn spawn(path: &Path, scrub: bool) -> Player {
+        let path = path.to_path_buf();
         let shared = Arc::new(Shared::new());
         let (s, p) = (shared.clone(), path.clone());
         let thread = std::thread::Builder::new()
@@ -67,7 +93,12 @@ impl Player {
                     }
                     return;
                 }
-                if let Err(e) = run(&p, &s, true) {
+                let r = if scrub {
+                    run_scrub(&p, &s)
+                } else {
+                    run(&p, &s, true)
+                };
+                if let Err(e) = r {
                     *s.error.lock().unwrap() = Some(e.to_string());
                 }
             })
@@ -176,6 +207,245 @@ fn run(path: &Path, shared: &Shared, looping: bool) -> Result<(), ff::Error> {
         *shared.latest.lock().unwrap() = Some(frame);
         true
     })
+}
+
+/// Clips whose decoded RGBA frames fit this budget are cached whole for scrubbing.
+pub const CACHE_BYTES: f64 = 384.0 * 1024.0 * 1024.0;
+
+/// Sequential decoder with seek, no pacing. Frames come out with their pts in seconds.
+struct Scrubber {
+    ictx: ff::format::context::Input,
+    decoder: ff::decoder::Video,
+    stream_idx: usize,
+    tb: f64,
+    fps: f64,
+    duration: f64,
+    scaler: Option<ff::software::scaling::Context>,
+    eof: bool,
+    count: u64,
+    /// pts of the last frame handed out (NaN if none) and a copy of it.
+    last_t: f64,
+    last: Option<Frame>,
+}
+
+impl Scrubber {
+    fn open(path: &Path) -> Result<Scrubber, ff::Error> {
+        ff::init()?;
+        let ictx = ff::format::input(&path)?;
+        let (stream_idx, tb, fps, params) = {
+            let st = ictx
+                .streams()
+                .best(ff::media::Type::Video)
+                .ok_or(ff::Error::StreamNotFound)?;
+            let r = st.avg_frame_rate();
+            let fps = if r.denominator() != 0 && r.numerator() != 0 {
+                r.numerator() as f64 / r.denominator() as f64
+            } else {
+                30.0
+            };
+            (st.index(), f64::from(st.time_base()), fps, st.parameters())
+        };
+        let decoder = ff::codec::context::Context::from_parameters(params)?
+            .decoder()
+            .video()?;
+        let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
+        Ok(Scrubber {
+            ictx,
+            decoder,
+            stream_idx,
+            tb,
+            fps,
+            duration,
+            scaler: None,
+            eof: false,
+            count: 0,
+            last_t: f64::NAN,
+            last: None,
+        })
+    }
+
+    /// Next frame in decode order, or None at end of file.
+    fn next(&mut self) -> Result<Option<(f64, Frame)>, ff::Error> {
+        let mut decoded = ff::frame::Video::empty();
+        loop {
+            if self.decoder.receive_frame(&mut decoded).is_ok() {
+                if self.scaler.is_none() {
+                    self.scaler = Some(ff::software::scaling::Context::get(
+                        decoded.format(),
+                        decoded.width(),
+                        decoded.height(),
+                        ff::format::Pixel::RGBA,
+                        decoded.width(),
+                        decoded.height(),
+                        ff::software::scaling::Flags::BILINEAR,
+                    )?);
+                }
+                let mut rgba = ff::frame::Video::empty();
+                self.scaler.as_mut().unwrap().run(&decoded, &mut rgba)?;
+                let (w, h) = (rgba.width(), rgba.height());
+                let (stride, row) = (rgba.stride(0), w as usize * 4);
+                let src = rgba.data(0);
+                let mut data = Vec::with_capacity(row * h as usize);
+                for y in 0..h as usize {
+                    data.extend_from_slice(&src[y * stride..y * stride + row]);
+                }
+                let t = decoded
+                    .timestamp()
+                    .map(|p| p as f64 * self.tb)
+                    .unwrap_or(self.count as f64 / self.fps);
+                self.count += 1;
+                let frame = Frame {
+                    width: w,
+                    height: h,
+                    data: Arc::new(data),
+                    seq: self.count,
+                };
+                self.last_t = t;
+                self.last = Some(frame.clone());
+                return Ok(Some((t, frame)));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            let mut pkt = ff::Packet::empty();
+            match pkt.read(&mut self.ictx) {
+                Ok(()) => {
+                    if pkt.stream() == self.stream_idx {
+                        self.decoder.send_packet(&pkt)?;
+                    }
+                }
+                Err(ff::Error::Eof) => {
+                    self.eof = true;
+                    self.decoder.send_eof()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn seek(&mut self, t: f64) -> Result<(), ff::Error> {
+        let ts = (t.max(0.0) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
+        self.ictx.seek(ts, ..ts)?;
+        self.decoder.flush();
+        self.eof = false;
+        self.last_t = f64::NAN;
+        Ok(())
+    }
+
+    /// Frame to show at media time `target`. None when it is the frame already handed out.
+    /// Close ahead of the last frame it just decodes forward; anything else seeks to the
+    /// previous keyframe and decodes up to the target.
+    fn frame_at(&mut self, target: f64) -> Result<Option<Frame>, ff::Error> {
+        let half = 0.5 / self.fps;
+        if self.last_t.is_finite() {
+            if (target - self.last_t).abs() <= half {
+                return Ok(None);
+            }
+            if target < self.last_t || target - self.last_t > 2.0 {
+                self.seek(target)?;
+            }
+        } else {
+            self.seek(target)?;
+        }
+        loop {
+            match self.next()? {
+                Some((t, f)) if t + half >= target => return Ok(Some(f)),
+                Some(_) => {}
+                // Past the last frame: hold it.
+                None => return Ok(self.last.clone()),
+            }
+        }
+    }
+}
+
+/// Index into `frames` (sorted by pts) of the frame nearest to `target`.
+fn nearest(frames: &[(f64, Frame)], target: f64) -> usize {
+    let i = frames.partition_point(|(t, _)| *t < target);
+    if i == 0 {
+        0
+    } else if i == frames.len() || target - frames[i - 1].0 <= frames[i].0 - target {
+        i - 1
+    } else {
+        i
+    }
+}
+
+fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
+    let mut sc = Scrubber::open(path)?;
+    let mut seq = 0u64;
+    let publish = |f: &Frame, seq: &mut u64| {
+        *seq += 1;
+        *shared.latest.lock().unwrap() = Some(Frame {
+            seq: *seq,
+            ..f.clone()
+        });
+    };
+    let mut frames: Vec<(f64, Frame)> = vec![];
+    let mut cached = false;
+    if sc.duration > 0.0 {
+        // First frame early; the size is only known after decoding it.
+        if let Some((t, f)) = sc.next()? {
+            let bytes = f.data.len() as f64 * sc.duration * sc.fps;
+            publish(&f, &mut seq);
+            if bytes <= CACHE_BYTES {
+                frames.push((t, f));
+                while let Some(x) = sc.next()? {
+                    if shared.stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    frames.push(x);
+                }
+                cached = true;
+            }
+        }
+        // Publish the duration only once frames can be served, so the
+        // playhead does not advance (or finish a Once clip) while loading.
+        shared
+            .duration
+            .store(sc.duration.to_bits(), Ordering::Relaxed);
+    } else {
+        // Unknown duration: decode to learn it, but never past the cache
+        // budget; a longer stream is truncated to what fits.
+        let mut bytes = 0.0;
+        while let Some(x) = sc.next()? {
+            if shared.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            bytes += x.1.data.len() as f64;
+            frames.push(x);
+            if bytes > CACHE_BYTES {
+                break;
+            }
+        }
+        cached = true;
+        let end = frames.last().map_or(0.0, |(t, _)| t + 1.0 / sc.fps);
+        shared.duration.store(end.to_bits(), Ordering::Relaxed);
+        sc.duration = end;
+    }
+    let mut shown = f64::NAN;
+    let mut shown_idx = usize::MAX;
+    while !shared.stop.load(Ordering::Relaxed) {
+        let pos = f64::from_bits(shared.position.load(Ordering::Relaxed));
+        if pos == shown {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        shown = pos;
+        let target = pos * sc.duration;
+        if cached {
+            if frames.is_empty() {
+                return Ok(());
+            }
+            let i = nearest(&frames, target);
+            if i != shown_idx {
+                shown_idx = i;
+                publish(&frames[i].1, &mut seq);
+            }
+        } else if let Some(f) = sc.frame_at(target)? {
+            publish(&f, &mut seq);
+        }
+    }
+    Ok(())
 }
 
 fn decode_loop(
@@ -348,6 +618,71 @@ mod tests {
     }
 
     use super::*;
+
+    fn fake(ts: &[f64]) -> Vec<(f64, Frame)> {
+        ts.iter()
+            .map(|t| {
+                let f = Frame {
+                    width: 1,
+                    height: 1,
+                    data: Arc::new(vec![0; 4]),
+                    seq: 0,
+                };
+                (*t, f)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nearest_picks_closest_frame_and_clamps() {
+        let f = fake(&[0.0, 0.5, 1.0]);
+        assert_eq!(nearest(&f, -1.0), 0);
+        assert_eq!(nearest(&f, 0.2), 0);
+        assert_eq!(nearest(&f, 0.3), 1);
+        assert_eq!(nearest(&f, 0.9), 2);
+        assert_eq!(nearest(&f, 5.0), 2);
+    }
+
+    #[test]
+    fn scrub_serves_frame_at_position() {
+        let dir = std::env::temp_dir().join(format!("vjc-scrub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("s.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=64x48:rate=10:duration=2")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skip: cannot encode");
+            return;
+        }
+        let mut pl = Player::open_scrub(&out);
+        let wait = |pl: &Player, after: u64| {
+            let t = Instant::now();
+            loop {
+                if let Some(f) = pl.latest_frame()
+                    && f.seq > after
+                {
+                    return f;
+                }
+                assert!(t.elapsed() < Duration::from_secs(5), "{:?}", pl.error());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let first = wait(&pl, 0);
+        pl.set_position(1.0);
+        let end = wait(&pl, first.seq);
+        assert_ne!(end.data, first.data);
+        pl.set_position(0.0);
+        let back = wait(&pl, end.seq);
+        assert_eq!(back.data, first.data);
+        pl.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const SAMPLE: &str = "/Applications/Resolume Arena/media/AV/Beat 001.mov";
 

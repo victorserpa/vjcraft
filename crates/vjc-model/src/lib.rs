@@ -138,7 +138,7 @@ pub struct Transport {
     pub out_point: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlayMode {
     Loop,
     Bounce,
@@ -157,7 +157,7 @@ pub enum TriggerMode {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Forward,
     Backward,

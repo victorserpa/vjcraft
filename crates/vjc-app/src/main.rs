@@ -8,9 +8,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 use vjc_core::clock::{Clock, beat_sync_rate};
+use vjc_core::playhead::Playhead;
 use vjc_core::{Command, Event, History};
 use vjc_media::{Frame, Player};
-use vjc_model::{BlendMode, Column, FitMode, Layer, LayerId, Project, Track, Transition};
+use vjc_model::{
+    BlendMode, Column, Direction, FitMode, Layer, LayerId, PlayMode, Project, Track, Transition,
+};
 
 struct State {
     project: Project,
@@ -19,6 +22,9 @@ struct State {
     status: String,
     /// Playing clip per layer: (column, player). One clip per layer.
     players: HashMap<LayerId, (u32, Player)>,
+    /// Playhead per layer, restarted with each trigger (stale entries are harmless).
+    heads: HashMap<LayerId, Playhead>,
+    last_head_tick: std::time::Instant,
     comp: Option<Compositor>,
     comp_tex: Option<egui::TextureId>,
     /// Display id of the monitor the output window is on, while open.
@@ -154,6 +160,8 @@ impl State {
             warnings: vec![],
             status: "Drop video files on the grid cells.".into(),
             players: HashMap::new(),
+            heads: HashMap::new(),
+            last_head_tick: std::time::Instant::now(),
             comp: None,
             comp_tex: None,
             output: None,
@@ -401,7 +409,14 @@ impl State {
                 } => {
                     if path.exists() {
                         self.players.remove(&layer); // joins the old decode thread
-                        self.players.insert(layer, (column, Player::open(&path)));
+                        self.players
+                            .insert(layer, (column, Player::open_scrub(&path)));
+                        let tr = self.transport(layer, column);
+                        let dir = tr.map_or(Direction::Forward, |t| t.direction);
+                        let seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(1, |d| d.as_nanos() as u64);
+                        self.heads.insert(layer, Playhead::new(dir, seed));
                     } else {
                         self.status = format!("File not found: {}", path.display());
                     }
@@ -425,8 +440,14 @@ impl State {
         }
     }
 
-    /// Once per frame: follows the project BPM, advances the clock and sets the player
-    /// rate of every beat-synced clip (clip length = n beats; else just `speed`).
+    fn transport(&self, layer: LayerId, column: u32) -> Option<vjc_model::Transport> {
+        let c = &self.project.composition;
+        let deck = c.decks.iter().find(|d| d.id == c.current_deck)?;
+        Some(deck.clip_at(layer, column)?.transport.clone())
+    }
+
+    /// Once per frame: follows the project BPM, advances the clock and every playhead.
+    /// Effective speed = `speed` x beat-sync factor (clip length = n beats).
     fn tick_clock(&mut self) {
         let now = std::time::Instant::now();
         let bpm = self.project.composition.tempo.bpm;
@@ -442,6 +463,11 @@ impl State {
         let Some(deck) = c.decks.iter().find(|d| d.id == c.current_deck) else {
             return;
         };
+        let dt = now
+            .saturating_duration_since(self.last_head_tick)
+            .as_secs_f64();
+        self.last_head_tick = now;
+        let mut finished = vec![];
         for (layer, (col, player)) in &self.players {
             let Some(clip) = deck.clip_at(*layer, *col) else {
                 continue;
@@ -451,7 +477,18 @@ impl State {
                 (Some(n), Some(d)) => beat_sync_rate(d, n, bpm),
                 _ => 1.0,
             };
-            player.set_rate(tr.speed * sync);
+            // Play modes: the playhead picks the position, the player serves the frame.
+            if let (Some(d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
+                let t = head.tick(dt, tr.play_mode, tr.direction, tr.speed * sync, d);
+                player.set_position(t.position);
+                if t.finished {
+                    finished.push(*layer);
+                }
+            }
+        }
+        // Once: clear the layer after the last frame.
+        for layer in finished {
+            self.exec(Command::ClearLayer { layer });
         }
     }
 
@@ -831,6 +868,7 @@ impl State {
                     }
                     ui.label("Opacity");
                     ui.label("Blend");
+                    ui.label("Speed");
                     ui.label("");
                     ui.end_row();
                     for li in 0..comp.layers.len() {
@@ -848,7 +886,46 @@ impl State {
                             let r = ui.add(btn);
                             if let Some(cur_fit) = clip.map(|k| k.fit) {
                                 let cur_sync = clip.and_then(|k| k.transport.beat_sync);
+                                let cur_mode = clip.map(|k| k.transport.play_mode);
+                                let cur_dir = clip.map(|k| k.transport.direction);
                                 r.context_menu(|ui| {
+                                    ui.label("Play mode");
+                                    let modes = [
+                                        (PlayMode::Loop, "Loop"),
+                                        (PlayMode::Bounce, "Bounce"),
+                                        (PlayMode::Once, "Once"),
+                                        (PlayMode::OnceHold, "Once, hold last frame"),
+                                    ];
+                                    for (m, name) in modes {
+                                        if ui.selectable_label(cur_mode == Some(m), name).clicked()
+                                        {
+                                            cmds.push(Command::SetPlayMode {
+                                                layer: lid,
+                                                column: ci,
+                                                mode: m,
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    ui.label("Direction");
+                                    let dirs = [
+                                        (Direction::Forward, "Forward"),
+                                        (Direction::Backward, "Backward"),
+                                        (Direction::Pause, "Pause"),
+                                        (Direction::Random, "Random"),
+                                    ];
+                                    for (d, name) in dirs {
+                                        if ui.selectable_label(cur_dir == Some(d), name).clicked() {
+                                            cmds.push(Command::SetDirection {
+                                                layer: lid,
+                                                column: ci,
+                                                direction: d,
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
                                     ui.label("Sync to BPM");
                                     let opts = [
                                         None,
@@ -954,6 +1031,27 @@ impl State {
                                     }
                                 }
                             });
+                        // Speed of the clip playing on this layer.
+                        let active = self.players.get(&lid).map(|(c, _)| *c);
+                        match active.and_then(|c| Some((c, comp.decks[deck_idx?].clip_at(lid, c)?)))
+                        {
+                            Some((c, k)) => {
+                                let mut sp = k.transport.speed as f32;
+                                if ui
+                                    .add(egui::Slider::new(&mut sp, 0.0..=4.0).fixed_decimals(2))
+                                    .changed()
+                                {
+                                    cmds.push(Command::SetSpeed {
+                                        layer: lid,
+                                        column: c,
+                                        speed: sp as f64,
+                                    });
+                                }
+                            }
+                            None => {
+                                ui.label("-");
+                            }
+                        }
                         if ui.button("Clear").clicked() {
                             cmds.push(Command::ClearLayer { layer: lid });
                         }
