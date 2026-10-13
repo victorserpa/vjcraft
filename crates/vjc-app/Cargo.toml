@@ -13,3 +13,6 @@ vjc-model = { path = "../vjc-model" }
 vjc-avc = { path = "../vjc-avc" }
 eframe = "0.36.2"
 rfd = "0.17.2"
+vjc-media = { path = "../vjc-media" }
+bytemuck = { version = "1", features = ["derive"] }
+uuid.workspace = true
