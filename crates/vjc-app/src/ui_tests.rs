@@ -1371,3 +1371,233 @@ fn dragging_shared_bottom_panel_updates_monitor_height_too() {
         cur.params_h
     );
 }
+
+// ---- replica-test: flows F01-F08 gaps (see replica/test-plan.md) ----
+
+fn project_file_with_missing_media(base: &vjc_model::Project, name: &str) -> PathBuf {
+    let mut p = base.clone();
+    let layer = p.composition.layers[0].id;
+    let mut clip = vjc_core::clip_from_path(PathBuf::from("/nope/gone.mov"));
+    clip.name = "gone".into();
+    p.composition.decks[0].clips.push(vjc_model::CellClip {
+        layer,
+        column: 0,
+        clip,
+    });
+    let f = tmp_vjc(name);
+    vjc_io::save(&p, &f).unwrap();
+    f
+}
+
+// F08-N1
+#[test]
+fn opening_a_corrupt_project_reports_and_keeps_the_current_one() {
+    let mut h = app();
+    click(&mut h, "Add layer");
+    let before = h.state().project.clone();
+    let f = tmp_vjc("corrupt.vjc");
+    std::fs::write(&f, b"{\"format_version\": 1, \"compo").unwrap();
+    assert!(!h.state_mut().load(f));
+    assert!(
+        h.state().status.contains("Open failed"),
+        "{}",
+        h.state().status
+    );
+    assert_eq!(h.state().project, before);
+    assert!(h.state().file.is_none());
+}
+
+// F08-N2
+#[test]
+fn opening_a_newer_format_project_asks_to_update() {
+    let mut h = app();
+    let f = tmp_vjc("future.vjc");
+    std::fs::write(&f, b"{\"format_version\": 99}").unwrap();
+    assert!(!h.state_mut().load(f));
+    assert!(h.state().status.contains("newer"), "{}", h.state().status);
+}
+
+// F08-E1 and F01-N1
+#[test]
+fn missing_media_warns_and_triggering_that_clip_does_not_panic() {
+    let mut h = app();
+    let f = project_file_with_missing_media(&h.state().project, "missing.vjc");
+    assert!(h.state_mut().load(f), "{}", h.state().status);
+    assert!(
+        h.state()
+            .warnings
+            .iter()
+            .any(|w| w.contains("Missing media")),
+        "{:?}",
+        h.state().warnings
+    );
+    let deck = h.state().project.composition.current_deck;
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer,
+        column: 0,
+    });
+    settle(&mut h);
+    for _ in 0..5 {
+        h.step();
+    }
+}
+
+// F02-H1
+#[test]
+fn triggering_a_column_starts_every_layer_that_has_a_clip() {
+    let mut h = app();
+    for layer_idx in 0..2 {
+        // A different generator per layer: the first clip's name would clash otherwise.
+        let (gen_id, _) = vjc_fx::GENERATORS[layer_idx];
+        let (_, pos) = cell_center(&h, layer_idx, 1);
+        browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    }
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    let st = h.state();
+    for l in &st.project.composition.layers {
+        assert_eq!(active_of(&st.players, &st.gens, l.id), Some((deck, 1)));
+    }
+}
+
+// F02-N1: a column past the end is rejected, nothing plays
+#[test]
+fn triggering_a_column_out_of_range_changes_nothing() {
+    let mut h = app();
+    let deck = h.state().project.composition.current_deck;
+    assert!(
+        !h.state_mut()
+            .exec_ok(Command::TriggerColumn { deck, column: 99 })
+    );
+    let st = h.state();
+    assert!(st.players.is_empty() && st.gens.is_empty());
+}
+
+// F07-H1: learn a CC on master opacity, then the CC moves it
+#[test]
+fn midi_learn_then_cc_moves_master_opacity() {
+    use vjc_core::midi as m;
+    let mut h = app();
+    let st = h.state_mut();
+    let src = m::source_of("pad", m::parse(&[0xB0, 7, 127]).unwrap()).unwrap();
+    let cmds = m::learn(&st.project, "/comp/master/opacity", src);
+    st.learned("pad -> master".into(), cmds);
+    assert!(!st.project.shortcuts.is_empty(), "shortcut added");
+    let rt = st.rt_ctx();
+    let cmds: Vec<Command> = st
+        .project
+        .shortcuts
+        .iter()
+        .filter_map(|s| {
+            m::command_for(&st.project, &rt, s, "pad", m::parse(&[0xB0, 7, 0]).unwrap())
+        })
+        .collect();
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    for c in cmds {
+        st.exec(c);
+    }
+    assert_eq!(
+        st.project.composition.master.opacity.value,
+        vjc_model::Value::Number(0.0)
+    );
+}
+
+// F08-H2: save, edit, undo-redo, reopen keeps no stray temp file
+#[test]
+fn saving_leaves_no_temp_file_next_to_the_project() {
+    let mut h = app();
+    click(&mut h, "Add column");
+    let f = tmp_vjc("notmp.vjc");
+    assert!(h.state_mut().save_to(f.clone()), "{}", h.state().status);
+    let mut tmp = f.as_os_str().to_owned();
+    tmp.push(".tmp");
+    assert!(!PathBuf::from(tmp).exists());
+}
+
+/// Soak base for fixes.md item 1. Renders the UI and decodes a looping clip for
+/// `VJC_SOAK_MINUTES` (default 1) and fails if the decoder stops delivering frames or
+/// memory (RSS, via `ps`) grows by more than `VJC_SOAK_MAX_RSS_MB` (default 300).
+/// Run: `VJC_SOAK_MINUTES=360 cargo test -p vjc-app soak -- --ignored --nocapture`
+#[test]
+#[ignore = "long-running; set VJC_SOAK_MINUTES"]
+fn soak_render_and_decode_loop() {
+    fn env_f64(k: &str, d: f64) -> f64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    }
+    fn rss_mb() -> f64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok();
+        out.and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+        .map_or(0.0, |kb| kb / 1024.0)
+    }
+    let minutes = env_f64("VJC_SOAK_MINUTES", 1.0);
+    let max_growth = env_f64("VJC_SOAK_MAX_RSS_MB", 300.0);
+    let video = test_video("soak.mp4");
+    let mut h = app();
+    let lid = match &video {
+        Some(v) => drop_video_on_cell(&mut h, 1, 0, v),
+        None => {
+            eprintln!("ffmpeg missing: render-only soak");
+            h.state().project.composition.layers[1].id
+        }
+    };
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 0 });
+    let start = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs_f64(minutes * 60.0);
+    let (mut last_frame, mut last_report) = (start, start);
+    let base = {
+        for _ in 0..60 {
+            h.step();
+        }
+        rss_mb()
+    };
+    let mut frames = 0u64;
+    while start.elapsed() < limit {
+        h.step();
+        frames += 1;
+        if video.is_some() {
+            if h.state()
+                .players
+                .get(&lid)
+                .is_some_and(|p| p.2.latest_frame().is_some())
+            {
+                last_frame = std::time::Instant::now();
+            }
+            assert!(
+                last_frame.elapsed().as_secs() < 30,
+                "decoder produced no frame for 30 s"
+            );
+        }
+        if last_report.elapsed().as_secs() >= 60 {
+            last_report = std::time::Instant::now();
+            eprintln!(
+                "soak {:.0}s frames={frames} rss={:.0}MB",
+                start.elapsed().as_secs_f64(),
+                rss_mb()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    let growth = rss_mb() - base;
+    eprintln!("soak done: frames={frames} rss growth={growth:.0}MB");
+    assert!(
+        growth < max_growth,
+        "RSS grew {growth:.0} MB (> {max_growth} MB)"
+    );
+}

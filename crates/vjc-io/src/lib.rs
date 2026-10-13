@@ -157,6 +157,34 @@ fn version_number(v: &Value) -> Option<u64> {
     })
 }
 
+/// Clamps size, fps and tempo to what the UI allows (a hand-edited or damaged file could
+/// hold zero or absurd values and crash texture allocation). Returns how many were changed.
+fn clamp_composition(p: &mut Project) -> usize {
+    use vjc_core::clock::{MAX_BPM, MIN_BPM};
+    let c = &mut p.composition;
+    let mut n = 0;
+    for v in [&mut c.width, &mut c.height] {
+        let w = (*v).clamp(1, 16384);
+        n += usize::from(w != *v);
+        *v = w;
+    }
+    let fps = if c.fps.is_finite() && c.fps > 0.0 {
+        c.fps.clamp(1.0, 240.0)
+    } else {
+        30.0
+    };
+    n += usize::from(fps != c.fps);
+    c.fps = fps;
+    let bpm = if c.tempo.bpm.is_finite() {
+        c.tempo.bpm.clamp(MIN_BPM, MAX_BPM)
+    } else {
+        120.0
+    };
+    n += usize::from(bpm != c.tempo.bpm);
+    c.tempo.bpm = bpm;
+    n
+}
+
 /// Opens a project. Media are resolved as: relative to the project folder,
 /// then as stored (absolute), then by file name inside the project folder.
 /// Returns the project and warnings for media that could not be found.
@@ -181,6 +209,12 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
     if n > 0 {
         warnings.push(format!(
             "{n} layer(s) had an invalid group and were ungrouped"
+        ));
+    }
+    let n = clamp_composition(&mut project);
+    if n > 0 {
+        warnings.push(format!(
+            "{n} composition value(s) (size, fps, tempo) were out of range and were clamped"
         ));
     }
     vjc_core::shortcuts::bind_legacy(&mut project);
@@ -378,6 +412,61 @@ mod tests {
         let f2 = d.join("new.vjc");
         save(&p, &f2).unwrap();
         assert_eq!(open(&f2).unwrap().0, p);
+    }
+
+    #[test]
+    fn stale_tmp_blocking_the_temp_name_keeps_the_old_file() {
+        // A directory squats on the temp name: an atomic writer must fail without touching
+        // the target. A direct `fs::write(path)` would succeed and overwrite it.
+        let d = tmp("staletmp");
+        let f = d.join("p.vjc");
+        save(&Project::new("one"), &f).unwrap();
+        std::fs::create_dir(d.join("p.vjc.tmp")).unwrap();
+        assert!(save(&Project::new("two"), &f).is_err());
+        assert_eq!(open(&f).unwrap().0.composition.name, "one");
+    }
+
+    #[test]
+    fn write_atomic_replaces_content_and_leaves_no_tmp() {
+        let d = tmp("replace");
+        let f = d.join("x.json");
+        write_atomic(&f, b"old").unwrap();
+        write_atomic(&f, b"new").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"new");
+        assert!(!d.join("x.json.tmp").exists());
+    }
+
+    #[test]
+    fn truncated_project_is_an_error_not_a_panic() {
+        let d = tmp("trunc");
+        let f = d.join("p.vjc");
+        save(&Project::new("one"), &f).unwrap();
+        let raw = std::fs::read(&f).unwrap();
+        std::fs::write(&f, &raw[..raw.len() / 2]).unwrap();
+        assert!(matches!(open(&f), Err(Error::Json(_))));
+        std::fs::write(&f, b"").unwrap();
+        assert!(open(&f).is_err());
+    }
+
+    #[test]
+    fn open_clamps_out_of_range_composition_values_with_a_warning() {
+        let d = tmp("range");
+        let f = d.join("p.vjc");
+        let mut p = Project::new("r");
+        p.composition.width = 0;
+        p.composition.height = 4_000_000;
+        p.composition.fps = 0.0;
+        p.composition.tempo.bpm = 0.0;
+        save(&p, &f).unwrap();
+        let (back, w) = open(&f).unwrap();
+        let c = &back.composition;
+        assert_eq!((c.width, c.height), (1, 16384));
+        assert!(c.fps > 0.0 && c.fps <= 240.0, "{}", c.fps);
+        assert!(c.tempo.bpm >= vjc_core::clock::MIN_BPM, "{}", c.tempo.bpm);
+        assert!(w.iter().any(|m| m.contains("out of range")), "{w:?}");
+        // A sane project produces no such warning.
+        save(&Project::new("ok"), &f).unwrap();
+        assert!(open(&f).unwrap().1.is_empty());
     }
 
     #[test]
