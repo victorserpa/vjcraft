@@ -2197,9 +2197,12 @@ impl State {
             .default_size(260.0)
             .show(ui, |ui| opened = self.browser.show(ui, &fxs));
         let mut pcmds = vec![];
+        // Heights are relative to the window so the grid always keeps room.
+        let win_h = ui.max_rect().height();
         egui::Panel::bottom("params")
-            .default_size(220.0)
+            .default_size((win_h * 0.25).min(220.0))
             .resizable(true)
+            .size_range(40.0..=(win_h * 0.3).max(40.0))
             .show(ui, |ui| self.params_panel(ui, &mut pcmds));
         for c in pcmds {
             self.exec(c);
@@ -2337,41 +2340,56 @@ impl State {
         });
 
         // Monitors: preview and output side by side, each letterboxed to the comp aspect.
-        egui::Panel::top("monitors")
-            .resizable(true)
-            .default_size(220.0)
-            .size_range(80.0..=700.0)
-            .show(ui, |ui| {
-                let Some(id) = self.comp_tex else { return };
-                let c = &self.project.composition;
-                let aspect = c.width as f32 / c.height.max(1) as f32;
-                let avail = ui.available_size();
-                let w = (avail.x - ui.spacing().item_spacing.x) / 2.0;
-                ui.horizontal(|ui| {
-                    for name in ["Preview", "Output"] {
-                        ui.vertical(|ui| {
-                            ui.set_width(w);
-                            ui.label(name);
-                            let size = egui::vec2(w, (avail.y - 24.0).max(10.0));
-                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                            let mut fit = egui::vec2(size.x, size.x / aspect);
-                            if fit.y > size.y {
-                                fit = egui::vec2(size.y * aspect, size.y);
-                            }
-                            ui.painter().image(
-                                id,
-                                egui::Rect::from_center_size(rect.center(), fit),
-                                egui::Rect::from_min_max(
-                                    egui::pos2(0.0, 0.0),
-                                    egui::pos2(1.0, 1.0),
-                                ),
-                                egui::Color32::WHITE,
-                            );
-                        });
-                    }
+        // Keep >= 80 px for the grid (+ deck tabs); monitors take only what is left.
+        let mon_max = (ui.available_height() - 80.0 - 40.0)
+            .min(win_h * 0.35)
+            .min(700.0);
+        if mon_max < 40.0 {
+            // Too short for monitors: collapse them entirely.
+        } else if let Some(id) = self.comp_tex {
+            egui::Panel::top("monitors")
+                .resizable(true)
+                .default_size(220.0_f32.min(mon_max))
+                .size_range(40.0..=mon_max)
+                .show(ui, |ui| {
+                    let c = &self.project.composition;
+                    let aspect = c.width as f32 / c.height.max(1) as f32;
+                    let avail = ui.available_size();
+                    let label_h = ui.text_style_height(&egui::TextStyle::Body);
+                    let w = ((avail.x - ui.spacing().item_spacing.x) / 2.0).max(0.0);
+                    ui.horizontal(|ui| {
+                        for name in ["Preview", "Output"] {
+                            ui.vertical(|ui| {
+                                ui.set_width(w);
+                                ui.label(name);
+                                let h = (avail.y - label_h - ui.spacing().item_spacing.y).max(0.0);
+                                let size = egui::vec2(w, h);
+                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                                let mut fit = egui::vec2(size.x, size.x / aspect);
+                                if fit.y > size.y {
+                                    fit = egui::vec2(size.y * aspect, size.y);
+                                }
+                                ui.painter().image(
+                                    id,
+                                    egui::Rect::from_center_size(rect.center(), fit),
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            });
+                        }
+                    });
                 });
-            });
+        } else {
+            egui::Panel::top("monitors")
+                .resizable(false)
+                .show(ui, |ui| {
+                    ui.weak("No signal");
+                });
+        }
 
         let mut cmds: Vec<Command> = vec![];
         self.deck_tabs(ui, &mut cmds);
@@ -2638,7 +2656,7 @@ impl State {
                     egui::DragValue::new(&mut fps)
                         .speed(0.0)
                         .range(1.0..=240.0)
-                        .max_decimals(2),
+                        .max_decimals(3),
                 )
                 .changed();
         });

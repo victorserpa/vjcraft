@@ -519,26 +519,48 @@ fn panel_tabs_switch() {
 // 12
 #[test]
 fn small_window_no_panic_no_overlap() {
-    let mut h = app_sized(800.0, 500.0);
-    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
-    // One anchor widget per main panel: top bars, browser, params, central area.
-    let anchors = [
-        ("topbars", h.get_by_label("Tap").rect()),
-        ("browser", h.get_by_label("Files").rect()),
-        ("params", h.get_by_label("Composition").rect()),
-        ("central", h.get_by_label("Add layer").rect()),
-    ];
-    for (name, r) in &anchors {
-        assert!(screen.contains_rect(*r), "{name} {r:?} outside {screen:?}");
-    }
-    for (i, (a, ra)) in anchors.iter().enumerate() {
-        for (b, rb) in &anchors[i + 1..] {
-            assert!(!ra.intersects(*rb), "{a} {ra:?} overlaps {b} {rb:?}");
+    for (w, hgt) in [(800.0, 500.0), (640.0, 400.0)] {
+        let mut h = app_sized(w, hgt);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, hgt));
+        // One anchor widget per main panel: top bars, browser, params, central area.
+        let anchors = [
+            ("topbars", h.get_by_label("Tap").rect()),
+            ("browser", h.get_by_label("Files").rect()),
+            ("params", h.get_by_label("Composition").rect()),
+            ("central", h.get_by_label("Add layer").rect()),
+        ];
+        for (name, r) in &anchors {
+            assert!(screen.contains_rect(*r), "{name} {r:?} outside {screen:?}");
+        }
+        for (i, (a, ra)) in anchors.iter().enumerate() {
+            for (b, rb) in &anchors[i + 1..] {
+                assert!(!ra.intersects(*rb), "{a} {ra:?} overlaps {b} {rb:?}");
+            }
+        }
+        // Same with content: a clip-less project plus extra layers still lays out.
+        for _ in 0..3 {
+            click(&mut h, "Add layer");
+        }
+        // Real rects: the grid's last column header and first layer row must not
+        // touch the bottom panel's tabs.
+        let tabs = ["Composition", "Layer", "Clip"]
+            .iter()
+            .map(|l| h.get_by_label(l).rect())
+            .fold(egui::Rect::NOTHING, |a, r| a.union(r));
+        let st = h.state();
+        let ncols = st.project.composition.columns.len();
+        let header = st.targets[ncols - 1].0;
+        let row = st.layer_rects.first().expect("layer row").0;
+        for (name, r) in [("last header", header), ("first layer row", row)] {
+            assert!(
+                !r.intersects(tabs),
+                "{w}x{hgt}: {name} {r:?} overlaps tabs {tabs:?}"
+            );
+            assert!(r.max.y <= tabs.min.y, "{name} {r:?} below tabs {tabs:?}");
+        }
+        snap(&mut h, &format!("12-small-window-{w}x{hgt}"));
+        if w == 800.0 {
+            snap(&mut h, "12-small-window");
         }
     }
-    // Same with content: a clip-less project plus extra layers still lays out.
-    for _ in 0..3 {
-        click(&mut h, "Add layer");
-    }
-    snap(&mut h, "12-small-window");
 }
