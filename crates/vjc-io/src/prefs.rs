@@ -81,12 +81,38 @@ pub struct Audio {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct Osc {
+    pub in_enabled: bool,
+    pub in_port: u16,
+    /// Bind 0.0.0.0 instead of 127.0.0.1 (anyone on the network can then send commands).
+    pub accept_network: bool,
+    pub out_enabled: bool,
+    pub out_host: String,
+    pub out_port: u16,
+}
+
+impl Default for Osc {
+    fn default() -> Self {
+        Osc {
+            in_enabled: false,
+            in_port: 7000,
+            accept_network: false,
+            out_enabled: false,
+            out_host: "127.0.0.1".into(),
+            out_port: 9000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Prefs {
     pub version: u32,
     pub general: General,
     pub video: Video,
     pub control: Control,
     pub audio: Audio,
+    pub osc: Osc,
 }
 
 impl Default for Prefs {
@@ -97,6 +123,7 @@ impl Default for Prefs {
             video: Video::default(),
             control: Control::default(),
             audio: Audio::default(),
+            osc: Osc::default(),
         }
     }
 }
@@ -111,6 +138,9 @@ impl Prefs {
             self.video.fps = Video::default().fps;
         }
         self.video.fps = self.video.fps.min(240.0);
+        self.osc.in_port = self.osc.in_port.max(1);
+        self.osc.out_port = self.osc.out_port.max(1);
+        self.osc.out_host = self.osc.out_host.trim().to_owned();
     }
 
     pub fn from_json(text: &str) -> (Prefs, Option<String>) {

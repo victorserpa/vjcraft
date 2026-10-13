@@ -8,3 +8,4 @@ license.workspace = true
 vjc-fx = { path = "../vjc-fx" }
 vjc-model = { path = "../vjc-model" }
 uuid.workspace = true
+rosc = "0.11.4"

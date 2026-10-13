@@ -3,6 +3,7 @@ mod compositor;
 mod fx;
 mod midi_io;
 mod monitors;
+mod osc_io;
 mod params;
 mod prefs_ui;
 
@@ -70,6 +71,11 @@ struct State {
     /// MIDI devices thread, and the LED state last sent to controllers.
     midi: midi_io::Midi,
     led_prev: HashMap<vjc_core::midi::Led, bool>,
+    /// OSC sockets thread, the config last sent to it, and the output state last sent.
+    osc: osc_io::Osc,
+    osc_cfg: Option<osc_io::Cfg>,
+    osc_prev: HashMap<String, f64>,
+    osc_limit: vjc_core::osc::RateLimit,
     /// Mappable widgets drawn this frame, for learn clicks and the key overlay.
     targets: Vec<(egui::Rect, String)>,
     /// Master bypass: black output (runtime only, not saved).
@@ -99,6 +105,7 @@ enum PrefsTab {
     Audio,
     Video,
     Control,
+    Osc,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -465,6 +472,10 @@ impl State {
             learn_target: None,
             learn_midi: false,
             midi: midi_io::Midi::spawn(),
+            osc: osc_io::Osc::spawn(),
+            osc_cfg: None,
+            osc_prev: HashMap::new(),
+            osc_limit: Default::default(),
             led_prev: HashMap::new(),
             targets: vec![],
             master_bypass: false,
@@ -1214,6 +1225,61 @@ impl State {
         self.led_prev = next;
     }
 
+    /// OSC, once per frame and never blocking: events from our own address space resolve
+    /// directly, learned external addresses fire their shortcuts (or get learned), then the
+    /// changed state goes out, rate limited per address.
+    fn osc_pump(&mut self) {
+        use vjc_core::osc as o;
+        let cfg = osc_io::Cfg::from_prefs(&self.prefs.osc);
+        if self.osc_cfg.as_ref() != Some(&cfg) {
+            self.osc.configure(cfg.clone());
+            self.osc_cfg = Some(cfg);
+            self.osc_prev.clear();
+        }
+        while let Ok(ev) = self.osc.rx.try_recv() {
+            if self.learn {
+                if self.learn_midi
+                    && let Some(target) = self.learn_target.clone()
+                {
+                    self.status = format!("{} -> {target}", ev.address);
+                    for c in o::learn(&self.project, &target, o::source_of(&ev)) {
+                        self.exec(c);
+                    }
+                }
+                continue;
+            }
+            let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+            let mut cmds: Vec<Command> = o::direct(&self.project, &rt, &ev).into_iter().collect();
+            cmds.extend(
+                self.project
+                    .shortcuts
+                    .iter()
+                    .filter_map(|s| o::command_for(&self.project, &rt, s, &ev)),
+            );
+            for c in cmds {
+                self.exec(c);
+            }
+        }
+        if !self.prefs.osc.out_enabled {
+            self.osc_prev.clear();
+            return;
+        }
+        let now = std::time::Instant::now();
+        let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+        let active = |l| active_of(&self.players, &self.gens, l);
+        let beat = self.clock.phase(now).floor() as i64;
+        let next = o::out_states(&self.project, &rt, &active, beat);
+        let due = self
+            .osc_limit
+            .filter(o::out_diff(&self.osc_prev, &next), now);
+        for (addr, v) in due {
+            if let Some(bytes) = o::encode(&addr, v) {
+                self.osc.send(bytes);
+            }
+            self.osc_prev.insert(addr, v);
+        }
+    }
+
     /// One key press in learn mode: Esc leaves, Delete unmaps the target, any other key
     /// maps to it (replacing its old key and taking the key from any other target).
     fn learn_key(&mut self, key: egui::Key) {
@@ -1272,6 +1338,7 @@ impl State {
             }
             let label = if self.learn_midi {
                 vjc_core::midi::label_for(&self.project, addr)
+                    .or_else(|| vjc_core::osc::label_for(&self.project, addr))
             } else {
                 vjc_core::shortcuts::key_for(&self.project, addr).map(str::to_owned)
             };
@@ -1496,6 +1563,7 @@ impl State {
         self.master_bar(ui);
         self.shortcut_keys(&ctx);
         self.midi_pump();
+        self.osc_pump();
 
         // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).
         let redo_key = egui::KeyboardShortcut::new(

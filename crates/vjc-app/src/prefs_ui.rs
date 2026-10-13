@@ -24,6 +24,7 @@ impl State {
                         (PrefsTab::Audio, "Audio"),
                         (PrefsTab::Video, "Video"),
                         (PrefsTab::Control, "Control"),
+                        (PrefsTab::Osc, "OSC"),
                     ] {
                         ui.selectable_value(&mut self.prefs_tab, t, l);
                     }
@@ -106,6 +107,31 @@ impl State {
                             &mut p.control.offer_shortcuts,
                             "Offer the preset when opening a project without shortcuts",
                         );
+                    }
+                    PrefsTab::Osc => {
+                        let o = &mut p.osc;
+                        ui.checkbox(&mut o.in_enabled, "Receive OSC");
+                        ui.add_enabled_ui(o.in_enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Port");
+                                ui.add(egui::DragValue::new(&mut o.in_port).range(1..=65535));
+                            });
+                            ui.checkbox(
+                                &mut o.accept_network,
+                                "Accept from network (default: this computer only)",
+                            );
+                        });
+                        ui.separator();
+                        ui.checkbox(&mut o.out_enabled, "Send OSC feedback");
+                        ui.add_enabled_ui(o.out_enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Host");
+                                ui.text_edit_singleline(&mut o.out_host);
+                                ui.label("Port");
+                                ui.add(egui::DragValue::new(&mut o.out_port).range(1..=65535));
+                            });
+                        });
+                        ui.weak("Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
                     }
                 }
                 ui.separator();
