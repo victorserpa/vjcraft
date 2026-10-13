@@ -84,6 +84,11 @@ pub fn output_lost(monitors: &[MonitorInfo], id: u32) -> bool {
     !monitors.is_empty() && find(monitors, id).is_none()
 }
 
+/// Display id at winit index `idx`; None when the list changed and the index is stale.
+pub fn id_at(monitors: &[MonitorInfo], idx: usize) -> Option<u32> {
+    monitors.get(idx).map(|m| m.id)
+}
+
 /// Index of the monitor with `id` in the current list, or `None` if it is gone.
 pub fn find(monitors: &[MonitorInfo], id: u32) -> Option<usize> {
     monitors.iter().position(|m| m.id == id)
@@ -107,6 +112,14 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn id_at_stale_index_is_none_not_a_panic() {
+        let l = vec![m(5), m(9)];
+        assert_eq!(id_at(&l, 1), Some(9));
+        assert_eq!(id_at(&l, 2), None);
+        assert_eq!(id_at(&[], 0), None);
+    }
 
     fn m(id: u32) -> MonitorInfo {
         MonitorInfo {

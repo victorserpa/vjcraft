@@ -14,6 +14,11 @@ pub fn help(r: egui::Response, key: &'static str) -> egui::Response {
     r
 }
 
+/// Key hovered so far in the current frame, without clearing it.
+pub fn peek(ctx: &egui::Context) -> Option<&'static str> {
+    ctx.data(|d| d.get_temp::<&'static str>(egui::Id::new(CUR)))
+}
+
 /// Key hovered during the frame that just ended; clears it for the next one.
 pub fn take_hovered(ctx: &egui::Context) -> Option<&'static str> {
     ctx.data_mut(|d| {

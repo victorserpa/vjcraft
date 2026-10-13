@@ -92,6 +92,8 @@ struct State {
     cells: Vec<CellInfo>,
     /// Layer name and master bar rects from the last frame, for browser effect drops.
     layer_rects: Vec<(egui::Rect, LayerId)>,
+    /// Screen rect the grid is clipped to (last frame).
+    grid_rect: egui::Rect,
     master_rect: Option<egui::Rect>,
     browser: browser::Browser,
     last_pointer: Option<egui::Pos2>,
@@ -161,13 +163,21 @@ struct State {
     metronome: bool,
     link: link_io::Link,
     link_sync: LinkSync,
-    /// Bumped when a layout is applied: panels get fresh ids so their saved sizes apply.
-    layout_gen: u32,
+    /// Set when a layout is applied or panels are toggled: the next frame forces the saved
+    /// sizes once (panel ids stay stable, so egui memory does not grow per layout switch).
+    force_panels: bool,
+    /// Height of the top bars last frame (reserved when capping the bottom panel).
+    topbars_h: f32,
     /// Name being typed in the "Save layout as..." window.
     save_layout: Option<String>,
+    /// Name of an existing custom layout waiting for overwrite confirmation.
+    overwrite_layout: Option<String>,
     /// Help text key under the pointer in the previous frame.
     help_shown: Option<&'static str>,
 }
+
+/// Smallest height the clip grid keeps when panels are enlarged.
+const GRID_MIN: f32 = 80.0;
 
 /// Old clip kept alive while a layer transition crosses to the new one (frozen on its
 /// last frame: only the incoming clip advances).
@@ -798,6 +808,7 @@ impl State {
             audio_failed: !live,
             cells: vec![],
             layer_rects: vec![],
+            grid_rect: egui::Rect::NOTHING,
             master_rect: None,
             browser: browser::Browser::new(browser_start(None, &prefs.general)),
             last_pointer: None,
@@ -863,8 +874,10 @@ impl State {
             metronome: false,
             link: link_io::Link::new(120.0),
             link_sync: LinkSync::default(),
-            layout_gen: 0,
+            force_panels: false,
+            topbars_h: 0.0,
             save_layout: None,
+            overwrite_layout: None,
             help_shown: None,
             renaming: None,
         }
@@ -921,7 +934,7 @@ impl State {
             return;
         }
         self.project = fresh_project(&self.prefs);
-        self.link_sync.note_bpm_edit();
+        self.link_sync.note_project_replaced();
         self.file = None;
         self.dirty = false;
         self.warnings.clear();
@@ -932,7 +945,7 @@ impl State {
     /// Makes `l` the current layout; panels take its sizes and visibility.
     fn apply_layout(&mut self, l: Layout) {
         self.prefs.layouts.current = l;
-        self.layout_gen += 1;
+        self.force_panels = true;
         self.prefs_dirty = true;
         self.save_prefs();
     }
@@ -979,9 +992,11 @@ impl State {
     }
 
     /// Remembers a panel's live size in the current layout (saved on exit or layout change).
-    fn track_size(&mut self, f: impl FnOnce(&mut Layout) -> &mut f32, size: f32) {
+    /// Only while the user drags the panel's handle: a size clamped to the window is not
+    /// written back, so the stored layout keeps its full value for a taller window.
+    fn track_size(&mut self, f: impl FnOnce(&mut Layout) -> &mut f32, size: f32, dragging: bool) {
         let v = f(&mut self.prefs.layouts.current);
-        if (*v - size).abs() > 0.5 && size >= 40.0 {
+        if dragging && (*v - size).abs() > 0.5 && size >= 40.0 {
             *v = size;
             self.prefs_dirty = true;
         }
@@ -1050,7 +1065,7 @@ impl State {
         }
         if new != l {
             self.prefs.layouts.current = new;
-            self.layout_gen += 1;
+            self.force_panels = true;
             self.prefs_dirty = true;
         }
     }
@@ -1071,7 +1086,7 @@ impl State {
             }
         }
         if *l != before {
-            self.layout_gen += 1;
+            self.force_panels = true;
             self.prefs_dirty = true;
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::Slash)) {
@@ -1101,9 +1116,38 @@ impl State {
                 }
             });
         if save && !name.trim().is_empty() {
-            self.save_layout_as(&name);
+            let n = name.trim();
+            if self.prefs.layouts.custom.iter().any(|l| l.name == n) {
+                // Existing custom layout: ask before replacing it.
+                self.overwrite_layout = Some(n.to_owned());
+            } else {
+                self.save_layout_as(&name);
+            }
         } else if keep {
             self.save_layout = Some(name);
+        }
+    }
+
+    fn overwrite_layout_window(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.overwrite_layout.clone() else {
+            return;
+        };
+        let (mut yes, mut no) = (false, false);
+        egui::Window::new("Replace layout?")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Layout \"{name}\" already exists. Replace it?"));
+                ui.horizontal(|ui| {
+                    yes = ui.button("Replace").clicked();
+                    no = ui.button("Cancel").clicked();
+                });
+            });
+        if yes {
+            self.save_layout_as(&name);
+        }
+        if yes || no {
+            self.overwrite_layout = None;
         }
     }
 
@@ -1160,7 +1204,7 @@ impl State {
             Ok((mut project, warnings)) => {
                 vjc_core::mapping::normalize_output(&mut project.output);
                 self.project = project;
-                self.link_sync.note_bpm_edit();
+                self.link_sync.note_project_replaced();
                 self.warnings = warnings;
                 self.status = format!("Opened {}", path.display());
                 self.prefs.general.last_project = Some(path.clone());
@@ -1200,15 +1244,19 @@ impl State {
         self.save_to(path)
     }
 
-    /// Writes the effective tempo (possibly from Link) into the project before saving.
-    fn store_effective_bpm(&mut self) {
-        let bpm = self.clock.bpm();
-        self.project.composition.tempo.bpm = bpm;
+    /// Runs `f` on the project with the effective tempo (possibly from Link) in it, so
+    /// files hold what is heard. The in-memory project is restored afterwards: saving
+    /// never changes it without a command and never touches the dirty flag or undo.
+    fn with_effective_bpm<R>(&mut self, f: impl FnOnce(&vjc_model::Project) -> R) -> R {
+        let prev = self.project.composition.tempo.bpm;
+        self.project.composition.tempo.bpm = self.clock.bpm();
+        let r = f(&self.project);
+        self.project.composition.tempo.bpm = prev;
+        r
     }
 
     fn save_to(&mut self, path: PathBuf) -> bool {
-        self.store_effective_bpm();
-        match vjc_io::save(&self.project, &path) {
+        match self.with_effective_bpm(|p| vjc_io::save(p, &path)) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
                 self.prefs.general.last_project = Some(path.clone());
@@ -1238,8 +1286,7 @@ impl State {
             if let Some(d) = r.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
-            self.store_effective_bpm();
-            if let Err(e) = vjc_io::save(&self.project, &r) {
+            if let Err(e) = self.with_effective_bpm(|p| vjc_io::save(p, &r)) {
                 self.status = format!("Autosave failed: {e}");
             }
         }
@@ -1274,7 +1321,7 @@ impl State {
                 self.status = format!("Imported {}", path.display());
                 self.warnings = i.warnings;
                 self.project = i.project;
-                self.link_sync.note_bpm_edit();
+                self.link_sync.note_project_replaced();
                 self.history.clear();
                 self.flow = Flow::default();
                 self.players.clear();
@@ -2838,6 +2885,16 @@ impl State {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        self.ui_body(ui);
+        // The help bar is drawn before the widgets, so it shows last frame's hover. If this
+        // frame's hover differs (also when the pointer left a control), draw once more.
+        let ctx = ui.ctx();
+        if help::peek(ctx) != self.help_shown {
+            ctx.request_repaint();
+        }
+    }
+
+    fn ui_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.help_shown = help::take_hovered(&ctx);
         egui::MenuBar::new().ui(ui, |ui| {
@@ -2965,26 +3022,45 @@ impl State {
         let fxs = browser_fx();
         let mut opened = None;
         let lay = self.prefs.layouts.current.clone();
-        let gen_ = self.layout_gen;
+        let force = std::mem::take(&mut self.force_panels);
+        let resizing = |id: &str| ctx.is_being_dragged(egui::Id::new(id).with("__resize"));
         if lay.browser {
-            let r = egui::Panel::right(egui::Id::new(("browser", gen_)))
-                .default_size(lay.browser_w)
-                .show(ui, |ui| opened = self.browser.show(ui, &fxs));
-            self.track_size(|l| &mut l.browser_w, r.response.rect.width());
+            let mut p = egui::Panel::right("browser").default_size(lay.browser_w);
+            if force {
+                p = p.exact_size(lay.browser_w);
+            }
+            let r = p.show(ui, |ui| opened = self.browser.show(ui, &fxs));
+            self.track_size(
+                |l| &mut l.browser_w,
+                r.response.rect.width(),
+                resizing("browser"),
+            );
         }
         let mut pcmds = vec![];
-        // Heights are relative to the window so the grid always keeps room.
-        let win_h = ui.max_rect().height();
+        // Only the grid's minimum is guaranteed (80 px + deck tabs + top bars); the rest
+        // is up to the user. The real window height bounds what the ui reports.
+        let win_h = ctx.content_rect().height();
         if self.prefs.layouts.help {
             self.help_bar(ui);
         }
+        // 40 px for the deck tabs + add buttons, 40 for the status line and separator.
+        let room = ui.available_height().min(win_h) - GRID_MIN - 80.0;
         if lay.params {
-            let r = egui::Panel::bottom(egui::Id::new(("params", gen_)))
-                .default_size(lay.params_h.min(win_h * 0.3))
+            let max = (room - self.topbars_h).max(40.0);
+            let h = lay.params_h.min(max);
+            let mut p = egui::Panel::bottom("params")
+                .default_size(h)
                 .resizable(true)
-                .size_range(40.0..=(win_h * 0.3).max(40.0))
-                .show(ui, |ui| self.params_panel(ui, &mut pcmds));
-            self.track_size(|l| &mut l.params_h, r.response.rect.height());
+                .size_range(40.0..=max);
+            if force {
+                p = p.exact_size(h);
+            }
+            let r = p.show(ui, |ui| self.params_panel(ui, &mut pcmds));
+            self.track_size(
+                |l| &mut l.params_h,
+                r.response.rect.height(),
+                resizing("params"),
+            );
         }
         for c in pcmds {
             self.exec(c);
@@ -3003,10 +3079,11 @@ impl State {
         }
         self.layer_rects.clear();
         self.targets.clear();
-        egui::Panel::top("topbars").show(ui, |ui| {
+        let r = egui::Panel::top("topbars").show(ui, |ui| {
             self.time_bar(ui);
             self.master_bar(ui);
         });
+        self.topbars_h = r.response.rect.height();
         self.shortcut_keys(&ctx);
         self.layout_keys(&ctx);
         self.midi_pump();
@@ -3039,6 +3116,7 @@ impl State {
         }
         self.prefs_window(&ctx);
         self.save_layout_window(&ctx);
+        self.overwrite_layout_window(&ctx);
         self.output_setup_window(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -3127,49 +3205,55 @@ impl State {
 
         // Monitors: preview and output side by side, each letterboxed to the comp aspect.
         // Keep >= 80 px for the grid (+ deck tabs); monitors take only what is left.
-        let mon_max = (ui.available_height() - 80.0 - 40.0)
-            .min(win_h * 0.35)
-            .min(700.0);
+        let mon_max = ui.available_height().min(win_h) - GRID_MIN - 40.0;
         if !lay.monitors || mon_max < 40.0 {
             // Hidden, or too short for monitors: collapse them entirely.
         } else if let Some(id) = self.comp_tex {
-            let r = egui::Panel::top(egui::Id::new(("monitors", gen_)))
+            let h = lay.monitors_h.min(mon_max);
+            let mut p = egui::Panel::top("monitors_tex")
                 .resizable(true)
-                .default_size(lay.monitors_h.min(mon_max))
-                .size_range(40.0..=mon_max)
-                .show(ui, |ui| {
-                    let c = &self.project.composition;
-                    let aspect = c.width as f32 / c.height.max(1) as f32;
-                    let avail = ui.available_size();
-                    let label_h = ui.text_style_height(&egui::TextStyle::Body);
-                    let w = ((avail.x - ui.spacing().item_spacing.x) / 2.0).max(0.0);
-                    ui.horizontal(|ui| {
-                        for name in ["Preview", "Output"] {
-                            ui.vertical(|ui| {
-                                ui.set_width(w);
-                                ui.label(name);
-                                let h = (avail.y - label_h - ui.spacing().item_spacing.y).max(0.0);
-                                let size = egui::vec2(w, h);
-                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                                let mut fit = egui::vec2(size.x, size.x / aspect);
-                                if fit.y > size.y {
-                                    fit = egui::vec2(size.y * aspect, size.y);
-                                }
-                                ui.painter().image(
-                                    id,
-                                    egui::Rect::from_center_size(rect.center(), fit),
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            });
-                        }
-                    });
+                .default_size(h)
+                .size_range(40.0..=mon_max);
+            if force {
+                p = p.exact_size(h);
+            }
+            let r = p.show(ui, |ui| {
+                let c = &self.project.composition;
+                let aspect = c.width as f32 / c.height.max(1) as f32;
+                let avail = ui.available_size();
+                let label_h = ui.text_style_height(&egui::TextStyle::Body);
+                let w = ((avail.x - ui.spacing().item_spacing.x) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    for name in ["Preview", "Output"] {
+                        ui.vertical(|ui| {
+                            ui.set_width(w);
+                            ui.label(name);
+                            let h = (avail.y - label_h - ui.spacing().item_spacing.y).max(0.0);
+                            let size = egui::vec2(w, h);
+                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                            let mut fit = egui::vec2(size.x, size.x / aspect);
+                            if fit.y > size.y {
+                                fit = egui::vec2(size.y * aspect, size.y);
+                            }
+                            ui.painter().image(
+                                id,
+                                egui::Rect::from_center_size(rect.center(), fit),
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        });
+                    }
                 });
-            self.track_size(|l| &mut l.monitors_h, r.response.rect.height());
+            });
+            self.track_size(
+                |l| &mut l.monitors_h,
+                r.response.rect.height(),
+                resizing("monitors_tex"),
+            );
         } else {
             egui::Panel::top("monitors")
                 .resizable(false)
@@ -3200,8 +3284,15 @@ impl State {
             .position(|d| d.id == cur);
         let comp = &self.project.composition;
         if lay.grid {
+            // Clip the grid to its own area: nothing of it may paint over the bottom panel.
+            let area = ui.available_rect_before_wrap();
+            self.grid_rect = area;
+            let mut gui = ui.new_child(egui::UiBuilder::new().max_rect(area));
+            gui.set_clip_rect(area.intersect(ui.clip_rect()));
+            let ui = &mut gui;
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
+                .max_height(area.height().max(0.0))
                 .show(ui, |ui| {
                     egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
                         ui.label("");
@@ -4397,7 +4488,6 @@ impl State {
     fn output_window(&mut self, ctx: &egui::Context) {
         let Some(comp_id) = self.comp_tex else { return };
         let mut wins: Vec<(Uuid, usize, egui::TextureId)> = vec![];
-        let ids: Vec<u32> = self.monitors.iter().map(|m| m.id).collect();
         if self.project.output.screens.is_empty() {
             if let Some(mon) = self
                 .output
@@ -4412,6 +4502,10 @@ impl State {
             }
         }
         for (sid, mon, tex) in wins {
+            // The list can change between pick and use (hotplug): skip a stale index.
+            let Some(mid) = monitors::id_at(&self.monitors, mon) else {
+                continue;
+            };
             let mut builder = egui::ViewportBuilder::default()
                 .with_title("VJCraft Output")
                 .with_fullscreen(true)
@@ -4422,7 +4516,7 @@ impl State {
             // Esc leaves learn mode first; it must not also close the output.
             let learning = self.learn;
             ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of(monitors::viewport_key(sid, ids[mon])),
+                egui::ViewportId::from_hash_of(monitors::viewport_key(sid, mid)),
                 builder,
                 |ui, _class| {
                     let ctx = ui.ctx().clone();

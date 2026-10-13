@@ -907,3 +907,163 @@ fn hovering_tap_with_help_on_shows_its_text() {
     let want = help::text("metronome").unwrap();
     assert!(exists(&h, want) || has_text(&h, want));
 }
+
+// Layout follow-ups (#92, #121)
+fn panel_h(h: &Harness<'_, State>, id: &str) -> f32 {
+    egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new(id)).map_or(0.0, |s| s.size().y)
+}
+
+fn panel_w(h: &Harness<'_, State>, id: &str) -> f32 {
+    egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new(id)).map_or(0.0, |s| s.size().x)
+}
+
+fn app_with_tex(w: f32, hgt: f32) -> Harness<'static, State> {
+    let mut st = State::headless(prefs());
+    // The font atlas stands in for the composition texture: only the layout matters.
+    st.comp_tex = Some(egui::TextureId::Managed(0));
+    app_with(st, egui::vec2(w, hgt))
+}
+
+#[test]
+fn mapping_preset_is_not_cut_by_a_fixed_ceiling_and_is_not_rewritten() {
+    let mut h = app_with_tex(1280.0, 900.0);
+    pick_layout(&mut h, "Mapping");
+    let mon = panel_h(&h, "monitors_tex");
+    assert!(
+        (mon - 420.0).abs() < 2.0,
+        "monitors {mon} (35% of 900 would be 315)"
+    );
+    snap(&mut h, "layout_mapping_tex");
+    // Small window: the panel shrinks to leave the grid room, the layout keeps 420.
+    let mut s = app_with_tex(1280.0, 520.0);
+    pick_layout(&mut s, "Mapping");
+    assert!(panel_h(&s, "monitors_tex") < 420.0);
+    assert_eq!(s.state().prefs.layouts.current.monitors_h, 420.0);
+    assert_eq!(s.state().prefs.layouts.current.params_h, 140.0);
+    let row = s.state().layer_rects.first().map(|r| r.0);
+    assert!(row.is_some_and(|r| r.height() >= 0.0));
+    snap(&mut s, "layout_mapping_tex_small");
+}
+
+#[test]
+fn params_panel_can_grow_past_thirty_percent_and_grid_keeps_room() {
+    let mut h = app_sized(1280.0, 600.0);
+    let l = Layout {
+        params_h: 330.0,
+        ..Layout::default()
+    };
+    h.state_mut().apply_layout(l);
+    settle(&mut h);
+    let p = panel_h(&h, "params");
+    assert!(p > 0.3 * 600.0 + 20.0, "params {p} cut to 30%");
+    let add = h.get_by_label("Add layer").rect();
+    assert!(add.max.y <= 600.0 - p, "grid overlaps params: {add:?}");
+    // Ridiculous size: clamped for the frame, kept in the layout, grid still >= 80 px.
+    let l = Layout {
+        params_h: 3000.0,
+        ..Layout::default()
+    };
+    h.state_mut().apply_layout(l);
+    settle(&mut h);
+    assert_eq!(h.state().prefs.layouts.current.params_h, 3000.0);
+    let p = panel_h(&h, "params");
+    assert!(p <= 600.0 - 80.0 - 40.0, "params {p} leaves no grid");
+    snap(&mut h, "layout_params_big");
+    for (w, hh) in [(800.0, 500.0), (640.0, 400.0)] {
+        let mut h = app_sized(w, hh);
+        let l = Layout {
+            params_h: 3000.0,
+            ..Layout::default()
+        };
+        h.state_mut().apply_layout(l);
+        settle(&mut h);
+        let grid = h.state().grid_rect;
+        let panel = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("params"))
+            .expect("params panel")
+            .outer_rect;
+        assert!(!h.state().layer_rects.is_empty());
+        for (r, _) in &h.state().layer_rects {
+            let visible = r.intersect(grid);
+            assert!(
+                visible.height() <= 0.0 || visible.width() <= 0.0 || !visible.intersects(panel),
+                "{w}x{hh}: row {r:?} grid {grid:?} overlaps params {panel:?}"
+            );
+        }
+        assert!(grid.height() >= 80.0, "{w}x{hh}: grid {grid:?} too small");
+        assert!(
+            grid.max.y <= panel.min.y + 0.5,
+            "{w}x{hh}: grid {grid:?} under {panel:?}"
+        );
+    }
+}
+
+#[test]
+fn switching_layouts_reapplies_sizes_with_stable_panel_ids() {
+    let mut h = app();
+    let l = Layout {
+        browser_w: 400.0,
+        params_h: 300.0,
+        ..Layout::default()
+    };
+    h.state_mut().apply_layout(l);
+    settle(&mut h);
+    assert!((panel_w(&h, "browser") - 400.0).abs() < 2.0);
+    assert!((panel_h(&h, "params") - 300.0).abs() < 2.0);
+    pick_layout(&mut h, "Performance");
+    pick_layout(&mut h, "Default");
+    assert!((panel_w(&h, "browser") - 260.0).abs() < 2.0);
+    assert!((panel_h(&h, "params") - 220.0).abs() < 2.0);
+}
+
+#[test]
+fn save_layout_as_existing_name_asks_before_overwriting() {
+    let mut h = app();
+    h.state_mut().prefs.layouts.current.browser_w = 300.0;
+    h.state_mut().save_layout_as("Mine");
+    h.state_mut().prefs.layouts.current.browser_w = 350.0;
+    h.state_mut().save_layout = Some("Mine".into());
+    settle(&mut h);
+    click(&mut h, "Save");
+    assert_eq!(h.state().overwrite_layout.as_deref(), Some("Mine"));
+    assert_eq!(
+        h.state().prefs.layouts.find("Mine").unwrap().browser_w,
+        300.0
+    );
+    click(&mut h, "Cancel");
+    assert_eq!(
+        h.state().prefs.layouts.find("Mine").unwrap().browser_w,
+        300.0
+    );
+    h.state_mut().save_layout = Some("Mine".into());
+    settle(&mut h);
+    click(&mut h, "Save");
+    click(&mut h, "Replace");
+    assert_eq!(
+        h.state().prefs.layouts.find("Mine").unwrap().browser_w,
+        350.0
+    );
+    assert!(h.state().overwrite_layout.is_none());
+}
+
+#[test]
+fn help_asks_for_a_repaint_when_hover_changes_or_ends() {
+    let mut h = app();
+    click(&mut h, "View");
+    click_menu(&mut h, "Help");
+    h.get_by_label("Tap").hover();
+    settle(&mut h);
+    assert_eq!(h.state().help_shown, Some("tap"));
+    h.step();
+    assert!(
+        !h.ctx.has_requested_repaint(),
+        "steady hover must not repaint"
+    );
+    // The bar shows last frame's hover; if this frame's differs, one more frame is due.
+    // No pointer event here, so only the help logic can ask for it.
+    h.ctx
+        .data_mut(|d| d.insert_temp(egui::Id::new("vjc_help_cur"), "metronome"));
+    h.step();
+    assert!(h.ctx.has_requested_repaint(), "stale help text, no repaint");
+    settle(&mut h);
+    assert_eq!(h.state().help_shown, Some("tap"));
+}

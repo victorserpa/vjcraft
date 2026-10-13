@@ -184,6 +184,9 @@ pub struct LinkSync {
     /// `note_bpm_edit`, consumed only when actually applied (never while Link
     /// has no state), so an edit to a value equal to the old project BPM still counts.
     pending_edit: bool,
+    /// The pending change is a replaced project (open/new/import): with peers in the
+    /// session its tempo is not pushed; the session tempo is adopted instead.
+    adopt_session: bool,
     /// The first update already ran (the first frame adopts the project BPM).
     synced: bool,
     /// Raw session tempo seen on the previous frame (while joined).
@@ -202,6 +205,14 @@ impl LinkSync {
     /// or a replaced project). Detection is by event, not by comparing values.
     pub fn note_bpm_edit(&mut self) {
         self.pending_edit = true;
+        self.adopt_session = false;
+    }
+
+    /// Signals that the whole project was replaced (open, new, import). Like joining:
+    /// with peers the session tempo wins over the file's BPM; alone, the file's BPM seeds it.
+    pub fn note_project_replaced(&mut self) {
+        self.pending_edit = true;
+        self.adopt_session = true;
     }
 
     /// Nudge while held. With Link on it shifts the local offset; otherwise the clock.
@@ -252,6 +263,7 @@ impl LinkSync {
                 clock.set_bpm(project, now);
             }
             self.pending_edit = false;
+            self.adopt_session = false;
             self.synced = true;
             return;
         }
@@ -261,7 +273,9 @@ impl LinkSync {
             self.last_update = None;
             return;
         };
+        let adopt = self.adopt_session;
         self.pending_edit = false;
+        self.adopt_session = false;
         self.synced = true;
         self.peers = s.peers;
         let mut eff = clock.bpm();
@@ -276,6 +290,9 @@ impl LinkSync {
                 self.last_link = Some(eff);
             }
             self.joined = true;
+        } else if project_changed && adopt && s.peers > 0 {
+            eff = s.bpm.clamp(MIN_BPM, MAX_BPM);
+            self.last_link = Some(s.bpm);
         } else if project_changed {
             eff = project;
             src.set_bpm(eff);
@@ -467,6 +484,31 @@ mod tests {
         ls.update(&mut f, true, 120.0, &mut c, ms(t0, 16));
         assert_eq!(c.bpm(), 100.0);
         assert!(f.sets.is_empty()); // not echoed back
+    }
+
+    #[test]
+    fn replaced_project_adopts_session_tempo_when_peers() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(140.0, 0.0, 1), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        ls.note_project_replaced(); // file says 90
+        ls.update(&mut f, true, 90.0, &mut c, ms(t0, 16));
+        assert_eq!(c.bpm(), 140.0);
+        assert!(f.sets.is_empty(), "file tempo must not reach the session");
+        assert_eq!(f.st.bpm, 140.0);
+    }
+
+    #[test]
+    fn replaced_project_seeds_session_when_alone() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls) = (fake(120.0, 0.0, 0), LinkSync::default());
+        ls.update(&mut f, true, 120.0, &mut c, t0);
+        ls.note_project_replaced();
+        ls.update(&mut f, true, 90.0, &mut c, ms(t0, 16));
+        assert_eq!(c.bpm(), 90.0);
+        assert_eq!(f.sets.last(), Some(&90.0));
     }
 
     #[test]
