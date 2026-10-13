@@ -172,6 +172,8 @@ struct State {
     /// Set when a layout is applied or panels are toggled: the next frame forces the saved
     /// sizes once (panel ids stay stable, so egui memory does not grow per layout switch).
     force_panels: bool,
+    /// Window size last frame: growth re-forces the saved panel sizes.
+    win_size: egui::Vec2,
     /// Height of the top bars last frame (reserved when capping the bottom panel).
     topbars_h: f32,
     /// Name being typed in the "Save layout as..." window.
@@ -886,6 +888,7 @@ impl State {
             link: link_io::Link::new(120.0),
             link_sync: LinkSync::default(),
             force_panels: false,
+            win_size: egui::Vec2::ZERO,
             topbars_h: 0.0,
             save_layout: None,
             overwrite_layout: None,
@@ -3086,6 +3089,13 @@ impl State {
         let fxs = browser_fx();
         let mut opened = None;
         let lay = self.prefs.layouts.current.clone();
+        // A panel clipped by a small window keeps its clipped size in egui memory; when the
+        // window grows again, bring it back to the layout size.
+        let win = ctx.content_rect().size();
+        if window_grew(self.win_size, win) {
+            self.force_panels = true;
+        }
+        self.win_size = win;
         let force = std::mem::take(&mut self.force_panels);
         let resizing = |id: &str| ctx.is_being_dragged(egui::Id::new(id).with("__resize"));
         if lay.browser {
@@ -4750,8 +4760,23 @@ fn autopilot_playable(source: &vjc_model::Source) -> bool {
     )
 }
 
+/// True when the window got larger in either axis (zero `prev` = first frame, no growth).
+fn window_grew(prev: egui::Vec2, now: egui::Vec2) -> bool {
+    prev.x > 0.0 && prev.y > 0.0 && (now.x > prev.x + 0.5 || now.y > prev.y + 0.5)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_growth_reforces_panels() {
+        let v = egui::vec2;
+        assert!(super::window_grew(v(800.0, 500.0), v(1200.0, 500.0)));
+        assert!(super::window_grew(v(800.0, 500.0), v(800.0, 700.0)));
+        assert!(!super::window_grew(v(800.0, 500.0), v(800.0, 500.0)));
+        assert!(!super::window_grew(v(800.0, 500.0), v(600.0, 400.0)));
+        assert!(!super::window_grew(v(0.0, 0.0), v(800.0, 500.0)));
+    }
+
     #[test]
     fn autopilot_takes_files_and_generators_not_live() {
         use vjc_model::Source;

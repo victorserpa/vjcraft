@@ -84,8 +84,13 @@ impl Ring {
 
     /// Consumer: drops everything buffered.
     pub fn skip_all(&self) {
-        self.read
-            .store(self.write.load(Ordering::Acquire), Ordering::Release);
+        self.skip_to(self.write.load(Ordering::Acquire));
+    }
+
+    /// Consumer: drops everything before write position `w`. Never moves `read` backwards
+    /// (the producer may have discarded further meanwhile), so stale frames do not return.
+    fn skip_to(&self, w: usize) {
+        self.read.fetch_max(w, Ordering::AcqRel);
     }
 
     /// Buffered stereo frames.
@@ -131,6 +136,22 @@ impl Voice {
         self.flush.load(Ordering::Acquire)
     }
 
+    /// Consumer: starts applying a requested flush. Returns the write position to drop up to.
+    /// The flag stays set until `finish_flush`, so the producer cannot push fresh audio in
+    /// between that the drop would eat (a slow callback may even outlast `FLUSH_WAIT`).
+    fn begin_flush(&self) -> Option<usize> {
+        if self.flush.load(Ordering::Acquire) {
+            Some(self.ring.write.load(Ordering::Acquire))
+        } else {
+            None
+        }
+    }
+
+    fn finish_flush(&self, w: usize) {
+        self.ring.skip_to(w);
+        self.flush.store(false, Ordering::Release);
+    }
+
     /// Asks the consumer to drop what is buffered (used before a re-seek).
     pub fn request_flush(&self) {
         self.flush.store(true, Ordering::Release);
@@ -157,8 +178,8 @@ pub fn mix_stereo(out: &mut [f32], voices: &[Arc<Voice>]) {
             v.ring.skip_all();
             continue;
         }
-        if v.flush.swap(false, Ordering::Acquire) {
-            v.ring.skip_all();
+        if let Some(w) = v.begin_flush() {
+            v.finish_flush(w);
         }
         let vol = f32::from_bits(v.volume.load(Ordering::Relaxed));
         let vol = if vol.is_finite() { vol.max(0.0) } else { 0.0 };
@@ -805,6 +826,32 @@ mod tests {
         assert_eq!(push_after_flush(&v, &fresh, 0, Duration::ZERO), Some(2));
         mix_stereo(&mut out, std::slice::from_ref(&v));
         assert_eq!(out, [0.5, 0.5]); // not eaten by a late flush
+    }
+
+    #[test]
+    fn flush_in_progress_keeps_producer_waiting() {
+        let v = Voice::new(64);
+        v.ring.push(&[0.9, 0.9]);
+        v.request_flush();
+        let w = v.begin_flush().expect("pending");
+        // Callback is mid-flush: the producer must not push yet.
+        assert_eq!(push_after_flush(&v, &[0.5, 0.5], 0, Duration::ZERO), None);
+        v.finish_flush(w);
+        assert_eq!(
+            push_after_flush(&v, &[0.5, 0.5], 0, Duration::ZERO),
+            Some(2)
+        );
+        assert_eq!(v.ring.pop_frame(), Some([0.5, 0.5]));
+    }
+
+    #[test]
+    fn consumer_skip_never_moves_read_backwards() {
+        let r = Ring::new(8);
+        r.push(&[1.0; 8]);
+        r.discard_from_producer(); // read = 8
+        r.skip_to(2); // stale snapshot
+        r.push(&[0.5, 0.5]);
+        assert_eq!(r.pop_frame(), Some([0.5, 0.5]));
     }
 
     #[test]
