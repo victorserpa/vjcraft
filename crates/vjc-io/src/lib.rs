@@ -1,6 +1,7 @@
 //! Save/open of `.vjc` project files (JSON, `format_version`), with relative
 //! media paths, missing-media warnings, migration and atomic writes.
 
+pub mod output_presets;
 pub mod prefs;
 
 use serde_json::Value;
@@ -412,6 +413,36 @@ mod tests {
         let f2 = d.join("new.vjc");
         save(&p, &f2).unwrap();
         assert_eq!(open(&f2).unwrap().0, p);
+    }
+
+    #[test]
+    fn slice_without_source_opens_as_composition_and_source_roundtrips() {
+        use vjc_model::SliceSource;
+        let d = tmp("slice_source");
+        let f = d.join("old.vjc");
+        let mut p = Project::new("old");
+        let mut scr = vjc_core::mapping::new_screen("S", 1920, 1080);
+        scr.slices.push(vjc_core::mapping::new_slice(1920, 1080));
+        p.output.screens.push(scr);
+        // A project saved before routing existed has no "source" key on its slices.
+        let mut v = serde_json::to_value(&p).unwrap();
+        let slice = &mut v["output"]["screens"][0]["slices"][0];
+        assert!(slice.as_object_mut().unwrap().remove("source").is_some());
+        std::fs::write(&f, serde_json::to_vec(&v).unwrap()).unwrap();
+        let (mut q, w) = open(&f).unwrap();
+        assert!(w.is_empty());
+        assert_eq!(
+            q.output.screens[0].slices[0].source,
+            SliceSource::Composition
+        );
+        let layer = vjc_model::LayerId::new_v4();
+        q.output.screens[0].slices[0].source = SliceSource::Layer(layer);
+        let f2 = d.join("new.vjc");
+        save(&q, &f2).unwrap();
+        assert_eq!(
+            open(&f2).unwrap().0.output.screens[0].slices[0].source,
+            SliceSource::Layer(layer)
+        );
     }
 
     #[test]

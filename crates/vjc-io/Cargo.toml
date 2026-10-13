@@ -9,3 +9,4 @@ vjc-core = { path = "../vjc-core" }
 vjc-model = { path = "../vjc-model" }
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true

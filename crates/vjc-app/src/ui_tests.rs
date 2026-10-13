@@ -1778,3 +1778,302 @@ fn output_menu_test_card_identify_fps_and_display_info() {
     assert!(h.state().display_info_open);
     assert!(exists(&h, "Display info"));
 }
+
+/// Opens Output setup on one 1920x1080 screen "Wall" with one slice whose output is the
+/// 480x270 rectangle at (100, 200); returns the harness.
+fn precise_slice_setup() -> Harness<'static, State> {
+    let mut h = app();
+    let mut scr = vjc_core::mapping::new_screen("Wall", 1920, 1080);
+    let mut sl = vjc_core::mapping::new_slice(1920, 1080);
+    sl.output_mesh = vec![
+        (100.0, 200.0),
+        (580.0, 200.0),
+        (100.0, 470.0),
+        (580.0, 470.0),
+    ];
+    scr.slices.push(sl);
+    h.state_mut().exec(Command::AddScreen {
+        screen: scr,
+        index: 0,
+    });
+    settle(&mut h);
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    h
+}
+
+fn first_slice(h: &Harness<'_, State>) -> vjc_model::Slice {
+    h.state().project.output.screens[0].slices[0].clone()
+}
+
+fn out_rect(h: &Harness<'_, State>) -> vjc_core::slice_geom::Rect {
+    vjc_core::slice_geom::bbox(&first_slice(h).output_mesh).unwrap()
+}
+
+/// Types `text` into the field that shows `shown`, then Enter.
+fn type_in_field(h: &mut Harness<'_, State>, shown: &str, text: &str) {
+    h.query_all_by_value(shown)
+        .next()
+        .unwrap_or_else(|| panic!("no field showing {shown}"))
+        .click();
+    settle(h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    settle(h);
+    h.event(egui::Event::Text(text.into()));
+    settle(h);
+    h.key_press(egui::Key::Enter);
+    settle(h);
+}
+
+#[test]
+fn slice_inspector_math_fields_buttons_and_undo() {
+    let mut h = precise_slice_setup();
+    let before = h.state().project.clone();
+    // 480 / 3 = 160 wide, same height.
+    type_in_field(&mut h, "480", "/3");
+    let r = out_rect(&h);
+    assert_eq!((r.w, r.h, r.x, r.y), (160.0, 270.0, 100.0, 200.0));
+    type_in_field(&mut h, "100", "+10");
+    assert_eq!(out_rect(&h).x, 110.0);
+    // Both field edits coalesce into one undo step.
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(h.state().project, before, "fields are undoable");
+    // Quarter turn swaps the box; flips keep it.
+    click(&mut h, "Rotate 90");
+    let r = out_rect(&h);
+    assert_eq!((r.w, r.h), (270.0, 480.0));
+    click(&mut h, "Flip H");
+    assert_eq!(out_rect(&h), r);
+    // The input side works in composition pixels: match output shape gives a 1:1 map.
+    let comp = (
+        h.state().project.composition.width,
+        h.state().project.composition.height,
+    );
+    h.state_mut().undo();
+    settle(&mut h);
+    assert!(!vjc_core::mapping::slice_unscaled(comp, &first_slice(&h)));
+    assert_eq!(out_rect(&h).w, 480.0);
+    click(&mut h, "Match output shape");
+    assert!(vjc_core::mapping::slice_unscaled(comp, &first_slice(&h)));
+    // Duplicate selects the copy right after the original.
+    click(&mut h, "Duplicate slice");
+    let slices = &h.state().project.output.screens[0].slices;
+    assert_eq!(slices.len(), 2);
+    assert_ne!(slices[0].id, slices[1].id);
+    assert_eq!(slices[0].output_mesh, slices[1].output_mesh);
+    assert_eq!(h.state().sel_slice, Some(slices[1].id));
+}
+
+#[test]
+fn slice_inspector_moves_slice_to_another_screen() {
+    let mut h = precise_slice_setup();
+    let b = vjc_core::mapping::new_screen("Wall B", 640, 480);
+    let bid = b.id;
+    h.state_mut().exec(Command::AddScreen {
+        screen: b,
+        index: 1,
+    });
+    settle(&mut h);
+    click(&mut h, "Move to screen");
+    // The name is also in the screen list: the last one is the menu entry.
+    h.query_all_by_label("Wall B").last().unwrap().click();
+    settle(&mut h);
+    let out = &h.state().project.output;
+    assert!(out.screens[0].slices.is_empty());
+    assert_eq!(out.screens[1].slices.len(), 1);
+    assert_eq!(h.state().sel_screen, Some(bid));
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 1);
+}
+
+/// Top-left of the output canvas: just under its caption.
+fn out_canvas_origin(h: &Harness<'_, State>) -> egui::Pos2 {
+    let r = h.get_by_label_contains("Output (mesh").rect();
+    egui::pos2(r.left(), r.bottom() + 4.0)
+}
+
+#[test]
+fn arrow_keys_move_the_slice_one_pixel_and_ten_with_shift() {
+    let mut h = precise_slice_setup();
+    let o = out_canvas_origin(&h);
+    h.hover_at(o + egui::vec2(170.0, 90.0));
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowRight);
+    settle(&mut h);
+    assert_eq!(out_rect(&h).x, 101.0);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+    settle(&mut h);
+    let r = out_rect(&h);
+    assert_eq!((r.x, r.y, r.w, r.h), (101.0, 210.0, 480.0, 270.0));
+}
+
+/// Drags the output handle of the top-left corner (100, 200) to canvas offset `to_x`,
+/// holding `mods`; returns the resulting x in pixels.
+fn drag_corner_to(h: &mut Harness<'_, State>, to_x: f32, mods: egui::Modifiers) -> f32 {
+    let o = out_canvas_origin(h);
+    let k = 340.0 / 1920.0;
+    let from = o + egui::vec2(100.0 * k, 200.0 * k);
+    let to = o + egui::vec2(to_x, 200.0 * k);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: mods,
+    };
+    h.event(egui::Event::ModifiersChanged(mods));
+    h.hover_at(from);
+    h.step();
+    h.event(button(from, true));
+    h.step();
+    // Small steps: egui reports the drag a few pixels in, and the handle must still be
+    // within reach of where the drag is first seen.
+    for i in 1..=60 {
+        h.event(egui::Event::PointerMoved(from.lerp(to, i as f32 / 60.0)));
+        h.step();
+    }
+    h.event(button(to, false));
+    settle(h);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    settle(h);
+    first_slice(h).output_mesh[0].0
+}
+
+#[test]
+fn dragging_a_corner_snaps_to_the_screen_centre_and_alt_disables_it() {
+    // 170 canvas px is the centre (960 px); 167 is 3 canvas px short of it.
+    let mut h = precise_slice_setup();
+    let x = drag_corner_to(&mut h, 167.0, egui::Modifiers::NONE);
+    assert_eq!(x, 960.0, "snapped to the screen centre");
+    let mut h = precise_slice_setup();
+    let x = drag_corner_to(&mut h, 167.0, egui::Modifiers::ALT);
+    assert!(
+        (x - 960.0).abs() > 5.0 && (x - 940.0).abs() < 30.0,
+        "free: {x}"
+    );
+}
+
+#[test]
+fn slice_source_dropdown_routes_a_layer_and_undoes() {
+    use vjc_model::SliceSource;
+    let mut h = precise_slice_setup();
+    assert_eq!(first_slice(&h).source, SliceSource::Composition);
+    let layer = h
+        .state()
+        .project
+        .composition
+        .layers
+        .iter()
+        .find(|l| l.name == "Layer 1")
+        .unwrap()
+        .id;
+    click(&mut h, "Source");
+    click(&mut h, "Layer: Layer 1");
+    assert_eq!(first_slice(&h).source, SliceSource::Layer(layer));
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(first_slice(&h).source, SliceSource::Composition);
+    // The menu also offers the preview.
+    click(&mut h, "Source");
+    assert!(exists(&h, "Preview"));
+}
+
+fn presets_tmp(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("vjc-ui-presets-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+#[test]
+fn output_presets_save_load_rename_delete_with_undo() {
+    let dir = presets_tmp("flow");
+    let mut h = precise_slice_setup();
+    h.state_mut().presets_dir = Some(dir.clone());
+    settle(&mut h);
+    let wall = h.state().project.output.clone();
+    h.state_mut().preset_text = "Venue A".into();
+    click(&mut h, "Save preset");
+    assert_eq!(vjc_io::output_presets::list(&dir), vec!["Venue A"]);
+    // Change the setup, then load the preset: the saved layout is back (new ids), undoable.
+    let before_edit = {
+        let id = h.state().project.output.screens[0].id;
+        h.state_mut().exec(Command::RemoveScreen { screen: id });
+        settle(&mut h);
+        assert!(h.state().project.output.screens.is_empty());
+        h.state().project.output.clone()
+    };
+    click(&mut h, "Load preset");
+    let out = &h.state().project.output;
+    assert_eq!(out.screens.len(), 1);
+    let (a, b) = (&out.screens[0], &wall.screens[0]);
+    assert_eq!((&a.name, a.width, a.height), (&b.name, b.width, b.height));
+    assert_eq!(a.slices[0].output_mesh, b.slices[0].output_mesh);
+    assert_eq!(h.state().sel_screen, Some(a.id));
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(h.state().project.output, before_edit);
+    // Rename (type the new name first), then the two-step delete.
+    h.state_mut().preset_text = "Venue B".into();
+    click(&mut h, "Rename preset");
+    assert_eq!(vjc_io::output_presets::list(&dir), vec!["Venue B"]);
+    click(&mut h, "Delete preset");
+    assert_eq!(
+        vjc_io::output_presets::list(&dir).len(),
+        1,
+        "first click only asks"
+    );
+    click(&mut h, "Confirm delete");
+    assert!(vjc_io::output_presets::list(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn output_preset_with_a_missing_display_loads_as_window_with_a_warning() {
+    let dir = presets_tmp("missing");
+    let mut h = precise_slice_setup();
+    h.state_mut().presets_dir = Some(dir.clone());
+    let id = h.state().project.output.screens[0].id;
+    h.state_mut().exec(Command::SetScreenDevice {
+        screen: id,
+        device: vjc_model::OutputDevice::Monitor {
+            name: "4242".into(),
+        },
+    });
+    settle(&mut h);
+    h.state_mut().preset_text = "Hall".into();
+    click(&mut h, "Save preset");
+    click(&mut h, "Load preset");
+    let s = &h.state().project.output.screens[0];
+    assert_eq!(s.device, vjc_model::OutputDevice::Window);
+    assert_eq!(h.state().preset_warnings.len(), 1);
+    assert!(h.get_by_label_contains("not connected").rect().width() > 0.0);
+    click(&mut h, "Dismiss warnings");
+    assert!(h.state().preset_warnings.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn output_presets_export_then_import_into_another_folder() {
+    let (a, b) = (presets_tmp("exp-a"), presets_tmp("exp-b"));
+    let mut h = precise_slice_setup();
+    h.state_mut().presets_dir = Some(a.clone());
+    h.state_mut().preset_save("Shared");
+    std::fs::create_dir_all(&b).unwrap();
+    let file = b.join("shared.vjcout");
+    h.state_mut().preset_export("Shared", &file);
+    assert!(file.exists());
+    h.state_mut().presets_dir = Some(b.join("mine"));
+    h.state_mut().preset_import(&file);
+    assert_eq!(
+        vjc_io::output_presets::list(&b.join("mine")),
+        vec!["Shared"]
+    );
+    // A broken file is reported, not imported.
+    std::fs::write(&file, b"nope").unwrap();
+    h.state_mut().preset_import(&file);
+    assert!(h.state().status.contains("failed"), "{}", h.state().status);
+    assert_eq!(vjc_io::output_presets::list(&b.join("mine")).len(), 1);
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}

@@ -16,9 +16,11 @@ mod monitors;
 mod netout;
 mod osc_io;
 mod output_overlay;
+mod output_presets_ui;
 mod output_ui;
 mod params;
 mod prefs_ui;
+mod slice_inspector;
 mod slice_render;
 mod theme;
 mod timecode_io;
@@ -160,6 +162,18 @@ struct State {
     sel_pt_in: Option<usize>,
     sel_pt_out: Option<usize>,
     snap: bool,
+    /// Folder of output presets; `None` in tests (nothing touches the user's folder).
+    presets_dir: Option<PathBuf>,
+    /// Preset names in the folder; `None` = read again.
+    preset_names: Option<Vec<String>>,
+    preset_sel: Option<String>,
+    /// Name typed for Save / Rename.
+    preset_text: String,
+    preset_confirm_delete: bool,
+    /// Why the last loaded preset differs from what was saved.
+    preset_warnings: Vec<String>,
+    /// Side of the slice the inspector's numeric fields and buttons edit.
+    geom_side: vjc_core::slice_geom::Side,
     /// Output canvas edits the slice mask polygon instead of the warp mesh.
     edit_mask: bool,
     sel_mask_pt: Option<usize>,
@@ -897,6 +911,15 @@ impl State {
             sel_pt_in: None,
             sel_pt_out: None,
             snap: false,
+            presets_dir: live
+                .then(|| project_dirs().map(|d| d.data_dir().join("output-presets")))
+                .flatten(),
+            preset_names: None,
+            preset_sel: None,
+            preset_text: String::new(),
+            preset_confirm_delete: false,
+            preset_warnings: vec![],
+            geom_side: vjc_core::slice_geom::Side::Output,
             edit_mask: false,
             sel_mask_pt: None,
             closed_screens: Default::default(),
@@ -2079,6 +2102,7 @@ impl State {
         let Some(rs) = frame.wgpu_render_state() else {
             return;
         };
+        let routes = self.active_routes();
         let c = &self.project.composition;
         let (w, h) = (c.width.max(1), c.height.max(1));
         let dials = self.dials();
@@ -2284,6 +2308,7 @@ impl State {
                 .count();
             if let Some(g) = c.group(gid).filter(|g| !c.group_off(g)) {
                 group_draws.push(compositor::GroupDraw {
+                    id: Some(gid),
                     start: i,
                     len,
                     opacity: vjc_core::anim::effective_number(&g.track.opacity, &actx) as f32,
@@ -2301,13 +2326,12 @@ impl State {
             }
             i += len;
         }
-        comp.render_groups(
+        comp.render_routed(
             &rs.device,
             &rs.queue,
-            &draws,
-            &group_draws,
-            &master,
-            master_opacity,
+            (&draws, &group_draws),
+            (&master, master_opacity),
+            &routes,
         );
         self.ml.pump(comp, &rs.device, &rs.queue);
         match self.rec_request.take() {
@@ -2370,6 +2394,27 @@ impl State {
             .collect()
     }
 
+    /// Screens that are rendered this frame: open monitor windows, Syphon / NDI and Art-Net.
+    fn output_screen_ids(&self) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = self.open_screens().into_iter().map(|(id, _)| id).collect();
+        ids.extend(self.net_wants().iter().map(|w| w.id));
+        ids.extend(self.artnet_wants().iter().map(|w| w.id));
+        ids
+    }
+
+    /// Layers and groups that a slice of a rendered screen routes: the only extra renders
+    /// the compositor does (a project that routes nothing pays nothing).
+    fn active_routes(&self) -> Vec<vjc_model::SliceSource> {
+        let ids = self.output_screen_ids();
+        vjc_core::mapping::routed_sources(
+            self.project
+                .output
+                .screens
+                .iter()
+                .filter(|s| ids.contains(&s.id)),
+        )
+    }
+
     /// Screens set to Syphon or NDI: what each publishes.
     fn net_wants(&self) -> Vec<netout::Want> {
         self.project
@@ -2420,9 +2465,7 @@ impl State {
         self.netout.sync(&wants);
         let art = self.artnet_wants();
         self.artnet.sync(&art);
-        let mut open: Vec<Uuid> = self.open_screens().into_iter().map(|(id, _)| id).collect();
-        open.extend(wants.iter().map(|w| w.id));
-        open.extend(art.iter().map(|w| w.id));
+        let open = self.output_screen_ids();
         let gone: Vec<Uuid> = self
             .screen_rt
             .keys()
@@ -2485,12 +2528,12 @@ impl State {
                 }
             }
             let t = &self.screen_rt[&id];
-            r.render(
-                &rs.device,
-                &rs.queue,
-                (scr, &comp.target_view, comp.size),
-                &t.view,
-            );
+            // Each slice samples its own source; a routed layer / group has its own texture.
+            let source = |sl: &vjc_model::Slice| {
+                let view = comp.routed_view(sl.source).unwrap_or(&comp.target_view);
+                (view, comp.size)
+            };
+            r.render(&rs.device, &rs.queue, scr, &source, &t.view);
         }
         // Publish: the screen's own target when it has slices, else the composition.
         let fps = self.project.composition.fps;

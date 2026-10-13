@@ -539,6 +539,25 @@ pub struct Slice {
     pub mesh_cols: u32,
     pub mask: Option<Vec<(f32, f32)>>,
     pub soft_edge: Option<SoftEdge>,
+    /// What the input rectangle samples. Projects saved before routing existed have no
+    /// field and load as the whole composition.
+    #[serde(default)]
+    pub source: SliceSource,
+}
+
+/// Where a slice takes its picture from (before the master chain).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SliceSource {
+    /// The finished composition.
+    #[default]
+    Composition,
+    /// One layer on its own (its opacity and chain, nothing below or above it).
+    Layer(LayerId),
+    /// One layer group on its own (its layers, group chain and opacity).
+    Group(GroupId),
+    /// The preview monitor. Preview currently equals the output, so this is the
+    /// composition.
+    Preview,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

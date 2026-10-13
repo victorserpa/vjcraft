@@ -2,7 +2,9 @@
 
 use crate::State;
 use crate::artnet_out;
+use crate::slice_inspector::{arrow_move, snap_dragged};
 use eframe::egui;
+use vjc_core::slice_geom::{self, Side};
 use vjc_core::{Command, dmx, mapping};
 use vjc_model::{ChannelOrder, Fixture, OutputDevice, PixelFormat, Screen};
 
@@ -110,6 +112,7 @@ fn canvas_rect(ui: &mut egui::Ui, w: f32, aspect: f32) -> egui::Rect {
 impl State {
     pub(crate) fn output_setup_window(&mut self, ctx: &egui::Context) {
         if !self.output_setup_open {
+            self.preset_names = None;
             return;
         }
         let mut open = true;
@@ -126,6 +129,7 @@ impl State {
             .open(&mut open)
             .default_width(820.0)
             .show(ctx, |ui| {
+                self.presets_row(ui);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(190.0);
@@ -555,13 +559,14 @@ impl State {
                 }
             });
             self.mask_and_edge_row(ui, scr, sl, cmds);
+            self.slice_inspector(ui, scr, sl, cmds);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.label("Input (composition)");
+                    ui.label("Input (composition; arrows move 1 px / Shift 10 px)");
                     self.input_canvas(ui, scr, sl, cmds);
                 });
                 ui.vertical(|ui| {
-                    ui.label("Output (mesh, arrows move 1 px / Shift 10 px)");
+                    ui.label("Output (mesh; arrows move 1 px / Shift 10 px; Alt = no snap)");
                     self.output_canvas(ui, scr, sl, cmds);
                 });
             });
@@ -693,6 +698,13 @@ impl State {
         let moved = handles(ui, id, (rect, (1.0, 1.0)), &sl.input, &mut sel, snap, false);
         self.sel_pt_in = sel;
         if let Some((i, q)) = moved {
+            let others: Vec<_> = scr
+                .slices
+                .iter()
+                .filter(|s| s.id != sl.id)
+                .filter_map(|s| slice_geom::bbox(&s.input))
+                .collect();
+            let q = snap_dragged(ui, q, (1.0, 1.0), &others, 1.0 / rect.width());
             let mut input = sl.input.clone();
             input[i] = q;
             cmds.push(Command::SetSliceInput {
@@ -700,6 +712,11 @@ impl State {
                 slice: sl.id,
                 input,
             });
+        } else if sel.is_none()
+            && let Some(by) = arrow_move(ui, rect)
+            && let Some(cmd) = self.nudge_slice(scr, sl, Side::Input, by)
+        {
+            cmds.push(cmd);
         }
     }
 
@@ -751,6 +768,13 @@ impl State {
         let moved = handles(ui, id, (rect, space), &sl.output_mesh, &mut sel, snap, true);
         self.sel_pt_out = sel;
         if let Some((i, q)) = moved {
+            let others: Vec<_> = scr
+                .slices
+                .iter()
+                .filter(|s| s.id != sl.id)
+                .filter_map(|s| slice_geom::bbox(&s.output_mesh))
+                .collect();
+            let q = snap_dragged(ui, q, space, &others, space.0 / rect.width());
             let mut mesh = sl.output_mesh.clone();
             mesh[i] = q;
             cmds.push(Command::SetSliceMesh {
@@ -759,6 +783,12 @@ impl State {
                 mesh,
                 cols: sl.mesh_cols,
             });
+        } else if sel.is_none()
+            && let Some(by) = arrow_move(ui, rect)
+            && let Some(cmd) = self.nudge_slice(scr, sl, Side::Output, by)
+        {
+            // No point selected: the arrows move the whole slice.
+            cmds.push(cmd);
         }
     }
 

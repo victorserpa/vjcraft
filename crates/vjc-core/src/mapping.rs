@@ -40,7 +40,25 @@ pub fn new_slice(w: u32, h: u32) -> Slice {
         mesh_cols: 2,
         mask: None,
         soft_edge: None,
+        source: Default::default(),
     }
+}
+
+/// Distinct layer / group sources routed by the slices of `screens`: the only ones the
+/// compositor has to render on their own.
+pub fn routed_sources<'a>(
+    screens: impl IntoIterator<Item = &'a Screen>,
+) -> Vec<vjc_model::SliceSource> {
+    use vjc_model::SliceSource;
+    let mut out: Vec<SliceSource> = vec![];
+    for sl in screens.into_iter().flat_map(|s| &s.slices) {
+        if matches!(sl.source, SliceSource::Layer(_) | SliceSource::Group(_))
+            && !out.contains(&sl.source)
+        {
+            out.push(sl.source);
+        }
+    }
+    out
 }
 
 pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
@@ -114,6 +132,28 @@ pub fn mesh_valid(mesh: &[Pt], cols: u32) -> bool {
         && (mesh.len() as u32).is_multiple_of(cols)
         && (MIN_GRID..=MAX_GRID).contains(&rows_of(mesh.len(), cols));
     ok && mesh.iter().all(|p| p.0.is_finite() && p.1.is_finite())
+}
+
+/// True when `screens` can replace the output setup: unique screen and slice ids, sizes
+/// 1..=16384, valid meshes, masks and inputs.
+pub fn screens_valid(screens: &[Screen]) -> bool {
+    let mut ids = std::collections::HashSet::new();
+    screens.iter().all(|s| {
+        (1..=16384).contains(&s.width)
+            && (1..=16384).contains(&s.height)
+            && ids.insert(s.id)
+            && s.slices.iter().all(|sl| {
+                ids.insert(sl.id)
+                    && mesh_valid(&sl.output_mesh, sl.mesh_cols)
+                    && sl.input.len() >= 3
+                    && sl.input.iter().all(|p| p.0.is_finite() && p.1.is_finite())
+                    && sl.mask.as_ref().is_none_or(|m| mask_valid(m))
+                    && sl
+                        .soft_edge
+                        .as_ref()
+                        .is_none_or(|e| clamp_soft_edge(e).is_some())
+            })
+    })
 }
 
 /// Replaces every invalid slice mesh with a 2x2 grid covering its screen.

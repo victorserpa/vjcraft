@@ -5,7 +5,7 @@
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use vjc_core::blend::shader_id;
-use vjc_model::{BlendMode, FitMode, LayerId};
+use vjc_model::{BlendMode, FitMode, GroupId, LayerId, SliceSource};
 
 use crate::ml_gpu::MlStore;
 pub use crate::ml_gpu::{MlDraw, MlFrame};
@@ -550,6 +550,8 @@ pub struct LayerDraw<'a> {
 /// are composed into an own buffer, `effects` run over it, then it is blended into the
 /// stack like a layer with `opacity` and `blend`.
 pub struct GroupDraw {
+    /// The model group, so a slice can route it on its own.
+    pub id: Option<GroupId>,
     pub start: usize,
     pub len: usize,
     pub opacity: f32,
@@ -592,6 +594,9 @@ pub struct Compositor {
     fade: (wgpu::Texture, wgpu::Buffer, wgpu::BindGroup),
     slots: HashMap<LayerId, Slot>,
     group: Option<GroupBuf>,
+    /// Layers / groups rendered on their own because a slice routes them (only the ones
+    /// in use are kept).
+    routed: HashMap<SliceSource, (wgpu::Texture, wgpu::TextureView)>,
     fx: Fx,
     pub target: wgpu::Texture,
     pub target_view: wgpu::TextureView,
@@ -926,6 +931,7 @@ impl Compositor {
             fade: (fade_tex, fade_buf, fade_bind),
             slots: HashMap::new(),
             group: None,
+            routed: HashMap::new(),
             fx,
             target,
             target_view,
@@ -1238,6 +1244,7 @@ impl Compositor {
     }
 
     /// Like `render`, with layer groups: each `GroupDraw` covers a run of `layers_bottom_to_top`.
+    #[cfg(test)]
     pub fn render_groups(
         &mut self,
         device: &wgpu::Device,
@@ -1246,6 +1253,30 @@ impl Compositor {
         groups: &[GroupDraw],
         master: &[EffectDraw],
         master_opacity: f32,
+    ) {
+        self.render_routed(
+            device,
+            queue,
+            (layers_bottom_to_top, groups),
+            (master, master_opacity),
+            &[],
+        );
+    }
+
+    /// The view of a routed layer / group rendered by the last `render_routed`.
+    pub fn routed_view(&self, source: SliceSource) -> Option<&wgpu::TextureView> {
+        self.routed.get(&source).map(|t| &t.1)
+    }
+
+    /// Composes the stack, and renders each layer / group in `routes` on its own (same size,
+    /// black background, master fade applied, master effects not) for slices that route it.
+    pub fn render_routed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        (layers_bottom_to_top, groups): (&[LayerDraw], &[GroupDraw]),
+        (master, master_opacity): (&[EffectDraw], f32),
+        routes: &[SliceSource],
     ) {
         self.fx.next = 0;
         self.fx.mix_next = 0;
@@ -1450,36 +1481,113 @@ impl Compositor {
                     1.0f32.to_bits(),
                 ]),
             );
-            enc.copy_texture_to_texture(
-                self.target.as_image_copy(),
-                self.base.as_image_copy(),
-                extent,
+            self.fade_pass(&mut enc, extent);
+        }
+        self.routed.retain(|k, _| routes.contains(k));
+        for r in routes {
+            self.render_route(
+                device,
+                queue,
+                &mut enc,
+                *r,
+                (layers_bottom_to_top, groups),
+                (extent, fade > 0.0, &mut group_no),
             );
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("master_fade"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipe);
-            pass.set_bind_group(0, &self.fade.2, &[]);
-            pass.set_bind_group(1, &self.base_bind, &[]);
-            pass.draw(0..3, 0..1);
         }
         let used = std::mem::take(&mut self.fx.used);
         self.fx.scratch.retain(|k, _| used.contains(k));
         queue.submit(Some(enc.finish()));
         self.fx.ml.dispatch(device, queue);
+    }
+
+    /// Blends the black master fade (set up by `render_routed`) over the current target.
+    fn fade_pass(&self, enc: &mut wgpu::CommandEncoder, extent: wgpu::Extent3d) {
+        enc.copy_texture_to_texture(
+            self.target.as_image_copy(),
+            self.base.as_image_copy(),
+            extent,
+        );
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("master_fade"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, &self.fade.2, &[]);
+        pass.set_bind_group(1, &self.base_bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Renders one routed layer or group alone into its own texture, by swapping it in as
+    /// the composition target for the duration of the draw.
+    fn render_route(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        route: SliceSource,
+        (layers, groups): (&[LayerDraw], &[GroupDraw]),
+        (extent, fade, group_no): (wgpu::Extent3d, bool, &mut usize),
+    ) {
+        let size = (self.size.0.max(1), self.size.1.max(1));
+        let mut rt = match self.routed.remove(&route) {
+            Some(t) if (t.0.width(), t.0.height()) == size => t,
+            _ => make_target(device, size.0, size.1),
+        };
+        std::mem::swap(&mut self.target, &mut rt.0);
+        std::mem::swap(&mut self.target_view, &mut rt.1);
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("route_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        }));
+        match route {
+            SliceSource::Layer(id) => {
+                if let Some(l) = layers.iter().find(|l| l.id == id) {
+                    self.draw_layer(device, queue, enc, l, false, extent);
+                }
+            }
+            SliceSource::Group(id) => {
+                let found = groups
+                    .iter()
+                    .find(|g| g.id == Some(id) && g.len > 0 && g.start + g.len <= layers.len());
+                if let Some(g) = found {
+                    let run = &layers[g.start..g.start + g.len];
+                    if self.compose_group(device, queue, enc, run, g, *group_no, extent) {
+                        *group_no += 1;
+                    }
+                }
+            }
+            SliceSource::Composition | SliceSource::Preview => {}
+        }
+        if fade {
+            self.fade_pass(enc, extent);
+        }
+        std::mem::swap(&mut self.target, &mut rt.0);
+        std::mem::swap(&mut self.target_view, &mut rt.1);
+        self.routed.insert(route, rt);
     }
 
     /// Reduced frames of ML effects whose readback finished (never waits).
@@ -2308,6 +2416,7 @@ mod tests {
 
     fn group(start: usize, len: usize, opacity: f32, effects: Vec<EffectDraw>) -> GroupDraw {
         GroupDraw {
+            id: None,
             start,
             len,
             opacity,
@@ -2388,5 +2497,107 @@ mod tests {
         for (g, w) in got.iter().zip([204u8, 153, 51]) {
             assert!(g.abs_diff(w) <= 2, "{got:?}");
         }
+    }
+
+    /// Copies a `w` x 1 texture (w <= 64) back as RGBA.
+    fn read_row_of(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        w: u32,
+    ) -> Vec<u8> {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got = buf.slice(..).get_mapped_range().expect("map")[..(w * 4) as usize].to_vec();
+        buf.unmap();
+        got
+    }
+
+    /// Four one-pixel slices on a 4x1 screen, each with its own source: the composition
+    /// (layer 2 inside the 50% group, over red), layer 1 alone (red), layer 2 alone (blue at 50% over black)
+    /// and a group holding layer 2 at 50% (blue at 25% over black). Master opacity 0 blacks
+    /// every routed slice too. Skipped when there is no adapter.
+    #[test]
+    fn gpu_routed_layer_and_group_show_only_in_their_slice() {
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (red, blue) = ([255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+        let gid = uuid::Uuid::from_u128(99);
+        let (l1, l2) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let layers = [solid(1, &red, 1.0), solid(2, &blue, 0.5)];
+        let groups = [GroupDraw {
+            id: Some(gid),
+            ..group(1, 1, 0.5, vec![])
+        }];
+        let sources = [
+            SliceSource::Composition,
+            SliceSource::Layer(l1),
+            SliceSource::Layer(l2),
+            SliceSource::Group(gid),
+        ];
+        let mut screen = vjc_core::mapping::new_screen("t", 4, 1);
+        for (i, src) in sources.iter().enumerate() {
+            let mut sl = vjc_core::mapping::new_slice(4, 1);
+            let x = i as f32;
+            sl.output_mesh = vec![(x, 0.0), (x + 1.0, 0.0), (x, 1.0), (x + 1.0, 1.0)];
+            sl.source = *src;
+            screen.slices.push(sl);
+        }
+        let routes = vjc_core::mapping::routed_sources(&[screen.clone()]);
+        assert_eq!(routes.len(), 3, "composition needs no extra render");
+        let mut comp = Compositor::new(&device, 1, 1);
+        let renderer = crate::slice_render::SliceRenderer::new(&device);
+        let (tex, view) = crate::slice_render::make_screen_target(&device, 4, 1);
+        let mut show = |opacity: f32, routes: &[SliceSource]| {
+            comp.render_routed(&device, &queue, (&layers, &groups), (&[], opacity), routes);
+            let src = |sl: &vjc_model::Slice| {
+                let v = comp.routed_view(sl.source).unwrap_or(&comp.target_view);
+                (v, comp.size)
+            };
+            renderer.render(&device, &queue, &screen, &src, &view);
+            read_row_of(&device, &queue, &tex, 4)
+        };
+        let img = show(1.0, &routes);
+        let at = |i: usize| [img[i * 4], img[i * 4 + 1], img[i * 4 + 2]];
+        let near =
+            |got: [u8; 3], want: [u8; 3]| got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 2);
+        assert!(near(at(0), [191, 0, 64]), "composition {:?}", at(0));
+        assert!(near(at(1), [255, 0, 0]), "layer 1 alone {:?}", at(1));
+        assert!(near(at(2), [0, 0, 127]), "layer 2 alone {:?}", at(2));
+        assert!(near(at(3), [0, 0, 64]), "group alone {:?}", at(3));
+        // Master opacity 0 (bypass) is black on routed slices as well.
+        let img = show(0.0, &routes);
+        assert!(img.chunks(4).all(|p| p[..3] == [0, 0, 0]), "{img:?}");
+        // Nothing routed: no extra texture is kept.
+        show(1.0, &[]);
+        assert!(comp.routed_view(SliceSource::Layer(l1)).is_none());
     }
 }

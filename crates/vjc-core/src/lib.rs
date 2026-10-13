@@ -16,6 +16,7 @@ pub mod osc;
 pub mod playback;
 pub mod playhead;
 pub mod shortcuts;
+pub mod slice_geom;
 pub mod timecode;
 pub mod transition;
 
@@ -219,6 +220,25 @@ pub enum Command {
         screen: Uuid,
         slice: Uuid,
         input: Vec<(f32, f32)>,
+    },
+    /// Replaces the whole output setup (screens, slices, masks, soft edge, routing), e.g.
+    /// when a saved output preset is loaded. Undoable.
+    SetOutputSetup {
+        screens: Vec<vjc_model::Screen>,
+    },
+    /// Source of a slice: composition, one layer, one group or the preview. Undoable.
+    SetSliceSource {
+        screen: Uuid,
+        slice: Uuid,
+        source: vjc_model::SliceSource,
+    },
+    /// Moves a slice to another screen, inserted at `index` (clamped). The mesh keeps its
+    /// pixel positions. Undoable.
+    MoveSlice {
+        from: Uuid,
+        to: Uuid,
+        slice: Uuid,
+        index: usize,
     },
     /// Mask polygon in normalized screen coordinates (3..=32 points); `None` clears it.
     /// Coalesces.
@@ -1468,6 +1488,66 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 Command::AddSlice {
                     screen,
                     slice: sl,
+                    index: i,
+                },
+                vec![],
+            )
+        }
+        Command::SetOutputSetup { screens } => {
+            if !mapping::screens_valid(&screens) {
+                return Err(Error::InvalidValue);
+            }
+            let mut monitors = std::collections::HashSet::new();
+            for s in &screens {
+                if let vjc_model::OutputDevice::Monitor { name } = &s.device
+                    && !monitors.insert(name.clone())
+                {
+                    return Err(Error::MonitorInUse);
+                }
+            }
+            let prev = std::mem::replace(&mut p.output.screens, screens);
+            undoable(Command::SetOutputSetup { screens: prev }, vec![])
+        }
+        Command::SetSliceSource {
+            screen,
+            slice,
+            source,
+        } => {
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.source, source);
+            undoable(
+                Command::SetSliceSource {
+                    screen,
+                    slice,
+                    source: prev,
+                },
+                vec![],
+            )
+        }
+        Command::MoveSlice {
+            from,
+            to,
+            slice,
+            index,
+        } => {
+            if from == to {
+                return Err(Error::InvalidValue);
+            }
+            screen_idx(p, to)?;
+            let src = screen_mut(p, from)?;
+            let i = src
+                .slices
+                .iter()
+                .position(|x| x.id == slice)
+                .ok_or(Error::NoSlice)?;
+            let sl = src.slices.remove(i);
+            let dst = screen_mut(p, to)?;
+            dst.slices.insert(index.min(dst.slices.len()), sl);
+            undoable(
+                Command::MoveSlice {
+                    from: to,
+                    to: from,
+                    slice,
                     index: i,
                 },
                 vec![],
@@ -4493,6 +4573,153 @@ mod tests {
         assert_eq!(p.normalize_screens(), 1);
         assert_eq!(p.output.screens[1].device, vjc_model::OutputDevice::Window);
         assert_eq!(p.normalize_screens(), 0);
+    }
+
+    #[test]
+    fn set_output_setup_replaces_everything_and_undoes() {
+        let (mut p, _) = setup();
+        let mut a = mapping::new_screen("A", 1920, 1080);
+        a.slices.push(mapping::new_slice(1920, 1080));
+        p.output.screens = vec![a];
+        let before = p.clone();
+        let mut b = mapping::new_screen("B", 800, 600);
+        b.slices.push(mapping::new_slice(800, 600));
+        b.slices[0].mask = Some(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]);
+        let new = vec![b.clone()];
+        let mut h = History::new();
+        let now = Instant::now();
+        let set = |screens| Command::SetOutputSetup { screens };
+        h.exec(&mut p, set(new.clone()), now).unwrap();
+        assert_eq!(p.output.screens, new);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(p.output.screens, new);
+        // Invalid setups are rejected and leave the project alone.
+        let kept = p.clone();
+        let mut bad_mesh = b.clone();
+        bad_mesh.slices[0].output_mesh.pop();
+        let mut bad_size = b.clone();
+        bad_size.width = 0;
+        let mut dup_slice = b.clone();
+        dup_slice.id = Uuid::new_v4();
+        dup_slice.slices.push(dup_slice.slices[0].clone());
+        let (mut m1, mut m2) = (
+            mapping::new_screen("M1", 10, 10),
+            mapping::new_screen("M2", 10, 10),
+        );
+        m1.device = vjc_model::OutputDevice::Monitor { name: "3".into() };
+        m2.device = vjc_model::OutputDevice::Monitor { name: "3".into() };
+        for (screens, err) in [
+            (vec![bad_mesh], Error::InvalidValue),
+            (vec![bad_size], Error::InvalidValue),
+            (vec![dup_slice], Error::InvalidValue),
+            (vec![b.clone(), b.clone()], Error::InvalidValue),
+            (vec![m1, m2], Error::MonitorInUse),
+        ] {
+            assert_eq!(h.exec(&mut p, set(screens), now), Err(err));
+        }
+        assert_eq!(p, kept);
+    }
+
+    #[test]
+    fn slice_source_undo_and_routed_sources() {
+        use vjc_model::SliceSource;
+        let (mut p, _) = setup();
+        let mut scr = mapping::new_screen("S", 1920, 1080);
+        let (a, b) = (mapping::new_slice(100, 100), mapping::new_slice(100, 100));
+        let (sid, aid, bid) = (scr.id, a.id, b.id);
+        scr.slices = vec![a, b];
+        p.output.screens.push(scr);
+        assert_eq!(
+            p.output.screens[0].slices[0].source,
+            SliceSource::Composition
+        );
+        assert!(mapping::routed_sources(&p.output.screens).is_empty());
+        let (l, g) = (Uuid::new_v4(), Uuid::new_v4());
+        let set = |slice, source| Command::SetSliceSource {
+            screen: sid,
+            slice,
+            source,
+        };
+        roundtrip(&mut p.clone(), set(aid, SliceSource::Layer(l)));
+        let mut h = History::new();
+        let now = Instant::now();
+        h.exec(&mut p, set(aid, SliceSource::Layer(l)), now)
+            .unwrap();
+        h.exec(&mut p, set(bid, SliceSource::Group(g)), now)
+            .unwrap();
+        assert_eq!(
+            mapping::routed_sources(&p.output.screens),
+            vec![SliceSource::Layer(l), SliceSource::Group(g)]
+        );
+        // Preview and composition need no extra render; the same layer twice counts once.
+        h.exec(&mut p, set(bid, SliceSource::Layer(l)), now)
+            .unwrap();
+        assert_eq!(
+            mapping::routed_sources(&p.output.screens),
+            vec![SliceSource::Layer(l)]
+        );
+        h.exec(&mut p, set(bid, SliceSource::Preview), now).unwrap();
+        assert_eq!(mapping::routed_sources(&p.output.screens).len(), 1);
+        while h.undo(&mut p).is_some() {}
+        assert!(mapping::routed_sources(&p.output.screens).is_empty());
+        let bad = Command::SetSliceSource {
+            screen: sid,
+            slice: Uuid::new_v4(),
+            source: SliceSource::Preview,
+        };
+        assert!(h.exec(&mut p, bad, now).is_err());
+    }
+
+    #[test]
+    fn move_slice_between_screens_undoes_in_place() {
+        let (mut p, _) = setup();
+        let (a, b) = (
+            mapping::new_screen("A", 1920, 1080),
+            mapping::new_screen("B", 640, 480),
+        );
+        let (aid, bid) = (a.id, b.id);
+        p.output.screens = vec![a, b];
+        let (s1, s2) = (
+            mapping::new_slice(1920, 1080),
+            mapping::new_slice(1920, 1080),
+        );
+        let (id1, id2) = (s1.id, s2.id);
+        p.output.screens[0].slices = vec![s1, s2];
+        let mv = Command::MoveSlice {
+            from: aid,
+            to: bid,
+            slice: id1,
+            index: 0,
+        };
+        roundtrip(&mut p.clone(), mv.clone());
+        let mut h = History::new();
+        h.exec(&mut p, mv, Instant::now()).unwrap();
+        assert_eq!(p.output.screens[0].slices.len(), 1);
+        assert_eq!(p.output.screens[1].slices[0].id, id1);
+        // The mesh keeps its pixel positions (still 1920 wide on a 640 screen).
+        assert_eq!(p.output.screens[1].slices[0].output_mesh[1].0, 1920.0);
+        h.undo(&mut p).unwrap().unwrap();
+        let ids: Vec<_> = p.output.screens[0].slices.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![id1, id2], "back at its original index");
+        assert!(p.output.screens[1].slices.is_empty());
+        // Same screen, unknown screen or unknown slice are rejected without changes.
+        let before = p.clone();
+        for (from, to, slice) in [
+            (aid, aid, id1),
+            (aid, Uuid::new_v4(), id1),
+            (aid, bid, Uuid::new_v4()),
+        ] {
+            let c = Command::MoveSlice {
+                from,
+                to,
+                slice,
+                index: 0,
+            };
+            assert!(h.exec(&mut p, c, Instant::now()).is_err());
+        }
+        assert_eq!(p, before);
     }
 
     #[test]
