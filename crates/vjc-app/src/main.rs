@@ -1851,6 +1851,10 @@ impl State {
         });
         if self.learn {
             for key in pressed {
+                if self.learn_midi && matches!(key, egui::Key::Delete | egui::Key::Backspace) {
+                    self.unlearn_midi_osc();
+                    continue;
+                }
                 if self.learn_midi && key != egui::Key::Escape {
                     continue;
                 }
@@ -1938,6 +1942,7 @@ impl State {
         while let Ok(ev) = self.osc.rx.try_recv() {
             if self.learn {
                 if self.learn_midi
+                    && o::learnable(&ev)
                     && let Some(target) = self.learn_target.clone()
                 {
                     self.status = format!("{} -> {target}", ev.address);
@@ -1976,6 +1981,19 @@ impl State {
                 self.osc.send(bytes);
             }
             self.osc_prev.insert(addr, v);
+        }
+    }
+
+    /// Delete in MIDI/OSC learn: unmaps the picked target's MIDI and OSC controls.
+    fn unlearn_midi_osc(&mut self) {
+        let Some(target) = self.learn_target.clone() else {
+            return;
+        };
+        self.status = format!("Unmapped {target}");
+        let mut cmds = vjc_core::midi::unlearn(&self.project, &target);
+        cmds.extend(vjc_core::osc::unlearn(&self.project, &target));
+        for c in cmds {
+            self.exec(c);
         }
     }
 
@@ -2019,7 +2037,7 @@ impl State {
         {
             self.learn_target = Some(a.clone());
             self.status = if self.learn_midi {
-                format!("{a}: move a MIDI control (Esc leaves)")
+                format!("{a}: move a MIDI or OSC control (Delete unmaps, Esc leaves)")
             } else {
                 format!("{a}: press a key (Delete unmaps, Esc leaves)")
             };
@@ -2212,7 +2230,7 @@ impl State {
                         self.status = match (self.learn, midi) {
                             (false, _) => "Shortcut editing off".into(),
                             (true, false) => "Click a cell, column, opacity, Tap or Bypass, then press a key (Esc leaves)".into(),
-                            (true, true) => "Click a cell, column, opacity, Tap or Bypass, then move a MIDI control (Esc leaves)".into(),
+                            (true, true) => "Click a cell, column, opacity, Tap or Bypass, then move a MIDI or OSC control (Delete unmaps, Esc leaves)".into(),
                         };
                     }
                 }

@@ -110,6 +110,21 @@ pub fn source_of(ev: &Event) -> ControlSource {
     }
 }
 
+/// Commands that remove every OSC shortcut of `target`.
+pub fn unlearn(p: &Project, target: &str) -> Vec<Command> {
+    p.shortcuts
+        .iter()
+        .filter(|s| s.target == target && is_osc(&s.source))
+        .map(|s| Command::RemoveShortcut { id: s.id })
+        .collect()
+}
+
+/// Whether a message may be learned: our own address space (`/comp/...`, e.g. an echo of
+/// our feedback) is not a controller.
+pub fn learnable(ev: &Event) -> bool {
+    !ev.address.starts_with("/comp/")
+}
+
 fn is_osc(src: &ControlSource) -> bool {
     matches!(src, ControlSource::Osc { .. })
 }
@@ -117,12 +132,17 @@ fn is_osc(src: &ControlSource) -> bool {
 /// Commands that map the OSC source to `target`: the target's old OSC shortcut and any other
 /// target on the same address go away first. Key and MIDI shortcuts are untouched.
 pub fn learn(p: &Project, target: &str, source: ControlSource) -> Vec<Command> {
+    let same = |s: &Shortcut| s.target == target && s.source == source;
     let mut cmds: Vec<Command> = p
         .shortcuts
         .iter()
-        .filter(|s| (s.target == target && is_osc(&s.source)) || s.source == source)
+        .filter(|s| !same(s) && ((s.target == target && is_osc(&s.source)) || s.source == source))
         .map(|s| Command::RemoveShortcut { id: s.id })
         .collect();
+    // A fader streams values: once mapped, further messages change nothing.
+    if p.shortcuts.iter().any(same) {
+        return cmds;
+    }
     let (mode, range) = if shortcuts::is_continuous(target) {
         (ShortcutMode::Absolute, (0.0, 1.0))
     } else if target.ends_with("/bpm") {
@@ -356,6 +376,27 @@ mod tests {
         };
         assert!(command_for(&p, &ctx, shortcut, &other).is_none());
         assert_eq!(label_for(&p, "/comp/tempo/bpm"), None);
+    }
+
+    #[test]
+    fn learn_ignores_own_space_and_is_idempotent() {
+        let ev = |a: &str| Event {
+            address: a.into(),
+            value: Some(0.5),
+        };
+        assert!(!learnable(&ev("/comp/master/opacity")));
+        assert!(learnable(&ev("/1/fader1")));
+        let mut p = Project::new("t");
+        let src = ControlSource::Osc {
+            address: "/1/fader1".into(),
+        };
+        let first = learn(&p, "/comp/master/opacity", src.clone());
+        let Some(Command::AddShortcut { shortcut, .. }) = first.last() else {
+            panic!("no add");
+        };
+        p.shortcuts.push(shortcut.clone());
+        assert!(learn(&p, "/comp/master/opacity", src).is_empty());
+        assert_eq!(unlearn(&p, "/comp/master/opacity").len(), 1);
     }
 
     #[test]

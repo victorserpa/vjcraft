@@ -157,6 +157,19 @@ pub fn unlearn(p: &Project, target: &str) -> Vec<Command> {
 /// Commands that map `source` to `target`: the target's old MIDI shortcut and any other
 /// target using the same control go away first. Keyboard shortcuts are untouched.
 pub fn learn(p: &Project, target: &str, source: ControlSource) -> Vec<Command> {
+    // A CC knob sends a stream: once the mapping exists, further ticks change nothing.
+    if p.shortcuts
+        .iter()
+        .any(|s| s.target == target && s.source == source)
+    {
+        let others = p.shortcuts.iter().filter(|s| {
+            let same = s.target == target && s.source == source;
+            !same && ((s.target == target && is_midi(&s.source)) || s.source == source)
+        });
+        return others
+            .map(|s| Command::RemoveShortcut { id: s.id })
+            .collect();
+    }
     let mut cmds = unlearn(p, target);
     for s in &p.shortcuts {
         if s.source == source && s.target != target {
@@ -424,6 +437,18 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn learn_same_control_again_is_noop() {
+        let mut p = Project::new("t");
+        let src = source_of("pad", cc(1)).unwrap();
+        let first = learn(&p, "/comp/master/opacity", src.clone());
+        let Some(Command::AddShortcut { shortcut, .. }) = first.last() else {
+            panic!("no add");
+        };
+        p.shortcuts.push(shortcut.clone());
+        assert!(learn(&p, "/comp/master/opacity", src).is_empty());
     }
 
     #[test]

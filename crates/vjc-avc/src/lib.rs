@@ -87,6 +87,8 @@ pub struct Import {
 #[derive(Default)]
 struct Warns {
     kinds: BTreeMap<String, (usize, BTreeSet<String>)>,
+    /// Effect passes that import_chain looked at (imported or warned about).
+    chain_effects: usize,
 }
 
 impl Warns {
@@ -322,6 +324,19 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
         comp.current_deck = decks[cur.min(decks.len() - 1)].id;
         comp.decks = decks;
     }
+    // Effects the track chains never reached (e.g. inside a source) would vanish silently.
+    let mut total = 0;
+    root.walk(&mut |n| {
+        if n.tag == "RenderPass" && n.attr("baseType") == Some("Effect") {
+            let name = n.attr("type").or(n.attr("name")).unwrap_or("?");
+            if name != "TransformEffect" {
+                total += 1;
+            }
+        }
+    });
+    for _ in warnings.chain_effects..total {
+        warnings.add("effect outside layer/clip/master chains not imported", "");
+    }
     Ok(Import {
         project,
         warnings: warnings.lines(),
@@ -417,6 +432,7 @@ fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
         if name == "TransformEffect" {
             continue;
         }
+        w.chain_effects += 1;
         let Some(mut fx) = map_effect(name).and_then(vjc_fx::new_effect) else {
             w.add("effect not imported", name);
             continue;
@@ -704,6 +720,16 @@ fn collect_unsupported(root: &Node, w: &mut Warns) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effect_outside_chain_warns() {
+        let xml = r#"<Composition name="x" numColumns="1"><Layer layerIndex="0"/><Deck><Clip layerIndex="0" columnIndex="0"><VideoTrack><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/a.mov"/><RenderPass baseType="Effect" type="Blur"/></VideoSource></PrimarySource></VideoTrack></Clip></Deck></Composition>"#;
+        let i = super::import_str(xml).unwrap();
+        assert!(
+            i.warning_counts
+                .contains_key("effect outside layer/clip/master chains not imported")
+        );
+    }
+
     #[test]
     fn transport_choice_codes() {
         let mk = |m: u32, d: u32| {
