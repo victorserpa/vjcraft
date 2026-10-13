@@ -467,6 +467,14 @@ pub enum Event {
         column: ColumnIdx,
         path: PathBuf,
     },
+    /// A live capture clip (camera) started on the layer; `device` is the avfoundation
+    /// index or name.
+    CaptureStarted {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        device: String,
+    },
     /// A generator clip started on the layer (no player; the app renders it).
     GeneratorStarted {
         deck: DeckId,
@@ -766,6 +774,12 @@ fn trigger_event(
             layer,
             column,
             path: path.clone(),
+        }),
+        Source::Capture { device } => Ok(Event::CaptureStarted {
+            deck,
+            layer,
+            column,
+            device: device.clone(),
         }),
         // Imported generators with no bundled equivalent are placeholders.
         Source::Generator { kind, .. } if vjc_fx::GENERATORS.iter().any(|(id, _)| id == kind) => {
@@ -2090,11 +2104,38 @@ mod tests {
     }
 
     #[test]
-    fn trigger_non_file_source_fails() {
+    fn trigger_capture_source_starts_capture() {
         let (mut p, l) = setup();
         let mut c = clip_from_path("/x/a.mov".into());
         c.source = Source::Capture {
             device: "cam".into(),
+        };
+        let set = Command::SetClip {
+            deck: A,
+            layer: l,
+            column: 0,
+            clip: c,
+        };
+        apply(&mut p, set).unwrap();
+        let a = apply(
+            &mut p,
+            Command::TriggerClip {
+                deck: A,
+                layer: l,
+                column: 0,
+            },
+        )
+        .unwrap();
+        assert!(matches!(&a.events[0], Event::CaptureStarted { device, .. } if device == "cam"));
+    }
+
+    #[test]
+    fn trigger_non_file_source_fails() {
+        let (mut p, l) = setup();
+        let mut c = clip_from_path("/x/a.mov".into());
+        c.source = Source::Network {
+            protocol: vjc_model::NetProtocol::Ndi,
+            name: "feed".into(),
         };
         apply(
             &mut p,

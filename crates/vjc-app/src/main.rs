@@ -21,6 +21,7 @@ use vjc_core::effects::EffectTarget;
 use vjc_core::playhead::Playhead;
 use vjc_core::{Command, Event, History};
 use vjc_io::prefs::Prefs;
+use vjc_media::audio::AudioEngine;
 use vjc_media::{Frame, Player};
 use vjc_model::{
     Autopilot, AutopilotMode, BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId,
@@ -43,6 +44,9 @@ struct State {
     /// Playing clip per layer: (deck it was triggered from, column, player). One clip per
     /// layer. Lookups of the playing clip use this deck, never `current_deck`.
     players: HashMap<LayerId, (DeckId, u32, Player)>,
+    /// Audio output, opened on the first clip start (None until then or when unavailable).
+    audio: Option<AudioEngine>,
+    audio_failed: bool,
     /// Playing generator clip per layer: (deck, column, own TIME in seconds). The time
     /// follows the clip transport (speed, direction, pause); a layer has a player or a
     /// generator, never both.
@@ -515,6 +519,8 @@ impl State {
             warnings: vec![],
             status: "Drop video files on the grid cells.".into(),
             players: HashMap::new(),
+            audio: None,
+            audio_failed: false,
             gens: HashMap::new(),
             heads: HashMap::new(),
             flow: Flow::default(),
@@ -571,6 +577,20 @@ impl State {
             metronome: false,
             renaming: None,
         }
+    }
+
+    /// Audio output, opened lazily; a failure is reported once in the status line.
+    fn audio_engine(&mut self) -> Option<AudioEngine> {
+        if self.audio.is_none() && !self.audio_failed {
+            match AudioEngine::start() {
+                Ok(e) => self.audio = Some(e),
+                Err(e) => {
+                    self.audio_failed = true;
+                    self.status = format!("Audio off: {e}");
+                }
+            }
+        }
+        self.audio.clone()
     }
 
     fn reset_players(&mut self) {
@@ -819,6 +839,7 @@ impl State {
                     // The step lands on the first playable clip: follow it.
                     let landed = events.iter().find_map(|e| match e {
                         Event::ClipStarted { column, .. }
+                        | Event::CaptureStarted { column, .. }
                         | Event::GeneratorStarted { column, .. } => Some(*column),
                         _ => None,
                     });
@@ -869,8 +890,11 @@ impl State {
                         self.flow.loops.remove(&layer);
                         self.flow.beat_loops.remove(&layer);
                         self.cross_from_old(layer);
-                        self.players
-                            .insert(layer, (deck, column, Player::open_scrub(&path)));
+                        let mut player = Player::open_scrub(&path);
+                        if let Some(engine) = self.audio_engine() {
+                            player.attach_audio(&engine);
+                        }
+                        self.players.insert(layer, (deck, column, player));
                         let tr = self.transport(deck, layer, column);
                         let dir = tr.map_or(Direction::Forward, |t| t.direction);
                         let seed = std::time::SystemTime::now()
@@ -880,6 +904,20 @@ impl State {
                     } else {
                         self.status = format!("File not found: {}", path.display());
                     }
+                }
+                Event::CaptureStarted {
+                    deck,
+                    layer,
+                    column,
+                    device,
+                } => {
+                    self.gens.remove(&layer);
+                    self.flow.loops.remove(&layer);
+                    self.flow.beat_loops.remove(&layer);
+                    self.cross_from_old(layer);
+                    self.players
+                        .insert(layer, (deck, column, Player::open_capture(&device)));
+                    self.heads.remove(&layer);
                 }
                 Event::GeneratorStarted {
                     deck,
@@ -1098,6 +1136,14 @@ impl State {
                     position = np;
                 }
                 player.set_position(position);
+                // Audio only at forward 1x; any other speed, direction or pause is muted.
+                let audible = rate.is_finite()
+                    && (rate - 1.0).abs() < 1e-3
+                    && is_sequential(tr.play_mode, tr.direction, rate)
+                    && tr.direction != Direction::Pause
+                    && !t.finished;
+                let (vol, pan) = audio_mix(&self.project, *layer, clip);
+                player.set_audio(vol, pan, audible);
                 self.flow.pos.insert(*layer, position);
                 if t.finished {
                     finished.push(*layer);
@@ -3261,4 +3307,26 @@ mod sequential_tests {
         assert!(is_sequential(PlayMode::Loop, Direction::Forward, 0.0));
         assert!(is_sequential(PlayMode::Loop, Direction::Pause, 1.0));
     }
+}
+
+/// Linear volume and pan for a clip on a layer: volumes multiply (clip, layer, master), pans
+/// add (clamped). Opacity does not affect audio.
+fn audio_mix(p: &Project, layer: LayerId, clip: &vjc_model::Clip) -> (f32, f32) {
+    let num = |param: &vjc_model::Param| match param.value {
+        vjc_model::Value::Number(n) => n,
+        _ => 0.0,
+    };
+    let lt = p
+        .composition
+        .layers
+        .iter()
+        .find(|l| l.id == layer)
+        .map(|l| &l.track);
+    let mut vol = num(&clip.track.volume) * num(&p.composition.master.volume);
+    let mut pan = num(&clip.track.pan) + num(&p.composition.master.pan);
+    if let Some(t) = lt {
+        vol *= num(&t.volume);
+        pan += num(&t.pan);
+    }
+    (vol.max(0.0) as f32, pan.clamp(-1.0, 1.0) as f32)
 }

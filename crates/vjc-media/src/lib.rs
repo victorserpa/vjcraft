@@ -7,7 +7,8 @@
 //!   global budget `CACHE_BUDGET_BYTES` (summed over all players) admits it, otherwise
 //!   it seeks to the previous keyframe and decodes up to the target.
 //!
-//! FFmpeg decodes H264, ProRes, MJPEG and HAP.
+//! FFmpeg decodes H264, ProRes, MJPEG and HAP. Live cameras are in `capture`, clip audio
+//! in `audio`.
 
 pub mod record;
 
@@ -17,6 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+pub mod audio;
+pub mod capture;
 
 /// A decoded RGBA8 frame (tightly packed, `width * 4` bytes per row).
 #[derive(Clone)]
@@ -80,7 +84,7 @@ pub fn pts_to_pos(start: f64, duration: f64, pts: f64) -> f64 {
     }
 }
 
-struct Shared {
+pub(crate) struct Shared {
     latest: Mutex<Option<Frame>>,
     stop: AtomicBool,
     error: Mutex<Option<String>>,
@@ -109,6 +113,7 @@ pub struct Player {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
     pub path: PathBuf,
+    audio: Option<audio::AudioPart>,
 }
 
 impl Player {
@@ -137,6 +142,44 @@ impl Player {
             shared,
             thread,
             path,
+            audio: None,
+        }
+    }
+
+    /// Opens a live capture device (macOS: avfoundation index or name). Open failures and
+    /// disconnects are reported via `error()`; the last frame stays available.
+    pub fn open_capture(device: &str) -> Player {
+        let shared = Arc::new(Shared::new());
+        let (s, d) = (shared.clone(), device.to_string());
+        let thread = std::thread::Builder::new()
+            .name("vjc-capture".into())
+            .spawn(move || {
+                if let Err(e) = capture::run_capture(&d, &s) {
+                    *s.error.lock().unwrap() = Some(e);
+                }
+            })
+            .ok();
+        Player {
+            shared,
+            thread,
+            path: PathBuf::from(format!("camera:{device}")),
+            audio: None,
+        }
+    }
+
+    /// Starts decoding the file's audio stream into `engine`. No-op for images, captures and
+    /// files without audio. Audio follows this player's position (see `audio` module docs).
+    pub fn attach_audio(&mut self, engine: &audio::AudioEngine) {
+        if self.audio.is_none() && !is_image(&self.path) && !self.path.starts_with("camera:") {
+            self.audio = audio::AudioPart::start(engine, &self.path, self.shared.clone());
+        }
+    }
+
+    /// Per-frame audio control: linear volume, pan (-1..1) and whether the clip plays
+    /// forward at 1x (otherwise it is muted).
+    pub fn set_audio(&self, volume: f32, pan: f32, audible: bool) {
+        if let Some(a) = &self.audio {
+            a.voice.set(volume, pan, audible);
         }
     }
 
@@ -173,6 +216,9 @@ impl Player {
 
     pub fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(a) = self.audio.take() {
+            a.stop();
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -200,6 +246,40 @@ fn load_image(path: &Path) -> Result<Frame, String> {
         height,
         data: Arc::new(img.into_raw()),
         seq: 1,
+    })
+}
+
+/// Converts a decoded frame to a tightly packed RGBA `Frame`, creating the scaler on first use.
+pub(crate) fn frame_to_rgba(
+    scaler: &mut Option<ff::software::scaling::Context>,
+    decoded: &ff::frame::Video,
+    seq: u64,
+) -> Result<Frame, ff::Error> {
+    if scaler.is_none() {
+        *scaler = Some(ff::software::scaling::Context::get(
+            decoded.format(),
+            decoded.width(),
+            decoded.height(),
+            ff::format::Pixel::RGBA,
+            decoded.width(),
+            decoded.height(),
+            ff::software::scaling::Flags::BILINEAR,
+        )?);
+    }
+    let mut rgba = ff::frame::Video::empty();
+    scaler.as_mut().unwrap().run(decoded, &mut rgba)?;
+    let (w, h) = (rgba.width(), rgba.height());
+    let (stride, row) = (rgba.stride(0), w as usize * 4);
+    let src = rgba.data(0);
+    let mut data = Vec::with_capacity(row * h as usize);
+    for y in 0..h as usize {
+        data.extend_from_slice(&src[y * stride..y * stride + row]);
+    }
+    Ok(Frame {
+        width: w,
+        height: h,
+        data: Arc::new(data),
+        seq,
     })
 }
 
@@ -257,33 +337,8 @@ impl Scrubber {
 
     /// Converts a decoded frame to RGBA.
     fn convert(&mut self, decoded: &ff::frame::Video) -> Result<Frame, ff::Error> {
-        if self.scaler.is_none() {
-            self.scaler = Some(ff::software::scaling::Context::get(
-                decoded.format(),
-                decoded.width(),
-                decoded.height(),
-                ff::format::Pixel::RGBA,
-                decoded.width(),
-                decoded.height(),
-                ff::software::scaling::Flags::BILINEAR,
-            )?);
-        }
-        let mut rgba = ff::frame::Video::empty();
-        self.scaler.as_mut().unwrap().run(decoded, &mut rgba)?;
-        let (w, h) = (rgba.width(), rgba.height());
-        let (stride, row) = (rgba.stride(0), w as usize * 4);
-        let src = rgba.data(0);
-        let mut data = Vec::with_capacity(row * h as usize);
-        for y in 0..h as usize {
-            data.extend_from_slice(&src[y * stride..y * stride + row]);
-        }
         self.count += 1;
-        Ok(Frame {
-            width: w,
-            height: h,
-            data: Arc::new(data),
-            seq: self.count,
-        })
+        frame_to_rgba(&mut self.scaler, decoded, self.count)
     }
 
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
