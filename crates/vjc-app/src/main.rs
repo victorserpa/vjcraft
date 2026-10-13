@@ -29,6 +29,11 @@ struct State {
     last_pointer: Option<egui::Pos2>,
     /// Cell selected by click; fallback target for drops.
     selected: Option<(LayerId, u32)>,
+    /// Path of the open .vjc, if any.
+    file: Option<PathBuf>,
+    dirty: bool,
+    last_autosave: std::time::Instant,
+    title: String,
 }
 
 /// Grid cell geometry for hit-testing.
@@ -71,6 +76,36 @@ fn resolve_drop(
         return Some((c.layer, c.col, DropWhere::FirstEmpty));
     }
     row.next().map(|c| (c.layer, c.col, DropWhere::FirstCell))
+}
+
+/// ~/Library/Application Support/VJCraft/recovery.vjc
+fn recovery_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join("Library/Application Support/VJCraft/recovery.vjc"))
+}
+
+/// Offers to restore a recovery file newer than the last saved project.
+fn offer_recovery(s: &mut State) {
+    let Some(r) = recovery_path() else { return };
+    if !r.exists() {
+        return;
+    }
+    let ask = rfd::MessageDialog::new()
+        .set_title("Recover project")
+        .set_description("VJCraft found an autosaved project from a previous session. Restore it?")
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(
+            "Restore".into(),
+            "Discard".into(),
+        ))
+        .show();
+    if matches!(ask, rfd::MessageDialogResult::Custom(ref l) if l == "Restore") && s.load(r.clone())
+    {
+        s.file = None;
+        s.dirty = true;
+    }
+    // Restored state now lives in memory (and is re-autosaved while dirty);
+    // a discarded or unreadable file must not be offered again.
+    let _ = std::fs::remove_file(r);
 }
 
 fn new_layer(n: usize) -> Layer {
@@ -118,10 +153,163 @@ impl State {
             cells: vec![],
             last_pointer: None,
             selected: None,
+            file: None,
+            dirty: false,
+            last_autosave: std::time::Instant::now(),
+            title: String::new(),
         }
     }
 
+    fn reset_players(&mut self) {
+        self.players.clear();
+        self.history.clear();
+        self.selected = None;
+    }
+
+    /// Asks what to do with unsaved changes. Returns false to cancel.
+    fn confirm_discard(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let r = rfd::MessageDialog::new()
+            .set_title("Unsaved changes")
+            .set_description("Save changes before continuing?")
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                "Save".into(),
+                "Don't Save".into(),
+                "Cancel".into(),
+            ))
+            .show();
+        match r {
+            rfd::MessageDialogResult::Custom(l) if l == "Save" => self.save(),
+            rfd::MessageDialogResult::Custom(l) if l == "Don't Save" => {
+                if let Some(r) = recovery_path() {
+                    let _ = std::fs::remove_file(r);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn new_project(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        let fresh = State::new();
+        self.project = fresh.project;
+        self.file = None;
+        self.dirty = false;
+        self.warnings.clear();
+        self.reset_players();
+        self.status = "New project".into();
+    }
+
+    fn open_project(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("VJCraft project", &["vjc"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.load(path);
+    }
+
+    fn load(&mut self, path: PathBuf) -> bool {
+        match vjc_io::open(&path) {
+            Ok((project, warnings)) => {
+                self.project = project;
+                self.warnings = warnings;
+                self.status = format!("Opened {}", path.display());
+                self.file = Some(path);
+                self.dirty = false;
+                self.reset_players();
+                true
+            }
+            Err(e) => {
+                self.status = format!("Open failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Saves to the current file or asks for one. Returns true when saved.
+    fn save(&mut self) -> bool {
+        match self.file.clone() {
+            Some(p) => self.save_to(p),
+            None => self.save_as(),
+        }
+    }
+
+    fn save_as(&mut self) -> bool {
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter("VJCraft project", &["vjc"])
+            .set_file_name(format!("{}.vjc", self.project.composition.name))
+            .save_file()
+        else {
+            return false;
+        };
+        if path.extension().is_none() {
+            path.set_extension("vjc");
+        }
+        self.save_to(path)
+    }
+
+    fn save_to(&mut self, path: PathBuf) -> bool {
+        match vjc_io::save(&self.project, &path) {
+            Ok(()) => {
+                self.status = format!("Saved {}", path.display());
+                self.file = Some(path);
+                self.dirty = false;
+                if let Some(r) = recovery_path() {
+                    let _ = std::fs::remove_file(r);
+                }
+                true
+            }
+            Err(e) => {
+                self.status = format!("Save failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Every 60 s while dirty, writes the recovery file.
+    fn autosave(&mut self) {
+        if !self.dirty || self.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+        self.last_autosave = std::time::Instant::now();
+        if let Some(r) = recovery_path() {
+            if let Some(d) = r.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            if let Err(e) = vjc_io::save(&self.project, &r) {
+                self.status = format!("Autosave failed: {e}");
+            }
+        }
+    }
+
+    fn window_title(&self) -> String {
+        let name = match &self.file {
+            Some(p) => p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            None => "Untitled".into(),
+        };
+        format!(
+            "{name}{} - VJCraft",
+            if self.dirty { " \u{2022}" } else { "" }
+        )
+    }
+
     fn import(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Composition", &["avc"])
             .pick_file()
@@ -135,6 +323,8 @@ impl State {
                 self.project = i.project;
                 self.history.clear();
                 self.players.clear();
+                self.file = None;
+                self.dirty = true;
             }
             Err(e) => self.status = format!("Import failed: {e}"),
         }
@@ -146,14 +336,20 @@ impl State {
             .history
             .exec(&mut self.project, cmd, std::time::Instant::now())
         {
-            Ok(events) => self.handle(events),
+            Ok(events) => {
+                self.dirty = true;
+                self.handle(events);
+            }
             Err(e) => self.status = format!("Command failed: {e}"),
         }
     }
 
     fn undo(&mut self) {
         match self.history.undo(&mut self.project) {
-            Some(Ok(ev)) => self.handle(ev),
+            Some(Ok(ev)) => {
+                self.dirty = true;
+                self.handle(ev);
+            }
             Some(Err(e)) => self.status = format!("Undo failed: {e}"),
             None => {}
         }
@@ -161,7 +357,10 @@ impl State {
 
     fn redo(&mut self) {
         match self.history.redo(&mut self.project) {
-            Some(Ok(ev)) => self.handle(ev),
+            Some(Ok(ev)) => {
+                self.dirty = true;
+                self.handle(ev);
+            }
             Some(Err(e)) => self.status = format!("Redo failed: {e}"),
             None => {}
         }
@@ -272,6 +471,32 @@ impl State {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui
+                    .add(egui::Button::new("New").shortcut_text("Cmd+N"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.new_project();
+                }
+                if ui
+                    .add(egui::Button::new("Open...").shortcut_text("Cmd+O"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.open_project();
+                }
+                if ui
+                    .add(egui::Button::new("Save").shortcut_text("Cmd+S"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.save();
+                }
+                if ui.button("Save As...").clicked() {
+                    ui.close();
+                    self.save_as();
+                }
+                ui.separator();
                 if ui.button("Import .avc...").clicked() {
                     ui.close();
                     self.import();
@@ -347,6 +572,24 @@ impl State {
             self.redo();
         } else if ctx.input_mut(|i| i.consume_shortcut(&undo_key)) {
             self.undo();
+        }
+
+        let key = |k| egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, k);
+        if ctx.input_mut(|i| i.consume_shortcut(&key(egui::Key::S))) {
+            self.save();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&key(egui::Key::O))) {
+            self.open_project();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&key(egui::Key::N))) {
+            self.new_project();
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        self.autosave();
+        let title = self.window_title();
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
         }
 
         // File drops onto grid cells.
@@ -669,6 +912,7 @@ fn main() -> eframe::Result {
         eframe::NativeOptions::default(),
         Box::new(|_cc| {
             let mut s = State::new();
+            offer_recovery(&mut s);
             // Debug aid: VJC_AUTOPLAY=/path/video.mov loads it in the bottom layer, column 1.
             if let Some(p) = std::env::var_os("VJC_AUTOPLAY") {
                 let l = s.project.composition.layers.last().map(|l| l.id);

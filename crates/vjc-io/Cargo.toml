@@ -1,0 +1,12 @@
+[package]
+name = "vjc-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vjc-model = { path = "../vjc-model" }
+serde_json.workspace = true
+
+[dev-dependencies]
+vjc-core = { path = "../vjc-core" }

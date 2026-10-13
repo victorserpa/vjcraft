@@ -3432,6 +3432,7 @@ dependencies = [
  "uuid",
  "vjc-avc",
  "vjc-core",
+ "vjc-io",
  "vjc-media",
  "vjc-model",
 ]
@@ -3450,6 +3451,15 @@ name = "vjc-core"
 version = "0.1.0"
 dependencies = [
  "uuid",
+ "vjc-model",
+]
+
+[[package]]
+name = "vjc-io"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "vjc-core",
  "vjc-model",
 ]
 
