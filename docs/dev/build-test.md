@@ -5,7 +5,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 cargo run -p vjc-app                      # app
 VJC_AUTOPLAY=path/to/video.mp4 ./target/debug/vjcraft   # starts playing a clip
-scripts/package-macos.sh                  # target/dist/VJCraft.app + .dmg (needs brew ffmpeg)
+scripts/package-macos.sh                  # target/dist/VJCraft.app + .dmg (needs brew ffmpeg; Developer ID + notarize, `--no-notarize` or `--adhoc` for local)
 ```
 
 - `target/` grows past 50 GB; `cargo clean` when disk is short.

@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
-# Builds target/dist/VJCraft.app and VJCraft-<version>-macos.dmg (ad-hoc signed).
-# Not notarized. ffmpeg stays a dynamic dependency (brew install ffmpeg).
+# Builds target/dist/VJCraft.app and VJCraft-<version>-macos.dmg, self-contained
+# (non-system dylibs bundled by scripts/bundle-dylibs.sh), signed with Developer ID
+# + hardened runtime, notarized and stapled.
+# Env: SIGN_ID, NOTARY_PROFILE. Flags: --no-notarize (local build, still signed).
+# --adhoc: sign ad hoc (no Developer ID), implies --no-notarize.
 set -euo pipefail
+SIGN_ID="${SIGN_ID:-Developer ID Application: SCHMUCKER DESENVOLVIMENTOS E SONORIZACAO LTDA (LHUJ4D96V2)}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-notchwake}"
+NOTARIZE=1
+for a in "$@"; do
+  case "$a" in
+    --no-notarize) NOTARIZE=0 ;;
+    --adhoc) NOTARIZE=0; SIGN_ID="-" ;;
+    *) echo "unknown flag $a" >&2; exit 2 ;;
+  esac
+done
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -67,7 +80,18 @@ cat > "$APP/Contents/Info.plist" <<PL
 </plist>
 PL
 
-codesign --force --deep -s - "$APP"
+scripts/bundle-dylibs.sh "$APP"
+
+# Sign inside-out: each dylib, then the app (no --deep). Hardened runtime needs a secure timestamp.
+if [ "$SIGN_ID" = "-" ]; then
+  SIGN_OPTS=(--force -s -)
+else
+  SIGN_OPTS=(--force --timestamp --options runtime -s "$SIGN_ID")
+fi
+for lib in "$APP"/Contents/Frameworks/*.dylib; do
+  codesign "${SIGN_OPTS[@]}" "$lib"
+done
+codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP"
 codesign --verify --deep --strict "$APP"
 
 mkdir -p "$DIST/dmg-root"
@@ -75,5 +99,12 @@ cp -R "$APP" "$DIST/dmg-root/"
 ln -s /Applications "$DIST/dmg-root/Applications"
 hdiutil create -volname "VJCraft" -srcfolder "$DIST/dmg-root" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$DIST/dmg-root"
+if [ "$SIGN_ID" != "-" ]; then codesign --force --timestamp -s "$SIGN_ID" "$DMG"; fi
+
+if [ "$NOTARIZE" -eq 1 ]; then
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$DMG"
+  spctl -a -vv -t install "$DMG"
+fi
 echo "$DMG"
 ls -lh "$DMG"

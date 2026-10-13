@@ -20,7 +20,8 @@
 
 ## FFmpeg (via ffmpeg-next 9.0.0, `crates/vjc-media`)
 
-- Video and audio decode. Linked dynamically to the libav* libraries of the user's Homebrew `ffmpeg` (`/opt/homebrew/opt/ffmpeg/lib`); the .app and .dmg do not bundle them. Binding crate `ffmpeg-next`: WTFPL. FFmpeg itself is LGPL-2.1-or-later, or GPL-2.0-or-later when built with GPL options (the Homebrew build enables them); both are compatible with GPL-3.0-only for this use. Source: https://ffmpeg.org. If a future .dmg bundles the libraries, ship their license texts and source offer with it.
+- Video and audio decode. The .app/.dmg bundles the Homebrew build of the libav* libraries and their dependencies in `Contents/Frameworks` (copied by `scripts/bundle-dylibs.sh`, install names rewritten to `@rpath`). Binding crate `ffmpeg-next`: WTFPL. That Homebrew FFmpeg is configured with `--enable-gpl --enable-version3`, so the bundled libav* are GPL-3.0-or-later (LGPL-2.1+ otherwise); the project is GPL-3.0-only, so this is compatible, and the whole bundle is distributed under GPL-3.0. Source: https://ffmpeg.org (the corresponding source is the upstream release matching the bundled version; offer it with every .dmg).
+- Bundled libraries (versions as built by Homebrew at packaging time): libavcodec/avdevice/avfilter/avformat/avutil/swresample/swscale (GPL-3.0+ as configured), libx264 (GPL-2.0+), libx265 (GPL-2.0+), libvpx (BSD-3-Clause), libdav1d (BSD-2-Clause), libSvtAv1Enc (BSD-3-Clause-Clear + AOM patent license), libopus (BSD-3-Clause), libmp3lame (LGPL-2.0+), libmpg123 (LGPL-2.1), liblzma (0BSD / public domain), libvmaf (BSD-2-Clause+Patent), libssl/libcrypto (OpenSSL 3, Apache-2.0). Re-check the list and licenses whenever the Homebrew ffmpeg changes.
 
 ## tiny_http and tungstenite (Remote API)
 
