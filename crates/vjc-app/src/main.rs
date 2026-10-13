@@ -2,6 +2,7 @@ mod browser;
 mod capture;
 mod compositor;
 mod fx;
+mod link_io;
 mod midi_io;
 mod monitors;
 mod osc_io;
@@ -16,7 +17,7 @@ use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
-use vjc_core::clock::{Clock, beat_sync_rate};
+use vjc_core::clock::{Clock, LinkSync, beat_sync_rate};
 use vjc_core::effects::EffectTarget;
 use vjc_core::playhead::Playhead;
 use vjc_core::{Command, Event, History};
@@ -129,6 +130,8 @@ struct State {
     nudge_dir: i8,
     /// Visual only for now. TODO(#9): click sound (see build-log).
     metronome: bool,
+    link: link_io::Link,
+    link_sync: LinkSync,
 }
 
 /// Old clip kept alive while a layer transition crosses to the new one (frozen on its
@@ -575,6 +578,8 @@ impl State {
             phase: 0.0,
             nudge_dir: 0,
             metronome: false,
+            link: link_io::Link::new(120.0),
+            link_sync: LinkSync::default(),
             renaming: None,
         }
     }
@@ -1090,7 +1095,11 @@ impl State {
     /// Effective speed = `speed` x beat-sync factor (clip length = n beats).
     fn tick_clock(&mut self) {
         let now = std::time::Instant::now();
-        let bpm = self.project.composition.tempo.bpm;
+        let mut bpm = self.project.composition.tempo.bpm;
+        let on = self.project.composition.tempo.link_enabled;
+        self.link_sync
+            .update(&mut self.link, on, &mut bpm, &mut self.clock, now);
+        self.project.composition.tempo.bpm = bpm;
         if self.clock.bpm() != bpm.clamp(vjc_core::clock::MIN_BPM, vjc_core::clock::MAX_BPM) {
             self.clock.set_bpm(bpm, now);
         }
@@ -1920,6 +1929,15 @@ impl State {
                 ui.painter().circle_filled(rect.center(), 6.0, col);
             }
             ui.toggle_value(&mut self.metronome, "Metronome");
+            let mut link = self.project.composition.tempo.link_enabled;
+            let label = if link {
+                format!("Link ({})", self.link_sync.peers)
+            } else {
+                "Link".to_owned()
+            };
+            if ui.toggle_value(&mut link, label).changed() {
+                cmds.push(Command::SetLink { enabled: link });
+            }
         });
         if self.learn {
             cmds.clear();

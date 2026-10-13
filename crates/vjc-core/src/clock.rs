@@ -128,6 +128,97 @@ pub struct Tick {
     pub beat: Option<i64>,
 }
 
+/// Snapshot of a shared Link session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinkState {
+    pub bpm: f64,
+    /// Session beat at the sampled instant.
+    pub beat: f64,
+    pub peers: u64,
+}
+
+/// External tempo/phase source (Ableton Link). Implemented by the app; faked in tests.
+pub trait LinkSource {
+    fn set_enabled(&mut self, on: bool);
+    /// Current session state, or None while disabled.
+    fn state(&mut self) -> Option<LinkState>;
+    /// Proposes a new session tempo.
+    fn set_bpm(&mut self, bpm: f64);
+}
+
+/// Beat error above which the clock jumps to the Link beat instead of slewing.
+const LINK_JUMP: f64 = 0.5;
+/// Fraction of the phase error corrected per frame while slewing.
+const LINK_SLEW: f64 = 0.2;
+
+impl Clock {
+    /// Moves the phase toward `target` beats: small errors are slewed over frames,
+    /// large ones adopted at once.
+    pub fn follow_phase(&mut self, target: f64, now: Instant) {
+        let err = target - self.phase(now);
+        let step = if err.abs() > LINK_JUMP {
+            err
+        } else {
+            err * LINK_SLEW
+        };
+        self.anchor_phase = self.phase(now) + step;
+        self.anchor = now;
+    }
+}
+
+/// Per-frame glue between the project BPM, the clock and a `LinkSource`.
+#[derive(Debug, Default)]
+pub struct LinkSync {
+    enabled: bool,
+    /// BPM both sides last agreed on.
+    last_bpm: Option<f64>,
+    pub peers: u64,
+}
+
+impl LinkSync {
+    /// Call once per frame. `bpm` is the project BPM (updated in place when Link
+    /// changes tempo). A local change of `bpm` is pushed to Link; otherwise a changed
+    /// Link tempo is pulled. With Link on, phase follows the session beat.
+    pub fn update(
+        &mut self,
+        src: &mut dyn LinkSource,
+        on: bool,
+        bpm: &mut f64,
+        clock: &mut Clock,
+        now: Instant,
+    ) {
+        if on != self.enabled {
+            self.enabled = on;
+            src.set_enabled(on);
+            self.last_bpm = None;
+            self.peers = 0;
+        }
+        if !on {
+            return;
+        }
+        let Some(s) = src.state() else { return };
+        self.peers = s.peers;
+        match self.last_bpm {
+            None => {
+                // Just joined: the session tempo wins if there are peers, else ours.
+                if s.peers > 0 {
+                    *bpm = s.bpm.clamp(MIN_BPM, MAX_BPM);
+                } else {
+                    src.set_bpm(*bpm);
+                }
+            }
+            Some(last) if (*bpm - last).abs() > 1e-9 => src.set_bpm(*bpm),
+            Some(last) if (s.bpm - last).abs() > 1e-6 => *bpm = s.bpm.clamp(MIN_BPM, MAX_BPM),
+            _ => {}
+        }
+        self.last_bpm = Some(*bpm);
+        if clock.bpm() != *bpm {
+            clock.set_bpm(*bpm, now);
+        }
+        clock.follow_phase(s.beat, now);
+    }
+}
+
 /// Playback rate that makes a clip of `duration` seconds last exactly `beats` beats
 /// at `bpm`. Rate 1.0 = original speed; clamped to a sane range.
 pub fn beat_sync_rate(duration: f64, beats: f64, bpm: f64) -> f64 {
@@ -242,6 +333,76 @@ mod tests {
         assert!((c.phase(ms(t0, 2000)) - 4.2).abs() < 1e-9);
         c.nudge(-1, ms(t0, 2000));
         assert!((c.phase(ms(t0, 3000)) - 6.0).abs() < 1e-9);
+    }
+
+    struct Fake {
+        on: bool,
+        st: LinkState,
+        sets: Vec<f64>,
+    }
+    impl LinkSource for Fake {
+        fn set_enabled(&mut self, on: bool) {
+            self.on = on;
+        }
+        fn state(&mut self) -> Option<LinkState> {
+            self.on.then_some(self.st)
+        }
+        fn set_bpm(&mut self, bpm: f64) {
+            self.sets.push(bpm);
+            self.st.bpm = bpm;
+        }
+    }
+    fn fake(bpm: f64, beat: f64, peers: u64) -> Fake {
+        Fake {
+            on: false,
+            st: LinkState { bpm, beat, peers },
+            sets: vec![],
+        }
+    }
+
+    #[test]
+    fn link_pulls_tempo_and_adopts_far_beat() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls, mut bpm) = (fake(140.0, 10.0, 1), LinkSync::default(), 120.0);
+        ls.update(&mut f, true, &mut bpm, &mut c, t0);
+        assert_eq!(bpm, 140.0);
+        assert_eq!(c.bpm(), 140.0);
+        assert!((c.phase(t0) - 10.0).abs() < 1e-9);
+        assert_eq!(ls.peers, 1);
+        assert!(f.sets.is_empty());
+        f.st.bpm = 100.0; // peer changes tempo
+        ls.update(&mut f, true, &mut bpm, &mut c, ms(t0, 16));
+        assert_eq!(bpm, 100.0);
+    }
+
+    #[test]
+    fn link_slews_small_phase_error() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls, mut bpm) = (fake(120.0, 0.2, 1), LinkSync::default(), 120.0);
+        ls.update(&mut f, true, &mut bpm, &mut c, t0);
+        let p = c.phase(t0);
+        assert!((p - 0.04).abs() < 1e-9, "{p}");
+    }
+
+    #[test]
+    fn link_pushes_local_bpm_and_toggle() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let (mut f, mut ls, mut bpm) = (fake(120.0, 0.0, 0), LinkSync::default(), 120.0);
+        ls.update(&mut f, true, &mut bpm, &mut c, t0);
+        assert_eq!(f.sets, vec![120.0]); // alone: our tempo seeds the session
+        bpm = 90.0; // tap / edit
+        ls.update(&mut f, true, &mut bpm, &mut c, ms(t0, 16));
+        assert_eq!(f.sets, vec![120.0, 90.0]);
+        assert_eq!(bpm, 90.0);
+        ls.update(&mut f, false, &mut bpm, &mut c, ms(t0, 32));
+        assert!(!f.on);
+        let phase = c.phase(ms(t0, 40));
+        f.st.beat = 99.0;
+        ls.update(&mut f, false, &mut bpm, &mut c, ms(t0, 40));
+        assert_eq!(c.phase(ms(t0, 40)), phase); // off: Link ignored
     }
 
     #[test]

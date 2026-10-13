@@ -282,6 +282,10 @@ pub enum Command {
     SetBpm {
         bpm: f64,
     },
+    /// Turns Ableton Link on/off (undoable like other tempo settings).
+    SetLink {
+        enabled: bool,
+    },
     /// Inserts a deck at `index`. Does not change the current deck unless `select` is set.
     AddDeck {
         deck: Deck,
@@ -1651,6 +1655,10 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.tempo.bpm, bpm);
             undoable(Command::SetBpm { bpm: prev }, vec![])
         }
+        Command::SetLink { enabled } => {
+            let prev = std::mem::replace(&mut p.composition.tempo.link_enabled, enabled);
+            undoable(Command::SetLink { enabled: prev }, vec![])
+        }
     }
 }
 
@@ -2342,6 +2350,14 @@ mod tests {
             apply(&mut p, Command::RemoveColumn { column: first }),
             Err(Error::InUse)
         );
+    }
+
+    #[test]
+    fn set_link() {
+        let (mut p, _) = setup();
+        roundtrip(&mut p, Command::SetLink { enabled: true });
+        apply(&mut p, Command::SetLink { enabled: true }).unwrap();
+        assert!(p.composition.tempo.link_enabled);
     }
 
     #[test]
