@@ -1052,6 +1052,11 @@ impl State {
                     pos,
                 } => {
                     if self.active(layer) == Some((deck, column)) {
+                        // A cue jump ends an active beat loop and is not a completed loop.
+                        self.flow.beat_loops.remove(&layer);
+                        if let Some(c) = self.flow.loops.get_mut(&layer) {
+                            c.rebase(pos);
+                        }
                         self.seek(layer, pos);
                     }
                 }
@@ -1171,16 +1176,8 @@ impl State {
         let n = self.project.composition.columns.len();
         let playable: Vec<bool> = (0..n as u32)
             .map(|c| {
-                vjc_core::clip_in(&self.project, deck, layer, c).is_some_and(|k| match &k.source {
-                    vjc_model::Source::File { .. } => true,
-                    vjc_model::Source::Network { protocol, .. } => {
-                        *protocol != vjc_model::NetProtocol::Spout
-                    }
-                    vjc_model::Source::Generator { kind, .. } => {
-                        vjc_fx::GENERATORS.iter().any(|(id, _)| id == kind)
-                    }
-                    _ => false,
-                })
+                vjc_core::clip_in(&self.project, deck, layer, c)
+                    .is_some_and(|k| autopilot_playable(&k.source))
             })
             .collect();
         let rand = std::time::SystemTime::now()
@@ -3640,8 +3637,28 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Only clips with an end can be autopilot targets: generators and live
+/// sources never finish or loop, so the layer would stop advancing on them.
+fn autopilot_playable(source: &vjc_model::Source) -> bool {
+    matches!(source, vjc_model::Source::File { .. })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autopilot_skips_generators_and_live() {
+        use vjc_model::Source;
+        let f = Source::File {
+            path: "a.mp4".into(),
+        };
+        assert!(super::autopilot_playable(&f));
+        let g = Source::Generator {
+            kind: "Plasma".into(),
+            params: Default::default(),
+        };
+        assert!(!super::autopilot_playable(&g));
+    }
+
     use super::*;
 
     #[test]

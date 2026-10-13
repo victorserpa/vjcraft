@@ -47,6 +47,11 @@ impl LoopCounter {
         wrapped
     }
 
+    /// A deliberate jump (cue): continue from `pos` without counting it as a loop.
+    pub fn rebase(&mut self, pos: f64) {
+        self.last = Some(pos);
+    }
+
     pub fn reset(&mut self) {
         *self = LoopCounter::default();
     }
@@ -113,6 +118,15 @@ mod tests {
             next_clip(AutopilotMode::Random, 0, &[true, false], 5),
             Some(0)
         );
+    }
+
+    #[test]
+    fn rebase_jump_is_not_a_loop() {
+        let mut c = LoopCounter::default();
+        c.observe(0.95, Direction::Forward);
+        c.rebase(0.1);
+        assert!(!c.observe(0.11, Direction::Forward));
+        assert_eq!(c.count, 0);
     }
 
     #[test]

@@ -1196,6 +1196,15 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             )
         }
         Command::SetScreenDevice { screen, device } => {
+            // One monitor drives one screen only.
+            if let vjc_model::OutputDevice::Monitor { name } = &device
+                && p.output.screens.iter().any(|o| {
+                    o.id != screen
+                        && matches!(&o.device, vjc_model::OutputDevice::Monitor { name: n } if n == name)
+                })
+            {
+                return Err(Error::InvalidValue);
+            }
             let s = screen_mut(p, screen)?;
             let prev = std::mem::replace(&mut s.device, device);
             undoable(
@@ -3892,6 +3901,33 @@ mod tests {
         };
         let sl = mapping::new_slice(1920, 1080);
         let lid = sl.id;
+        {
+            let mut q = p.clone();
+            let b = Uuid::new_v4();
+            let mut s2 = q.output.screens[0].clone();
+            s2.id = b;
+            q.output.screens.push(s2);
+            let r = h.exec(
+                &mut q,
+                Command::SetScreenDevice {
+                    screen: b,
+                    device: vjc_model::OutputDevice::Monitor { name: "3".into() },
+                },
+                now,
+            );
+            // first screen is not on monitor 3 yet in the clone: assign it, then dup must fail
+            assert!(r.is_ok());
+            let a = q.output.screens[0].id;
+            let r = h.exec(
+                &mut q,
+                Command::SetScreenDevice {
+                    screen: a,
+                    device: vjc_model::OutputDevice::Monitor { name: "3".into() },
+                },
+                now,
+            );
+            assert!(r.is_err());
+        }
         for c in [
             Command::AddSlice {
                 screen: sid,

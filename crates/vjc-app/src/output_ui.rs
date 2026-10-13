@@ -140,8 +140,9 @@ impl State {
             });
         self.output_setup_open = open;
         for c in cmds {
-            if matches!(c, Command::SetScreenDevice { .. }) {
-                self.closed_screens.clear();
+            if let Command::SetScreenDevice { screen, .. } = &c {
+                // Only the edited screen reopens; other closed screens stay closed.
+                self.closed_screens.remove(screen);
             }
             self.exec(c);
         }
