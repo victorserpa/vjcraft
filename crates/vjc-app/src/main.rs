@@ -2097,8 +2097,10 @@ impl State {
         }
         self.layer_rects.clear();
         self.targets.clear();
-        self.time_bar(ui);
-        self.master_bar(ui);
+        egui::Panel::top("topbars").show(ui, |ui| {
+            self.time_bar(ui);
+            self.master_bar(ui);
+        });
         self.shortcut_keys(&ctx);
         self.midi_pump();
         self.osc_pump();
@@ -2213,20 +2215,42 @@ impl State {
             }
         });
 
-        // Monitor (aspect-fit).
-        if let Some(id) = self.comp_tex {
-            let c = &self.project.composition;
-            let aspect = c.width as f32 / c.height.max(1) as f32;
-            let h = 220.0;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(h * aspect, h), egui::Sense::hover());
-            ui.painter().image(
-                id,
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        }
-        ui.separator();
+        // Monitors: preview and output side by side, each letterboxed to the comp aspect.
+        egui::Panel::top("monitors")
+            .resizable(true)
+            .default_size(220.0)
+            .size_range(80.0..=700.0)
+            .show(ui, |ui| {
+                let Some(id) = self.comp_tex else { return };
+                let c = &self.project.composition;
+                let aspect = c.width as f32 / c.height.max(1) as f32;
+                let avail = ui.available_size();
+                let w = (avail.x - ui.spacing().item_spacing.x) / 2.0;
+                ui.horizontal(|ui| {
+                    for name in ["Preview", "Output"] {
+                        ui.vertical(|ui| {
+                            ui.set_width(w);
+                            ui.label(name);
+                            let size = egui::vec2(w, (avail.y - 24.0).max(10.0));
+                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                            let mut fit = egui::vec2(size.x, size.x / aspect);
+                            if fit.y > size.y {
+                                fit = egui::vec2(size.y * aspect, size.y);
+                            }
+                            ui.painter().image(
+                                id,
+                                egui::Rect::from_center_size(rect.center(), fit),
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        });
+                    }
+                });
+            });
 
         let mut cmds: Vec<Command> = vec![];
         self.deck_tabs(ui, &mut cmds);
@@ -2252,6 +2276,7 @@ impl State {
             .show(ui, |ui| {
                 egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
                     ui.label("");
+                    ui.label("Opacity");
                     for (ci, n) in names.iter().enumerate() {
                         let b = egui::Button::new(format!("\u{25b6} {n}"))
                             .selected(self.col_sel == Some(ci as u32));
@@ -2265,7 +2290,7 @@ impl State {
                             });
                         }
                     }
-                    ui.label("Opacity");
+                    ui.label("A/B");
                     ui.label("Blend");
                     ui.label("");
                     ui.end_row();
@@ -2296,6 +2321,23 @@ impl State {
                             ui.separator();
                             add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
                         });
+                        let layer = &comp.layers[li];
+                        let mut op = match layer.track.opacity.value {
+                            vjc_model::Value::Number(n) => n as f32,
+                            _ => 1.0,
+                        };
+                        let op_r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
+                        if let Some(a) =
+                            vjc_core::shortcuts::layer_address(&self.project, lid, "opacity")
+                        {
+                            self.targets.push((op_r.rect, a));
+                        }
+                        if op_r.changed() {
+                            cmds.push(Command::SetOpacity {
+                                layer: lid,
+                                value: op as f64,
+                            });
+                        }
                         for ci in 0..ncols {
                             let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
                             // Highlight only when playing from the deck being shown.
@@ -2367,22 +2409,6 @@ impl State {
                             }
                         }
                         let layer = &comp.layers[li];
-                        let mut op = match layer.track.opacity.value {
-                            vjc_model::Value::Number(n) => n as f32,
-                            _ => 1.0,
-                        };
-                        let op_r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
-                        if let Some(a) =
-                            vjc_core::shortcuts::layer_address(&self.project, lid, "opacity")
-                        {
-                            self.targets.push((op_r.rect, a));
-                        }
-                        if op_r.changed() {
-                            cmds.push(Command::SetOpacity {
-                                layer: lid,
-                                value: op as f64,
-                            });
-                        }
                         ui.horizontal(|ui| {
                             for (txt, bus) in [
                                 ("A", Some(vjc_model::Bus::A)),
@@ -2487,7 +2513,12 @@ impl State {
                 .changed();
             ui.label("fps");
             size_changed |= ui
-                .add(egui::DragValue::new(&mut fps).speed(0.0).range(1.0..=240.0))
+                .add(
+                    egui::DragValue::new(&mut fps)
+                        .speed(0.0)
+                        .range(1.0..=240.0)
+                        .max_decimals(2),
+                )
                 .changed();
         });
         if size_changed {
