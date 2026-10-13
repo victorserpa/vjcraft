@@ -812,3 +812,98 @@ fn group_two_layers_and_change_group_opacity() {
     assert!(h.state().project.composition.groups.is_empty());
     assert!(!exists(&h, "\u{25be} Group 1"));
 }
+
+// Layouts and contextual help (#36)
+fn pick_layout(h: &mut Harness<'_, State>, name: &str) {
+    click(h, "View");
+    click(h, name);
+}
+
+#[test]
+fn performance_layout_hides_browser_and_default_restores_it() {
+    let mut h = app();
+    assert!(exists(&h, "Files"), "browser visible at start");
+    pick_layout(&mut h, "Performance");
+    assert!(!exists(&h, "Files"), "Performance hides the browser");
+    assert!(!exists(&h, "Clip"), "Performance hides the bottom panel");
+    assert!(exists(&h, "Add layer"), "grid stays");
+    snap(&mut h, "layout_performance");
+    pick_layout(&mut h, "Default");
+    assert!(exists(&h, "Files") && exists(&h, "Clip"));
+    snap(&mut h, "layout_default");
+    pick_layout(&mut h, "Mapping");
+    assert_eq!(h.state().prefs.layouts.current.name, "Mapping");
+    assert!(h.state().prefs.layouts.current.monitors_h > 300.0);
+    snap(&mut h, "layout_mapping");
+}
+
+#[test]
+fn panel_toggle_shortcut_hides_and_shows_browser() {
+    let mut h = app();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num1);
+    settle(&mut h);
+    assert!(!exists(&h, "Files"));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num1);
+    settle(&mut h);
+    assert!(exists(&h, "Files"));
+}
+
+#[test]
+fn custom_layout_survives_prefs_reload() {
+    let dir = std::env::temp_dir().join(format!("vjc-layout-test-{}", std::process::id()));
+    let path = dir.join("prefs.json");
+    let mut h = app();
+    h.state_mut().prefs.layouts.current.browser_w = 333.0;
+    pick_layout(&mut h, "Performance");
+    h.state_mut().save_layout_as("My stage");
+    h.state_mut().prefs.layouts.save(Layout {
+        name: "Other".into(),
+        ..Layout::default()
+    });
+    h.state_mut().prefs.save(&path).unwrap();
+    let (loaded, warn) = Prefs::load(&path);
+    assert!(warn.is_none());
+    assert_eq!(loaded.layouts.current.name, "My stage");
+    assert!(!loaded.layouts.current.browser);
+    assert!(loaded.layouts.find("My stage").is_some());
+    // A fresh app starts with the restored layout; the menu lists it.
+    let mut p = prefs();
+    p.layouts = loaded.layouts;
+    let mut h2 = app_with(State::headless(p), egui::vec2(1280.0, 800.0));
+    assert!(!exists(&h2, "Files"), "browser stays hidden after restart");
+    click(&mut h2, "View");
+    assert!(exists(&h2, "My stage"));
+    click(&mut h2, "Default");
+    assert!(exists(&h2, "Files"));
+    // Built-in names cannot be overwritten; custom ones can be deleted.
+    h2.state_mut().save_layout_as("Performance");
+    assert!(
+        h2.state()
+            .prefs
+            .layouts
+            .custom
+            .iter()
+            .all(|l| l.name != "Performance")
+    );
+    h2.state_mut().delete_layout("My stage");
+    assert!(h2.state().prefs.layouts.find("My stage").is_none());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn hovering_tap_with_help_on_shows_its_text() {
+    let mut h = app();
+    assert!(!exists(&h, help::IDLE), "help bar is off by default");
+    click(&mut h, "View");
+    click_menu(&mut h, "Help");
+    assert!(exists(&h, help::IDLE) || has_text(&h, help::IDLE));
+    h.get_by_label("Tap").hover();
+    settle(&mut h);
+    let want = help::text("tap").unwrap();
+    assert!(exists(&h, want) || has_text(&h, want), "tap help shown");
+    snap(&mut h, "help_tap");
+    h.get_by_label("Metronome").hover();
+    settle(&mut h);
+    let want = help::text("metronome").unwrap();
+    assert!(exists(&h, want) || has_text(&h, want));
+}

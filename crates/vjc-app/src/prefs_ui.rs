@@ -29,7 +29,9 @@ impl State {
                         (PrefsTab::Api, "Remote API"),
                         (PrefsTab::Timecode, "Timecode"),
                     ] {
-                        ui.selectable_value(&mut self.prefs_tab, t, l);
+                        let r = ui.selectable_value(&mut self.prefs_tab, t, l);
+ let key = match t { PrefsTab::General => "prefs-general", PrefsTab::Audio => "prefs-audio", PrefsTab::Video => "prefs-video", PrefsTab::Control => "prefs-control", PrefsTab::Osc => "prefs-osc", PrefsTab::Dmx => "prefs-dmx", PrefsTab::Api => "prefs-api", PrefsTab::Timecode => "prefs-timecode" };
+ crate::help::help(r, key);
                     }
                 });
                 ui.separator();

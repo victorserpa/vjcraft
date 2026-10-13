@@ -185,6 +185,128 @@ pub struct Timecode {
     pub ltc_fps: Option<TcFps>,
 }
 
+/// Panel visibility and sizes (points) of the main window, saved under a name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Layout {
+    pub name: String,
+    pub browser: bool,
+    pub browser_w: f32,
+    pub monitors: bool,
+    pub monitors_h: f32,
+    pub params: bool,
+    pub params_h: f32,
+    pub grid: bool,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Layout {
+            name: "Default".into(),
+            browser: true,
+            browser_w: 260.0,
+            monitors: true,
+            monitors_h: 220.0,
+            params: true,
+            params_h: 220.0,
+            grid: true,
+        }
+    }
+}
+
+impl Layout {
+    /// The built-in layouts, in menu order.
+    pub fn presets() -> Vec<Layout> {
+        let d = Layout::default();
+        vec![
+            d.clone(),
+            Layout {
+                name: "Performance".into(),
+                browser: false,
+                params: false,
+                monitors_h: 180.0,
+                ..d.clone()
+            },
+            Layout {
+                name: "Mapping".into(),
+                monitors_h: 420.0,
+                browser: false,
+                params_h: 140.0,
+                ..d
+            },
+        ]
+    }
+
+    pub fn is_preset(name: &str) -> bool {
+        Layout::presets().iter().any(|l| l.name == name)
+    }
+
+    fn sanitize(&mut self) {
+        self.name = self.name.trim().to_owned();
+        for v in [
+            &mut self.browser_w,
+            &mut self.monitors_h,
+            &mut self.params_h,
+        ] {
+            *v = if v.is_finite() {
+                v.clamp(40.0, 4000.0)
+            } else {
+                220.0
+            };
+        }
+    }
+}
+
+/// The layout in use (restored on start), the user's named layouts and the help toggle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Layouts {
+    pub current: Layout,
+    pub custom: Vec<Layout>,
+    pub help: bool,
+}
+
+impl Layouts {
+    fn sanitize(&mut self) {
+        self.current.sanitize();
+        for l in &mut self.custom {
+            l.sanitize();
+        }
+        self.custom
+            .retain(|l| !l.name.is_empty() && !Layout::is_preset(&l.name));
+        let mut seen = std::collections::HashSet::new();
+        self.custom.retain(|l| seen.insert(l.name.clone()));
+    }
+
+    /// Preset or custom layout by name.
+    pub fn find(&self, name: &str) -> Option<Layout> {
+        Layout::presets()
+            .into_iter()
+            .chain(self.custom.iter().cloned())
+            .find(|l| l.name == name)
+    }
+
+    /// Saves `layout` under its name (replacing a custom one); false for empty or preset names.
+    pub fn save(&mut self, layout: Layout) -> bool {
+        let name = layout.name.trim().to_owned();
+        if name.is_empty() || Layout::is_preset(&name) {
+            return false;
+        }
+        let l = Layout { name, ..layout };
+        match self.custom.iter_mut().find(|c| c.name == l.name) {
+            Some(c) => *c = l,
+            None => self.custom.push(l),
+        }
+        true
+    }
+
+    pub fn delete(&mut self, name: &str) -> bool {
+        let n = self.custom.len();
+        self.custom.retain(|l| l.name != name);
+        self.custom.len() != n
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -197,6 +319,7 @@ pub struct Prefs {
     pub dmx: Dmx,
     pub api: Api,
     pub timecode: Timecode,
+    pub layouts: Layouts,
 }
 
 impl Default for Prefs {
@@ -211,6 +334,7 @@ impl Default for Prefs {
             dmx: Dmx::default(),
             api: Api::default(),
             timecode: Timecode::default(),
+            layouts: Layouts::default(),
         }
     }
 }
@@ -233,6 +357,7 @@ impl Prefs {
         self.dmx.universe = self.dmx.universe.min(0x7FFF);
         self.dmx.universes = self.dmx.universes.clamp(1, 64);
         self.dmx.interface = self.dmx.interface.trim().to_owned();
+        self.layouts.sanitize();
     }
 
     pub fn from_json(text: &str) -> (Prefs, Option<String>) {

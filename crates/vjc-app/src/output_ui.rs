@@ -160,13 +160,13 @@ impl State {
         ui.strong("Screens");
         for s in screens {
             let on = cur.is_some_and(|c| c.id == s.id);
-            if ui.selectable_label(on, &s.name).clicked() {
+            if crate::help::help(ui.selectable_label(on, &s.name), "out-screens").clicked() {
                 self.sel_screen = Some(s.id);
                 self.sel_slice = None;
             }
         }
         ui.horizontal(|ui| {
-            if ui.button("Add").clicked() {
+            if crate::help::help(ui.button("Add"), "out-add-screen").clicked() {
                 let s = mapping::new_screen(&format!("Screen {}", screens.len() + 1), cw, ch);
                 self.sel_screen = Some(s.id);
                 cmds.push(Command::AddScreen {
@@ -437,7 +437,7 @@ impl State {
                         self.sel_pt_out = None;
                     }
                 }
-                if ui.button("Add slice").clicked() {
+                if crate::help::help(ui.button("Add slice"), "out-add-slice").clicked() {
                     let s = mapping::new_slice(scr.width, scr.height);
                     self.sel_slice = Some(s.id);
                     cmds.push(Command::AddSlice {
@@ -457,7 +457,7 @@ impl State {
                 return;
             };
             ui.horizontal(|ui| {
-                if ui.button("Remove slice").clicked() {
+                if crate::help::help(ui.button("Remove slice"), "out-remove-slice").clicked() {
                     self.sel_slice = None;
                     cmds.push(Command::RemoveSlice {
                         screen: scr.id,
@@ -518,7 +518,7 @@ impl State {
             ui.strong("Mask");
             if sl.mask.is_none() {
                 self.edit_mask = false;
-                if ui.button("Create mask").clicked() {
+                if crate::help::help(ui.button("Create mask"), "out-create-mask").clicked() {
                     self.edit_mask = true;
                     self.sel_mask_pt = None;
                     cmds.push(set_mask(Some(vec![
@@ -540,7 +540,7 @@ impl State {
                     m.remove(i);
                     cmds.push(set_mask(Some(m)));
                 }
-                if ui.button("Clear mask").clicked() {
+                if crate::help::help(ui.button("Clear mask"), "out-clear-mask").clicked() {
                     self.edit_mask = false;
                     self.sel_mask_pt = None;
                     cmds.push(set_mask(None));

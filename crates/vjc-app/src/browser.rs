@@ -334,10 +334,22 @@ impl Browser {
         let ctx = ui.ctx().clone();
         self.thumbs.poll();
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Files, "Files");
-            ui.selectable_value(&mut self.tab, Tab::Effects, "Effects");
-            ui.selectable_value(&mut self.tab, Tab::Generators, "Generators");
-            ui.selectable_value(&mut self.tab, Tab::Network, "Network");
+            crate::help::help(
+                ui.selectable_value(&mut self.tab, Tab::Files, "Files"),
+                "browser-files",
+            );
+            crate::help::help(
+                ui.selectable_value(&mut self.tab, Tab::Effects, "Effects"),
+                "browser-effects",
+            );
+            crate::help::help(
+                ui.selectable_value(&mut self.tab, Tab::Generators, "Generators"),
+                "browser-generators",
+            );
+            crate::help::help(
+                ui.selectable_value(&mut self.tab, Tab::Network, "Network"),
+                "browser-network",
+            );
         });
         if let Some(rx) = &self.net_rx
             && let Ok(l) = rx.try_recv()

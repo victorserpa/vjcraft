@@ -5,6 +5,7 @@ mod capture;
 mod compositor;
 mod dmx_io;
 mod fx;
+mod help;
 mod link_io;
 mod midi_io;
 mod monitors;
@@ -19,6 +20,7 @@ mod timecode_io;
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
 use eframe::egui_wgpu::wgpu;
+use help::help;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -26,7 +28,7 @@ use vjc_core::clock::{Clock, LinkSync, beat_sync_rate};
 use vjc_core::effects::EffectTarget;
 use vjc_core::playhead::Playhead;
 use vjc_core::{Command, Event, History};
-use vjc_io::prefs::Prefs;
+use vjc_io::prefs::{Layout, Prefs};
 use vjc_media::audio::AudioEngine;
 use vjc_media::{Frame, Player};
 use vjc_model::{
@@ -156,6 +158,12 @@ struct State {
     metronome: bool,
     link: link_io::Link,
     link_sync: LinkSync,
+    /// Bumped when a layout is applied: panels get fresh ids so their saved sizes apply.
+    layout_gen: u32,
+    /// Name being typed in the "Save layout as..." window.
+    save_layout: Option<String>,
+    /// Help text key under the pointer in the previous frame.
+    help_shown: Option<&'static str>,
 }
 
 /// Old clip kept alive while a layer transition crosses to the new one (frozen on its
@@ -834,6 +842,9 @@ impl State {
             metronome: false,
             link: link_io::Link::new(120.0),
             link_sync: LinkSync::default(),
+            layout_gen: 0,
+            save_layout: None,
+            help_shown: None,
             renaming: None,
         }
     }
@@ -895,6 +906,191 @@ impl State {
         self.warnings.clear();
         self.reset_players();
         self.status = "New project".into();
+    }
+
+    /// Makes `l` the current layout; panels take its sizes and visibility.
+    fn apply_layout(&mut self, l: Layout) {
+        self.prefs.layouts.current = l;
+        self.layout_gen += 1;
+        self.prefs_dirty = true;
+        self.save_prefs();
+    }
+
+    fn apply_layout_named(&mut self, name: &str) {
+        if let Some(l) = self.prefs.layouts.find(name) {
+            self.apply_layout(l);
+            self.status = format!("Layout {name}");
+        }
+    }
+
+    /// Saves the current panel sizes and visibility under `name` (custom layouts only).
+    fn save_layout_as(&mut self, name: &str) {
+        let l = Layout {
+            name: name.trim().to_owned(),
+            ..self.prefs.layouts.current.clone()
+        };
+        if self.prefs.layouts.save(l.clone()) {
+            self.prefs.layouts.current = l.clone();
+            self.status = format!("Layout {} saved", l.name);
+        } else {
+            self.status = "Layout name is empty or belongs to a built-in layout".into();
+        }
+        self.prefs_dirty = true;
+        self.save_prefs();
+    }
+
+    fn delete_layout(&mut self, name: &str) {
+        if self.prefs.layouts.delete(name) {
+            self.status = format!("Layout {name} deleted");
+            if self.prefs.layouts.current.name == name {
+                self.apply_layout(Layout::default());
+            } else {
+                self.prefs_dirty = true;
+                self.save_prefs();
+            }
+        }
+    }
+
+    fn set_help(&mut self, on: bool) {
+        self.prefs.layouts.help = on;
+        self.prefs_dirty = true;
+        self.save_prefs();
+    }
+
+    /// Remembers a panel's live size in the current layout (saved on exit or layout change).
+    fn track_size(&mut self, f: impl FnOnce(&mut Layout) -> &mut f32, size: f32) {
+        let v = f(&mut self.prefs.layouts.current);
+        if (*v - size).abs() > 0.5 && size >= 40.0 {
+            *v = size;
+            self.prefs_dirty = true;
+        }
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        let cur = self.prefs.layouts.current.name.clone();
+        let names: Vec<String> = Layout::presets()
+            .into_iter()
+            .chain(self.prefs.layouts.custom.iter().cloned())
+            .map(|l| l.name)
+            .collect();
+        for n in &names {
+            if ui.selectable_label(&cur == n, n).clicked() {
+                ui.close();
+                self.apply_layout_named(n);
+            }
+        }
+        ui.separator();
+        if ui.button("Save layout as...").clicked() {
+            ui.close();
+            self.save_layout = Some(String::new());
+        }
+        ui.menu_button("Delete layout", |ui| {
+            if self.prefs.layouts.custom.is_empty() {
+                ui.label("No saved layouts");
+            }
+            for n in self
+                .prefs
+                .layouts
+                .custom
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>()
+            {
+                if ui.button(&n).clicked() {
+                    ui.close();
+                    self.delete_layout(&n);
+                }
+            }
+        });
+        ui.separator();
+        let l = self.prefs.layouts.current.clone();
+        let mut new = l.clone();
+        for (on, label, key) in [
+            (&mut new.browser, "Browser", "Cmd+1"),
+            (&mut new.monitors, "Monitors", "Cmd+2"),
+            (&mut new.params, "Parameters", "Cmd+3"),
+            (&mut new.grid, "Clip grid", "Cmd+4"),
+        ] {
+            if ui
+                .add(egui::Button::selectable(*on, label).shortcut_text(key))
+                .clicked()
+            {
+                *on = !*on;
+            }
+        }
+        ui.separator();
+        let mut h = self.prefs.layouts.help;
+        if ui
+            .add(egui::Button::selectable(h, "Help").shortcut_text("Cmd+/"))
+            .clicked()
+        {
+            h = !h;
+            self.set_help(h);
+        }
+        if new != l {
+            self.prefs.layouts.current = new;
+            self.layout_gen += 1;
+            self.prefs_dirty = true;
+        }
+    }
+
+    fn layout_keys(&mut self, ctx: &egui::Context) {
+        use egui::Key;
+        let cmd = egui::Modifiers::COMMAND;
+        let l = &mut self.prefs.layouts.current;
+        let before = l.clone();
+        for (k, on) in [
+            (Key::Num1, &mut l.browser),
+            (Key::Num2, &mut l.monitors),
+            (Key::Num3, &mut l.params),
+            (Key::Num4, &mut l.grid),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(cmd, k)) {
+                *on = !*on;
+            }
+        }
+        if *l != before {
+            self.layout_gen += 1;
+            self.prefs_dirty = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd, Key::Slash)) {
+            self.set_help(!self.prefs.layouts.help);
+        }
+    }
+
+    fn save_layout_window(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.save_layout.take() else {
+            return;
+        };
+        let (mut keep, mut save) = (true, false);
+        egui::Window::new("Save layout as")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut keep)
+            .show(ctx, |ui| {
+                let r = ui.text_edit_singleline(&mut name);
+                r.request_focus();
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui
+                    .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+                    .clicked()
+                    || enter
+                {
+                    save = true;
+                }
+            });
+        if save && !name.trim().is_empty() {
+            self.save_layout_as(&name);
+        } else if keep {
+            self.save_layout = Some(name);
+        }
+    }
+
+    fn help_bar(&mut self, ui: &mut egui::Ui) {
+        let shown = self.help_shown.and_then(help::text).unwrap_or(help::IDLE);
+        egui::Panel::bottom("help_bar").show(ui, |ui| {
+            ui.label(shown);
+        });
     }
 
     fn save_prefs(&mut self) {
@@ -2103,17 +2299,17 @@ impl State {
         let bar = ui.horizontal(|ui| {
             ui.label("Master");
             let mut bypass = self.master_bypass;
-            let by = ui.toggle_value(&mut bypass, "Bypass");
+            let by = help(ui.toggle_value(&mut bypass, "Bypass"), "master-bypass");
             self.targets.push((by.rect, "/comp/master/bypass".into()));
             if by.changed() {
                 cmds.push(Command::SetMasterBypass { bypass });
             }
-            if ui.button("Clear All").clicked() {
+            if help(ui.button("Clear All"), "clear-all").clicked() {
                 cmds.push(Command::ClearAll);
             }
             let recording = self.capture.is_some();
             let label = if recording { "Stop rec" } else { "Record" };
-            if ui.selectable_label(recording, label).clicked() {
+            if help(ui.selectable_label(recording, label), "record").clicked() {
                 cmds.push(if recording {
                     Command::StopRecording
                 } else {
@@ -2141,6 +2337,7 @@ impl State {
                     .smallest_positive(0.001),
             );
             ui.label("B");
+            let cf = help(cf, "crossfader");
             self.targets.push((cf.rect, "/comp/crossfader".into()));
             if cf.changed() {
                 cmds.push(Command::SetCrossfader { value: pos });
@@ -2467,23 +2664,27 @@ impl State {
         ui.horizontal(|ui| {
             ui.label("BPM");
             let mut bpm = self.clock.bpm();
-            if ui
-                .add(
-                    egui::DragValue::new(&mut bpm)
-                        .range(vjc_core::clock::MIN_BPM..=vjc_core::clock::MAX_BPM)
-                        .speed(0.1),
-                )
-                .changed()
-            {
+            let bpm_r = ui.add(
+                egui::DragValue::new(&mut bpm)
+                    .range(vjc_core::clock::MIN_BPM..=vjc_core::clock::MAX_BPM)
+                    .speed(0.1),
+            );
+            if help(bpm_r, "bpm").changed() {
                 cmds.push(Command::SetBpm { bpm });
             }
-            let tap = ui.button("Tap");
+            let tap = help(ui.button("Tap"), "tap");
             self.targets.push((tap.rect, "/comp/tempo/tap".into()));
             if tap.clicked() {
                 cmds.push(Command::Tap { at: now });
             }
-            let minus = ui.button("\u{2212}").on_hover_text("Nudge slower (hold)");
-            let plus = ui.button("+").on_hover_text("Nudge faster (hold)");
+            let minus = help(
+                ui.button("\u{2212}").on_hover_text("Nudge slower (hold)"),
+                "nudge-slower",
+            );
+            let plus = help(
+                ui.button("+").on_hover_text("Nudge faster (hold)"),
+                "nudge-faster",
+            );
             let dir = if minus.is_pointer_button_down_on() {
                 -1
             } else if plus.is_pointer_button_down_on() {
@@ -2495,16 +2696,16 @@ impl State {
                 self.nudge_dir = dir;
                 cmds.push(Command::Nudge { dir, at: now });
             }
-            if ui.button("Resync").clicked() {
+            if help(ui.button("Resync"), "resync").clicked() {
                 cmds.push(Command::Resync { at: now });
             }
             let bpm = self.clock.bpm();
-            if ui.button("\u{00f7}2").clicked() {
+            if help(ui.button("\u{00f7}2"), "half-tempo").clicked() {
                 cmds.push(Command::SetBpm {
                     bpm: (bpm / 2.0).max(vjc_core::clock::MIN_BPM),
                 });
             }
-            if ui.button("\u{00d7}2").clicked() {
+            if help(ui.button("\u{00d7}2"), "double-tempo").clicked() {
                 cmds.push(Command::SetBpm {
                     bpm: (bpm * 2.0).min(vjc_core::clock::MAX_BPM),
                 });
@@ -2527,14 +2728,17 @@ impl State {
                 };
                 ui.painter().circle_filled(rect.center(), 6.0, col);
             }
-            ui.toggle_value(&mut self.metronome, "Metronome");
+            help(
+                ui.toggle_value(&mut self.metronome, "Metronome"),
+                "metronome",
+            );
             let mut link = self.project.composition.tempo.link_enabled;
             let label = if link {
                 format!("Link ({})", self.link_sync.peers)
             } else {
                 "Link".to_owned()
             };
-            if ui.toggle_value(&mut link, label).changed() {
+            if help(ui.toggle_value(&mut link, label), "link").changed() {
                 cmds.push(Command::SetLink { enabled: link });
             }
             if self.prefs.timecode.source != vjc_io::prefs::TcSource::Off {
@@ -2550,16 +2754,18 @@ impl State {
                 } else {
                     ui.visuals().weak_text_color()
                 };
-                ui.label(
-                    egui::RichText::new(format!("TC {text}"))
-                        .monospace()
-                        .color(color),
-                )
-                .on_hover_text(if cur.is_some() {
-                    "External timecode"
-                } else {
-                    "No timecode signal"
-                });
+                let r = ui
+                    .label(
+                        egui::RichText::new(format!("TC {text}"))
+                            .monospace()
+                            .color(color),
+                    )
+                    .on_hover_text(if cur.is_some() {
+                        "External timecode"
+                    } else {
+                        "No timecode signal"
+                    });
+                help(r, "timecode");
             }
         });
         if self.learn {
@@ -2572,6 +2778,7 @@ impl State {
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.help_shown = help::take_hovered(&ctx);
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui
@@ -2635,6 +2842,7 @@ impl State {
                     self.redo();
                 }
             });
+            ui.menu_button("View", |ui| self.view_menu(ui));
             ui.menu_button("Shortcuts", |ui| {
                 for (midi, label) in [(false, "Edit keyboard"), (true, "Edit MIDI")] {
                     let on = self.learn && self.learn_midi == midi;
@@ -2695,17 +2903,28 @@ impl State {
         });
         let fxs = browser_fx();
         let mut opened = None;
-        egui::Panel::right("browser")
-            .default_size(260.0)
-            .show(ui, |ui| opened = self.browser.show(ui, &fxs));
+        let lay = self.prefs.layouts.current.clone();
+        let gen_ = self.layout_gen;
+        if lay.browser {
+            let r = egui::Panel::right(egui::Id::new(("browser", gen_)))
+                .default_size(lay.browser_w)
+                .show(ui, |ui| opened = self.browser.show(ui, &fxs));
+            self.track_size(|l| &mut l.browser_w, r.response.rect.width());
+        }
         let mut pcmds = vec![];
         // Heights are relative to the window so the grid always keeps room.
         let win_h = ui.max_rect().height();
-        egui::Panel::bottom("params")
-            .default_size((win_h * 0.25).min(220.0))
-            .resizable(true)
-            .size_range(40.0..=(win_h * 0.3).max(40.0))
-            .show(ui, |ui| self.params_panel(ui, &mut pcmds));
+        if self.prefs.layouts.help {
+            self.help_bar(ui);
+        }
+        if lay.params {
+            let r = egui::Panel::bottom(egui::Id::new(("params", gen_)))
+                .default_size(lay.params_h.min(win_h * 0.3))
+                .resizable(true)
+                .size_range(40.0..=(win_h * 0.3).max(40.0))
+                .show(ui, |ui| self.params_panel(ui, &mut pcmds));
+            self.track_size(|l| &mut l.params_h, r.response.rect.height());
+        }
         for c in pcmds {
             self.exec(c);
         }
@@ -2728,6 +2947,7 @@ impl State {
             self.master_bar(ui);
         });
         self.shortcut_keys(&ctx);
+        self.layout_keys(&ctx);
         self.midi_pump();
         self.osc_pump();
         self.dmx_pump();
@@ -2757,6 +2977,7 @@ impl State {
             self.prefs_open = true;
         }
         self.prefs_window(&ctx);
+        self.save_layout_window(&ctx);
         self.output_setup_window(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2825,14 +3046,14 @@ impl State {
         ui.separator();
 
         ui.horizontal(|ui| {
-            if ui.button("Add layer").clicked() {
+            if help(ui.button("Add layer"), "add-layer").clicked() {
                 let n = self.project.composition.layers.len() + 1;
                 self.exec(Command::AddLayer {
                     layer: new_layer(n),
                     index: 0,
                 });
             }
-            if ui.button("Add column").clicked() {
+            if help(ui.button("Add column"), "add-column").clicked() {
                 let n = self.project.composition.columns.len() + 1;
                 self.exec(Command::AddColumn {
                     column: Column {
@@ -2848,12 +3069,12 @@ impl State {
         let mon_max = (ui.available_height() - 80.0 - 40.0)
             .min(win_h * 0.35)
             .min(700.0);
-        if mon_max < 40.0 {
-            // Too short for monitors: collapse them entirely.
+        if !lay.monitors || mon_max < 40.0 {
+            // Hidden, or too short for monitors: collapse them entirely.
         } else if let Some(id) = self.comp_tex {
-            egui::Panel::top("monitors")
+            let r = egui::Panel::top(egui::Id::new(("monitors", gen_)))
                 .resizable(true)
-                .default_size(220.0_f32.min(mon_max))
+                .default_size(lay.monitors_h.min(mon_max))
                 .size_range(40.0..=mon_max)
                 .show(ui, |ui| {
                     let c = &self.project.composition;
@@ -2887,6 +3108,7 @@ impl State {
                         }
                     });
                 });
+            self.track_size(|l| &mut l.monitors_h, r.response.rect.height());
         } else {
             egui::Panel::top("monitors")
                 .resizable(false)
@@ -2896,7 +3118,9 @@ impl State {
         }
 
         let mut cmds: Vec<Command> = vec![];
-        self.deck_tabs(ui, &mut cmds);
+        if lay.grid {
+            self.deck_tabs(ui, &mut cmds);
+        }
         let mut cells = vec![];
         let ncols = self.project.composition.columns.len() as u32;
         let cur = self.project.composition.current_deck;
@@ -2914,207 +3138,218 @@ impl State {
             .iter()
             .position(|d| d.id == cur);
         let comp = &self.project.composition;
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
-                    ui.label("");
-                    ui.label("Opacity");
-                    for (ci, n) in names.iter().enumerate() {
-                        let b = egui::Button::new(format!("\u{25b6} {n}"))
-                            .selected(self.col_sel == Some(ci as u32));
-                        let r = ui.add(b);
-                        self.targets
-                            .push((r.rect, vjc_core::shortcuts::column_address(ci as u32)));
-                        if r.clicked() {
-                            cmds.push(Command::TriggerColumn {
-                                deck: cur,
-                                column: ci as u32,
-                            });
-                        }
-                    }
-                    ui.label("A/B");
-                    ui.label("Blend");
-                    ui.label("");
-                    ui.end_row();
-                    for li in 0..comp.layers.len() {
-                        let lid = comp.layers[li].id;
-                        let group_head = comp.layers[li]
-                            .group
-                            .filter(|g| li == 0 || comp.layers[li - 1].group != Some(*g))
-                            .and_then(|g| comp.group(g));
-                        if let Some(g) = group_head {
-                            group_header(
-                                ui,
-                                &self.project,
-                                g,
-                                ncols,
-                                (&mut self.sel_group, &mut self.panel_tab, &mut self.targets),
-                                &mut cmds,
-                            );
-                        }
-                        let in_group = comp.layers[li].group.is_some();
-                        let name = ui.add(
-                            egui::Label::new(if in_group {
-                                format!("  \u{2502} {}", comp.layers[li].name)
-                            } else {
-                                comp.layers[li].name.clone()
-                            })
-                            .sense(egui::Sense::click()),
-                        );
-                        self.layer_rects.push((name.rect, lid));
-                        if name.clicked() || name.secondary_clicked() {
-                            self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
-                        }
-                        name.context_menu(|ui| {
-                            let from = active_of(&self.players, &self.gens, lid)
-                                .filter(|(d, _)| *d == cur)
-                                .map(|(_, c)| c);
-                            for (label, delta) in [("Previous clip", -1), ("Next clip", 1)] {
-                                if ui.button(label).clicked() {
-                                    cmds.push(Command::StepClip {
-                                        deck: cur,
-                                        layer: lid,
-                                        from,
-                                        delta,
-                                    });
-                                    ui.close();
-                                }
+        if lay.grid {
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
+                        ui.label("");
+                        ui.label("Opacity");
+                        for (ci, n) in names.iter().enumerate() {
+                            let b = egui::Button::new(format!("\u{25b6} {n}"))
+                                .selected(self.col_sel == Some(ci as u32));
+                            let r = help(ui.add(b), "column");
+                            self.targets
+                                .push((r.rect, vjc_core::shortcuts::column_address(ci as u32)));
+                            if r.clicked() {
+                                cmds.push(Command::TriggerColumn {
+                                    deck: cur,
+                                    column: ci as u32,
+                                });
                             }
-                            ui.separator();
-                            group_menu(ui, comp, li, &mut cmds);
-                            ui.separator();
-                            add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
-                        });
-                        let layer = &comp.layers[li];
-                        let mut op = match layer.track.opacity.value {
-                            vjc_model::Value::Number(n) => n as f32,
-                            _ => 1.0,
-                        };
-                        let op_r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
-                        if let Some(a) =
-                            vjc_core::shortcuts::layer_address(&self.project, lid, "opacity")
-                        {
-                            self.targets.push((op_r.rect, a));
                         }
-                        if op_r.changed() {
-                            cmds.push(Command::SetOpacity {
-                                layer: lid,
-                                value: op as f64,
+                        ui.label("A/B");
+                        ui.label("Blend");
+                        ui.label("");
+                        ui.end_row();
+                        for li in 0..comp.layers.len() {
+                            let lid = comp.layers[li].id;
+                            let group_head = comp.layers[li]
+                                .group
+                                .filter(|g| li == 0 || comp.layers[li - 1].group != Some(*g))
+                                .and_then(|g| comp.group(g));
+                            if let Some(g) = group_head {
+                                group_header(
+                                    ui,
+                                    &self.project,
+                                    g,
+                                    ncols,
+                                    (&mut self.sel_group, &mut self.panel_tab, &mut self.targets),
+                                    &mut cmds,
+                                );
+                            }
+                            let in_group = comp.layers[li].group.is_some();
+                            let name = ui.add(
+                                egui::Label::new(if in_group {
+                                    format!("  \u{2502} {}", comp.layers[li].name)
+                                } else {
+                                    comp.layers[li].name.clone()
+                                })
+                                .sense(egui::Sense::click()),
+                            );
+                            let name = help(name, "layer-name");
+                            self.layer_rects.push((name.rect, lid));
+                            if name.clicked() || name.secondary_clicked() {
+                                self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
+                            }
+                            name.context_menu(|ui| {
+                                let from = active_of(&self.players, &self.gens, lid)
+                                    .filter(|(d, _)| *d == cur)
+                                    .map(|(_, c)| c);
+                                for (label, delta) in [("Previous clip", -1), ("Next clip", 1)] {
+                                    if ui.button(label).clicked() {
+                                        cmds.push(Command::StepClip {
+                                            deck: cur,
+                                            layer: lid,
+                                            from,
+                                            delta,
+                                        });
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                group_menu(ui, comp, li, &mut cmds);
+                                ui.separator();
+                                add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
                             });
-                        }
-                        for ci in 0..ncols {
-                            let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
-                            // Highlight only when playing from the deck being shown.
-                            let on = active_of(&self.players, &self.gens, lid) == Some((cur, ci));
-                            let text = clip
-                                .map(|k| k.name.as_str())
-                                .unwrap_or("(drop / right-click)");
-                            let btn = egui::Button::new(text)
-                                .selected(on)
-                                .min_size(egui::vec2(90.0, 24.0));
-                            let r = ui.add(btn);
-                            if clip.is_some() {
-                                r.context_menu(|ui| {
-                                    let t = EffectTarget::Clip {
+                            let layer = &comp.layers[li];
+                            let mut op = match layer.track.opacity.value {
+                                vjc_model::Value::Number(n) => n as f32,
+                                _ => 1.0,
+                            };
+                            let op_r =
+                                ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
+                            let op_r = help(op_r, "layer-opacity");
+                            if let Some(a) =
+                                vjc_core::shortcuts::layer_address(&self.project, lid, "opacity")
+                            {
+                                self.targets.push((op_r.rect, a));
+                            }
+                            if op_r.changed() {
+                                cmds.push(Command::SetOpacity {
+                                    layer: lid,
+                                    value: op as f64,
+                                });
+                            }
+                            for ci in 0..ncols {
+                                let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
+                                // Highlight only when playing from the deck being shown.
+                                let on =
+                                    active_of(&self.players, &self.gens, lid) == Some((cur, ci));
+                                let text = clip
+                                    .map(|k| k.name.as_str())
+                                    .unwrap_or("(drop / right-click)");
+                                let btn = egui::Button::new(text)
+                                    .selected(on)
+                                    .min_size(egui::vec2(90.0, 24.0));
+                                let r = help(
+                                    ui.add(btn),
+                                    if clip.is_some() { "cell" } else { "cell-empty" },
+                                );
+                                if clip.is_some() {
+                                    r.context_menu(|ui| {
+                                        let t = EffectTarget::Clip {
+                                            deck: cur,
+                                            layer: lid,
+                                            column: ci,
+                                        };
+                                        add_effect_menu(ui, t, &mut cmds);
+                                    });
+                                }
+                                if clip.is_none() {
+                                    r.context_menu(|ui| {
+                                        if ui.button("Import file...").clicked() {
+                                            pick = Some((lid, ci));
+                                            ui.close();
+                                        }
+                                        generator_menu(ui, cur, lid, ci, &mut cmds);
+                                    });
+                                }
+                                if let Some(a) =
+                                    vjc_core::shortcuts::clip_address(&self.project, lid, ci)
+                                {
+                                    self.targets.push((r.rect, a));
+                                }
+                                cells.push(CellInfo {
+                                    rect: r.rect,
+                                    layer: lid,
+                                    col: ci,
+                                    empty: clip.is_none(),
+                                });
+                                if drag_target == Some((lid, ci)) {
+                                    ui.painter().rect_stroke(
+                                        r.rect,
+                                        3.0,
+                                        egui::Stroke::new(2.5, egui::Color32::YELLOW),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                } else if self.selected == Some((lid, ci)) {
+                                    ui.painter().rect_stroke(
+                                        r.rect,
+                                        3.0,
+                                        egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if r.clicked() || r.secondary_clicked() {
+                                    self.selected = Some((lid, ci));
+                                }
+                                if r.clicked() && clip.is_some() {
+                                    cmds.push(Command::TriggerClip {
                                         deck: cur,
                                         layer: lid,
                                         column: ci,
-                                    };
-                                    add_effect_menu(ui, t, &mut cmds);
-                                });
-                            }
-                            if clip.is_none() {
-                                r.context_menu(|ui| {
-                                    if ui.button("Import file...").clicked() {
-                                        pick = Some((lid, ci));
-                                        ui.close();
-                                    }
-                                    generator_menu(ui, cur, lid, ci, &mut cmds);
-                                });
-                            }
-                            if let Some(a) =
-                                vjc_core::shortcuts::clip_address(&self.project, lid, ci)
-                            {
-                                self.targets.push((r.rect, a));
-                            }
-                            cells.push(CellInfo {
-                                rect: r.rect,
-                                layer: lid,
-                                col: ci,
-                                empty: clip.is_none(),
-                            });
-                            if drag_target == Some((lid, ci)) {
-                                ui.painter().rect_stroke(
-                                    r.rect,
-                                    3.0,
-                                    egui::Stroke::new(2.5, egui::Color32::YELLOW),
-                                    egui::StrokeKind::Outside,
-                                );
-                            } else if self.selected == Some((lid, ci)) {
-                                ui.painter().rect_stroke(
-                                    r.rect,
-                                    3.0,
-                                    egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            if r.clicked() || r.secondary_clicked() {
-                                self.selected = Some((lid, ci));
-                            }
-                            if r.clicked() && clip.is_some() {
-                                cmds.push(Command::TriggerClip {
-                                    deck: cur,
-                                    layer: lid,
-                                    column: ci,
-                                });
-                            }
-                            if clip.is_none() && r.double_clicked() {
-                                pick = Some((lid, ci));
-                            }
-                        }
-                        let layer = &comp.layers[li];
-                        ui.horizontal(|ui| {
-                            for (txt, bus) in [
-                                ("A", Some(vjc_model::Bus::A)),
-                                ("-", None),
-                                ("B", Some(vjc_model::Bus::B)),
-                            ] {
-                                if ui
-                                    .selectable_label(layer.crossfader_bus == bus, txt)
-                                    .clicked()
-                                {
-                                    cmds.push(Command::SetLayerBus { layer: lid, bus });
+                                    });
+                                }
+                                if clip.is_none() && r.double_clicked() {
+                                    pick = Some((lid, ci));
                                 }
                             }
-                        });
-                        let label = vjc_core::blend::COMPOSITION_MODES
-                            .iter()
-                            .find(|(m, _)| *m == layer.track.blend)
-                            .map_or("Normal", |(_, n)| *n);
-                        egui::ComboBox::from_id_salt(("blend", lid))
-                            .selected_text(label)
-                            .width(90.0)
-                            .show_ui(ui, |ui| {
-                                for (b, name) in vjc_core::blend::COMPOSITION_MODES {
+                            let layer = &comp.layers[li];
+                            let bus_row = ui.horizontal(|ui| {
+                                for (txt, bus) in [
+                                    ("A", Some(vjc_model::Bus::A)),
+                                    ("-", None),
+                                    ("B", Some(vjc_model::Bus::B)),
+                                ] {
                                     if ui
-                                        .selectable_label(layer.track.blend == *b, *name)
+                                        .selectable_label(layer.crossfader_bus == bus, txt)
                                         .clicked()
                                     {
-                                        cmds.push(Command::SetBlend {
-                                            layer: lid,
-                                            blend: b.clone(),
-                                        });
+                                        cmds.push(Command::SetLayerBus { layer: lid, bus });
                                     }
                                 }
                             });
-                        if ui.button("Clear").clicked() {
-                            cmds.push(Command::ClearLayer { layer: lid });
+                            help(bus_row.response, "layer-bus");
+                            let label = vjc_core::blend::COMPOSITION_MODES
+                                .iter()
+                                .find(|(m, _)| *m == layer.track.blend)
+                                .map_or("Normal", |(_, n)| *n);
+                            let blend = egui::ComboBox::from_id_salt(("blend", lid))
+                                .selected_text(label)
+                                .width(90.0)
+                                .show_ui(ui, |ui| {
+                                    for (b, name) in vjc_core::blend::COMPOSITION_MODES {
+                                        if ui
+                                            .selectable_label(layer.track.blend == *b, *name)
+                                            .clicked()
+                                        {
+                                            cmds.push(Command::SetBlend {
+                                                layer: lid,
+                                                blend: b.clone(),
+                                            });
+                                        }
+                                    }
+                                });
+                            help(blend.response, "layer-blend");
+                            if help(ui.button("Clear"), "layer-clear").clicked() {
+                                cmds.push(Command::ClearLayer { layer: lid });
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
-                    }
+                    });
                 });
-            });
+        }
         self.cells = cells;
         if let Some((l, c)) = pick
             && let Some(path) = rfd::FileDialog::new()
@@ -3145,10 +3380,15 @@ impl State {
     /// Bottom panel: Composition / Layer / Clip parameters of the selection.
     fn params_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.panel_tab, PanelTab::Composition, "Composition");
-            ui.selectable_value(&mut self.panel_tab, PanelTab::Layer, "Layer");
-            ui.selectable_value(&mut self.panel_tab, PanelTab::Group, "Group");
-            ui.selectable_value(&mut self.panel_tab, PanelTab::Clip, "Clip");
+            for (t, label, key) in [
+                (PanelTab::Composition, "Composition", "tab-composition"),
+                (PanelTab::Layer, "Layer", "tab-layer"),
+                (PanelTab::Group, "Group", "tab-group"),
+                (PanelTab::Clip, "Clip", "tab-clip"),
+            ] {
+                let r = ui.selectable_value(&mut self.panel_tab, t, label);
+                help(r, key);
+            }
         });
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| match self.panel_tab {
@@ -3168,7 +3408,7 @@ impl State {
         }
         let (mut w, mut h, mut fps) = (c.width, c.height, c.fps);
         let mut size_changed = false;
-        ui.horizontal(|ui| {
+        let size_row = ui.horizontal(|ui| {
             ui.label("Size");
             // speed 0: typed only, so a drag does not resize the output every frame.
             size_changed |= ui
@@ -3188,6 +3428,7 @@ impl State {
                 )
                 .changed();
         });
+        help(size_row.response, "comp-size");
         if size_changed {
             cmds.push(Command::SetCompositionSize {
                 width: w,
@@ -4008,7 +4249,7 @@ impl State {
                     }
                     continue;
                 }
-                let r = ui.selectable_label(*id == cur, name);
+                let r = help(ui.selectable_label(*id == cur, name), "deck-tab");
                 if r.double_clicked() {
                     self.renaming = Some((*id, name.clone()));
                 } else if r.clicked() && *id != cur {
