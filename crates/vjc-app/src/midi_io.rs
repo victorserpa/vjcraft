@@ -61,6 +61,18 @@ pub fn input_ports() -> Vec<String> {
         .collect()
 }
 
+/// Names of the MIDI output ports now present.
+pub fn output_ports() -> Vec<String> {
+    let Ok(probe) = MidiOutput::new(CLIENT) else {
+        return vec![];
+    };
+    probe
+        .ports()
+        .iter()
+        .filter_map(|p| probe.port_name(p).ok())
+        .collect()
+}
+
 fn run(tx: Sender<In>, out_rx: Receiver<(String, [u8; 3])>) {
     let mut inputs: HashMap<String, MidiInputConnection<()>> = HashMap::new();
     let mut outputs: HashMap<String, midir::MidiOutputConnection> = HashMap::new();

@@ -4,7 +4,7 @@
 //! Nothing here opens MIDI/OSC/audio/Link or touches the user's prefs and recovery files.
 
 use super::*;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{Harness, HarnessBuilder};
 use std::sync::OnceLock;
 
@@ -1600,4 +1600,124 @@ fn soak_render_and_decode_loop() {
         growth < max_growth,
         "RSS grew {growth:.0} MB (> {max_growth} MB)"
     );
+}
+
+#[test]
+fn midi_prefs_tab_lists_ports_and_persists_enable_flags() {
+    let mut h = app();
+    h.state_mut().midi_ports = Some((
+        vec!["Pad In".into(), "Keys In".into()],
+        vec!["Pad Out".into()],
+    ));
+    h.state_mut().prefs_open = true;
+    settle(&mut h);
+    click(&mut h, "MIDI");
+    assert!(exists(&h, "Pad In") && exists(&h, "Keys In") && exists(&h, "Pad Out"));
+    click(&mut h, "Pad In");
+    click(&mut h, "Pad Out");
+    let m = h.state().prefs.midi.clone();
+    assert!(!m.input_enabled("Pad In") && m.input_enabled("Keys In"));
+    assert!(!m.output_enabled("Pad Out"));
+    let path = tmp_vjc("midiprefs").with_extension("json");
+    h.state().prefs.save(&path).unwrap();
+    let back = Prefs::load(&path).0;
+    assert_eq!(back.midi, m);
+    click(&mut h, "Pad In");
+    assert!(h.state().prefs.midi.input_enabled("Pad In"));
+}
+
+/// The Composition tab with master speed at 2 (default 1), so its reset button is live.
+fn comp_tab_speed_two() -> Harness<'static, State> {
+    // Fast frames, so two clicks land inside egui's double-click delay.
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_step_dt(0.02)
+        .build_ui_state(
+            |ui, st| {
+                st.tick_clock();
+                State::ui(st, ui);
+            },
+            State::headless(prefs()),
+        );
+    settle(&mut h);
+    click(&mut h, "Composition");
+    h.state_mut().exec(Command::SetMasterSpeed { value: 2.0 });
+    settle(&mut h);
+    h
+}
+
+fn master_speed(h: &Harness<'_, State>) -> f64 {
+    h.state().project.composition.master_speed
+}
+
+#[test]
+fn param_reset_button_restores_default_and_then_disables() {
+    let mut h = comp_tab_speed_two();
+    assert_eq!(master_speed(&h), 2.0);
+    let enabled = |h: &Harness<'_, State>| {
+        h.query_all_by_label("\u{21ba}")
+            .filter(|n| !NodeT::accesskit_node(n).is_disabled())
+            .count()
+    };
+    assert_eq!(enabled(&h), 1, "only the changed param can reset");
+    let btn = h
+        .query_all_by_label("\u{21ba}")
+        .find(|n| !NodeT::accesskit_node(n).is_disabled())
+        .unwrap();
+    btn.click();
+    settle(&mut h);
+    assert_eq!(master_speed(&h), 1.0);
+    assert_eq!(enabled(&h), 0, "at default the reset is disabled");
+}
+
+fn double_click_at(h: &mut Harness<'_, State>, p: egui::Pos2) {
+    let button = |pressed| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    // Let earlier clicks age out: egui counts 3 clicks inside 2 x 0.3 s as a triple click,
+    // which is not a double click.
+    h.run_steps(40);
+    h.hover_at(p);
+    h.step();
+    for _ in 0..2 {
+        h.event(button(true));
+        h.step();
+        h.event(button(false));
+        h.step();
+    }
+    settle(h);
+}
+
+#[test]
+fn double_click_value_opens_entry_enter_commits_esc_cancels() {
+    let mut h = comp_tab_speed_two();
+    // The value label shows "2"; double click turns it into a text field.
+    let p = h.get_by_label("2").rect().center();
+    double_click_at(&mut h, p);
+    assert!(!exists(&h, "2"), "the value label became a text field");
+    h.key_press(egui::Key::Backspace);
+    settle(&mut h);
+    h.event(egui::Event::Text("3.5".into()));
+    settle(&mut h);
+    h.event(egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: Some(egui::Key::Enter),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    settle(&mut h);
+    assert_eq!(master_speed(&h), 3.5);
+    // Escape leaves the value alone.
+    let p = h.get_by_label("3.5").rect().center();
+    double_click_at(&mut h, p);
+    h.event(egui::Event::Text("9".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(master_speed(&h), 3.5);
+    assert!(exists(&h, "3.5"));
 }

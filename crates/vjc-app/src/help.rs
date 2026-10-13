@@ -153,6 +153,7 @@ pub fn text(key: &str) -> Option<&'static str> {
         "prefs-timecode" => {
             "Follow an external timecode source and choose what happens when the signal is lost."
         }
+        "prefs-midi" => "List the MIDI input and output ports and switch each one on or off.",
         // View
         "help-bar" => {
             "This bar describes the control under the pointer. Turn it off in View > Help."

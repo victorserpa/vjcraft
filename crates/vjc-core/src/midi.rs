@@ -259,6 +259,22 @@ pub fn led_states(p: &Project, ctx: &Ctx, active: Active) -> HashMap<Led, bool> 
 
 /// LED writes needed to go from `prev` to `next`: new or changed LEDs, and LEDs that lost
 /// their mapping go dark. Sorted, so the result is deterministic.
+/// LED messages to send this frame: the diff against what was sent, restricted to enabled
+/// devices. Returns the state to remember as sent (disabled devices left out, so enabling
+/// one again resends everything to it).
+pub fn led_sends(
+    prev: &HashMap<Led, bool>,
+    mut next: HashMap<Led, bool>,
+    enabled: impl Fn(&str) -> bool,
+) -> (Vec<(Led, bool)>, HashMap<Led, bool>) {
+    next.retain(|(d, _, _), _| enabled(d));
+    let sends = feedback_diff(prev, &next)
+        .into_iter()
+        .filter(|((d, _, _), _)| enabled(d))
+        .collect();
+    (sends, next)
+}
+
 pub fn feedback_diff(prev: &HashMap<Led, bool>, next: &HashMap<Led, bool>) -> Vec<(Led, bool)> {
     let mut out: Vec<(Led, bool)> = next
         .iter()
@@ -451,6 +467,21 @@ mod tests {
         };
         p.shortcuts.push(shortcut.clone());
         assert!(learn(&p, "/comp/master/opacity", src).is_empty());
+    }
+
+    #[test]
+    fn led_sends_skip_disabled_devices_and_resend_on_enable() {
+        let k = |d: &str, n: u8| (d.to_string(), 0u8, n);
+        let on = HashMap::from([(k("pad", 1), true), (k("pad", 2), false)]);
+        let (s, prev) = led_sends(&HashMap::new(), on.clone(), |_| true);
+        assert_eq!(s.len(), 2);
+        // Disabling sends nothing to that device, not even a last off.
+        let (s, prev) = led_sends(&prev, on.clone(), |d| d != "pad");
+        assert!(s.is_empty(), "{s:?}");
+        assert!(prev.is_empty());
+        // Enabling again resends the full state.
+        let (s, _) = led_sends(&prev, on, |_| true);
+        assert_eq!(s, vec![(k("pad", 1), true), (k("pad", 2), false)]);
     }
 
     #[test]

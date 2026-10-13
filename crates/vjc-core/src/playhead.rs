@@ -157,6 +157,46 @@ impl Playhead {
 
 #[cfg(test)]
 mod tests {
+    /// What the app does each frame for a beat-synced clip: rate = speed x sync x master.
+    fn synced(bpm: f64, beats: f64, dur: f64, wall: f64) -> f64 {
+        let mut h = Playhead::new(Direction::Forward, 1);
+        let rate = crate::playback_rate(1.0, crate::clock::beat_sync_rate(dur, beats, bpm), 1.0);
+        let mut pos = 0.0;
+        for _ in 0..(wall * 600.0).round() as usize {
+            pos = h
+                .tick(1.0 / 600.0, PlayMode::Loop, Direction::Forward, rate, dur)
+                .position;
+        }
+        pos
+    }
+
+    #[test]
+    fn beat_sync_paces_the_playhead_to_the_beats() {
+        // 4 s clip over 2 beats at 120 bpm = 1 s: half way after 0.5 s of wall time.
+        assert!((synced(120.0, 2.0, 4.0, 0.5) - 0.5).abs() < 1e-3);
+        // Same clip at 60 bpm lasts 2 s: a quarter after 0.5 s.
+        assert!((synced(60.0, 2.0, 4.0, 0.5) - 0.25).abs() < 1e-3);
+        // A clip already as long as its beats plays at file speed.
+        assert!((synced(120.0, 4.0, 2.0, 1.0) - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn beat_sync_rate_change_mid_play_does_not_jump() {
+        let mut h = Playhead::new(Direction::Forward, 1);
+        let r = |bpm| crate::playback_rate(1.0, crate::clock::beat_sync_rate(4.0, 2.0, bpm), 1.0);
+        let a = h
+            .tick(0.25, PlayMode::Loop, Direction::Forward, r(120.0), 4.0)
+            .position;
+        let b = h
+            .tick(0.0, PlayMode::Loop, Direction::Forward, r(60.0), 4.0)
+            .position;
+        assert_eq!(a, b, "new tempo only changes the slope");
+        let c = h
+            .tick(0.5, PlayMode::Loop, Direction::Forward, r(60.0), 4.0)
+            .position;
+        assert!((c - (a + 0.25)).abs() < 1e-6);
+    }
+
     use super::*;
 
     fn run(mode: PlayMode, dir: Direction, speed: f64, steps: usize) -> Vec<f64> {

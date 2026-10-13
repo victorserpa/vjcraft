@@ -75,6 +75,40 @@ impl Default for Control {
     }
 }
 
+/// MIDI ports the user switched off (by port name). Everything is enabled by default, so
+/// a new device works at once.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Midi {
+    pub disabled_inputs: Vec<String>,
+    pub disabled_outputs: Vec<String>,
+}
+
+impl Midi {
+    pub fn input_enabled(&self, name: &str) -> bool {
+        !self.disabled_inputs.iter().any(|n| n == name)
+    }
+
+    pub fn output_enabled(&self, name: &str) -> bool {
+        !self.disabled_outputs.iter().any(|n| n == name)
+    }
+
+    pub fn set_input(&mut self, name: &str, on: bool) {
+        Self::set(&mut self.disabled_inputs, name, on);
+    }
+
+    pub fn set_output(&mut self, name: &str, on: bool) {
+        Self::set(&mut self.disabled_outputs, name, on);
+    }
+
+    fn set(list: &mut Vec<String>, name: &str, on: bool) {
+        list.retain(|n| n != name);
+        if !on {
+            list.push(name.to_owned());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Audio {
@@ -328,6 +362,7 @@ pub struct Prefs {
     pub video: Video,
     pub control: Control,
     pub audio: Audio,
+    pub midi: Midi,
     pub osc: Osc,
     pub dmx: Dmx,
     pub api: Api,
@@ -343,6 +378,7 @@ impl Default for Prefs {
             video: Video::default(),
             control: Control::default(),
             audio: Audio::default(),
+            midi: Midi::default(),
             osc: Osc::default(),
             dmx: Dmx::default(),
             api: Api::default(),

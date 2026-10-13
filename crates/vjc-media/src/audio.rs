@@ -303,6 +303,72 @@ impl AudioEngine {
     }
 }
 
+/// Beats per bar for the metronome accent (the beat lights in the UI use the same bar).
+pub const BEATS_PER_BAR: i64 = 4;
+/// Click length in seconds.
+const CLICK_SECONDS: f64 = 0.03;
+/// Click pitch: the downbeat is higher so the bar is audible.
+const CLICK_HZ: f64 = 1000.0;
+const CLICK_ACCENT_HZ: f64 = 1600.0;
+const CLICK_GAIN: f32 = 0.5;
+
+/// A short synthesized click (interleaved stereo f32): a sine with a 1 ms linear attack and
+/// an exponential decay to near silence, so it starts and ends at 0 without a pop.
+pub fn click_samples(rate: u32, accent: bool) -> Vec<f32> {
+    let n = (rate as f64 * CLICK_SECONDS) as usize;
+    let hz = if accent { CLICK_ACCENT_HZ } else { CLICK_HZ };
+    let attack = (rate as f64 * 0.001).max(1.0);
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64 / rate as f64;
+        let env = (i as f64 / attack).min(1.0) * (-t / (CLICK_SECONDS / 6.0)).exp();
+        let v = ((2.0 * std::f64::consts::PI * hz * t).sin() * env) as f32 * CLICK_GAIN;
+        out.push(v);
+        out.push(v);
+    }
+    // Hard zero on the last frame so the click never ends mid-wave.
+    if let Some(last) = out.last_chunk_mut::<2>() {
+        *last = [0.0, 0.0];
+    }
+    out
+}
+
+/// Which click a clock tick asks for: `beat` is the beat that just started (None = no beat
+/// boundary this tick). Returns `Some(accent)`, accent on the downbeat of each bar.
+pub fn beat_click(enabled: bool, beat: Option<i64>) -> Option<bool> {
+    let b = beat?;
+    enabled.then(|| b.rem_euclid(BEATS_PER_BAR) == 0)
+}
+
+/// Metronome output: its own voice in the mixer, fed one click at a time.
+pub struct Metronome {
+    engine: AudioEngine,
+    voice: Arc<Voice>,
+}
+
+impl Metronome {
+    pub fn new(engine: &AudioEngine) -> Metronome {
+        let voice = engine.add_voice();
+        voice.set(1.0, 0.0, true);
+        Metronome {
+            engine: engine.clone(),
+            voice,
+        }
+    }
+
+    /// Queues a click now (dropped if the previous one has not played out, never blocks).
+    pub fn click(&self, accent: bool) {
+        let samples = click_samples(self.engine.sample_rate().max(8000), accent);
+        self.voice.ring.push(&samples);
+    }
+}
+
+impl Drop for Metronome {
+    fn drop(&mut self) {
+        self.engine.remove_voice(&self.voice);
+    }
+}
+
 /// Pause between attempts to reopen a lost output device.
 const REOPEN: Duration = Duration::from_secs(2);
 /// How often the supervisor looks at the stream's error flag.
@@ -738,6 +804,33 @@ fn run_audio(path: &Path, rate: &AtomicU32, voice: &Voice, shared: &Shared, stop
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn click_is_short_bounded_and_accent_is_higher() {
+        let (n, a) = (click_samples(48000, false), click_samples(48000, true));
+        assert_eq!(n.len(), 48000 * 30 / 1000 * 2);
+        assert!(n.iter().all(|s| s.abs() <= 0.5 + 1e-6));
+        assert!(n.iter().any(|s| s.abs() > 0.1), "audible");
+        assert_eq!(n[..2], [0.0, 0.0], "starts at zero");
+        assert_eq!(n[n.len() - 2..], [0.0, 0.0], "ends at zero");
+        assert_eq!(n[0], n[1], "centered");
+        // Higher pitch = more zero crossings.
+        let zc = |v: &[f32]| v.windows(4).filter(|w| w[0] * w[2] < 0.0).count();
+        assert!(zc(&a) > zc(&n));
+        // Decays: the tail is much quieter than the head.
+        let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak(&n[n.len() / 2..]) < peak(&n) * 0.3);
+    }
+
+    #[test]
+    fn beat_click_accents_the_downbeat_only() {
+        let got: Vec<_> = (0..8).map(|b| beat_click(true, Some(b))).collect();
+        let want: Vec<_> = (0..8).map(|b| Some(b % 4 == 0)).collect();
+        assert_eq!(got, want);
+        assert_eq!(beat_click(false, Some(0)), None, "off = silent");
+        assert_eq!(beat_click(true, None), None, "no beat boundary = no click");
+        assert_eq!(beat_click(true, Some(-4)), Some(true));
+    }
+
     use super::*;
     use std::process::Command;
 

@@ -1814,6 +1814,102 @@ mod tests {
         }
     }
 
+    /// Master fade on the GPU: opacity 0.5 halves the colour towards black, bypass (opacity 0)
+    /// is pure black. Writes PPMs to `target/ui-snapshots/`. Skipped when there is no adapter.
+    #[test]
+    fn gpu_master_opacity_and_bypass_fade_to_black() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        // 64 px x 4 bytes = 256: rows are already copy-aligned.
+        let (w, h) = (64u32, 36u32);
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("solid_color").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, w, h);
+        comp.add_effect(&device, "solid_color", &wgsl).unwrap();
+        let mut params = isf.default_params();
+        params[0].value = vjc_model::Value::Color([0.2, 0.4, 0.8, 1.0]);
+        let layer = [LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![],
+            frame: None,
+            generator: Some(EffectDraw {
+                kind: "solid_color".into(),
+                uniforms: isf.pack(&params, 0.0, (w, h)),
+                dry_wet: 1.0,
+                ml: None,
+            }),
+            transition: None,
+        }];
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        // (name, master opacity as the app passes it, expected pixel)
+        let cases: [(&str, f32, [u8; 3]); 3] = [
+            ("master-opacity-1", 1.0, [51, 102, 204]),
+            ("master-opacity-0.5", 0.5, [26, 51, 102]),
+            ("master-bypass", 0.0, [0, 0, 0]),
+        ];
+        for (name, opacity, want) in cases {
+            comp.render(&device, &queue, &layer, &[], opacity);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (256 * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_texture_to_buffer(
+                comp.target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            let data = buf.slice(..).get_mapped_range().expect("map").to_vec();
+            buf.unmap();
+            let mid = ((h / 2) * 256 + (w / 2) * 4) as usize;
+            for (g, wnt) in data[mid..mid + 3].iter().zip(want) {
+                assert!(g.abs_diff(wnt) <= 2, "{name}: {:?}", &data[mid..mid + 4]);
+            }
+            // Same everywhere: the fade covers the whole frame.
+            assert!(
+                data.chunks(4).all(|p| p[..3] == data[mid..mid + 3]),
+                "{name}"
+            );
+            // Binary PPM, for eyeballing (no image crate here); the asserts above are the check.
+            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for p in data.chunks(4).take((w * h) as usize) {
+                ppm.extend_from_slice(&p[..3]);
+            }
+            std::fs::write(dir.join(format!("{name}.ppm")), ppm).unwrap();
+        }
+    }
+
     #[test]
     fn mix_plan_cases() {
         assert_eq!(mix_plan(0.0), MixPlan::Skip);

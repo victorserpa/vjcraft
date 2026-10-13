@@ -59,6 +59,8 @@ struct State {
     players: HashMap<LayerId, (DeckId, u32, Player)>,
     /// Audio output, opened on the first clip start (None until then or when unavailable).
     audio: Option<AudioEngine>,
+    /// Click output, created the first time a beat lands with Metronome on.
+    metro: Option<vjc_media::audio::Metronome>,
     audio_failed: bool,
     /// Output device `audio` was (or will be) opened on.
     audio_device: Option<String>,
@@ -125,6 +127,8 @@ struct State {
     tc: timecode_io::TcRuntime,
     /// MIDI input ports and audio input devices listed in Preferences > Timecode.
     tc_devices: Option<(Vec<String>, Vec<String>)>,
+    /// MIDI (input, output) port names for the Preferences tab; `None` = rescan.
+    midi_ports: Option<(Vec<String>, Vec<String>)>,
     led_prev: HashMap<vjc_core::midi::Led, bool>,
     /// OSC sockets thread, the config last sent to it, and the output state last sent.
     osc: osc_io::Osc,
@@ -228,6 +232,7 @@ enum PrefsTab {
     Dmx,
     Api,
     Timecode,
+    Midi,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -802,6 +807,7 @@ impl State {
             status: "Drop video files on the grid cells.".into(),
             players: HashMap::new(),
             audio: None,
+            metro: None,
             gens: HashMap::new(),
             heads: HashMap::new(),
             flow: Flow::default(),
@@ -839,6 +845,7 @@ impl State {
             learn_midi: false,
             tc: timecode_io::TcRuntime::new(),
             tc_devices: None,
+            midi_ports: None,
             midi: if live {
                 midi_io::Midi::spawn()
             } else {
@@ -1185,6 +1192,7 @@ impl State {
         if self.audio_device != self.prefs.audio.output_device {
             self.audio_device = self.prefs.audio.output_device.clone();
             // Retry only if audio was live (open, or failed on a real error).
+            self.metro = None;
             if self.audio.take().is_some() || self.audio_error {
                 self.audio_failed = false;
                 self.audio_error = false;
@@ -1725,6 +1733,16 @@ impl State {
         self.phase = t.phase;
         if let Some(b) = t.beat {
             self.beat = b;
+        }
+        if let Some(accent) = vjc_media::audio::beat_click(self.metronome, t.beat) {
+            if self.metro.is_none()
+                && let Some(engine) = self.audio_engine()
+            {
+                self.metro = Some(vjc_media::audio::Metronome::new(&engine));
+            }
+            if let Some(m) = &self.metro {
+                m.click(accent);
+            }
         }
         let dt = now
             .saturating_duration_since(self.last_head_tick)
@@ -2581,6 +2599,7 @@ impl State {
         use vjc_core::midi as m;
         while let Ok(ev) = self.midi.rx.try_recv() {
             let (device, bytes, at) = match ev {
+                midi_io::In::Msg(d, ..) if !self.prefs.midi.input_enabled(&d) => continue,
                 midi_io::In::Connected(d) => {
                     self.led_prev.retain(|(dev, _, _), _| *dev != d);
                     continue;
@@ -2617,10 +2636,12 @@ impl State {
         let rt = self.rt_ctx();
         let active = |l| active_of(&self.players, &self.gens, l);
         let next = m::led_states(&self.project, &rt, &active);
-        for ((device, ch, note), on) in m::feedback_diff(&self.led_prev, &next) {
+        let (sends, sent) =
+            m::led_sends(&self.led_prev, next, |d| self.prefs.midi.output_enabled(d));
+        for ((device, ch, note), on) in sends {
             self.midi.send(&device, m::led_bytes(ch, note, on));
         }
-        self.led_prev = next;
+        self.led_prev = sent;
     }
 
     /// OSC, once per frame and never blocking: events from our own address space resolve

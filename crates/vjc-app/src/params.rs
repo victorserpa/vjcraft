@@ -233,7 +233,11 @@ fn slider_inner(
             let e = ui.add(
                 egui::TextEdit::singleline(&mut buf).desired_width(crate::theme::PROP_VALUE_W),
             );
-            e.request_focus();
+            // Focus only when the entry opens: asking again every frame would take the focus
+            // back on the frame Enter/Esc/click-away releases it, and the entry never closed.
+            if !e.has_focus() && !e.lost_focus() {
+                e.request_focus();
+            }
             if e.lost_focus() {
                 if ui.input(|i| i.key_pressed(egui::Key::Enter))
                     && let Some(v) = parse_value(&buf, Some(range))

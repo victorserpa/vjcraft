@@ -24,13 +24,14 @@ impl State {
                         (PrefsTab::Audio, "Audio"),
                         (PrefsTab::Video, "Video"),
                         (PrefsTab::Control, "Control"),
+                        (PrefsTab::Midi, "MIDI"),
                         (PrefsTab::Osc, "OSC"),
                         (PrefsTab::Dmx, "DMX"),
                         (PrefsTab::Api, "Remote API"),
                         (PrefsTab::Timecode, "Timecode"),
                     ] {
                         let r = ui.selectable_value(&mut self.prefs_tab, t, l);
- let key = match t { PrefsTab::General => "prefs-general", PrefsTab::Audio => "prefs-audio", PrefsTab::Video => "prefs-video", PrefsTab::Control => "prefs-control", PrefsTab::Osc => "prefs-osc", PrefsTab::Dmx => "prefs-dmx", PrefsTab::Api => "prefs-api", PrefsTab::Timecode => "prefs-timecode" };
+ let key = match t { PrefsTab::General => "prefs-general", PrefsTab::Audio => "prefs-audio", PrefsTab::Video => "prefs-video", PrefsTab::Control => "prefs-control", PrefsTab::Osc => "prefs-osc", PrefsTab::Dmx => "prefs-dmx", PrefsTab::Api => "prefs-api", PrefsTab::Timecode => "prefs-timecode", PrefsTab::Midi => "prefs-midi" };
  crate::help::help(r, key);
                     }
                 });
@@ -140,6 +141,39 @@ impl State {
                             &mut p.control.offer_shortcuts,
                             "Offer the preset when opening a project without shortcuts",
                         );
+                    }
+                    PrefsTab::Midi => {
+                        let (ins, outs) = self.midi_ports.get_or_insert_with(|| {
+                            (
+                                crate::midi_io::input_ports(),
+                                crate::midi_io::output_ports(),
+                            )
+                        });
+                        ui.strong("Inputs");
+                        if ins.is_empty() {
+                            ui.weak("No MIDI input ports found.");
+                        }
+                        for n in ins.iter() {
+                            let mut on = p.midi.input_enabled(n);
+                            if ui.checkbox(&mut on, n).changed() {
+                                p.midi.set_input(n, on);
+                            }
+                        }
+                        ui.separator();
+                        ui.strong("Outputs");
+                        if outs.is_empty() {
+                            ui.weak("No MIDI output ports found.");
+                        }
+                        for n in outs.iter() {
+                            let mut on = p.midi.output_enabled(n);
+                            if ui.checkbox(&mut on, n).changed() {
+                                p.midi.set_output(n, on);
+                            }
+                        }
+                        if ui.button("Refresh ports").clicked() {
+                            self.midi_ports = None;
+                        }
+                        ui.weak("Disabled inputs are ignored; disabled outputs get no LED feedback.");
                     }
                     PrefsTab::Osc => {
                         let o = &mut p.osc;

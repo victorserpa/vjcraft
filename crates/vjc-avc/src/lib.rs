@@ -417,10 +417,9 @@ fn node_id(n: &Node) -> usize {
 
 /// Effects of a track's own RenderPassChain (not the source's chain).
 fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
-    let Some(chain) = vt
-        .kids("RenderPass")
-        .find(|r| r.attr("baseType") == Some("RenderPassChain"))
-    else {
+    let Some(chain) = vt.kids("RenderPass").find(|r| {
+        r.attr("baseType") == Some("RenderPassChain") || r.attr("name") == Some("RenderPassChain")
+    }) else {
         return vec![];
     };
     let mut out = vec![];
