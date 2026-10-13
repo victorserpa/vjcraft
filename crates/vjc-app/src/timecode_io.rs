@@ -123,10 +123,21 @@ impl TcRuntime {
     /// frames. Returns an error text when the audio input failed to open.
     pub fn sync(&mut self, p: &TcPrefs, now: Instant) -> Option<String> {
         let key = (p.source.clone(), p.offset_frames);
-        if self.state_key.as_ref() != Some(&key) {
-            self.state_key = Some(key);
-            self.reset_state();
+        match self.state_key.take() {
+            Some((src, off)) if src == key.0 && off != key.1 => {
+                // Offset drag: shift what we hold instead of resetting, so the cue tracker
+                // keeps its high-water mark and does not refire a cue one frame back.
+                let d = i64::from(key.1) - i64::from(off);
+                if let Some(last) = self.last {
+                    let new = last.add_frames(d);
+                    self.last = Some(new);
+                    self.follower.shift(new.seconds() - last.seconds());
+                }
+            }
+            Some(k) if k == key => {}
+            _ => self.reset_state(),
         }
+        self.state_key = Some(key);
         let want = match &p.source {
             TcSource::Ltc { device, channel } => Some((device.clone(), *channel, p.ltc_fps)),
             _ => None,
@@ -269,6 +280,29 @@ mod tests {
             }))
         });
         (TcRuntime::with_opener(opener), opens, chans)
+    }
+
+    #[test]
+    fn offset_drag_keeps_cue_state_and_signal() {
+        let (mut rt, _, _) = rt(0);
+        let mut p = TcPrefs::default();
+        let t0 = Instant::now();
+        rt.sync(&p, t0);
+        let cue = vjc_model::TimecodeCue {
+            time: Timecode::new(0, 0, 5, 0, TcFps::F25),
+            column: 0,
+            layer: None,
+        };
+        rt.accept(Timecode::new(0, 0, 5, 0, TcFps::F25), t0, &p);
+        let cur = rt.current(t0).unwrap();
+        assert_eq!(rt.cues.step(std::slice::from_ref(&cue), cur), vec![0]);
+        p.offset_frames = -1;
+        rt.sync(&p, t0);
+        let cur = rt.current(t0).expect("signal kept");
+        assert!(
+            rt.cues.step(std::slice::from_ref(&cue), cur).is_empty(),
+            "cue refired"
+        );
     }
 
     #[test]

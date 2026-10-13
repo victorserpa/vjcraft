@@ -113,6 +113,13 @@ impl TcFollower {
         self.last = Some((tc_secs, now));
     }
 
+    /// Moves the held timecode by `secs` (offset change) without losing the signal.
+    pub fn shift(&mut self, secs: f64) {
+        if let Some((tc, _)) = &mut self.last {
+            *tc += secs;
+        }
+    }
+
     /// Current timecode in seconds, or None when no update arrived within the timeout.
     pub fn current(&self, now: f64) -> Option<f64> {
         let (tc, at) = self.last?;
