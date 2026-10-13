@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod audio;
 pub mod capture;
@@ -345,6 +345,8 @@ struct Scrubber {
     scaler: Option<ff::software::scaling::Context>,
     eof: bool,
     count: u64,
+    /// Bytes of packets (all streams) read from the container so far.
+    bytes_in: u64,
     /// pts of the last frame handed out (NaN if none) and a copy of it.
     last_t: f64,
     last: Option<Frame>,
@@ -381,6 +383,7 @@ impl Scrubber {
             scaler: None,
             eof: false,
             count: 0,
+            bytes_in: 0,
             last_t: f64::NAN,
             last: None,
         })
@@ -420,6 +423,7 @@ impl Scrubber {
             let mut pkt = ff::Packet::empty();
             match pkt.read(&mut self.ictx) {
                 Ok(()) => {
+                    self.bytes_in += pkt.size() as u64;
                     if pkt.stream() == self.stream_idx
                         && let Err(e) = self.decoder.send_packet(&pkt)
                     {
@@ -477,18 +481,41 @@ fn unknown_duration(start: f64, last: f64, fps: f64) -> f64 {
     (last + 1.0 / fps - start).max(0.0)
 }
 
-type Learned = (f64, Option<(Vec<(f64, Frame)>, u64)>);
+/// Result of `learn_duration`: duration, whether it is exact (false = estimate to refine
+/// with `measure_full`), and the frames when the whole clip fit in the cache budget.
+struct Learned {
+    duration: f64,
+    exact: bool,
+    cache: Option<(Vec<(f64, Frame)>, u64)>,
+}
+
+/// Longest time spent measuring a long clip before an estimated duration is published.
+const LEARN_LIMIT: Duration = Duration::from_secs(2);
+
+/// Duration guess from how much of the file (`bytes_in` of `size`) covered `span` seconds.
+fn estimate_duration(span: f64, bytes_in: u64, size: u64) -> f64 {
+    if bytes_in == 0 || size == 0 {
+        return span;
+    }
+    let frac = (bytes_in as f64 / size as f64).clamp(0.001, 1.0);
+    span / frac
+}
 
 /// Learns the duration of a clip that has none in its container by decoding it. Short
-/// clips (under `cap` bytes) come back cached; longer ones are measured to the end without
-/// keeping frames, so they are not truncated. None if the player was stopped meanwhile.
+/// clips (under `cap` bytes) come back cached; longer ones are measured without keeping
+/// frames, for at most `limit`, after which an estimate from the file size is returned
+/// (`exact` false). None if the player was stopped meanwhile. The scrubber is left so
+/// the next `frame_at` seeks from scratch.
 fn learn_duration(
     sc: &mut Scrubber,
     start: f64,
     first: Frame,
     shared: &Shared,
     cap: u64,
+    limit: Duration,
+    file_size: u64,
 ) -> Option<Learned> {
+    let t0 = Instant::now();
     let mut bytes = first.data.len() as u64;
     let mut frames = vec![(start, first)];
     let mut capped = false;
@@ -510,17 +537,50 @@ fn learn_duration(
     }
     if !capped {
         let last = frames.last().map_or(start, |(t, _)| *t);
-        return Some((unknown_duration(start, last, sc.fps), Some((frames, bytes))));
+        sc.last_t = f64::NAN;
+        return Some(Learned {
+            duration: unknown_duration(start, last, sc.fps),
+            exact: true,
+            cache: Some((frames, bytes)),
+        });
     }
     let mut last = frames.last().map_or(start, |(t, _)| *t);
     drop(frames);
+    let mut exact = true;
+    while let Some((t, _)) = sc.next() {
+        if shared.stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        last = last.max(t);
+        if t0.elapsed() >= limit {
+            exact = false;
+            break;
+        }
+    }
+    let mut duration = unknown_duration(start, last, sc.fps);
+    if !exact {
+        duration = estimate_duration(duration, sc.bytes_in, file_size).max(duration);
+    }
+    sc.last_t = f64::NAN;
+    Some(Learned {
+        duration,
+        exact,
+        cache: None,
+    })
+}
+
+/// Full measure of a clip without a container duration, on its own decoder. None if stopped.
+fn measure_full(path: &Path, shared: &Shared) -> Option<f64> {
+    let mut sc = Scrubber::open(path).ok()?;
+    let (start, _) = sc.next()?;
+    let mut last = start;
     while let Some((t, _)) = sc.next() {
         if shared.stop.load(Ordering::Relaxed) {
             return None;
         }
         last = last.max(t);
     }
-    Some((unknown_duration(start, last, sc.fps), None))
+    Some(unknown_duration(start, last, sc.fps))
 }
 
 /// Index into `frames` (sorted by pts) of the frame nearest to `target`.
@@ -559,19 +619,29 @@ fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
     let frame_bytes = first.data.len() as u64;
     let mut cache: Option<Cache> = None;
     // Unknown duration: decode once to learn it (bounded), then it is always cached.
+    // Long clips publish an estimate after LEARN_LIMIT and refine it on a side thread.
+    let mut exact = true;
     if sc.duration <= 0.0 {
-        match learn_duration(&mut sc, start, first, shared, UNKNOWN_DURATION_CAP) {
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        match learn_duration(
+            &mut sc,
+            start,
+            first,
+            shared,
+            UNKNOWN_DURATION_CAP,
+            LEARN_LIMIT,
+            size,
+        ) {
             None => return Ok(()),
-            Some((d, Some((frames, bytes)))) => {
-                sc.duration = d;
-                cache = Some(Cache {
-                    frames,
-                    _res: Reservation::forced(bytes),
-                });
-            }
-            Some((d, None)) => {
-                sc.duration = d;
-                sc.last_t = f64::NAN;
+            Some(l) => {
+                sc.duration = l.duration;
+                exact = l.exact;
+                if let Some((frames, bytes)) = l.cache {
+                    cache = Some(Cache {
+                        frames,
+                        _res: Reservation::forced(bytes),
+                    });
+                }
             }
         }
     }
@@ -580,12 +650,53 @@ fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
     shared
         .duration
         .store(sc.duration.to_bits(), Ordering::Relaxed);
+    let refined = AtomicU64::new(f64::NAN.to_bits());
+    std::thread::scope(|scope| {
+        if !exact {
+            scope.spawn(|| {
+                if let Some(d) = measure_full(path, shared) {
+                    refined.store(d.to_bits(), Ordering::Relaxed);
+                }
+            });
+        }
+        scrub_loop(
+            &mut sc,
+            start,
+            frame_bytes,
+            cache,
+            shared,
+            &refined,
+            &mut seq,
+            &publish,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scrub_loop(
+    sc: &mut Scrubber,
+    start: f64,
+    frame_bytes: u64,
+    mut cache: Option<Cache>,
+    shared: &Shared,
+    refined: &AtomicU64,
+    seq: &mut u64,
+    publish: &dyn Fn(&Frame, &mut u64),
+) -> Result<(), ff::Error> {
     let unknown = cache.is_some();
-    let need = (frame_bytes as f64 * sc.duration * sc.fps) as u64;
+    let mut need = (frame_bytes as f64 * sc.duration * sc.fps) as u64;
     let mut shown = f64::NAN;
     let mut shown_idx = usize::MAX;
     let mut was_sequential = true;
     while !shared.stop.load(Ordering::Relaxed) {
+        let r = f64::from_bits(refined.load(Ordering::Relaxed));
+        if r.is_finite() && r > 0.0 && r != sc.duration {
+            // The side thread measured the real length: replace the estimate.
+            sc.duration = r;
+            need = (frame_bytes as f64 * r * sc.fps) as u64;
+            shared.duration.store(r.to_bits(), Ordering::Relaxed);
+            shown = f64::NAN;
+        }
         let sequential = shared.sequential.load(Ordering::Relaxed);
         if sequential != was_sequential {
             // Mode switch: streaming drops the cache and frees its budget.
@@ -603,7 +714,7 @@ fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
             && cache.is_none()
             && let Some(res) = Reservation::try_new(need)
         {
-            match load_all(&mut sc, start, shared) {
+            match load_all(sc, start, shared) {
                 Some(frames) => {
                     cache = Some(Cache { frames, _res: res });
                     shown = f64::NAN;
@@ -624,11 +735,11 @@ fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
                 let i = nearest(&c.frames, target);
                 if i != shown_idx {
                     shown_idx = i;
-                    publish(&c.frames[i].1, &mut seq);
+                    publish(&c.frames[i].1, seq);
                 }
             }
             _ => match sc.frame_at(target) {
-                Ok(Some(f)) => publish(&f, &mut seq),
+                Ok(Some(f)) => publish(&f, seq),
                 Ok(None) => {}
                 Err(e) => eprintln!("vjc-media: seek to {target:.3}s failed: {e}"),
             },
@@ -930,9 +1041,22 @@ mod tests {
         let (start, first) = sc.next().unwrap();
         // Cap of a few frames: the clip (20 frames, 2 s) must still be measured whole.
         let cap = first.data.len() as u64 * 3;
-        let (d, cached) = learn_duration(&mut sc, start, first, &shared, cap).unwrap();
-        assert!(cached.is_none());
-        assert!((d - 2.0).abs() < 0.15, "duration {d}");
+        let big = Duration::from_secs(60);
+        let l = learn_duration(&mut sc, start, first.clone(), &shared, cap, big, 0).unwrap();
+        assert!(l.cache.is_none() && l.exact);
+        assert!((l.duration - 2.0).abs() < 0.15, "duration {}", l.duration);
+        // After learning, the scrubber must serve the start again (rewind via seek).
+        let f = sc.frame_at(start).unwrap().unwrap();
+        assert_eq!(f.data, first.data);
+        // A time limit stops the measure early and flags an estimate, never below the span.
+        let mut sc = Scrubber::open(&out).unwrap();
+        let (start, first) = sc.next().unwrap();
+        let size = std::fs::metadata(&out).unwrap().len();
+        let l = learn_duration(&mut sc, start, first, &shared, cap, Duration::ZERO, size).unwrap();
+        assert!(!l.exact && l.cache.is_none());
+        assert!(l.duration >= 0.3, "estimate {}", l.duration);
+        assert_eq!(estimate_duration(1.0, 10, 100), 10.0);
+        assert_eq!(estimate_duration(1.0, 0, 100), 1.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -315,12 +315,13 @@ impl LinkSync {
 }
 
 /// Playback rate that makes a clip of `duration` seconds last exactly `beats` beats
-/// at `bpm`. Rate 1.0 = original speed; clamped to a sane range.
+/// at `bpm`. Rate 1.0 = original speed (also for non-positive inputs, i.e. no tempo);
+/// clamped to 0.01..100 so a clip stretched over many bars still syncs.
 pub fn beat_sync_rate(duration: f64, beats: f64, bpm: f64) -> f64 {
     if !(duration > 0.0 && beats > 0.0 && bpm > 0.0) {
         return 1.0;
     }
-    (duration * bpm / (60.0 * beats)).clamp(0.05, 20.0)
+    (duration * bpm / (60.0 * beats)).clamp(0.01, 100.0)
 }
 
 /// TIME rate of a generator clip. Generators have no length, so a beat sync of `n` beats
@@ -647,5 +648,10 @@ mod tests {
         // 1 s clip over 2 beats at 60 BPM (2 s): half speed.
         assert!((beat_sync_rate(1.0, 2.0, 60.0) - 0.5).abs() < 1e-9);
         assert_eq!(beat_sync_rate(0.0, 4.0, 120.0), 1.0);
+        assert_eq!(beat_sync_rate(4.0, 4.0, 0.0), 1.0);
+        assert_eq!(beat_sync_rate(4.0, 4.0, -10.0), 1.0);
+        // 4 s clip over 128 beats at 120 bpm: 0.0625, below the old 0.05..20 floor region.
+        assert!((beat_sync_rate(4.0, 400.0, 120.0) - 0.02).abs() < 1e-9);
+        assert_eq!(beat_sync_rate(100.0, 1.0, 240.0), 100.0);
     }
 }

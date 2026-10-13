@@ -57,7 +57,13 @@ pub fn migrate(value: Value, from_version: u32) -> Result<Value, Error> {
             supported: CURRENT_VERSION,
         }),
         // v1 is current; future steps chain here (1 -> 2 ...).
-        _ => Ok(value),
+        _ => {
+            let mut value = value;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("format_version".into(), Value::from(CURRENT_VERSION));
+            }
+            Ok(value)
+        }
     }
 }
 
@@ -161,8 +167,7 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
         .and_then(version_number)
         .and_then(|v| u32::try_from(v).ok())
         .ok_or(Error::BadVersion)?;
-    let mut value = migrate(value, version)?;
-    value["format_version"] = Value::from(version);
+    let value = migrate(value, version)?;
     let mut project: Project = serde_json::from_value(value)?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut warnings = vec![];
@@ -326,6 +331,9 @@ mod tests {
     fn migrate_versions() {
         let v = serde_json::json!({"format_version": 1});
         assert_eq!(migrate(v.clone(), 1).unwrap(), v);
+        // Whatever the file said, the migrated value carries the current version.
+        let old = serde_json::json!({"format_version": 1.0});
+        assert_eq!(migrate(old, 1).unwrap()["format_version"], CURRENT_VERSION);
         let e = migrate(v, 99).unwrap_err().to_string();
         assert!(e.contains("newer"), "{e}");
     }

@@ -323,7 +323,83 @@ const RESERVED: &[&str] = &[
     "continue",
     "true",
     "false",
+    "switch",
+    "case",
+    "default",
+    "precision",
+    "highp",
+    "mediump",
+    "lowp",
+    "bvec2",
+    "bvec3",
+    "bvec4",
+    "uvec2",
+    "uvec3",
+    "uvec4",
+    "mat2x2",
+    "mat2x3",
+    "mat2x4",
+    "mat3x2",
+    "mat3x3",
+    "mat3x4",
+    "mat4x2",
+    "mat4x3",
+    "mat4x4",
+    "double",
+    "attribute",
+    "varying",
+    "buffer",
+    "shared",
+    "centroid",
+    "flat",
+    "smooth",
+    "invariant",
+    "sampler3D",
+    "samplerCube",
 ];
+
+const TYPES: &[&str] = &[
+    "float", "int", "uint", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "uvec2",
+    "uvec3", "uvec4", "bvec2", "bvec3", "bvec4", "mat2", "mat3", "mat4",
+];
+
+/// First input name that the body declares as a variable, parameter or struct member
+/// (`float name`). The rewrite to `vjc_u_<name>` would turn that into invalid GLSL, so
+/// the effect is rejected with a clear message instead. Comments are skipped.
+fn declared_input(body: &str, names: &[&str]) -> Option<String> {
+    let c: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    let mut prev_type = false;
+    while i < c.len() {
+        if c[i] == '/' && c.get(i + 1) == Some(&'/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+        } else if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if c[i].is_ascii_alphanumeric() || c[i] == '_' {
+            let st = i;
+            while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') {
+                i += 1;
+            }
+            let id: String = c[st..i].iter().collect();
+            if prev_type && names.contains(&id.as_str()) {
+                return Some(id);
+            }
+            prev_type = TYPES.contains(&id.as_str());
+        } else {
+            if !c[i].is_whitespace() {
+                prev_type = false;
+            }
+            i += 1;
+        }
+    }
+    None
+}
 
 /// Rewrites whole-identifier uses of each input name in `body` to `vjc_u_<name>`.
 /// Skips comments, swizzles/members (`.name`) and calls (`name(`), so a float input
@@ -512,6 +588,12 @@ impl Isf {
 /// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects); `@location(0)` input is the ISF y-up uv).
 pub fn translate(isf: &Isf) -> Result<String, FxError> {
     use naga::{back::wgsl, front::glsl, valid};
+    let names: Vec<&str> = isf.inputs.iter().map(|i| i.name.as_str()).collect();
+    if let Some(n) = declared_input(&isf.body, &names) {
+        return err(format!(
+            "input {n} is also declared as a variable or member in the shader; rename one"
+        ));
+    }
     let src = glsl_source(isf);
     let module = glsl::Frontend::default()
         .parse(&glsl::Options::from(naga::ShaderStage::Fragment), &src)
@@ -533,6 +615,59 @@ pub fn compile(src: &str) -> Result<(Isf, String), FxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_body(body: &str, input: &str) -> Isf {
+        parse(&format!(
+            r#"/*{{"INPUTS":[{{"NAME":"inputImage","TYPE":"image"}},{{"NAME":"{input}","TYPE":"float","MIN":0,"MAX":1,"DEFAULT":0.5}}]}}*/
+{body}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn extra_glsl_keywords_are_rejected_as_input_names() {
+        for n in [
+            "switch",
+            "case",
+            "default",
+            "precision",
+            "highp",
+            "bvec3",
+            "uvec2",
+            "mat2x3",
+        ] {
+            let src = format!(
+                r#"/*{{"INPUTS":[{{"NAME":"{n}","TYPE":"float","MIN":0,"MAX":1,"DEFAULT":0}}]}}*/
+void main() {{ gl_FragColor = vec4(1.0); }}"#
+            );
+            assert!(parse(&src).is_err(), "{n}");
+        }
+    }
+
+    #[test]
+    fn input_redeclared_in_body_is_a_clear_error() {
+        let ok = with_body(
+            "void main() { vec4 q = vec4(amount); gl_FragColor = q.xxxw; }",
+            "amount",
+        );
+        assert!(translate(&ok).is_ok());
+        for body in [
+            "void main() { float amount = 1.0; gl_FragColor = vec4(amount); }",
+            "float f(float amount) { return amount; }\nvoid main() { gl_FragColor = vec4(f(1.0)); }",
+            "struct S { vec2 amount; };\nvoid main() { gl_FragColor = vec4(1.0); }",
+        ] {
+            let e = translate(&with_body(body, "amount"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("amount") && e.contains("declared"), "{e}");
+        }
+        // Member access and comments do not count.
+        let m = with_body(
+            "// float amount\nvoid main() { vec4 v = vec4(1.0); gl_FragColor = vec4(v.x * amount); }",
+            "x2",
+        );
+        assert!(declared_input(&m.body, &["x"]).is_none());
+    }
 
     #[test]
     fn parses_all_input_types() {
