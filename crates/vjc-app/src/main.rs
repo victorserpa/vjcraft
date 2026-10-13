@@ -8,6 +8,7 @@ mod dmx_io;
 mod fx;
 mod grid_ui;
 mod help;
+mod icons;
 mod link_io;
 mod midi_io;
 mod ml_fx;
@@ -419,9 +420,17 @@ fn group_header(
     let (sel_group, panel_tab, targets) = ui_state;
     let gid = g.id;
     let name = ui.add(
-        egui::Button::new(egui::RichText::new(format!("\u{25be} {}", g.name)).strong())
+        egui::Button::new(icons::with_text(ui, icons::i::CARET_DOWN, &g.name))
             .selected(*sel_group == Some(gid)),
     );
+    name.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            *sel_group == Some(gid),
+            g.name.clone(),
+        )
+    });
     if name.clicked() || name.secondary_clicked() {
         *sel_group = Some(gid);
         *panel_tab = PanelTab::Group;
@@ -453,16 +462,14 @@ fn group_header(
     }
     let (mut bypass, mut solo) = (g.bypass, g.solo);
     ui.horizontal(|ui| {
-        let b = ui
-            .toggle_value(&mut bypass, "B")
-            .on_hover_text("Group bypass");
+        let b = icons::toggle(ui, &mut bypass, icons::i::POWER, "Group bypass");
         if let Some(a) = vjc_core::shortcuts::group_address(project, gid, "bypass") {
             targets.push((b.rect, a));
         }
         if b.changed() {
             cmds.push(Command::SetGroupBypass { group: gid, bypass });
         }
-        let s = ui.toggle_value(&mut solo, "S").on_hover_text("Group solo");
+        let s = icons::toggle(ui, &mut solo, icons::i::HEADPHONES, "Group solo");
         if let Some(a) = vjc_core::shortcuts::group_address(project, gid, "solo") {
             targets.push((s.rect, a));
         }
@@ -3057,9 +3064,7 @@ impl State {
         let mut cmds = vec![];
         let (mut undo, mut redo) = (false, false);
         ui.horizontal_wrapped(|ui| {
-            let play = ui
-                .button("\u{25b6}")
-                .on_hover_text("Play the selected clip");
+            let play = icons::button(ui, icons::i::PLAY, "Play the selected clip");
             if help(play, "transport-play").clicked()
                 && let Some((layer, column)) = self.selected
             {
@@ -3069,9 +3074,11 @@ impl State {
                     column,
                 });
             }
-            let pause = ui
-                .button("\u{23f8}")
-                .on_hover_text("Pause or resume the clip playing on the selected layer (all layers when none is selected)");
+            let pause = icons::button(
+                ui,
+                icons::i::PAUSE,
+                "Pause or resume the clip playing on the selected layer (all layers when none is selected)",
+            );
             if help(pause, "transport-pause").clicked() {
                 let layer = self.selected.map(|s| s.0);
                 let active = self.rt_ctx().active;
@@ -3082,7 +3089,7 @@ impl State {
                     cmds.push(c);
                 }
             }
-            let stop = ui.button("\u{25a0}").on_hover_text("Stop all layers");
+            let stop = icons::button(ui, icons::i::STOP, "Stop all layers");
             if help(stop, "transport-stop").clicked() {
                 cmds.push(Command::ClearAll);
             }
@@ -3111,11 +3118,11 @@ impl State {
                 cmds.push(Command::Tap { at: now });
             }
             let minus = help(
-                ui.button("\u{2212}").on_hover_text("Nudge slower (hold)"),
+                icons::button(ui, icons::i::MINUS, "Nudge slower (hold)"),
                 "nudge-slower",
             );
             let plus = help(
-                ui.button("+").on_hover_text("Nudge faster (hold)"),
+                icons::button(ui, icons::i::PLUS, "Nudge faster (hold)"),
                 "nudge-faster",
             );
             let dir = if minus.is_pointer_button_down_on() {
@@ -3162,20 +3169,18 @@ impl State {
                 ui.painter().circle_filled(rect.center(), 6.0, col);
             }
             help(
-                ui.toggle_value(&mut self.metronome, "Metronome"),
+                icons::toggle(ui, &mut self.metronome, icons::i::METRONOME, "Metronome"),
                 "metronome",
             );
             ui.separator();
             let (can_undo, can_redo) = (self.history.can_undo(), self.history.can_redo());
             undo = help(
-                ui.add_enabled(can_undo, egui::Button::new("\u{21b6}"))
-                    .on_hover_text("Undo"),
+                icons::button_enabled(ui, can_undo, icons::i::ARROW_COUNTER_CLOCKWISE, "Undo"),
                 "transport-undo",
             )
             .clicked();
             redo = help(
-                ui.add_enabled(can_redo, egui::Button::new("\u{21b7}"))
-                    .on_hover_text("Redo"),
+                icons::button_enabled(ui, can_redo, icons::i::ARROW_CLOCKWISE, "Redo"),
                 "transport-redo",
             )
             .clicked();
@@ -3685,10 +3690,18 @@ impl State {
                     egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
                         ui.label("");
                         for (ci, n) in names.iter().enumerate() {
-                            let b = egui::Button::new(format!("\u{25b6} {n}"))
+                            let b = egui::Button::new(icons::with_text(ui, icons::i::PLAY, n))
                                 .selected(self.col_sel == Some(ci as u32))
                                 .min_size(egui::vec2(theme::CELL_W, theme::COLUMN_HEAD_H));
-                            let r = help(ui.add(b), "column");
+                            let r = ui.add(b);
+                            r.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    format!("Trigger column {n}"),
+                                )
+                            });
+                            let r = help(r, "column");
                             self.targets
                                 .push((r.rect, vjc_core::shortcuts::column_address(ci as u32)));
                             if r.clicked() {
@@ -3698,7 +3711,6 @@ impl State {
                                 });
                             }
                         }
-                        ui.label("Blend");
                         ui.end_row();
                         for li in 0..comp.layers.len() {
                             let lid = comp.layers[li].id;
@@ -3719,7 +3731,12 @@ impl State {
                             let in_group = comp.layers[li].group.is_some();
                             ui.vertical(|ui| {
                                 ui.set_min_width(theme::LAYER_HEAD_W);
+                                ui.set_max_width(theme::LAYER_HEAD_W);
+                                ui.set_height(theme::THUMB_H + theme::NAME_H);
+                                ui.spacing_mut().item_spacing =
+                                    egui::vec2(theme::SP_1, theme::SP_1);
                                 ui.spacing_mut().slider_width = theme::LAYER_FADER_W;
+                                ui.spacing_mut().slider_rail_height = 3.0;
                                 let layer = &comp.layers[li];
                                 let name = ui.add(
                                     egui::Label::new(if in_group {
@@ -3758,55 +3775,63 @@ impl State {
                                 ui.horizontal(|ui| {
                                     let sq = egui::vec2(theme::LAYER_BTN, theme::LAYER_BTN);
                                     if help(
-                                        ui.add(egui::Button::new("X").min_size(sq))
-                                            .on_hover_text("Clear layer"),
+                                        icons::square(ui, icons::i::X, "Clear layer", sq.x, None),
                                         "layer-clear",
                                     )
                                     .clicked()
                                     {
                                         cmds.push(Command::ClearLayer { layer: lid });
                                     }
-                                    let by = ui.add(egui::Button::new("B").min_size(sq).fill(
-                                        if layer.bypass {
-                                            theme::LAYER_ON
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        },
-                                    ));
-                                    if help(by.on_hover_text("Bypass layer"), "layer-bypass")
-                                        .clicked()
-                                    {
+                                    let by = icons::square(
+                                        ui,
+                                        icons::i::POWER,
+                                        "Bypass layer",
+                                        sq.x,
+                                        Some(layer.bypass),
+                                    );
+                                    if help(by, "layer-bypass").clicked() {
                                         cmds.push(Command::SetLayerBypass {
                                             layer: lid,
                                             bypass: !layer.bypass,
                                         });
                                     }
-                                    let so = ui.add(egui::Button::new("S").min_size(sq).fill(
-                                        if layer.solo {
-                                            theme::LAYER_SOLO_ON
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        },
-                                    ));
-                                    if help(so.on_hover_text("Solo layer"), "layer-solo").clicked()
-                                    {
+                                    let so = icons::square(
+                                        ui,
+                                        icons::i::HEADPHONES,
+                                        "Solo layer",
+                                        sq.x,
+                                        Some(layer.solo),
+                                    );
+                                    if help(so, "layer-solo").clicked() {
                                         cmds.push(Command::SetLayerSolo {
                                             layer: lid,
                                             solo: !layer.solo,
                                         });
                                     }
-                                    for (txt, tip, on, video) in [
-                                        ("V", "Layer video on/off", layer.video, true),
-                                        ("\u{266A}", "Layer audio on/off", layer.audio, false),
-                                    ] {
-                                        let b = ui.add(egui::Button::new(txt).min_size(sq).fill(
-                                            if on {
-                                                egui::Color32::TRANSPARENT
+                                    for (icon, tip, on, video) in [
+                                        (
+                                            if layer.video {
+                                                icons::i::EYE
                                             } else {
-                                                theme::LAYER_ON
+                                                icons::i::EYE_SLASH
                                             },
-                                        ));
-                                        if b.on_hover_text(tip).clicked() {
+                                            "Layer video on/off",
+                                            layer.video,
+                                            true,
+                                        ),
+                                        (
+                                            if layer.audio {
+                                                icons::i::SPEAKER_HIGH
+                                            } else {
+                                                icons::i::SPEAKER_SLASH
+                                            },
+                                            "Layer audio on/off",
+                                            layer.audio,
+                                            false,
+                                        ),
+                                    ] {
+                                        let b = icons::square(ui, icon, tip, sq.x, Some(!on));
+                                        if b.clicked() {
                                             cmds.push(if video {
                                                 Command::SetLayerVideo {
                                                     layer: lid,
@@ -3820,11 +3845,13 @@ impl State {
                                             });
                                         }
                                     }
-                                    ui.menu_button("Fx+", |ui| {
-                                        add_effect_list(ui, EffectTarget::Layer(lid), &mut cmds)
-                                    })
-                                    .response
-                                    .on_hover_text("Add effect");
+                                    let fx_menu =
+                                        ui.menu_button(icons::glyph(icons::i::SPARKLE), |ui| {
+                                            add_effect_list(ui, EffectTarget::Layer(lid), &mut cmds)
+                                        });
+                                    icons::name(fx_menu.response, "Add effect", None);
+                                });
+                                ui.horizontal(|ui| {
                                     let bus_row = ui.horizontal(|ui| {
                                         for (txt, bus) in [
                                             ("A", Some(vjc_model::Bus::A)),
@@ -3840,30 +3867,57 @@ impl State {
                                         }
                                     });
                                     help(bus_row.response, "layer-bus");
-                                    let mut op = match layer.track.opacity.value {
-                                        vjc_model::Value::Number(n) => n as f32,
-                                        _ => 1.0,
-                                    };
-                                    let op_r = ui.add(
-                                        egui::Slider::new(&mut op, 0.0..=1.0)
-                                            .show_value(false)
-                                            .trailing_fill(true),
-                                    );
-                                    let op_r = help(op_r, "layer-opacity");
-                                    if let Some(a) = vjc_core::shortcuts::layer_address(
-                                        &self.project,
-                                        lid,
-                                        "opacity",
-                                    ) {
-                                        self.targets.push((op_r.rect, a));
-                                    }
-                                    if op_r.changed() {
-                                        cmds.push(Command::SetOpacity {
-                                            layer: lid,
-                                            value: op as f64,
+                                    let label = vjc_core::blend::COMPOSITION_MODES
+                                        .iter()
+                                        .find(|(m, _)| *m == layer.track.blend)
+                                        .map_or("Normal", |(_, n)| *n);
+                                    let blend = egui::ComboBox::from_id_salt(("blend", lid))
+                                        .selected_text(label)
+                                        .width(70.0)
+                                        .show_ui(ui, |ui| {
+                                            for (b, name) in vjc_core::blend::COMPOSITION_MODES {
+                                                if ui
+                                                    .selectable_label(
+                                                        layer.track.blend == *b,
+                                                        *name,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    cmds.push(Command::SetBlend {
+                                                        layer: lid,
+                                                        blend: b.clone(),
+                                                    });
+                                                }
+                                            }
                                         });
-                                    }
+                                    help(blend.response, "layer-blend");
                                 });
+                                let mut op = match layer.track.opacity.value {
+                                    vjc_model::Value::Number(n) => n as f32,
+                                    _ => 1.0,
+                                };
+                                let op_r = ui.add(
+                                    egui::Slider::new(&mut op, 0.0..=1.0)
+                                        .show_value(false)
+                                        .handle_shape(egui::style::HandleShape::Rect {
+                                            aspect_ratio: 0.4,
+                                        })
+                                        .trailing_fill(true),
+                                );
+                                let op_r = help(op_r, "layer-opacity");
+                                if let Some(a) = vjc_core::shortcuts::layer_address(
+                                    &self.project,
+                                    lid,
+                                    "opacity",
+                                ) {
+                                    self.targets.push((op_r.rect, a));
+                                }
+                                if op_r.changed() {
+                                    cmds.push(Command::SetOpacity {
+                                        layer: lid,
+                                        value: op as f64,
+                                    });
+                                }
                             });
                             for ci in 0..ncols {
                                 let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
@@ -3895,7 +3949,16 @@ impl State {
                                     }
                                 };
                                 let r = help(
-                                    grid_ui::cell(ui, label, label, tile, on),
+                                    grid_ui::cell(
+                                        ui,
+                                        label,
+                                        label,
+                                        tile,
+                                        grid_ui::CellState {
+                                            playing: on,
+                                            selected: self.selected == Some((lid, ci)),
+                                        },
+                                    ),
                                     if clip.is_some() { "cell" } else { "cell-empty" },
                                 );
                                 if clip.is_some() {
@@ -3935,13 +3998,6 @@ impl State {
                                         egui::Stroke::new(2.5, theme::CELL_DROP),
                                         egui::StrokeKind::Outside,
                                     );
-                                } else if self.selected == Some((lid, ci)) {
-                                    ui.painter().rect_stroke(
-                                        r.rect,
-                                        3.0,
-                                        egui::Stroke::new(1.5, theme::CELL_SELECTED),
-                                        egui::StrokeKind::Inside,
-                                    );
                                 }
                                 if r.clicked() || r.secondary_clicked() {
                                     self.selected = Some((lid, ci));
@@ -3957,28 +4013,6 @@ impl State {
                                     pick = Some((lid, ci));
                                 }
                             }
-                            let layer = &comp.layers[li];
-                            let label = vjc_core::blend::COMPOSITION_MODES
-                                .iter()
-                                .find(|(m, _)| *m == layer.track.blend)
-                                .map_or("Normal", |(_, n)| *n);
-                            let blend = egui::ComboBox::from_id_salt(("blend", lid))
-                                .selected_text(label)
-                                .width(90.0)
-                                .show_ui(ui, |ui| {
-                                    for (b, name) in vjc_core::blend::COMPOSITION_MODES {
-                                        if ui
-                                            .selectable_label(layer.track.blend == *b, *name)
-                                            .clicked()
-                                        {
-                                            cmds.push(Command::SetBlend {
-                                                layer: lid,
-                                                blend: b.clone(),
-                                            });
-                                        }
-                                    }
-                                });
-                            help(blend.response, "layer-blend");
                             ui.end_row();
                         }
                     });
@@ -4131,7 +4165,7 @@ impl State {
             let (mut w, mut h, mut fps) = (c.width, c.height, c.fps);
             let mut size_changed = false;
             let size_row = ui.horizontal(|ui| {
-                ui.label("Size");
+                params::row_label(ui, "Size");
                 // speed 0: typed only, so a drag does not resize the output every frame.
                 size_changed |= ui
                     .add(egui::DragValue::new(&mut w).speed(0.0).range(1..=16384))
@@ -4219,7 +4253,7 @@ impl State {
                 });
             }
             ui.horizontal(|ui| {
-                ui.label("Crossfader curve");
+                params::row_label(ui, "Crossfader curve");
                 egui::ComboBox::from_id_salt("cfcurve")
                     .selected_text(cf_curve.label())
                     .show_ui(ui, |ui| {
@@ -4325,11 +4359,7 @@ impl State {
                                 .changed();
                         }
                     });
-                if ui
-                    .small_button("\u{2715}")
-                    .on_hover_text("Remove cue")
-                    .clicked()
-                {
+                if icons::button(ui, icons::i::X, "Remove cue").clicked() {
                     remove = Some(i);
                 }
             });
@@ -5299,15 +5329,13 @@ impl State {
                             .inner
                         })
                         .inner;
-                    let by = ui.add(
-                        egui::Button::new("B")
-                            .min_size(theme::FX_BTN)
-                            .selected(e.bypass),
+                    let by = icons::square(
+                        ui,
+                        icons::i::POWER,
+                        "Bypass effect",
+                        theme::FX_BTN.y,
+                        Some(e.bypass),
                     );
-                    let by = by.on_hover_text("Bypass effect");
-                    by.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Bypass effect")
-                    });
                     self.fx_target(by.rect, target, i, "bypass");
                     if by.clicked() {
                         cmds.push(Command::SetEffectBypass {
@@ -5316,27 +5344,15 @@ impl State {
                             bypass: !e.bypass,
                         });
                     }
-                    let pr = ui
-                        .add(
-                            egui::Button::new("P")
-                                .min_size(theme::FX_BTN)
-                                .selected(open),
-                        )
-                        .on_hover_text("Show or hide parameters");
-                    pr.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button,
-                            true,
-                            "Effect parameters",
-                        )
-                    });
+                    let pr = icons::square(
+                        ui,
+                        icons::i::SLIDERS_HORIZONTAL,
+                        "Effect parameters",
+                        theme::FX_BTN.y,
+                        Some(open),
+                    );
                     toggle_open = pr.clicked();
-                    let rm = ui
-                        .add(egui::Button::new("X").min_size(theme::FX_BTN))
-                        .on_hover_text("Remove effect");
-                    rm.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Remove effect")
-                    });
+                    let rm = icons::square(ui, icons::i::X, "Remove effect", theme::FX_BTN.y, None);
                     if rm.clicked() {
                         cmds.push(Command::RemoveEffect {
                             target,
@@ -5471,7 +5487,7 @@ impl State {
                     }
                 });
             }
-            if ui.button("+").on_hover_text("Add deck").clicked() {
+            if icons::button(ui, icons::i::PLUS, "Add deck").clicked() {
                 let deck = Deck {
                     id: Uuid::new_v4(),
                     name: format!("Deck {}", decks.len() + 1),
@@ -5671,7 +5687,8 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "VJCraft",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            theme::apply_style(&cc.egui_ctx);
             let mut s = State::new(prefs);
             if let Some(w) = warn {
                 s.status = w.clone();

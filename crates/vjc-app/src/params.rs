@@ -27,23 +27,72 @@ pub fn reset_to(current: &Value, default: &Value) -> Option<Value> {
     (current != default).then(|| default.clone())
 }
 
-/// Collapsible section header ("- Title" open, "+ Title" closed). The open state lives in
-/// egui memory under `id`, sections start open. Returns whether the body should be drawn.
+/// Collapsible section header: full-width bar with a fold arrow and the title. The open
+/// state lives in egui memory under `id`, sections start open. Returns whether the body
+/// should be drawn. AccessKit name: "<title> (expanded|collapsed)".
 pub fn section(ui: &mut egui::Ui, id: &'static str, title: &str) -> bool {
+    use crate::theme;
     let key = ui.id().with(("section", id));
     let mut open = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(true);
-    let arrow = if open { "-" } else { "+" };
-    let text = egui::RichText::new(format!("{arrow} {title}"))
-        .strong()
-        .color(crate::theme::SECTION_HEAD);
-    if ui
-        .add(egui::Label::new(text).sense(egui::Sense::click()))
-        .clicked()
-    {
+    let (rect, r) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), theme::SECTION_ROW_H),
+        egui::Sense::click(),
+    );
+    let state = if open { "expanded" } else { "collapsed" };
+    r.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{title} ({state})"))
+    });
+    let fill = if r.hovered() {
+        theme::SURFACE_RAISED
+    } else {
+        theme::SURFACE
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, theme::CELL_ROUNDING, fill);
+    let arrow = if open {
+        crate::icons::i::CARET_DOWN
+    } else {
+        crate::icons::i::CARET_RIGHT
+    };
+    let mid = rect.left_center();
+    p.text(
+        mid + egui::vec2(theme::SP_3 + 4.0, 0.0),
+        egui::Align2::CENTER_CENTER,
+        arrow,
+        theme::icon_font(theme::FS_SM),
+        theme::SECTION_HEAD,
+    );
+    p.text(
+        mid + egui::vec2(theme::SP_3 + 16.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        theme::bold_font(ui.ctx(), theme::FS_BASE),
+        theme::TEXT,
+    );
+    if r.has_focus() {
+        p.rect_stroke(
+            rect,
+            theme::CELL_ROUNDING,
+            egui::Stroke::new(2.0, theme::CELL_SELECTED),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if r.clicked() {
         open = !open;
         ui.data_mut(|d| d.insert_temp(key, open));
     }
     open
+}
+
+/// Label column of a property row: right-aligned in a fixed width so values line up.
+pub fn row_label(ui: &mut egui::Ui, label: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(crate::theme::PROP_LABEL_W, crate::theme::PROP_ROW_H),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.add(egui::Label::new(label).truncate());
+        },
+    );
 }
 
 /// Slider with value label (double click to type, Enter commits, Esc cancels) and a reset
@@ -197,7 +246,7 @@ fn anim_menu(
                     changed |= ui
                         .add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.01))
                         .changed();
-                    if ui.small_button("x").clicked() {
+                    if crate::icons::button(ui, crate::icons::i::X, "Remove point").clicked() {
                         remove = Some(i);
                     }
                 });
@@ -239,16 +288,14 @@ fn slider_inner(
     let mut out = None;
     let mut anim_out = None;
     ui.horizontal(|ui| {
-        ui.label(label);
-        let mut x = value;
-        let s = egui::Slider::new(&mut x, range.0..=range.1).show_value(false);
-        if ui.add(s).changed() {
-            out = Some(x);
-        }
+        row_label(ui, label);
+        // Value | - | + | slider | reset | animation.
         let editing: Option<String> = ui.data(|d| d.get_temp(id));
         if let Some(mut buf) = editing {
             let e = ui.add(
-                egui::TextEdit::singleline(&mut buf).desired_width(crate::theme::PROP_VALUE_W),
+                egui::TextEdit::singleline(&mut buf)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(crate::theme::PROP_VALUE_W),
             );
             // Focus only when the entry opens: asking again every frame would take the focus
             // back on the frame Enter/Esc/click-away releases it, and the entry never closed.
@@ -266,32 +313,79 @@ fn slider_inner(
                 ui.data_mut(|d| d.insert_temp(id, buf));
             }
         } else {
-            let r = ui.add(egui::Label::new(format_value(value)).sense(egui::Sense::click()));
+            let (rect, r) = ui.allocate_exact_size(
+                egui::vec2(crate::theme::PROP_VALUE_W, crate::theme::PROP_ROW_H),
+                egui::Sense::click(),
+            );
+            let text = format_value(value);
+            r.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text.clone())
+            });
+            let stroke = if r.hovered() {
+                egui::Stroke::new(1.0, crate::theme::ACCENT)
+            } else {
+                egui::Stroke::new(1.0, crate::theme::BORDER_INPUT)
+            };
+            let p = ui.painter();
+            p.rect_filled(rect, 3.0, crate::theme::BG);
+            p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+            p.text(
+                rect.left_center() + egui::vec2(crate::theme::SP_3, 0.0),
+                egui::Align2::LEFT_CENTER,
+                &text,
+                egui::TextStyle::Monospace.resolve(ui.style()),
+                crate::theme::TEXT,
+            );
             if r.double_clicked() {
                 ui.data_mut(|d| d.insert_temp(id, format_value(value)));
             }
         }
         let step = step.unwrap_or((range.1 - range.0) / 100.0);
-        for (txt, name, sign) in [("-", "Decrease", -1.0), ("+", "Increase", 1.0)] {
-            let b = ui.small_button(txt);
-            b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+        for (icon, name, sign) in [
+            (crate::icons::i::MINUS, "Decrease", -1.0),
+            (crate::icons::i::PLUS, "Increase", 1.0),
+        ] {
+            let b = crate::icons::button(ui, icon, name);
             if b.clicked() {
                 out = Some((value + sign * step).clamp(range.0, range.1));
             }
         }
+        let mut x = value;
+        let tail = if anim.is_some() { 84.0 } else { 44.0 };
+        // Bounded by what is visible: the content width must never feed back into itself.
+        let room = ui
+            .available_width()
+            .min(ui.clip_rect().right() - ui.cursor().left());
+        ui.spacing_mut().slider_width = (room - tail).clamp(48.0, 480.0);
+        ui.spacing_mut().slider_rail_height = 4.0;
+        let s = egui::Slider::new(&mut x, range.0..=range.1)
+            .show_value(false)
+            .trailing_fill(true)
+            .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.4 });
+        if ui.add(s).changed() {
+            out = Some(x);
+        }
         let reset = reset_to(&Value::Number(value), &Value::Number(default));
-        let btn = egui::Button::new("\u{21ba}");
-        if ui
-            .add_enabled(reset.is_some(), btn)
-            .on_hover_text("Reset to default")
-            .clicked()
+        if crate::icons::button_enabled(
+            ui,
+            reset.is_some(),
+            crate::icons::i::ARROW_COUNTER_CLOCKWISE,
+            "Reset to default",
+        )
+        .clicked()
         {
             out = Some(default.clamp(range.0, range.1));
         }
         if let Some(cur) = anim {
-            let b = ui.menu_button(if cur.is_some() { "\u{223f}" } else { "~" }, |ui| {
-                anim_menu(ui, id, cur)
-            });
+            let b = ui.menu_button(
+                crate::icons::glyph(if cur.is_some() {
+                    crate::icons::i::WAVE_SINE
+                } else {
+                    crate::icons::i::WAVE_SAWTOOTH
+                }),
+                |ui| anim_menu(ui, id, cur),
+            );
+            crate::icons::name(b.response.clone(), "Animate", None);
             if let Some(Some(a)) = b.inner {
                 anim_out = Some(a);
             }
@@ -311,7 +405,7 @@ pub fn text_field(
     let id = ui.id().with(id);
     let mut out = None;
     ui.horizontal(|ui| {
-        ui.label(label);
+        row_label(ui, label);
         // A buffer left from an edit that never lost focus (tab switched away) is stale:
         // it only counts if the field was drawn in the previous frame too, so a focus
         // loss this frame (Tab, click outside) still sees the typed text.
@@ -351,7 +445,7 @@ pub fn combo<T: PartialEq + Clone>(
 ) -> Option<T> {
     let mut out = None;
     ui.horizontal(|ui| {
-        ui.label(label);
+        row_label(ui, label);
         let text = options
             .iter()
             .find(|(v, _)| v == current)

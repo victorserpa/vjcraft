@@ -14,6 +14,7 @@ vjc-core = { path = "../vjc-core" }
 vjc-io = { path = "../vjc-io" }
 vjc-avc = { path = "../vjc-avc" }
 eframe = "0.36.2"
+egui-phosphor = "0.14"
 rfd = "0.17.2"
 vjc-media = { path = "../vjc-media" }
 bytemuck = { version = "1", features = ["derive"] }

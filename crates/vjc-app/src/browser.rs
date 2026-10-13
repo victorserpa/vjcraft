@@ -546,7 +546,14 @@ impl Browser {
                                 |n| n.to_string_lossy().into_owned(),
                             );
                             if ui
-                                .small_button(format!("\u{2665} {name}"))
+                                .add(
+                                    egui::Button::new(crate::icons::with_text(
+                                        ui,
+                                        crate::icons::i::HEART,
+                                        &name,
+                                    ))
+                                    .small(),
+                                )
                                 .on_hover_text(f.display().to_string())
                                 .clicked()
                             {
@@ -879,8 +886,8 @@ impl Browser {
             ui.painter().text(
                 hr.center(),
                 egui::Align2::CENTER_CENTER,
-                "\u{2665}",
-                egui::FontId::proportional(14.0),
+                crate::icons::i::HEART,
+                crate::theme::icon_font(14.0),
                 if on {
                     crate::theme::ACCENT
                 } else {

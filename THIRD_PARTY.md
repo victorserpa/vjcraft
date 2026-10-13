@@ -37,3 +37,11 @@
 - The effects load `.onnx` files from a user folder; VJCraft neither bundles nor downloads them (`*.onnx` is git-ignored). How to get them: `docs/ml.md`.
 - MiDaS v2.1 small (`model-small.onnx`), Depth effect. License: MIT. Source: https://github.com/isl-org/MiDaS.
 - Robust Video Matting, MobileNetV3 fp32 (`rvm_mobilenetv3_fp32.onnx`), Remove Background effect. License: GPL-3.0, same as this project. Source: https://github.com/PeterL1n/RobustVideoMatting.
+
+## Inter (font, `assets/fonts/`)
+
+- Proportional UI font (Regular and SemiBold, embedded with `include_bytes!`). License: SIL OFL 1.1, see `assets/fonts/Inter-LICENSE.txt`. Source: https://github.com/rsms/inter (release v4.1).
+
+## egui-phosphor 0.14 and Phosphor Icons
+
+- Icon font for the UI (crate `egui-phosphor`, depends only on egui, no build script, no network). Crate and icons: MIT. Sources: https://crates.io/crates/egui-phosphor, https://phosphoricons.com.

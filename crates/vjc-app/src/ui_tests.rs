@@ -27,18 +27,28 @@ fn gpu() -> bool {
     })
 }
 
+/// The app's ui callback. The first pass only installs the style (fonts take effect at the
+/// start of the next pass), so nothing draws with an unbound font family.
+fn styled_ui() -> impl FnMut(&mut egui::Ui, &mut State) {
+    let mut styled = false;
+    move |ui, st| {
+        if !styled {
+            styled = true;
+            theme::apply_style(ui.ctx());
+            return;
+        }
+        st.tick_clock();
+        State::ui(st, ui);
+    }
+}
+
 fn app_with(state: State, size: egui::Vec2) -> Harness<'static, State> {
     let mut b: HarnessBuilder<State> = Harness::builder().with_size(size);
     if gpu() {
         b = b.wgpu();
     }
-    let mut h = b.build_ui_state(
-        |ui, st| {
-            st.tick_clock();
-            State::ui(st, ui);
-        },
-        state,
-    );
+    // The first pass only installs the style: fonts take effect at the start of the next one.
+    let mut h = b.build_ui_state(styled_ui(), state);
     settle(&mut h);
     h
 }
@@ -218,7 +228,7 @@ fn add_layer_and_column_change_grid() {
     click(&mut h, "Add column");
     assert_eq!(layers_cols(&h), (3, 5));
     assert_eq!(all(&h, "(drop / right-click)"), 15);
-    assert!(exists(&h, "\u{25b6} 5"));
+    assert!(exists(&h, "Trigger column 5"));
     snap(&mut h, "02-grid-3x5");
 }
 
@@ -279,7 +289,12 @@ fn tap_bpm_halve_double_and_resync() {
 #[test]
 fn nudge_buttons_hold_and_release() {
     let mut h = app();
-    let center = h.query_all_by_label("+").next().unwrap().rect().center();
+    let center = h
+        .query_all_by_label("Nudge faster (hold)")
+        .next()
+        .unwrap()
+        .rect()
+        .center();
     let button = |pressed| egui::Event::PointerButton {
         pos: center,
         button: egui::PointerButton::Primary,
@@ -294,7 +309,7 @@ fn nudge_buttons_hold_and_release() {
     h.event(button(false));
     h.run_steps(3);
     assert_eq!(h.state().nudge_dir, 0);
-    let minus = h.get_by_label("\u{2212}").rect().center();
+    let minus = h.get_by_label("Nudge slower (hold)").rect().center();
     h.hover_at(minus);
     h.step();
     h.event(egui::Event::PointerButton {
@@ -482,22 +497,29 @@ fn clip_panel_has_collapsible_sections() {
     // Own panel beside the tabs: visible whatever tab is open.
     for tab in ["Layer", "Group", "Composition"] {
         click(&mut h, tab);
-        for sec in ["- Transport", "- Video", "- Audio", "- Effects"] {
-            assert!(has_text(&h, sec), "{sec} under tab {tab}");
+        for sec in [
+            "Transport (expanded)",
+            "Video (expanded)",
+            "Audio (expanded)",
+            "Effects (expanded)",
+        ] {
+            assert!(exists(&h, sec), "{sec} under tab {tab}");
         }
     }
     assert!(has_text(&h, "Volume") && has_text(&h, "Pan"));
     // Fold the clip panel's Transform rows (the rightmost header) so Audio stays on screen.
-    h.get_all_by_label("- Transform")
+    h.get_all_by_label("Transform (expanded)")
         .max_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
         .unwrap()
         .click();
     settle(&mut h);
-    click(&mut h, "- Audio");
-    assert!(has_text(&h, "+ Audio"));
+    h.get_by_label("Audio (expanded)").scroll_to_me();
+    settle(&mut h);
+    click(&mut h, "Audio (expanded)");
+    assert!(exists(&h, "Audio (collapsed)"));
     // Only the Composition tab's master volume is left.
     assert_eq!(all(&h, "Volume"), 1, "collapsed section hides its rows");
-    click(&mut h, "+ Audio");
+    click(&mut h, "Audio (collapsed)");
     assert_eq!(all(&h, "Volume"), 2);
     snap(&mut h, "clip-panel-sections");
 }
@@ -508,7 +530,7 @@ fn layer_audio_section_edits_volume() {
     let lid = playing_generator(&mut h);
     click(&mut h, "Layer");
     assert!(
-        has_text(&h, "- Audio") && all(&h, "Volume") == 2,
+        exists(&h, "Audio (expanded)") && all(&h, "Volume") == 2,
         "layer + clip"
     );
     h.state_mut().exec(Command::SetAudio {
@@ -537,7 +559,10 @@ fn transform_sections_show_values_and_follow_undo() {
     let deck = h.state().project.composition.current_deck;
     for tab in ["Layer", "Composition"] {
         click(&mut h, tab);
-        assert!(has_text(&h, "- Transform"), "Transform section in {tab}");
+        assert!(
+            exists(&h, "Transform (expanded)"),
+            "Transform section in {tab}"
+        );
         for row in ["Position X", "Position Y", "Scale", "Rotation", "Anchor X"] {
             assert!(exists(&h, row), "{row} row in {tab}");
         }
@@ -565,7 +590,13 @@ fn transform_sections_show_values_and_follow_undo() {
     // Collapsing one of the two sections (tab and clip panel) hides its rows.
     let rows = all(&h, "Position X");
     assert_eq!(rows, 2);
-    h.get_all_by_label("- Transform").next().unwrap().click();
+    let t = h.get_all_by_label("Transform (expanded)").next().unwrap();
+    t.scroll_to_me();
+    settle(&mut h);
+    h.get_all_by_label("Transform (expanded)")
+        .next()
+        .unwrap()
+        .click();
     settle(&mut h);
     assert_eq!(all(&h, "Position X"), 1);
 }
@@ -645,10 +676,10 @@ fn scrub_bar_drags_in_and_out_markers() {
     let (lid, deck) = file_clip(&mut h);
     let r = scrub_rect(&mut h);
     let y = r.center().y;
-    // Grab the In marker (at the left edge) and drag it to a quarter of the bar.
+    // Grab the In marker (at the left edge, past the panel's resize handle) and drag it to a quarter of the bar.
     drag(
         &mut h,
-        egui::pos2(r.left() + 2.0, y),
+        egui::pos2(r.left() + 6.0, y),
         egui::pos2(r.left() + r.width() * 0.25, y),
     );
     let t = transport_of(&h, lid, deck);
@@ -690,6 +721,7 @@ fn duration_buttons_change_the_speed_and_undo() {
     let speed = |h: &Harness<'_, State>| transport_of(h, lid, deck).speed;
     assert_eq!(speed(&h), 1.0);
     h.get_by_label("Halve duration").scroll_to_me();
+    settle(&mut h);
     click(&mut h, "Halve duration");
     assert_eq!(speed(&h), 2.0, "half the duration, twice the speed");
     click(&mut h, "Double duration");
@@ -751,9 +783,15 @@ fn pause_button_toggles_selected_layer_and_undoes() {
             .direction
     };
     assert_eq!(dir(&h), vjc_model::Direction::Forward);
-    click(&mut h, "\u{23f8}");
+    click(
+        &mut h,
+        "Pause or resume the clip playing on the selected layer (all layers when none is selected)",
+    );
     assert_eq!(dir(&h), vjc_model::Direction::Pause);
-    click(&mut h, "\u{23f8}");
+    click(
+        &mut h,
+        "Pause or resume the clip playing on the selected layer (all layers when none is selected)",
+    );
     assert_eq!(
         dir(&h),
         vjc_model::Direction::Forward,
@@ -771,13 +809,13 @@ fn undo_redo_via_edit_menu() {
     click(&mut h, "Add column");
     assert_eq!(layers_cols(&h), (3, 5));
     click(&mut h, "Edit");
-    click_menu(&mut h, "Undo");
+    click_menu(&mut h, "Cmd+Z");
     assert_eq!(layers_cols(&h), (3, 4));
     click(&mut h, "Edit");
-    click_menu(&mut h, "Undo");
+    click_menu(&mut h, "Cmd+Z");
     assert_eq!(layers_cols(&h), (2, 4));
     click(&mut h, "Edit");
-    click_menu(&mut h, "Redo");
+    click_menu(&mut h, "Cmd+Shift+Z");
     assert_eq!(layers_cols(&h), (3, 4));
     // Keyboard shortcuts do the same.
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
@@ -898,7 +936,7 @@ fn output_setup_soft_edge_and_mask() {
 fn panel_tabs_switch() {
     let mut h = app();
     assert!(matches!(h.state().panel_tab, PanelTab::Composition));
-    assert!(has_text(&h, "- Dashboard"));
+    assert!(exists(&h, "Dashboard (expanded)"));
     click(&mut h, "Layer");
     assert!(matches!(h.state().panel_tab, PanelTab::Layer));
     assert!(has_text(&h, "Select a layer (click its name or a cell)."));
@@ -1078,9 +1116,9 @@ fn group_two_layers_and_change_group_opacity() {
         assert_eq!(c.groups.len(), 1);
         assert!(c.layers.iter().all(|l| l.group == Some(c.groups[0].id)));
     }
-    assert!(exists(&h, "\u{25be} Group 1"));
+    assert!(exists(&h, "Group 1"));
     // The header row has its own opacity slider: the one on the same row as the header.
-    let y = h.get_by_label("\u{25be} Group 1").rect().center().y;
+    let y = h.get_by_label("Group 1").rect().center().y;
     let slider = slider_rects(&h)
         .into_iter()
         .find(|r| (r.center().y - y).abs() < 6.0)
@@ -1098,7 +1136,7 @@ fn group_two_layers_and_change_group_opacity() {
         "layer opacity untouched"
     );
     // Clicking the header opens the Group tab.
-    click(&mut h, "\u{25be} Group 1");
+    click(&mut h, "Group 1");
     assert_eq!(
         h.state().sel_group,
         Some(h.state().project.composition.groups[0].id)
@@ -1109,7 +1147,7 @@ fn group_two_layers_and_change_group_opacity() {
     h.get_all_by_label("Ungroup").next().unwrap().click();
     settle(&mut h);
     assert!(h.state().project.composition.groups.is_empty());
-    assert!(!exists(&h, "\u{25be} Group 1"));
+    assert!(!exists(&h, "Group 1"));
 }
 
 // Layouts and contextual help (#36)
@@ -1471,7 +1509,7 @@ fn layout_has_monitor_column_status_bar_and_transport() {
         "status bar version"
     );
     // Transport sits under the grid and above the property panels.
-    let play = h.get_by_label("\u{25b6}").rect();
+    let play = h.get_by_label("Play the selected clip").rect();
     let add = h.get_by_label("Add layer").rect();
     let tabs = h.get_by_label("Composition").rect();
     assert!(add.max.y < play.min.y && play.max.y < tabs.min.y);
@@ -1492,11 +1530,11 @@ fn transport_stop_and_undo_redo_buttons_work() {
         name: "Renamed".into(),
     });
     settle(&mut h);
-    click(&mut h, "\u{21b6}");
+    click(&mut h, "Undo");
     assert_eq!(name(&h), old);
-    click(&mut h, "\u{21b7}");
+    click(&mut h, "Redo");
     assert_eq!(name(&h), "Renamed");
-    click(&mut h, "\u{25a0}");
+    click(&mut h, "Stop all layers");
     assert!(h.state().players.is_empty());
 }
 
@@ -1504,15 +1542,14 @@ fn transport_stop_and_undo_redo_buttons_work() {
 fn layer_header_buttons_toggle_solo_and_bypass() {
     let mut h = app();
     let first = |h: &Harness<'_, State>| h.state().project.composition.layers[0].clone();
-    h.query_all_by_label("S").next().unwrap().click();
+    h.query_all_by_label("Solo layer").next().unwrap().click();
     settle(&mut h);
     assert!(first(&h).solo);
-    // The master bar's crossfader "B" comes first.
-    h.query_all_by_label("B").nth(1).unwrap().click();
+    h.query_all_by_label("Bypass layer").next().unwrap().click();
     settle(&mut h);
     assert!(first(&h).bypass);
     let n = layers_cols(&h).0;
-    h.query_all_by_label("X").next().unwrap().click();
+    h.query_all_by_label("Clear layer").next().unwrap().click();
     settle(&mut h);
     assert_eq!(layers_cols(&h).0, n, "clear keeps the layer");
 }
@@ -1526,10 +1563,10 @@ fn property_sections_collapse() {
         ..Layout::default()
     });
     settle(&mut h);
-    assert!(has_text(&h, "- Dashboard"));
+    assert!(exists(&h, "Dashboard (expanded)"));
     assert!(exists(&h, "Dial 1") || has_text(&h, "Dial 1"));
-    click(&mut h, "- Dashboard");
-    assert!(has_text(&h, "+ Dashboard") || exists(&h, "+ Dashboard"));
+    click(&mut h, "Dashboard (expanded)");
+    assert!(exists(&h, "Dashboard (collapsed)") || exists(&h, "Dashboard (collapsed)"));
     assert!(!exists(&h, "Dial 1") && !has_text(&h, "Dial 1"));
 }
 
@@ -1849,13 +1886,7 @@ fn comp_tab_speed_two() -> Harness<'static, State> {
     let mut h = Harness::builder()
         .with_size(egui::vec2(1280.0, 800.0))
         .with_step_dt(0.02)
-        .build_ui_state(
-            |ui, st| {
-                st.tick_clock();
-                State::ui(st, ui);
-            },
-            State::headless(prefs()),
-        );
+        .build_ui_state(styled_ui(), State::headless(prefs()));
     settle(&mut h);
     click(&mut h, "Composition");
     h.state_mut().exec(Command::SetMasterSpeed { value: 2.0 });
@@ -1872,13 +1903,13 @@ fn param_reset_button_restores_default_and_then_disables() {
     let mut h = comp_tab_speed_two();
     assert_eq!(master_speed(&h), 2.0);
     let enabled = |h: &Harness<'_, State>| {
-        h.query_all_by_label("\u{21ba}")
+        h.query_all_by_label("Reset to default")
             .filter(|n| !NodeT::accesskit_node(n).is_disabled())
             .count()
     };
     assert_eq!(enabled(&h), 1, "only the changed param can reset");
     let btn = h
-        .query_all_by_label("\u{21ba}")
+        .query_all_by_label("Reset to default")
         .find(|n| !NodeT::accesskit_node(n).is_disabled())
         .unwrap();
     btn.click();
@@ -2318,7 +2349,7 @@ fn mixer_toggles_crossfader_behaviour_and_master_audio() {
     click(&mut h, "Audio");
     assert!(!h.state().project.composition.layers[0].audio);
     // The header has the same toggles and the Add effect dropdown.
-    assert!(exists(&h, "Fx+"));
+    assert!(exists(&h, "Add effect"));
     snap(&mut h, "170-mixer");
 }
 
@@ -2336,13 +2367,7 @@ fn browser_compositions_tab_opens_recent_project_on_double_click() {
     let mut h = Harness::builder()
         .with_size(egui::vec2(1280.0, 800.0))
         .with_step_dt(0.02)
-        .build_ui_state(
-            |ui, st| {
-                st.tick_clock();
-                State::ui(st, ui);
-            },
-            State::headless(p),
-        );
+        .build_ui_state(styled_ui(), State::headless(p));
     settle(&mut h);
     assert!(exists(&h, "Record"));
     click(&mut h, "Compositions");
