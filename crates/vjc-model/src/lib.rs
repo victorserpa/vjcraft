@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub type LayerId = Uuid;
+pub type GroupId = Uuid;
 pub type ClipId = Uuid;
 pub type EffectId = Uuid;
 pub type DeckId = Uuid;
@@ -37,6 +38,10 @@ pub struct Composition {
     pub decks: Vec<Deck>,
     pub current_deck: DeckId,
     pub master: Track,
+    /// Layer groups, ordered top to bottom like `layers`. A group's layers are adjacent
+    /// and point back through `Layer::group`; groups never nest.
+    #[serde(default)]
+    pub groups: Vec<LayerGroup>,
     /// Multiplies the speed of every clip, 0..=4.
     #[serde(default = "one")]
     pub master_speed: f64,
@@ -63,6 +68,35 @@ pub struct Layer {
     pub autopilot: Autopilot,
     pub crossfader_bus: Option<Bus>,
     pub group: Option<Uuid>,
+}
+
+/// Adjacent layers composed together first, then blended into the stack as one layer.
+/// `track.effects` run over the composed result; `speed` multiplies the clips' speed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerGroup {
+    pub id: GroupId,
+    pub name: String,
+    pub track: Track,
+    #[serde(default)]
+    pub solo: bool,
+    #[serde(default)]
+    pub bypass: bool,
+    /// Multiplies the speed of every clip in the group, 0..=4.
+    #[serde(default = "one")]
+    pub speed: f64,
+}
+
+impl LayerGroup {
+    pub fn new(name: &str) -> Self {
+        LayerGroup {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            track: Track::new(BlendMode::Normal),
+            solo: false,
+            bypass: false,
+            speed: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -530,6 +564,7 @@ impl Project {
                 current_deck: deck.id,
                 decks: vec![deck],
                 master: Track::new(BlendMode::Normal),
+                groups: vec![],
                 master_speed: 1.0,
                 crossfader: None,
                 dashboard: vec![],
@@ -543,7 +578,34 @@ impl Project {
 impl Composition {
     /// True when the layer is not rendered: bypassed, or another layer is soloed.
     pub fn layer_off(&self, l: &Layer) -> bool {
-        l.bypass || (!l.solo && self.layers.iter().any(|o| o.solo))
+        let g = l.group.and_then(|id| self.group(id));
+        l.bypass
+            || g.is_some_and(|g| g.bypass)
+            || (!l.solo && !g.is_some_and(|g| g.solo) && self.any_solo())
+    }
+
+    pub fn group(&self, id: GroupId) -> Option<&LayerGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    fn any_solo(&self) -> bool {
+        self.layers.iter().any(|o| o.solo) || self.groups.iter().any(|g| g.solo)
+    }
+
+    /// True when the whole group is not rendered: bypassed, or something else is soloed
+    /// (a soloed layer inside the group keeps it on).
+    pub fn group_off(&self, g: &LayerGroup) -> bool {
+        g.bypass
+            || (!g.solo
+                && self.any_solo()
+                && !self.layers.iter().any(|l| l.solo && l.group == Some(g.id)))
+    }
+
+    /// Speed multiplier a layer's clips get from its group (1 when ungrouped).
+    pub fn group_speed(&self, l: &Layer) -> f64 {
+        l.group
+            .and_then(|id| self.group(id))
+            .map_or(1.0, |g| g.speed)
     }
 }
 

@@ -732,3 +732,60 @@ fn layer_name(h: &Harness<'_, State>, lid: LayerId) -> String {
         .name
         .clone()
 }
+
+// Groups: context menu groups two layers, the header slider edits the group opacity,
+// undo dissolves it, and the Group tab shows the params.
+#[test]
+fn group_two_layers_and_change_group_opacity() {
+    let mut h = app();
+    let ids: Vec<LayerId> = h
+        .state()
+        .project
+        .composition
+        .layers
+        .iter()
+        .map(|l| l.id)
+        .collect();
+    assert_eq!(ids.len(), 2);
+    // Layers are listed top to bottom: "Layer 2" is above "Layer 1".
+    h.get_by_label("Layer 2").click_secondary();
+    settle(&mut h);
+    click_menu(&mut h, "Group with layer below");
+    {
+        let c = &h.state().project.composition;
+        assert_eq!(c.groups.len(), 1);
+        assert!(c.layers.iter().all(|l| l.group == Some(c.groups[0].id)));
+    }
+    assert!(exists(&h, "\u{25be} Group 1"));
+    // The header row has its own opacity slider: the one on the same row as the header.
+    let y = h.get_by_label("\u{25be} Group 1").rect().center().y;
+    let slider = slider_rects(&h)
+        .into_iter()
+        .find(|r| (r.center().y - y).abs() < 6.0)
+        .expect("group opacity slider on the header row");
+    drag_to_slider_pct(&mut h, slider, 0.25);
+    let c = &h.state().project.composition;
+    let Value::Number(op) = c.groups[0].track.opacity.value else {
+        panic!("opacity is a number");
+    };
+    assert!(op < 0.9, "group opacity changed: {op}");
+    assert!(
+        c.layers
+            .iter()
+            .all(|l| l.track.opacity.value == Value::Number(1.0)),
+        "layer opacity untouched"
+    );
+    // Clicking the header opens the Group tab.
+    click(&mut h, "\u{25be} Group 1");
+    assert_eq!(
+        h.state().sel_group,
+        Some(h.state().project.composition.groups[0].id)
+    );
+    assert!(exists(&h, "Speed") && exists(&h, "Ungroup"));
+    snap(&mut h, "group-header-and-tab");
+    // Ungroup from the header.
+    h.get_all_by_label("Ungroup").next().unwrap().click();
+    settle(&mut h);
+    assert!(h.state().project.composition.groups.is_empty());
+    assert!(!exists(&h, "\u{25be} Group 1"));
+}

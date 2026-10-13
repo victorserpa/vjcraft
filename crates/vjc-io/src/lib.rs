@@ -298,6 +298,31 @@ mod tests {
     }
 
     #[test]
+    fn project_without_groups_opens_and_groups_roundtrip() {
+        let d = tmp("groups");
+        let f = d.join("old.vjc");
+        // A project written before groups existed has no "groups" key.
+        let mut v = serde_json::to_value(Project::new("old")).unwrap();
+        assert!(
+            v["composition"]
+                .as_object_mut()
+                .unwrap()
+                .remove("groups")
+                .is_some()
+        );
+        std::fs::write(&f, serde_json::to_vec(&v).unwrap()).unwrap();
+        let (p, w) = open(&f).unwrap();
+        assert!(w.is_empty() && p.composition.groups.is_empty());
+        let mut p = p;
+        let mut g = vjc_model::LayerGroup::new("G");
+        g.speed = 2.0;
+        p.composition.groups.push(g);
+        let f2 = d.join("new.vjc");
+        save(&p, &f2).unwrap();
+        assert_eq!(open(&f2).unwrap().0, p);
+    }
+
+    #[test]
     fn migrate_versions() {
         let v = serde_json::json!({"format_version": 1});
         assert_eq!(migrate(v.clone(), 1).unwrap(), v);

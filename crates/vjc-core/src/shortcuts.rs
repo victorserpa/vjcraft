@@ -49,6 +49,7 @@ pub fn effect_address(
     match target {
         EffectTarget::Master => Some(format!("/comp/effect/{}/{tail}", k + 1)),
         EffectTarget::Layer(l) => layer_address(p, l, &format!("effect/{}/{tail}", k + 1)),
+        EffectTarget::Group(g) => group_address(p, g, &format!("effect/{}/{tail}", k + 1)),
         EffectTarget::Clip {
             deck,
             layer,
@@ -78,6 +79,13 @@ fn parse_fx<'a>(
             number_of(n)
                 .and_then(|n| layer_by_number(p, n))
                 .map(EffectTarget::Layer),
+            k,
+            rest,
+        ),
+        ["comp", "group", n, "effect", k, rest @ ..] => (
+            number_of(n)
+                .and_then(|n| group_by_number(p, n))
+                .map(EffectTarget::Group),
             k,
             rest,
         ),
@@ -185,6 +193,7 @@ fn fx_resolve(p: &Project, ctx: &Ctx, parts: &[&str], value: f64) -> Option<Opti
 /// True for targets a knob sweeps (opacity and effect params / dry-wet) rather than flips.
 pub fn is_continuous(address: &str) -> bool {
     address.ends_with("/opacity")
+        || address.ends_with("/speed")
         || address.ends_with("/drywet")
         || (address.contains("/effect/") && address.contains("/param/"))
 }
@@ -194,6 +203,21 @@ pub fn layer_address(p: &Project, layer: LayerId, tail: &str) -> Option<String> 
     let i = ls.iter().position(|l| l.id == layer)?;
     Some(format!("/comp/layer/{}/{tail}", ls.len() - i))
 }
+
+/// Groups are numbered from the bottom like layers: "/comp/group/N/opacity|bypass|solo|speed".
+pub fn group_address(p: &Project, group: vjc_model::GroupId, tail: &str) -> Option<String> {
+    let gs = &p.composition.groups;
+    let i = gs.iter().position(|g| g.id == group)?;
+    Some(format!("/comp/group/{}/{tail}", gs.len() - i))
+}
+
+fn group_by_number(p: &Project, n: usize) -> Option<vjc_model::GroupId> {
+    let gs = &p.composition.groups;
+    (n >= 1 && n <= gs.len()).then(|| gs[gs.len() - n].id)
+}
+
+/// Group speed is 0..=4; addresses carry it normalized (0..1).
+const GROUP_SPEED_MAX: f64 = 4.0;
 
 pub fn clip_address(p: &Project, layer: LayerId, column: ColumnIdx) -> Option<String> {
     layer_address(p, layer, &format!("clip/{}/connect", column + 1))
@@ -223,6 +247,17 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
             let l = layer_by_number(p, number_of(n)?)?;
             let l = p.composition.layers.iter().find(|x| x.id == l)?;
             Some(number(&l.track.opacity.value))
+        }
+        ["comp", "group", n, prop] => {
+            let id = group_by_number(p, number_of(n)?)?;
+            let g = p.composition.group(id)?;
+            match *prop {
+                "opacity" => Some(number(&g.track.opacity.value)),
+                "bypass" => Some(f64::from(u8::from(g.bypass))),
+                "solo" => Some(f64::from(u8::from(g.solo))),
+                "speed" => Some(g.speed / GROUP_SPEED_MAX),
+                _ => None,
+            }
         }
         ["comp", "master", "opacity"] => Some(number(&p.composition.master.opacity.value)),
         ["comp", "master", "bypass"] => Some(f64::from(u8::from(ctx.master_bypass))),
@@ -271,6 +306,28 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
             layer: layer_by_number(p, number_of(n)?)?,
             value: value.clamp(0.0, 1.0),
         }),
+        ["comp", "group", n, prop] => {
+            let group = group_by_number(p, number_of(n)?)?;
+            match *prop {
+                "opacity" => Some(Command::SetGroupOpacity {
+                    group,
+                    value: value.clamp(0.0, 1.0),
+                }),
+                "bypass" => Some(Command::SetGroupBypass {
+                    group,
+                    bypass: value >= 0.5,
+                }),
+                "solo" => Some(Command::SetGroupSolo {
+                    group,
+                    solo: value >= 0.5,
+                }),
+                "speed" => value.is_finite().then_some(Command::SetGroupSpeed {
+                    group,
+                    value: value.clamp(0.0, 1.0) * GROUP_SPEED_MAX,
+                }),
+                _ => None,
+            }
+        }
         ["comp", "layer", n, "clear"] => fire.then_some(Command::ClearLayer {
             layer: layer_by_number(p, number_of(n)?)?,
         }),

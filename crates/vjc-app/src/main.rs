@@ -87,6 +87,8 @@ struct State {
     last_pointer: Option<egui::Pos2>,
     /// Cell selected by click; fallback target for drops.
     selected: Option<(LayerId, u32)>,
+    /// Group shown in the Group tab.
+    sel_group: Option<vjc_model::GroupId>,
     /// Column last triggered (by column, cell or step); the "selected" column of shortcuts.
     col_sel: Option<u32>,
     /// Shortcuts > Edit keyboard: clicks pick a target instead of acting.
@@ -178,6 +180,7 @@ enum PrefsTab {
 enum PanelTab {
     Composition,
     Layer,
+    Group,
     Clip,
 }
 
@@ -224,6 +227,156 @@ fn fx_label(id: &str) -> String {
 }
 
 /// "Add effect" submenu listing the bundled effects.
+/// Context-menu entries to group, ungroup and move layer `li` (index in the layer list,
+/// 0 = top) in or out of groups.
+fn group_menu(
+    ui: &mut egui::Ui,
+    comp: &vjc_model::Composition,
+    li: usize,
+    cmds: &mut Vec<Command>,
+) {
+    let me = &comp.layers[li];
+    let above = li.checked_sub(1).map(|i| &comp.layers[i]);
+    let below = comp.layers.get(li + 1);
+    match me.group {
+        None => {
+            for (label, join, nb) in [
+                ("Group with layer above", "Add to group above", above),
+                ("Group with layer below", "Add to group below", below),
+            ] {
+                let Some(nb) = nb else { continue };
+                if let Some(group) = nb.group {
+                    if ui.button(join).clicked() {
+                        cmds.push(Command::MoveLayerToGroup {
+                            layer: me.id,
+                            group,
+                        });
+                        ui.close();
+                    }
+                } else if ui.button(label).clicked() {
+                    let group =
+                        vjc_model::LayerGroup::new(&format!("Group {}", comp.groups.len() + 1));
+                    cmds.push(Command::CreateGroup {
+                        group,
+                        layers: vec![nb.id, me.id],
+                    });
+                    ui.close();
+                }
+            }
+        }
+        Some(group) => {
+            let members = comp
+                .layers
+                .iter()
+                .filter(|l| l.group == Some(group))
+                .count();
+            let edge = above.is_none_or(|a| a.group != Some(group))
+                || below.is_none_or(|b| b.group != Some(group));
+            if ui
+                .add_enabled(members > 1 && edge, egui::Button::new("Remove from group"))
+                .clicked()
+            {
+                cmds.push(Command::MoveLayerOutOfGroup { layer: me.id });
+                ui.close();
+            }
+            if ui.button("Ungroup").clicked() {
+                cmds.push(Command::Ungroup { group });
+                ui.close();
+            }
+        }
+    }
+}
+
+/// Grid row above the first layer of a group: name, opacity, blend, bypass/solo.
+fn group_header(
+    ui: &mut egui::Ui,
+    project: &vjc_model::Project,
+    g: &vjc_model::LayerGroup,
+    ncols: u32,
+    ui_state: (
+        &mut Option<vjc_model::GroupId>,
+        &mut PanelTab,
+        &mut Vec<(egui::Rect, String)>,
+    ),
+    cmds: &mut Vec<Command>,
+) {
+    let (sel_group, panel_tab, targets) = ui_state;
+    let gid = g.id;
+    let name = ui.add(
+        egui::Button::new(egui::RichText::new(format!("\u{25be} {}", g.name)).strong())
+            .selected(*sel_group == Some(gid)),
+    );
+    if name.clicked() || name.secondary_clicked() {
+        *sel_group = Some(gid);
+        *panel_tab = PanelTab::Group;
+    }
+    name.context_menu(|ui| {
+        if ui.button("Ungroup").clicked() {
+            cmds.push(Command::Ungroup { group: gid });
+            ui.close();
+        }
+        ui.separator();
+        add_effect_menu(ui, EffectTarget::Group(gid), cmds);
+    });
+    let mut op = match g.track.opacity.value {
+        Value::Number(n) => n as f32,
+        _ => 1.0,
+    };
+    let r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
+    if let Some(a) = vjc_core::shortcuts::group_address(project, gid, "opacity") {
+        targets.push((r.rect, a));
+    }
+    if r.changed() {
+        cmds.push(Command::SetGroupOpacity {
+            group: gid,
+            value: op as f64,
+        });
+    }
+    for _ in 0..ncols {
+        ui.label("");
+    }
+    let (mut bypass, mut solo) = (g.bypass, g.solo);
+    ui.horizontal(|ui| {
+        let b = ui
+            .toggle_value(&mut bypass, "B")
+            .on_hover_text("Group bypass");
+        if let Some(a) = vjc_core::shortcuts::group_address(project, gid, "bypass") {
+            targets.push((b.rect, a));
+        }
+        if b.changed() {
+            cmds.push(Command::SetGroupBypass { group: gid, bypass });
+        }
+        let s = ui.toggle_value(&mut solo, "S").on_hover_text("Group solo");
+        if let Some(a) = vjc_core::shortcuts::group_address(project, gid, "solo") {
+            targets.push((s.rect, a));
+        }
+        if s.changed() {
+            cmds.push(Command::SetGroupSolo { group: gid, solo });
+        }
+    });
+    let label = vjc_core::blend::COMPOSITION_MODES
+        .iter()
+        .find(|(m, _)| *m == g.track.blend)
+        .map_or("Normal", |(_, n)| *n);
+    egui::ComboBox::from_id_salt(("gblend", gid))
+        .selected_text(label)
+        .width(90.0)
+        .show_ui(ui, |ui| {
+            for (b, name) in vjc_core::blend::COMPOSITION_MODES {
+                if ui.selectable_label(g.track.blend == *b, *name).clicked() {
+                    cmds.push(Command::SetGroupBlend {
+                        group: gid,
+                        blend: b.clone(),
+                    });
+                }
+            }
+        });
+    if ui.button("Ungroup").clicked() {
+        cmds.push(Command::Ungroup { group: gid });
+    }
+    ui.end_row();
+}
+
 fn add_effect_menu(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
     ui.menu_button("Add effect", |ui| {
         for (id, _) in vjc_fx::BUILTIN {
@@ -602,6 +755,7 @@ impl State {
             browser: browser::Browser::new(browser_start(None, &prefs.general)),
             last_pointer: None,
             selected: None,
+            sel_group: None,
             col_sel: None,
             learn: false,
             learn_target: None,
@@ -1239,6 +1393,16 @@ impl State {
             .as_secs_f64();
         self.last_head_tick = now;
         let master_speed = self.project.composition.master_speed;
+        // A group's speed multiplies the clips of its layers, on top of the master speed.
+        let comp = &self.project.composition;
+        let speed_of = |layer: &LayerId| {
+            master_speed
+                * comp
+                    .layers
+                    .iter()
+                    .find(|l| l.id == *layer)
+                    .map_or(1.0, |l| comp.group_speed(l))
+        };
         let mut finished = vec![];
         let mut autopilot = vec![];
         for o in self.flow.outgoing.values_mut() {
@@ -1267,7 +1431,7 @@ impl State {
                 (Some(n), Some(d)) => beat_sync_rate(d, n, bpm),
                 _ => 1.0,
             };
-            let rate = vjc_core::playback_rate(tr.speed, sync, master_speed);
+            let rate = vjc_core::playback_rate(tr.speed, sync, speed_of(layer));
             // Play modes: the playhead picks the position, the player serves the frame.
             if let (Some(d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
                 let t = head.tick(dt, tr.play_mode, tr.direction, rate, d);
@@ -1322,7 +1486,7 @@ impl State {
                     _ => 1.0,
                 };
                 let sync = vjc_core::clock::generator_sync_rate(tr.beat_sync, bpm);
-                *t += dt * vjc_core::playback_rate(tr.speed, sync, master_speed) * dir;
+                *t += dt * vjc_core::playback_rate(tr.speed, sync, speed_of(layer)) * dir;
             }
         }
         // Once: clear the layer after the last frame.
@@ -1534,6 +1698,8 @@ impl State {
                 vjc_core::anim::effective_number(&x.position, &actx)
             });
         let mut draws: Vec<LayerDraw> = vec![];
+        // Group of each entry of `draws` (an outgoing transition source shares its layer's).
+        let mut draw_groups: Vec<Option<vjc_model::GroupId>> = vec![];
         for (l, f) in &frames {
             // Clip chain first, then the layer chain.
             let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
@@ -1587,6 +1753,7 @@ impl State {
                     (of.width, of.height),
                     &actx,
                 );
+                draw_groups.push(l.group);
                 draws.push(LayerDraw {
                     id: Uuid::from_u128(l.id.as_u128() ^ OUT_MASK),
                     opacity,
@@ -1598,6 +1765,7 @@ impl State {
                     frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
                 });
             }
+            draw_groups.push(l.group);
             draws.push(LayerDraw {
                 id: l.id,
                 transition: cross.map(|(_, (k, p), _)| (k.shader_id(), p, false)),
@@ -1617,7 +1785,37 @@ impl State {
         } else {
             vjc_core::anim::effective_number(&c.master.opacity, &actx) as f32
         };
-        comp.render(&rs.device, &rs.queue, &draws, &master, master_opacity);
+        // Consecutive draws of one group form a run composed in the group's own buffer.
+        let mut group_draws: Vec<compositor::GroupDraw> = vec![];
+        let mut i = 0;
+        while i < draws.len() {
+            let Some(gid) = draw_groups[i] else {
+                i += 1;
+                continue;
+            };
+            let len = draw_groups[i..]
+                .iter()
+                .take_while(|g| **g == Some(gid))
+                .count();
+            if let Some(g) = c.group(gid).filter(|g| !c.group_off(g)) {
+                group_draws.push(compositor::GroupDraw {
+                    start: i,
+                    len,
+                    opacity: vjc_core::anim::effective_number(&g.track.opacity, &actx) as f32,
+                    blend: g.track.blend.clone(),
+                    effects: draw_chain(&mut self.fx, &g.track.effects, time, (w, h), &actx),
+                });
+            }
+            i += len;
+        }
+        comp.render_groups(
+            &rs.device,
+            &rs.queue,
+            &draws,
+            &group_draws,
+            &master,
+            master_opacity,
+        );
         match self.rec_request.take() {
             Some(true) if self.capture.is_none() => {
                 let size = comp.size;
@@ -2523,8 +2721,28 @@ impl State {
                     ui.end_row();
                     for li in 0..comp.layers.len() {
                         let lid = comp.layers[li].id;
+                        let group_head = comp.layers[li]
+                            .group
+                            .filter(|g| li == 0 || comp.layers[li - 1].group != Some(*g))
+                            .and_then(|g| comp.group(g));
+                        if let Some(g) = group_head {
+                            group_header(
+                                ui,
+                                &self.project,
+                                g,
+                                ncols,
+                                (&mut self.sel_group, &mut self.panel_tab, &mut self.targets),
+                                &mut cmds,
+                            );
+                        }
+                        let in_group = comp.layers[li].group.is_some();
                         let name = ui.add(
-                            egui::Label::new(&comp.layers[li].name).sense(egui::Sense::click()),
+                            egui::Label::new(if in_group {
+                                format!("  \u{2502} {}", comp.layers[li].name)
+                            } else {
+                                comp.layers[li].name.clone()
+                            })
+                            .sense(egui::Sense::click()),
                         );
                         self.layer_rects.push((name.rect, lid));
                         if name.clicked() || name.secondary_clicked() {
@@ -2545,6 +2763,8 @@ impl State {
                                     ui.close();
                                 }
                             }
+                            ui.separator();
+                            group_menu(ui, comp, li, &mut cmds);
                             ui.separator();
                             add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
                         });
@@ -2709,12 +2929,14 @@ impl State {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.panel_tab, PanelTab::Composition, "Composition");
             ui.selectable_value(&mut self.panel_tab, PanelTab::Layer, "Layer");
+            ui.selectable_value(&mut self.panel_tab, PanelTab::Group, "Group");
             ui.selectable_value(&mut self.panel_tab, PanelTab::Clip, "Clip");
         });
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| match self.panel_tab {
             PanelTab::Composition => self.composition_tab(ui, cmds),
             PanelTab::Layer => self.layer_tab(ui, cmds),
+            PanelTab::Group => self.group_tab(ui, cmds),
             PanelTab::Clip => self.clip_tab(ui, cmds),
         });
     }
@@ -2991,6 +3213,60 @@ impl State {
         }
         ui.separator();
         self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
+    }
+
+    fn group_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let Some(g) = self
+            .sel_group
+            .and_then(|id| self.project.composition.group(id))
+            .cloned()
+        else {
+            ui.label("Select a group (click its header in the grid).");
+            return;
+        };
+        let gid = g.id;
+        if let Some(name) = params::text_field(ui, ("gname", gid), "Name", &g.name) {
+            cmds.push(Command::RenameGroup { group: gid, name });
+        }
+        if let Some(value) = params::param_slider(
+            ui,
+            ("gop", gid),
+            "Opacity",
+            match g.track.opacity.value {
+                Value::Number(n) => n,
+                _ => 1.0,
+            },
+            1.0,
+            (0.0, 1.0),
+        ) {
+            cmds.push(Command::SetGroupOpacity { group: gid, value });
+        }
+        let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
+            .iter()
+            .map(|(m, n)| (m.clone(), n.to_string()))
+            .collect();
+        if let Some(blend) = params::combo(ui, ("gbl", gid), "Blend", &g.track.blend, &modes) {
+            cmds.push(Command::SetGroupBlend { group: gid, blend });
+        }
+        if let Some(value) =
+            params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
+        {
+            cmds.push(Command::SetGroupSpeed { group: gid, value });
+        }
+        let (mut solo, mut bypass) = (g.solo, g.bypass);
+        ui.horizontal(|ui| {
+            if ui.toggle_value(&mut solo, "Solo").changed() {
+                cmds.push(Command::SetGroupSolo { group: gid, solo });
+            }
+            if ui.toggle_value(&mut bypass, "Bypass").changed() {
+                cmds.push(Command::SetGroupBypass { group: gid, bypass });
+            }
+            if ui.button("Ungroup").clicked() {
+                cmds.push(Command::Ungroup { group: gid });
+            }
+        });
+        ui.separator();
+        self.chain_ui(ui, EffectTarget::Group(gid), cmds);
     }
 
     fn clip_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {

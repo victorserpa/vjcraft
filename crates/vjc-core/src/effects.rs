@@ -2,7 +2,7 @@
 //! the composition (master) track.
 
 use super::{Applied, Command, Error, check_cell, deck_mut, layer_idx, undoable};
-use vjc_model::{ColumnIdx, DeckId, Effect, EffectId, LayerId, Project, Track, Value};
+use vjc_model::{ColumnIdx, DeckId, Effect, EffectId, GroupId, LayerId, Project, Track, Value};
 
 /// Whose chain a command edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,12 +13,18 @@ pub enum EffectTarget {
         column: ColumnIdx,
     },
     Layer(LayerId),
+    /// Chain run over the composed result of a layer group.
+    Group(GroupId),
     Master,
 }
 
 pub fn track_mut(p: &mut Project, t: EffectTarget) -> Result<&mut Track, Error> {
     match t {
         EffectTarget::Master => Ok(&mut p.composition.master),
+        EffectTarget::Group(g) => {
+            let i = crate::groups::group_idx(p, g)?;
+            Ok(&mut p.composition.groups[i].track)
+        }
         EffectTarget::Layer(l) => {
             let i = layer_idx(p, l)?;
             Ok(&mut p.composition.layers[i].track)
@@ -43,6 +49,12 @@ pub fn track_mut(p: &mut Project, t: EffectTarget) -> Result<&mut Track, Error> 
 pub fn chain(p: &Project, t: EffectTarget) -> Option<&[Effect]> {
     match t {
         EffectTarget::Master => Some(&p.composition.master.effects),
+        EffectTarget::Group(g) => p
+            .composition
+            .groups
+            .iter()
+            .find(|x| x.id == g)
+            .map(|x| x.track.effects.as_slice()),
         EffectTarget::Layer(l) => p
             .composition
             .layers

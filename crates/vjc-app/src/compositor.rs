@@ -161,8 +161,17 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         rgb = vec3(l);
     } else {
         rgb = vec3(channel(id, b.r, s.r), channel(id, b.g, s.g), channel(id, b.b, s.b));
+        // Over a see-through base (a group's own buffer) the blend only applies where the
+        // base has coverage: Cs' = (1 - ab) Cs + ab B(Cb, Cs).
+        rgb = mix(s.rgb, rgb, b.a);
     }
-    return vec4(mix(b.rgb, rgb, a), a + b.a * (1.0 - a));
+    // The composition and group buffers hold straight (non-premultiplied) colour.
+    if (b.a >= 1.0) {
+        return vec4(mix(b.rgb, rgb, a), 1.0);
+    }
+    let oa = a + b.a * (1.0 - a);
+    if (oa <= 0.0) { return vec4(0.0); }
+    return vec4((rgb * a + b.rgb * b.a * (1.0 - a)) / oa, oa);
 }
 "#;
 
@@ -499,6 +508,28 @@ pub struct LayerDraw<'a> {
     pub transition: Option<(u32, f32, bool)>,
 }
 
+/// A layer group: `len` consecutive entries of the layer list (bottom to top) from `start`
+/// are composed into an own buffer, `effects` run over it, then it is blended into the
+/// stack like a layer with `opacity` and `blend`.
+pub struct GroupDraw {
+    pub start: usize,
+    pub len: usize,
+    pub opacity: f32,
+    pub blend: BlendMode,
+    pub effects: Vec<EffectDraw>,
+}
+
+/// Intermediate buffer the layers of a group are composed into, one at a time.
+struct GroupBuf {
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    base: wgpu::Texture,
+    base_bind: wgpu::BindGroup,
+    size: (u32, u32),
+    /// One uniform per group drawn in a frame (writes land before the submit).
+    uniforms: Vec<wgpu::Buffer>,
+}
+
 struct Slot {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
@@ -520,6 +551,7 @@ pub struct Compositor {
     /// Opaque black 1x1 texture, its uniform and bind group: draws the master fade.
     fade: (wgpu::Texture, wgpu::Buffer, wgpu::BindGroup),
     slots: HashMap<LayerId, Slot>,
+    group: Option<GroupBuf>,
     fx: Fx,
     pub target: wgpu::Texture,
     pub target_view: wgpu::TextureView,
@@ -821,6 +853,7 @@ impl Compositor {
             blank,
             fade: (fade_tex, fade_buf, fade_bind),
             slots: HashMap::new(),
+            group: None,
             fx,
             target,
             target_view,
@@ -887,13 +920,258 @@ impl Compositor {
         }
     }
 
+    /// Draws one layer onto the composition (or the group buffer): effects, then one blend
+    /// pass reading a copy of what is below.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layer(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        l: &LayerDraw,
+        to_group: bool,
+        extent: wgpu::Extent3d,
+    ) {
+        let Some(slot) = self.slots.get(&l.id) else {
+            return;
+        };
+        if let Some(g) = &l.generator {
+            self.fx.generate(
+                device,
+                queue,
+                enc,
+                &self.bgl,
+                &self.sampler,
+                &self.blank,
+                &slot.view,
+                g,
+            );
+        }
+        let out = self.fx.run(
+            device,
+            queue,
+            enc,
+            &self.bgl,
+            &self.sampler,
+            &slot.view,
+            slot.size,
+            &l.effects,
+        );
+        let (dst_tex, dst_view, base_tex, base_bind) = match &self.group {
+            Some(g) if to_group => (&g.tex, &g.view, &g.base, &g.base_bind),
+            _ => (&self.target, &self.target_view, &self.base, &self.base_bind),
+        };
+        let fx_bind;
+        let bind = match out {
+            None => &slot.bind,
+            Some(i) => {
+                fx_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("layer_fx_bg"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: slot.uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.fx.scratch[&slot.size][i].1,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+                &fx_bind
+            }
+        };
+        enc.copy_texture_to_texture(dst_tex.as_image_copy(), base_tex.as_image_copy(), extent);
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("compose"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dst_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_bind_group(1, base_bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Composes `run` into the group buffer (transparent start), applies the group chain and
+    /// blends the result into the composition. False when nothing in the group is drawn.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_group(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        run: &[LayerDraw],
+        g: &GroupDraw,
+        n: usize,
+        extent: wgpu::Extent3d,
+    ) -> bool {
+        if !run.iter().any(|l| self.slots.contains_key(&l.id)) {
+            return false;
+        }
+        let size = (self.size.0.max(1), self.size.1.max(1));
+        if self.group.as_ref().is_none_or(|b| b.size != size) {
+            let (tex, view) = make_target(device, size.0, size.1);
+            let (base, base_bind) = make_base(device, &self.base_bgl, size.0, size.1);
+            self.group = Some(GroupBuf {
+                tex,
+                view,
+                base,
+                base_bind,
+                size,
+                uniforms: vec![],
+            });
+        }
+        let gb = self.group.as_mut().unwrap();
+        while gb.uniforms.len() <= n {
+            gb.uniforms
+                .push(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("group_u"),
+                    size: 32,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+        }
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("group_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &gb.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        }));
+        for l in run {
+            self.draw_layer(device, queue, enc, l, true, extent);
+        }
+        let gb = self.group.as_ref().unwrap();
+        let out = self.fx.run(
+            device,
+            queue,
+            enc,
+            &self.bgl,
+            &self.sampler,
+            &gb.view,
+            size,
+            &g.effects,
+        );
+        queue.write_buffer(
+            &gb.uniforms[n],
+            0,
+            bytemuck::bytes_of(&[
+                g.opacity.to_bits(),
+                shader_id(&g.blend),
+                1.0f32.to_bits(),
+                1.0f32.to_bits(),
+                0.0f32.to_bits(),
+                0u32,
+                0u32,
+                0u32,
+            ]),
+        );
+        let src = match out {
+            None => &gb.view,
+            Some(i) => &self.fx.scratch[&size][i].1,
+        };
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("group_bg"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gb.uniforms[n].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        enc.copy_texture_to_texture(
+            self.target.as_image_copy(),
+            self.base.as_image_copy(),
+            extent,
+        );
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("group_blend"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(1, &self.base_bind, &[]);
+        pass.draw(0..3, 0..1);
+        true
+    }
+
     /// `master` runs over the finished composition, then the master fade: black drawn with
     /// alpha `1 - master_opacity` (0 = black output, used by bypass too).
+    #[cfg(test)]
     pub fn render(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layers_bottom_to_top: &[LayerDraw],
+        master: &[EffectDraw],
+        master_opacity: f32,
+    ) {
+        self.render_groups(
+            device,
+            queue,
+            layers_bottom_to_top,
+            &[],
+            master,
+            master_opacity,
+        );
+    }
+
+    /// Like `render`, with layer groups: each `GroupDraw` covers a run of `layers_bottom_to_top`.
+    pub fn render_groups(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers_bottom_to_top: &[LayerDraw],
+        groups: &[GroupDraw],
         master: &[EffectDraw],
         master_opacity: f32,
     ) {
@@ -1034,84 +1312,29 @@ impl Compositor {
             height: self.size.1.max(1),
             depth_or_array_layers: 1,
         };
-        for l in layers_bottom_to_top {
-            let Some(slot) = self.slots.get(&l.id) else {
-                continue;
-            };
-            if let Some(g) = &l.generator {
-                self.fx.generate(
+        let mut i = 0;
+        let mut group_no = 0;
+        while i < layers_bottom_to_top.len() {
+            let group = groups
+                .iter()
+                .find(|g| g.start == i && g.len > 0 && i + g.len <= layers_bottom_to_top.len());
+            if let Some(g) = group {
+                let run = &layers_bottom_to_top[i..i + g.len];
+                if self.compose_group(device, queue, &mut enc, run, g, group_no, extent) {
+                    group_no += 1;
+                }
+                i += g.len;
+            } else {
+                self.draw_layer(
                     device,
                     queue,
                     &mut enc,
-                    &self.bgl,
-                    &self.sampler,
-                    &self.blank,
-                    &slot.view,
-                    g,
+                    &layers_bottom_to_top[i],
+                    false,
+                    extent,
                 );
+                i += 1;
             }
-            let out = self.fx.run(
-                device,
-                queue,
-                &mut enc,
-                &self.bgl,
-                &self.sampler,
-                &slot.view,
-                slot.size,
-                &l.effects,
-            );
-            let fx_bind;
-            let bind = match out {
-                None => &slot.bind,
-                Some(i) => {
-                    fx_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("layer_fx_bg"),
-                        layout: &self.bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: slot.uniform.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.fx.scratch[&slot.size][i].1,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                        ],
-                    });
-                    &fx_bind
-                }
-            };
-            enc.copy_texture_to_texture(
-                self.target.as_image_copy(),
-                self.base.as_image_copy(),
-                extent,
-            );
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("compose"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipe);
-            pass.set_bind_group(0, bind, &[]);
-            pass.set_bind_group(1, &self.base_bind, &[]);
-            pass.draw(0..3, 0..1);
         }
         if let Some(i) = self.fx.run(
             device,
@@ -1587,6 +1810,150 @@ mod tests {
             for g in &got[..3] {
                 assert!(g.abs_diff(want) <= 3, "want {want}, got {got:?}");
             }
+        }
+    }
+
+    fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return None;
+        };
+        let Ok(dq) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return None;
+        };
+        Some(dq)
+    }
+
+    fn read_px(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor) -> [u8; 4] {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got = buf.slice(..).get_mapped_range().expect("map")[..4].to_vec();
+        buf.unmap();
+        [got[0], got[1], got[2], got[3]]
+    }
+
+    fn solid<'a>(n: u128, px: &'a [u8; 4], opacity: f32) -> LayerDraw<'a> {
+        LayerDraw {
+            id: uuid::Uuid::from_u128(n),
+            opacity,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![],
+            frame: Some((1, 1, px, 1)),
+            generator: None,
+            transition: None,
+        }
+    }
+
+    fn group(start: usize, len: usize, opacity: f32, effects: Vec<EffectDraw>) -> GroupDraw {
+        GroupDraw {
+            start,
+            len,
+            opacity,
+            blend: BlendMode::Normal,
+            effects,
+        }
+    }
+
+    /// Two white layers at 50% in a group: the group alone equals the flat stack, group
+    /// opacity scales the composed result (not each layer), over black and over grey.
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_group_opacity_matches_flat_stack() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (white, grey) = ([255u8; 4], [102u8, 102, 102, 255]);
+        let mut comp = Compositor::new(&device, 1, 1);
+        // (with grey bottom layer?, group opacity, expected value)
+        let cases = [
+            (false, None, 191u8), // flat: 0.5 then 0.5 over it = 0.75
+            (false, Some(1.0), 191),
+            (false, Some(0.5), 96), // 0.75 * 0.5 = 0.375
+            (true, None, 217),      // grey 0.4 -> 0.7 -> 0.85
+            (true, Some(1.0), 217),
+            (true, Some(0.5), 159), // 0.4 * 0.625 + 0.375 = 0.625
+        ];
+        for (with_grey, group_opacity, want) in cases {
+            let mut layers = vec![];
+            if with_grey {
+                layers.push(solid(1, &grey, 1.0));
+            }
+            let start = layers.len();
+            layers.push(solid(2, &white, 0.5));
+            layers.push(solid(3, &white, 0.5));
+            let groups: Vec<GroupDraw> = group_opacity
+                .map(|o| group(start, 2, o, vec![]))
+                .into_iter()
+                .collect();
+            comp.render_groups(&device, &queue, &layers, &groups, &[], 1.0);
+            let got = read_px(&device, &queue, &comp);
+            for c in &got[..3] {
+                assert!(
+                    c.abs_diff(want) <= 2,
+                    "grey={with_grey} group={group_opacity:?}: {got:?} want {want}"
+                );
+            }
+        }
+    }
+
+    /// The group chain runs over the composed group, not over the layers below it.
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_group_effect_applies_to_group_only() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("invert").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.add_effect(&device, "invert", &wgsl).unwrap();
+        let fx = EffectDraw {
+            kind: "invert".into(),
+            uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
+            dry_wet: 1.0,
+        };
+        let (below, src) = ([255u8, 0, 0, 255], [51u8, 102, 204, 255]);
+        let layers = [solid(1, &below, 1.0), solid(2, &src, 1.0)];
+        comp.render_groups(
+            &device,
+            &queue,
+            &layers,
+            &[group(1, 1, 1.0, vec![fx])],
+            &[],
+            1.0,
+        );
+        let got = read_px(&device, &queue, &comp);
+        for (g, w) in got.iter().zip([204u8, 153, 51]) {
+            assert!(g.abs_diff(w) <= 2, "{got:?}");
         }
     }
 }

@@ -7,6 +7,7 @@ pub mod blend;
 pub mod clock;
 pub mod crossfader;
 pub mod effects;
+pub mod groups;
 pub mod mapping;
 pub mod midi;
 pub mod osc;
@@ -20,8 +21,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vjc_model::{
-    BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId, FitMode, Layer,
-    LayerId, Param, PlayMode, Project, Source, Track, Transport, Value,
+    BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId, FitMode,
+    GroupId, Layer, LayerId, Param, PlayMode, Project, Source, Track, Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -276,6 +277,50 @@ pub enum Command {
         column: ColumnIdx,
         fit: FitMode,
     },
+    /// Groups adjacent, ungrouped layers under `group` (any order; at least one).
+    CreateGroup {
+        group: vjc_model::LayerGroup,
+        layers: Vec<LayerId>,
+    },
+    /// Dissolves the group; its layers stay where they are.
+    Ungroup {
+        group: GroupId,
+    },
+    RenameGroup {
+        group: GroupId,
+        name: String,
+    },
+    /// Group opacity 0..=1 (coalesces).
+    SetGroupOpacity {
+        group: GroupId,
+        value: f64,
+    },
+    SetGroupBlend {
+        group: GroupId,
+        blend: BlendMode,
+    },
+    SetGroupBypass {
+        group: GroupId,
+        bypass: bool,
+    },
+    SetGroupSolo {
+        group: GroupId,
+        solo: bool,
+    },
+    /// Group speed 0..=4, multiplies the speed of its clips (coalesces).
+    SetGroupSpeed {
+        group: GroupId,
+        value: f64,
+    },
+    /// Puts an ungrouped layer directly above or below the group into it.
+    MoveLayerToGroup {
+        layer: LayerId,
+        group: GroupId,
+    },
+    /// Takes the topmost or bottommost layer out of its group (never the last one).
+    MoveLayerOutOfGroup {
+        layer: LayerId,
+    },
     /// Inserts a layer at `index` (0 = top).
     AddLayer {
         layer: Layer,
@@ -434,6 +479,8 @@ enum Target {
     Bpm,
     MasterOpacity,
     MasterSpeed,
+    GroupOpacity(GroupId),
+    GroupSpeed(GroupId),
     Crossfader,
     EffectParam(EffectId, usize),
     EffectDryWet(EffectId),
@@ -464,6 +511,8 @@ impl Command {
             Command::SetAnimation { target, .. } => Some(Target::Anim(*target)),
             Command::SetMasterOpacity { .. } => Some(Target::MasterOpacity),
             Command::SetMasterSpeed { .. } => Some(Target::MasterSpeed),
+            Command::SetGroupOpacity { group, .. } => Some(Target::GroupOpacity(*group)),
+            Command::SetGroupSpeed { group, .. } => Some(Target::GroupSpeed(*group)),
             Command::SetCrossfader { .. } => Some(Target::Crossfader),
             Command::SetEffectDryWet { effect, .. } => Some(Target::EffectDryWet(*effect)),
             Command::SetEffectParam { effect, param, .. } => {
@@ -569,6 +618,9 @@ pub enum Error {
     NoDeck,
     NoClip,
     NoEffect,
+    NoGroup,
+    /// Group rule broken: layers not adjacent, already grouped, or group would be empty.
+    BadGroup,
     NoShortcut,
     NoScreen,
     NoSlice,
@@ -590,6 +642,8 @@ impl std::fmt::Display for Error {
             Error::NoDeck => "current deck not found",
             Error::NoClip => "no clip in cell",
             Error::NoEffect => "effect not found",
+            Error::NoGroup => "group not found",
+            Error::BadGroup => "group layers must be adjacent, ungrouped, and a group never empty",
             Error::NoShortcut => "shortcut not found",
             Error::NotPlayable => "clip has no playable file source",
             Error::InUse => "layer or column is not empty",
@@ -1499,7 +1553,20 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         Command::AddLayer { layer, index } => {
             let id = layer.id;
             let ls = &mut p.composition.layers;
-            ls.insert(index.min(ls.len()), layer);
+            let mut index = index.min(ls.len());
+            // Never split a group: an ungrouped layer lands above the group it hit.
+            if layer.group.is_none()
+                && index > 0
+                && index < ls.len()
+                && ls[index].group.is_some()
+                && ls[index - 1].group == ls[index].group
+            {
+                let g = ls[index].group;
+                while index > 0 && ls[index - 1].group == g {
+                    index -= 1;
+                }
+            }
+            ls.insert(index, layer);
             undoable(Command::RemoveLayer { layer: id }, vec![])
         }
         Command::RemoveLayer { layer } => {
@@ -1510,6 +1577,11 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 .any(|d| d.clips.iter().any(|c| c.layer == layer))
             {
                 return Err(Error::InUse);
+            }
+            if let Some(g) = p.composition.layers[i].group
+                && groups::members(p, g).len() < 2
+            {
+                return Err(Error::BadGroup);
             }
             let removed = p.composition.layers.remove(i);
             undoable(
@@ -1744,6 +1816,16 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::SetEffectBypass { .. }
         | Command::SetEffectDryWet { .. }
         | Command::SetEffectParam { .. } => effects::apply(p, cmd),
+        Command::CreateGroup { .. }
+        | Command::Ungroup { .. }
+        | Command::RenameGroup { .. }
+        | Command::SetGroupOpacity { .. }
+        | Command::SetGroupBlend { .. }
+        | Command::SetGroupBypass { .. }
+        | Command::SetGroupSolo { .. }
+        | Command::SetGroupSpeed { .. }
+        | Command::MoveLayerToGroup { .. }
+        | Command::MoveLayerOutOfGroup { .. } => groups::apply(p, cmd),
         Command::AddShortcut { .. } | Command::RemoveShortcut { .. } => shortcuts::apply(p, cmd),
         Command::SetBpm { bpm } => {
             if !bpm.is_finite() || bpm <= 0.0 {
@@ -1819,7 +1901,8 @@ impl History {
         // `apply` because a name that was already empty must be restorable.
         if let Command::RenameLayer { name, .. }
         | Command::RenameClip { name, .. }
-        | Command::RenameDeck { name, .. } = &cmd
+        | Command::RenameDeck { name, .. }
+        | Command::RenameGroup { name, .. } = &cmd
             && name.trim().is_empty()
         {
             return Err(Error::InvalidValue);
