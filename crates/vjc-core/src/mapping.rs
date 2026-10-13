@@ -51,7 +51,57 @@ pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
         width: w,
         height: h,
         slices: vec![],
+        pixel_perfect: false,
     }
+}
+
+/// True when the slice maps source pixels to screen pixels one to one: axis-aligned input
+/// rectangle and flat output grid whose size in pixels equals the input region of a
+/// `src` (w, h) composition (within a quarter pixel). Such a slice may use nearest sampling.
+pub fn slice_unscaled(src: (u32, u32), s: &Slice) -> bool {
+    let q = input_quad(&s.input);
+    let flat = |a: Pt, b: Pt, c: Pt, d: Pt| {
+        (a.1 - b.1).abs() < 1e-4
+            && (c.1 - d.1).abs() < 1e-4
+            && (a.0 - d.0).abs() < 1e-4
+            && (b.0 - c.0).abs() < 1e-4
+    };
+    if !flat(q[0], q[1], q[2], q[3]) || s.output_mesh.len() < 4 || s.mesh_cols < 2 {
+        return false;
+    }
+    let (iw, ih) = (
+        (q[1].0 - q[0].0) * src.0 as f32,
+        (q[3].1 - q[0].1) * src.1 as f32,
+    );
+    let rows = rows_of(s.output_mesh.len(), s.mesh_cols);
+    if rows < 2 || !mesh_valid(&s.output_mesh, s.mesh_cols) {
+        return false;
+    }
+    let cols = s.mesh_cols as usize;
+    let m = &s.output_mesh;
+    let (tl, tr, bl) = (m[0], m[cols - 1], m[(rows as usize - 1) * cols]);
+    let br = m[rows as usize * cols - 1];
+    if (tl.1 - tr.1).abs() > 1e-3 || (bl.1 - br.1).abs() > 1e-3 {
+        return false;
+    }
+    if (tl.0 - bl.0).abs() > 1e-3 || (tr.0 - br.0).abs() > 1e-3 {
+        return false;
+    }
+    if ((tr.0 - tl.0) - iw).abs() >= 0.25 || ((bl.1 - tl.1) - ih).abs() >= 0.25 {
+        return false;
+    }
+    // Interior nodes must sit on the flat grid too (no warp).
+    (0..rows as usize).all(|j| {
+        (0..cols).all(|i| {
+            let e = quad_lerp(
+                [tl, tr, br, bl],
+                i as f32 / (cols - 1) as f32,
+                j as f32 / (rows as usize - 1) as f32,
+            );
+            let n = m[j * cols + i];
+            (n.0 - e.0).abs() < 0.25 && (n.1 - e.1).abs() < 0.25
+        })
+    })
 }
 
 pub fn rows_of(mesh_len: usize, cols: u32) -> u32 {
@@ -280,6 +330,18 @@ pub fn edge_ramp(e: &vjc_model::SoftEdge, s: f32, t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unscaled_slice_detection() {
+        let mut sl = new_slice(1920, 1080);
+        assert!(slice_unscaled((1920, 1080), &sl));
+        assert!(!slice_unscaled((1280, 720), &sl), "scaled up");
+        sl.output_mesh[1].0 -= 10.0;
+        assert!(!slice_unscaled((1920, 1080), &sl), "warped");
+        let mut half = new_slice(960, 1080);
+        half.input = vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)];
+        assert!(slice_unscaled((1920, 1080), &half), "crop 1:1");
+    }
 
     #[test]
     fn resample_keeps_shape() {

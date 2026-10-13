@@ -69,3 +69,24 @@ pub fn tile_color(key: &str) -> Color32 {
     let c = eframe::egui::ecolor::Hsva::new(hue, 0.45, 0.42, 1.0);
     c.into()
 }
+
+/// Output test card, identify and FPS overlays (drawn over a screen's output).
+pub const TESTCARD_GRID: Color32 = Color32::from_rgb(90, 90, 100);
+pub const TESTCARD_BORDER: Color32 = Color32::WHITE;
+pub const TESTCARD_SLICE: Color32 = Color32::from_rgb(255, 210, 60);
+pub const TESTCARD_TEXT: Color32 = Color32::WHITE;
+pub const TESTCARD_TEXT_BG: Color32 = Color32::from_black_alpha(190);
+/// Color bars, left to right.
+pub const TESTCARD_BARS: [Color32; 8] = [
+    Color32::WHITE,
+    Color32::from_rgb(255, 255, 0),
+    Color32::from_rgb(0, 255, 255),
+    Color32::from_rgb(0, 255, 0),
+    Color32::from_rgb(255, 0, 255),
+    Color32::from_rgb(255, 0, 0),
+    Color32::from_rgb(0, 0, 255),
+    Color32::BLACK,
+];
+pub const IDENTIFY_BG: Color32 = Color32::from_black_alpha(170);
+pub const IDENTIFY_TEXT: Color32 = ACCENT;
+pub const FPS_TEXT: Color32 = CELL_PLAYING;

@@ -1721,3 +1721,60 @@ fn double_click_value_opens_entry_enter_commits_esc_cancels() {
     assert_eq!(master_speed(&h), 3.5);
     assert!(exists(&h, "3.5"));
 }
+
+#[test]
+fn output_setup_pixel_perfect_toggle_and_free_resolution() {
+    let mut h = app();
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    click(&mut h, "Add");
+    let id = h.state().project.output.screens[0].id;
+    assert!(!h.state().project.output.screens[0].pixel_perfect);
+    click(&mut h, "Pixel-perfect (nearest)");
+    assert!(h.state().project.output.screens[0].pixel_perfect);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert!(!h.state().project.output.screens[0].pixel_perfect);
+    // The size is free and independent of the composition.
+    h.state_mut().exec(Command::SetScreenSize {
+        screen: id,
+        width: 3840,
+        height: 2160,
+    });
+    let s = &h.state().project.output.screens[0];
+    assert_eq!((s.width, s.height), (3840, 2160));
+    assert_ne!(h.state().project.composition.width, 3840);
+}
+
+#[test]
+fn output_menu_test_card_identify_fps_and_display_info() {
+    let mut h = app();
+    let scr = vjc_core::mapping::new_screen("Wall", 1920, 1080);
+    let id = scr.id;
+    h.state_mut().exec(Command::AddScreen {
+        screen: scr,
+        index: 0,
+    });
+    settle(&mut h);
+    click(&mut h, "Output");
+    click_menu(&mut h, "Show test card");
+    click(&mut h, "Wall");
+    assert!(h.state().test_cards.contains(&id));
+    click(&mut h, "Output");
+    click_menu(&mut h, "Show test card");
+    click(&mut h, "Wall");
+    assert!(!h.state().test_cards.contains(&id));
+    click(&mut h, "Output");
+    click(&mut h, "Identify displays");
+    assert!(output_overlay::identifying(
+        h.state().identify_at,
+        std::time::Instant::now()
+    ));
+    click(&mut h, "Output");
+    click(&mut h, "Show FPS");
+    assert!(h.state().show_fps);
+    click(&mut h, "Output");
+    click(&mut h, "Display info");
+    assert!(h.state().display_info_open);
+    assert!(exists(&h, "Display info"));
+}

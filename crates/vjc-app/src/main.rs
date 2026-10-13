@@ -15,6 +15,7 @@ mod ml_gpu;
 mod monitors;
 mod netout;
 mod osc_io;
+mod output_overlay;
 mod output_ui;
 mod params;
 mod prefs_ui;
@@ -36,6 +37,7 @@ use vjc_core::{AudioParam, AudioTarget, Command, Event, History};
 use vjc_io::prefs::{Layout, Prefs};
 use vjc_media::audio::AudioEngine;
 use vjc_media::{Frame, Player};
+use vjc_model::Screen;
 use vjc_model::{
     Autopilot, AutopilotMode, BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId,
     OutputDevice, PlayMode, Project, Track, Transition, Value,
@@ -47,6 +49,8 @@ struct ScreenRt {
     view: wgpu::TextureView,
     size: (u32, u32),
     id: egui::TextureId,
+    /// Registered with nearest filtering (pixel-perfect screen).
+    nearest: bool,
 }
 
 struct State {
@@ -161,6 +165,15 @@ struct State {
     sel_mask_pt: Option<usize>,
     /// Screens whose output window the user closed (runtime only).
     closed_screens: std::collections::HashSet<Uuid>,
+    /// Screens showing the test card on their output (runtime only).
+    test_cards: std::collections::HashSet<Uuid>,
+    /// FPS overlay on every output.
+    show_fps: bool,
+    /// When "Identify displays" was pressed (shows for `output_overlay::IDENTIFY_FOR`).
+    identify_at: Option<std::time::Instant>,
+    display_info_open: bool,
+    /// Presented-frame rate per output window.
+    out_fps: HashMap<Uuid, output_overlay::FpsMeter>,
     slice_r: Option<slice_render::SliceRenderer>,
     /// Per-screen render target and its egui texture id.
     screen_rt: HashMap<Uuid, ScreenRt>,
@@ -887,6 +900,11 @@ impl State {
             edit_mask: false,
             sel_mask_pt: None,
             closed_screens: Default::default(),
+            test_cards: Default::default(),
+            show_fps: false,
+            identify_at: None,
+            display_info_open: false,
+            out_fps: HashMap::new(),
             slice_r: None,
             screen_rt: HashMap::new(),
             prefs_tab: PrefsTab::General,
@@ -2423,24 +2441,36 @@ impl State {
             let Some(scr) = self.project.output.screens.iter().find(|s| s.id == id) else {
                 continue;
             };
-            if scr.slices.is_empty() {
-                if let Some(old) = self.screen_rt.remove(&id) {
-                    rs.renderer.write().free_texture(&old.id);
-                }
-                continue;
-            }
+            // A screen without slices shows the whole composition, still at its own size.
+            let plain;
+            let scr = if scr.slices.is_empty() {
+                let mut s = scr.clone();
+                s.slices
+                    .push(vjc_core::mapping::new_slice(s.width, s.height));
+                plain = s;
+                &plain
+            } else {
+                scr
+            };
             let size = (scr.width.max(1), scr.height.max(1));
             let r = self
                 .slice_r
                 .get_or_insert_with(|| slice_render::SliceRenderer::new(&rs.device));
-            let fresh = self.screen_rt.get(&id).is_none_or(|t| t.size != size);
+            let fresh = self
+                .screen_rt
+                .get(&id)
+                .is_none_or(|t| t.size != size || t.nearest != scr.pixel_perfect);
             if fresh {
                 let (tex, view) = slice_render::make_screen_target(&rs.device, size.0, size.1);
-                let tid = rs.renderer.write().register_native_texture(
-                    &rs.device,
-                    &view,
-                    wgpu::FilterMode::Linear,
-                );
+                let filter = if scr.pixel_perfect {
+                    wgpu::FilterMode::Nearest
+                } else {
+                    wgpu::FilterMode::Linear
+                };
+                let tid = rs
+                    .renderer
+                    .write()
+                    .register_native_texture(&rs.device, &view, filter);
                 if let Some(old) = self.screen_rt.insert(
                     id,
                     ScreenRt {
@@ -2448,13 +2478,19 @@ impl State {
                         view,
                         size,
                         id: tid,
+                        nearest: scr.pixel_perfect,
                     },
                 ) {
                     rs.renderer.write().free_texture(&old.id);
                 }
             }
             let t = &self.screen_rt[&id];
-            r.render(&rs.device, &rs.queue, scr, &comp.target_view, &t.view);
+            r.render(
+                &rs.device,
+                &rs.queue,
+                (scr, &comp.target_view, comp.size),
+                &t.view,
+            );
         }
         // Publish: the screen's own target when it has slices, else the composition.
         let fps = self.project.composition.fps;
@@ -3163,6 +3199,34 @@ impl State {
                     ui.close();
                     self.output_setup_open = true;
                 }
+                ui.menu_button("Show test card", |ui| {
+                    if self.project.output.screens.is_empty() {
+                        ui.label("No screens");
+                    }
+                    for s in self.project.output.screens.clone() {
+                        let mut on = self.test_cards.contains(&s.id);
+                        if ui.checkbox(&mut on, &s.name).changed() {
+                            if on {
+                                self.test_cards.insert(s.id);
+                            } else {
+                                self.test_cards.remove(&s.id);
+                            }
+                        }
+                    }
+                });
+                if ui.button("Identify displays").clicked() {
+                    ui.close();
+                    self.identify_at = Some(std::time::Instant::now());
+                    // Repaint once more when it expires, even if nothing else animates.
+                    ui.ctx().request_repaint_after(
+                        output_overlay::IDENTIFY_FOR + std::time::Duration::from_millis(50),
+                    );
+                }
+                ui.checkbox(&mut self.show_fps, "Show FPS");
+                if ui.button("Display info").clicked() {
+                    ui.close();
+                    self.display_info_open = true;
+                }
                 if ui
                     .add_enabled(
                         self.output.is_some() || !self.open_screens().is_empty(),
@@ -3341,6 +3405,7 @@ impl State {
         self.save_layout_window(&ctx);
         self.overwrite_layout_window(&ctx);
         self.output_setup_window(&ctx);
+        self.display_info_window(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -4900,21 +4965,28 @@ impl State {
     /// or the whole composition when it has no slices.
     fn output_window(&mut self, ctx: &egui::Context) {
         let Some(comp_id) = self.comp_tex else { return };
-        let mut wins: Vec<(Uuid, usize, egui::TextureId)> = vec![];
+        let mut wins: Vec<(Uuid, usize, egui::TextureId, Option<Screen>)> = vec![];
         if self.project.output.screens.is_empty() {
             if let Some(mon) = self
                 .output
                 .and_then(|id| monitors::find(&self.monitors, id))
             {
-                wins.push((Uuid::nil(), mon, comp_id));
+                wins.push((Uuid::nil(), mon, comp_id, None));
             }
         } else {
             for (id, mon) in self.open_screens() {
                 let tex = self.screen_rt.get(&id).map_or(comp_id, |t| t.id);
-                wins.push((id, mon, tex));
+                let info = self
+                    .project
+                    .output
+                    .screens
+                    .iter()
+                    .find(|s| s.id == id)
+                    .cloned();
+                wins.push((id, mon, tex, info));
             }
         }
-        for (sid, mon, tex) in wins {
+        for (sid, mon, tex, info) in wins {
             // The list can change between pick and use (hotplug): skip a stale index.
             let Some(mid) = monitors::id_at(&self.monitors, mon) else {
                 continue;
@@ -4928,19 +5000,56 @@ impl State {
             let mut leave_learn = false;
             // Esc leaves learn mode first; it must not also close the output.
             let learning = self.learn;
+            let card = self.test_cards.contains(&sid);
+            let identify = output_overlay::identifying(self.identify_at, std::time::Instant::now());
+            let number = self
+                .project
+                .output
+                .screens
+                .iter()
+                .position(|s| s.id == sid)
+                .map_or(1, |i| i + 1);
+            let show_fps = self.show_fps;
+            let out_fps = &mut self.out_fps;
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of(monitors::viewport_key(sid, mid)),
                 builder,
                 |ui, _class| {
                     let ctx = ui.ctx().clone();
-                    let rect = ui.max_rect();
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                    let full = ui.max_rect();
+                    ui.painter().rect_filled(full, 0.0, egui::Color32::BLACK);
+                    // Physical pixels: the window's own scale factor (Retina, mixed monitors).
+                    let rect = match &info {
+                        Some(s) => monitors::present_rect(
+                            full.size(),
+                            ctx.pixels_per_point(),
+                            (s.width, s.height),
+                            s.pixel_perfect,
+                        )
+                        .translate(full.min.to_vec2()),
+                        None => full,
+                    };
                     ui.painter().image(
                         tex,
                         rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
+                    if let Some(s) = &info {
+                        let now = std::time::Instant::now();
+                        let meter = out_fps.entry(sid).or_default();
+                        meter.tick(now);
+                        output_overlay::draw(
+                            ui.painter(),
+                            rect,
+                            &output_overlay::Overlay {
+                                screen: s,
+                                test_card: card,
+                                identify: identify.then_some(number),
+                                fps: show_fps.then_some(meter.fps),
+                            },
+                        );
+                    }
                     let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
                     if esc && learning {
                         // The main window never sees this viewport's keys.

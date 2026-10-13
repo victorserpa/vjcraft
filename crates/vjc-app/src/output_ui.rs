@@ -143,6 +143,38 @@ impl State {
         self.run_output_cmds(cmds);
     }
 
+    /// "Display info" window: name, resolution and refresh of each monitor, and which
+    /// screens are bound to it.
+    pub(crate) fn display_info_window(&mut self, ctx: &egui::Context) {
+        if !self.display_info_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Display info")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.monitors.is_empty() {
+                    ui.label("No monitors found");
+                }
+                for m in &self.monitors {
+                    ui.strong(&m.name);
+                    let hz = if m.refresh_hz > 0.0 {
+                        format!("{:.0} Hz", m.refresh_hz)
+                    } else {
+                        "refresh unknown".into()
+                    };
+                    ui.label(format!("{} x {} px, {}", m.width, m.height, hz));
+                    for s in &self.project.output.screens {
+                        if matches!(&s.device, OutputDevice::Monitor { name } if *name == m.id.to_string())
+                        {
+                            ui.weak(format!("Screen: {} ({} x {})", s.name, s.width, s.height));
+                        }
+                    }
+                }
+            });
+        self.display_info_open = open;
+    }
+
     /// Runs the commands of the setup window. A screen reopens only if its device change
     /// was accepted; a monitor already used by another screen is reported.
     pub(crate) fn run_output_cmds(&mut self, cmds: Vec<Command>) {
@@ -278,6 +310,18 @@ impl State {
                 screen: c.id,
                 width: w,
                 height: h,
+            });
+        }
+        let mut pp = c.pixel_perfect;
+        if crate::help::help(
+            ui.checkbox(&mut pp, "Pixel-perfect (nearest)"),
+            "out-pixel-perfect",
+        )
+        .changed()
+        {
+            cmds.push(Command::SetScreenPixelPerfect {
+                screen: c.id,
+                pixel_perfect: pp,
             });
         }
         self.artnet_setup(ui, c, cmds);

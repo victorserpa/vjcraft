@@ -3,13 +3,15 @@
 //! the moment a window is created, because `ViewportBuilder::monitor` wants winit's
 //! `available_monitors()` position (same order as CGGetActiveDisplayList on macOS).
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MonitorInfo {
     /// Stable display id (changes only when the display is replugged).
     pub id: u32,
     pub name: String,
     pub width: u32,
     pub height: u32,
+    /// Refresh rate in Hz (0 when unknown).
+    pub refresh_hz: f64,
     /// Top-left in the global desktop space.
     pub x: i32,
     pub y: i32,
@@ -43,6 +45,7 @@ pub fn list() -> Vec<MonitorInfo> {
                 name: format!("{} {}{}", kind, i + 1, main),
                 width: d.pixels_wide() as u32,
                 height: d.pixels_high() as u32,
+                refresh_hz: d.display_mode().map_or(0.0, |m| m.refresh_rate()),
                 x: b.origin.x as i32,
                 y: b.origin.y as i32,
             }
@@ -66,6 +69,7 @@ pub fn fallback_list() -> Vec<MonitorInfo> {
             name: format!("Monitor {}", i + 1),
             width: 0,
             height: 0,
+            refresh_hz: 0.0,
             x: 0,
             y: 0,
         })
@@ -94,6 +98,31 @@ pub fn find(monitors: &[MonitorInfo], id: u32) -> Option<usize> {
     monitors.iter().position(|m| m.id == id)
 }
 
+/// Where a `tex` (w, h in pixels) canvas is drawn inside a window of `avail` points at
+/// `ppp` pixels per point (the scale factor: 2.0 on Retina). Not `exact`: it fills the
+/// window. `exact` (pixel-perfect screens): one texel per physical pixel, centered on a
+/// whole pixel; only a canvas larger than the window is scaled down, keeping its aspect.
+pub fn present_rect(
+    avail: eframe::egui::Vec2,
+    ppp: f32,
+    tex: (u32, u32),
+    exact: bool,
+) -> eframe::egui::Rect {
+    use eframe::egui::{Rect, Vec2, pos2, vec2};
+    if !exact {
+        return Rect::from_min_size(pos2(0.0, 0.0), avail);
+    }
+    let phys = avail * ppp;
+    let t = vec2(tex.0.max(1) as f32, tex.1.max(1) as f32);
+    let k = (phys.x / t.x).min(phys.y / t.y).min(1.0);
+    let size: Vec2 = t * k;
+    let off = vec2(
+        ((phys.x - size.x) / 2.0).floor(),
+        ((phys.y - size.y) / 2.0).floor(),
+    );
+    Rect::from_min_size((off / ppp).to_pos2(), size / ppp)
+}
+
 /// Size in points of the main display, when the platform can tell.
 #[cfg(target_os = "macos")]
 pub fn main_size_points() -> Option<(f32, f32)> {
@@ -115,6 +144,7 @@ mod tests {
             name: "A".into(),
             width: 1,
             height: 1,
+            refresh_hz: 0.0,
             x: 0,
             y: 0,
         }];
@@ -139,6 +169,7 @@ mod tests {
             name: "X".into(),
             width: 1920,
             height: 1080,
+            refresh_hz: 60.0,
             x: 0,
             y: 0,
         }
@@ -162,6 +193,24 @@ mod tests {
         let s = uuid::Uuid::from_u128(1);
         assert_ne!(viewport_key(s, 7), viewport_key(s, 9));
         assert_eq!(viewport_key(s, 7), viewport_key(s, 7));
+    }
+
+    #[test]
+    fn present_rect_is_one_to_one_in_physical_pixels() {
+        use eframe::egui::{pos2, vec2};
+        // Retina: 1920x1080 points = 3840x2160 pixels, canvas 3840x2160 fills it exactly.
+        let r = present_rect(vec2(1920.0, 1080.0), 2.0, (3840, 2160), true);
+        assert_eq!((r.min, r.size()), (pos2(0.0, 0.0), vec2(1920.0, 1080.0)));
+        // Smaller canvas stays 1:1 and centered on a whole pixel (2 px per point).
+        let r = present_rect(vec2(960.0, 540.0), 2.0, (1001, 1000), true);
+        assert_eq!(r.size() * 2.0, vec2(1001.0, 1000.0));
+        assert_eq!(r.min.x * 2.0, 459.0);
+        // Larger canvas is scaled down keeping the aspect.
+        let r = present_rect(vec2(1000.0, 500.0), 1.0, (4000, 1000), true);
+        assert_eq!(r.size(), vec2(1000.0, 250.0));
+        // Not exact: fills the window.
+        let r = present_rect(vec2(800.0, 600.0), 1.0, (10, 10), false);
+        assert_eq!(r.size(), vec2(800.0, 600.0));
     }
 
     #[test]

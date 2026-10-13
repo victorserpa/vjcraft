@@ -453,6 +453,10 @@ pub struct Screen {
     pub width: u32,
     pub height: u32,
     pub slices: Vec<Slice>,
+    /// Slices that are not scaled sample with nearest (no filtering) and the output
+    /// window presents the canvas 1:1 in physical pixels.
+    #[serde(default)]
+    pub pixel_perfect: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

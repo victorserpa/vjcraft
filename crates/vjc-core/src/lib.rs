@@ -200,6 +200,12 @@ pub enum Command {
         width: u32,
         height: u32,
     },
+    /// Pixel-perfect output of a screen (nearest sampling of unscaled slices, 1:1 window).
+    /// Undoable.
+    SetScreenPixelPerfect {
+        screen: Uuid,
+        pixel_perfect: bool,
+    },
     AddSlice {
         screen: Uuid,
         slice: vjc_model::Slice,
@@ -1406,6 +1412,20 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             }
             (s.width, s.height) = (width, height);
             undoable(inverse, vec![])
+        }
+        Command::SetScreenPixelPerfect {
+            screen,
+            pixel_perfect,
+        } => {
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.pixel_perfect, pixel_perfect);
+            undoable(
+                Command::SetScreenPixelPerfect {
+                    screen,
+                    pixel_perfect: prev,
+                },
+                vec![],
+            )
         }
         Command::RestoreScreen {
             screen,
@@ -4712,6 +4732,23 @@ mod tests {
         assert_eq!(p, mid);
         h2.exec(&mut p, mask(None), now).unwrap();
         assert!(p.output.screens[0].slices[0].mask.is_none());
+    }
+
+    #[test]
+    fn screen_pixel_perfect_toggles_with_undo() {
+        let (mut p, sid, _) = one_screen_slice();
+        let before = p.clone();
+        let mut h = History::new();
+        let c = Command::SetScreenPixelPerfect {
+            screen: sid,
+            pixel_perfect: true,
+        };
+        h.exec(&mut p, c, Instant::now()).unwrap();
+        assert!(p.output.screens[0].pixel_perfect);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        h.redo(&mut p).unwrap().unwrap();
+        assert!(p.output.screens[0].pixel_perfect);
     }
 
     #[test]

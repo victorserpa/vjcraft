@@ -95,6 +95,7 @@ pub struct SliceRenderer {
     bgl: wgpu::BindGroupLayout,
     ubgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    nearest: wgpu::Sampler,
 }
 
 impl SliceRenderer {
@@ -177,39 +178,48 @@ impl SliceRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
         Self {
             pipe,
             bgl,
             ubgl,
             sampler,
+            nearest,
         }
     }
 
-    /// Clears `target` to black and draws every slice of `screen` sampling `src`.
+    /// Clears `target` to black and draws every slice of `screen` sampling `src` (of size
+    /// `src_size`). With `screen.pixel_perfect`, unscaled slices sample nearest.
     pub fn render(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        screen: &Screen,
-        src: &wgpu::TextureView,
+        (screen, src, src_size): (&Screen, &wgpu::TextureView, (u32, u32)),
         target: &wgpu::TextureView,
     ) {
         use wgpu::util::DeviceExt;
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("slices_bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(src),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        let bufs: Vec<(wgpu::Buffer, u32, wgpu::BindGroup)> = screen
+        let bind_with = |smp: &wgpu::Sampler| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("slices_bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(smp),
+                    },
+                ],
+            })
+        };
+        let (bind, bind_nearest) = (bind_with(&self.sampler), bind_with(&self.nearest));
+        let bufs: Vec<(wgpu::Buffer, u32, wgpu::BindGroup, bool)> = screen
             .slices
             .iter()
             .filter_map(|s| {
@@ -238,7 +248,12 @@ impl SliceRenderer {
                             resource: ubuf.as_entire_binding(),
                         }],
                     });
-                    (b, v.len() as u32, ubind)
+                    (
+                        b,
+                        v.len() as u32,
+                        ubind,
+                        screen.pixel_perfect && mapping::slice_unscaled(src_size, s),
+                    )
                 })
             })
             .collect();
@@ -261,8 +276,8 @@ impl SliceRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipe);
-            pass.set_bind_group(0, &bind, &[]);
-            for (b, n, ubind) in &bufs {
+            for (b, n, ubind, near) in &bufs {
+                pass.set_bind_group(0, if *near { &bind_nearest } else { &bind }, &[]);
                 pass.set_bind_group(1, ubind, &[]);
                 pass.set_vertex_buffer(0, b.slice(..));
                 pass.draw(0..*n, 0..1);
@@ -334,7 +349,7 @@ mod tests {
         );
         let (w, h) = (screen.width, screen.height);
         let (dst, dst_v) = make_screen_target(&device, w, h);
-        SliceRenderer::new(&device).render(&device, &queue, screen, &src_v, &dst_v);
+        SliceRenderer::new(&device).render(&device, &queue, (screen, &src_v, (1, 1)), &dst_v);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 256 * h as u64,
