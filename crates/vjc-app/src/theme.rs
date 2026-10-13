@@ -18,6 +18,9 @@ pub const CELL_SELECTED: Color32 = Color32::from_rgb(110, 170, 240);
 pub const CELL_DROP: Color32 = Color32::from_rgb(240, 200, 60);
 pub const CELL_PENDING: Color32 = Color32::from_rgb(44, 48, 56);
 
+/// Brand accent (violet), token `accent` in replica/design/tokens.json.
+pub const ACCENT: Color32 = Color32::from_rgb(169, 139, 255);
+
 /// Layer header block (left of the cells).
 pub const LAYER_HEAD_W: f32 = 170.0;
 pub const LAYER_FADER_W: f32 = 44.0;
@@ -53,7 +56,7 @@ pub const CLOCK_TEXT: Color32 = Color32::from_rgb(170, 178, 192);
 
 /// Beat lights and warnings.
 pub const BEAT_DOWN: Color32 = Color32::YELLOW;
-pub const BEAT_OTHER: Color32 = Color32::LIGHT_BLUE;
+pub const BEAT_OTHER: Color32 = ACCENT;
 pub const ERROR_TEXT: Color32 = Color32::LIGHT_RED;
 
 /// Tile color for a generator, stable per kind.

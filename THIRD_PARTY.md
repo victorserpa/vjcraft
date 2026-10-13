@@ -18,6 +18,10 @@
 - Used for NDI input and output (cargo feature `ndi`, on by default). The NDI library (`libndi`) is loaded at runtime with `libloading` from NDI Tools / the NDI runtime (`NDI_RUNTIME_DIR_V6`, `/usr/local/lib`, `/Library/NDI SDK for Apple`). VJCraft neither links, bundles nor downloads it; without it NDI is reported as unavailable.
 - The few C structs and functions used are declared by hand in `crates/vjc-net/src/ndi.rs`. NDI is a trademark of Vizrt NDI AB; users install the runtime under its own license (https://ndi.video).
 
+## FFmpeg (via ffmpeg-next 9.0.0, `crates/vjc-media`)
+
+- Video and audio decode. Linked dynamically to the libav* libraries of the user's Homebrew `ffmpeg` (`/opt/homebrew/opt/ffmpeg/lib`); the .app and .dmg do not bundle them. Binding crate `ffmpeg-next`: WTFPL. FFmpeg itself is LGPL-2.1-or-later, or GPL-2.0-or-later when built with GPL options (the Homebrew build enables them); both are compatible with GPL-3.0-only for this use. Source: https://ffmpeg.org. If a future .dmg bundles the libraries, ship their license texts and source offer with it.
+
 ## tiny_http and tungstenite (Remote API)
 
 - Used by the optional Remote API (`crates/vjc-app/src/api_io.rs`): `tiny_http` 0.12 serves REST, `tungstenite` 0.30 (feature `handshake` only, no TLS) serves WebSocket. Both are off the network unless the user enables the API in Preferences.
