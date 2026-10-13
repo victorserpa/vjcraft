@@ -7,13 +7,13 @@ use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
+use vjc_core::{Command, Event, History};
 use vjc_media::{Frame, Player};
-use vjc_model::{
-    BlendMode, Clip, Column, FitMode, Layer, LayerId, Project, Source, Track, Transition, Transport,
-};
+use vjc_model::{BlendMode, Column, FitMode, Layer, LayerId, Project, Track, Transition};
 
 struct State {
     project: Project,
+    history: History,
     warnings: Vec<String>,
     status: String,
     /// Playing clip per layer: (column, player). One clip per layer.
@@ -106,6 +106,7 @@ impl State {
         }
         State {
             project,
+            history: History::new(),
             warnings: vec![],
             status: "Drop video files on the grid cells.".into(),
             players: HashMap::new(),
@@ -132,52 +133,74 @@ impl State {
                 self.status = format!("Imported {}", path.display());
                 self.warnings = i.warnings;
                 self.project = i.project;
+                self.history.clear();
                 self.players.clear();
             }
             Err(e) => self.status = format!("Import failed: {e}"),
         }
     }
 
-    fn clip_path(&self, layer: LayerId, col: u32) -> Option<PathBuf> {
-        let c = &self.project.composition;
-        let deck = c.decks.iter().find(|d| d.id == c.current_deck)?;
-        match &deck.clip_at(layer, col)?.source {
-            Source::File { path } => Some(path.clone()),
-            _ => None,
+    /// Sends a command through the bus and reacts to the resulting events.
+    fn exec(&mut self, cmd: Command) {
+        match self
+            .history
+            .exec(&mut self.project, cmd, std::time::Instant::now())
+        {
+            Ok(events) => self.handle(events),
+            Err(e) => self.status = format!("Command failed: {e}"),
         }
     }
 
-    fn trigger(&mut self, layer: LayerId, col: u32) {
-        match self.clip_path(layer, col) {
-            Some(p) if p.exists() => {
-                self.players.remove(&layer); // joins the old decode thread
-                self.players.insert(layer, (col, Player::open(&p)));
+    fn undo(&mut self) {
+        match self.history.undo(&mut self.project) {
+            Some(Ok(ev)) => self.handle(ev),
+            Some(Err(e)) => self.status = format!("Undo failed: {e}"),
+            None => {}
+        }
+    }
+
+    fn redo(&mut self) {
+        match self.history.redo(&mut self.project) {
+            Some(Ok(ev)) => self.handle(ev),
+            Some(Err(e)) => self.status = format!("Redo failed: {e}"),
+            None => {}
+        }
+    }
+
+    fn handle(&mut self, events: Vec<Event>) {
+        for e in events {
+            match e {
+                Event::ClipStarted {
+                    layer,
+                    column,
+                    path,
+                } => {
+                    if path.exists() {
+                        self.players.remove(&layer); // joins the old decode thread
+                        self.players.insert(layer, (column, Player::open(&path)));
+                    } else {
+                        self.status = format!("File not found: {}", path.display());
+                    }
+                }
+                Event::LayerCleared { layer } => {
+                    self.players.remove(&layer);
+                }
+                Event::CellChanged { layer, column } => {
+                    if self.players.get(&layer).map(|(c, _)| *c) == Some(column) {
+                        self.players.remove(&layer);
+                    }
+                }
             }
-            Some(p) => self.status = format!("File not found: {}", p.display()),
-            None => self.status = "Clip has no playable file source".into(),
         }
     }
 
-    fn drop_file(&mut self, layer: LayerId, col: u32, path: PathBuf) {
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let clip = Clip {
-            id: Uuid::new_v4(),
-            name,
-            source: Source::File { path },
-            transport: Transport::default(),
-            track: Track::new(BlendMode::Normal),
-            blend_override: None,
-            fit: FitMode::default(),
-        };
-        let c = &mut self.project.composition;
-        let cur = c.current_deck;
-        if let Some(d) = c.decks.iter_mut().find(|d| d.id == cur) {
-            d.set_clip(layer, col, clip);
-        }
-        self.trigger(layer, col);
+    fn drop_file(&mut self, layer: LayerId, column: u32, path: PathBuf) {
+        self.exec(Command::ImportMedia {
+            layer,
+            column,
+            path,
+        });
+        self.exec(Command::TriggerClip { layer, column });
     }
 
     fn compose(&mut self, frame: &eframe::Frame) {
@@ -254,6 +277,28 @@ impl State {
                     self.import();
                 }
             });
+            ui.menu_button("Edit", |ui| {
+                if ui
+                    .add_enabled(
+                        self.history.can_undo(),
+                        egui::Button::new("Undo").shortcut_text("Cmd+Z"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.undo();
+                }
+                if ui
+                    .add_enabled(
+                        self.history.can_redo(),
+                        egui::Button::new("Redo").shortcut_text("Cmd+Shift+Z"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.redo();
+                }
+            });
             ui.menu_button("Output", |ui| {
                 if self.monitors.is_empty() {
                     ui.label("No monitors found");
@@ -278,13 +323,31 @@ impl State {
             });
             ui.separator();
             ui.label("BPM");
-            ui.add(
-                egui::DragValue::new(&mut self.project.composition.tempo.bpm)
-                    .range(20.0..=300.0)
-                    .speed(0.1),
-            );
+            let mut bpm = self.project.composition.tempo.bpm;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut bpm)
+                        .range(20.0..=300.0)
+                        .speed(0.1),
+                )
+                .changed()
+            {
+                self.exec(Command::SetBpm { bpm });
+            }
             // TODO: BPM is fixed for M0; no clock/sync yet.
         });
+
+        // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).
+        let redo_key = egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Z,
+        );
+        let undo_key = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+        if ctx.input_mut(|i| i.consume_shortcut(&redo_key)) {
+            self.redo();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&undo_key)) {
+            self.undo();
+        }
 
         // File drops onto grid cells.
         self.last_pointer = ctx
@@ -345,13 +408,18 @@ impl State {
         ui.horizontal(|ui| {
             if ui.button("Add layer").clicked() {
                 let n = self.project.composition.layers.len() + 1;
-                self.project.composition.layers.insert(0, new_layer(n));
+                self.exec(Command::AddLayer {
+                    layer: new_layer(n),
+                    index: 0,
+                });
             }
             if ui.button("Add column").clicked() {
                 let n = self.project.composition.columns.len() + 1;
-                self.project.composition.columns.push(Column {
-                    id: Uuid::new_v4(),
-                    name: n.to_string(),
+                self.exec(Command::AddColumn {
+                    column: Column {
+                        id: Uuid::new_v4(),
+                        name: n.to_string(),
+                    },
                 });
             }
         });
@@ -371,9 +439,7 @@ impl State {
         }
         ui.separator();
 
-        let mut trigger: Option<(LayerId, u32)> = None;
-        let mut clear: Option<LayerId> = None;
-        let mut set_fit: Option<(LayerId, u32, FitMode)> = None;
+        let mut cmds: Vec<Command> = vec![];
         let mut cells = vec![];
         let ncols = self.project.composition.columns.len() as u32;
         let cur = self.project.composition.current_deck;
@@ -390,7 +456,7 @@ impl State {
             .decks
             .iter()
             .position(|d| d.id == cur);
-        let comp = &mut self.project.composition;
+        let comp = &self.project.composition;
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -421,7 +487,11 @@ impl State {
                                     ui.label("Aspect ratio");
                                     for m in FitMode::ALL {
                                         if ui.selectable_label(cur_fit == m, m.label()).clicked() {
-                                            set_fit = Some((lid, ci, m));
+                                            cmds.push(Command::SetFit {
+                                                layer: lid,
+                                                column: ci,
+                                                fit: m,
+                                            });
                                             ui.close();
                                         }
                                     }
@@ -452,13 +522,16 @@ impl State {
                                 self.selected = Some((lid, ci));
                             }
                             if r.clicked() && clip.is_some() {
-                                trigger = Some((lid, ci));
+                                cmds.push(Command::TriggerClip {
+                                    layer: lid,
+                                    column: ci,
+                                });
                             }
                             if clip.is_none() && (r.secondary_clicked() || r.double_clicked()) {
                                 pick = Some((lid, ci));
                             }
                         }
-                        let layer = &mut comp.layers[li];
+                        let layer = &comp.layers[li];
                         let mut op = match layer.track.opacity.value {
                             vjc_model::Value::Number(n) => n as f32,
                             _ => 1.0,
@@ -467,7 +540,10 @@ impl State {
                             .add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2))
                             .changed()
                         {
-                            layer.track.opacity.set_number(op as f64);
+                            cmds.push(Command::SetOpacity {
+                                layer: lid,
+                                value: op as f64,
+                            });
                         }
                         let label = if layer.track.blend == BlendMode::Add {
                             "Add"
@@ -478,29 +554,25 @@ impl State {
                             .selected_text(label)
                             .width(70.0)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut layer.track.blend,
-                                    BlendMode::Normal,
-                                    "Normal",
-                                );
-                                ui.selectable_value(&mut layer.track.blend, BlendMode::Add, "Add");
+                                for (b, name) in
+                                    [(BlendMode::Normal, "Normal"), (BlendMode::Add, "Add")]
+                                {
+                                    if ui.selectable_label(layer.track.blend == b, name).clicked() {
+                                        cmds.push(Command::SetBlend {
+                                            layer: lid,
+                                            blend: b,
+                                        });
+                                    }
+                                }
                             });
                         if ui.button("Clear").clicked() {
-                            clear = Some(lid);
+                            cmds.push(Command::ClearLayer { layer: lid });
                         }
                         ui.end_row();
                     }
                 });
             });
         self.cells = cells;
-        if let (Some((l, c, m)), Some(d)) = (set_fit, deck_idx)
-            && let Some(k) = self.project.composition.decks[d]
-                .clips
-                .iter_mut()
-                .find(|k| k.layer == l && k.column == c)
-        {
-            k.clip.fit = m;
-        }
         if let Some((l, c)) = pick
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(
@@ -513,11 +585,8 @@ impl State {
         {
             self.drop_file(l, c, path);
         }
-        if let Some(l) = clear {
-            self.players.remove(&l);
-        }
-        if let Some((l, c)) = trigger {
-            self.trigger(l, c);
+        for c in cmds {
+            self.exec(c);
         }
     }
 

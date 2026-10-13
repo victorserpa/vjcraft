@@ -3431,6 +3431,7 @@ dependencies = [
  "rfd",
  "uuid",
  "vjc-avc",
+ "vjc-core",
  "vjc-media",
  "vjc-model",
 ]
@@ -3440,6 +3441,14 @@ name = "vjc-avc"
 version = "0.1.0"
 dependencies = [
  "quick-xml 0.37.5",
+ "uuid",
+ "vjc-model",
+]
+
+[[package]]
+name = "vjc-core"
+version = "0.1.0"
+dependencies = [
  "uuid",
  "vjc-model",
 ]

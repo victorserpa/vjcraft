@@ -1,0 +1,9 @@
+[package]
+name = "vjc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vjc-model = { path = "../vjc-model" }
+uuid.workspace = true
