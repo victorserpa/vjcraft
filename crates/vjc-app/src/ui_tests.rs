@@ -1159,6 +1159,11 @@ fn duplicate_monitor_keeps_screen_closed_and_reports() {
 
 // Work layout (#136)
 #[test]
+fn transport_height_is_reserved_before_the_first_frame() {
+    assert!(State::headless(prefs()).transport_h > 0.0);
+}
+
+#[test]
 fn layout_has_monitor_column_status_bar_and_transport() {
     let mut h = app();
     assert!(exists(&h, "Composition monitor") && exists(&h, "Preview monitor"));

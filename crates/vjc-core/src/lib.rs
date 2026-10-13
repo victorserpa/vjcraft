@@ -658,6 +658,8 @@ pub enum Error {
     InUse,
     /// Value outside the accepted range (e.g. BPM not finite or not positive).
     InvalidValue,
+    /// Another screen already outputs to that monitor.
+    MonitorInUse,
 }
 
 impl std::fmt::Display for Error {
@@ -676,6 +678,7 @@ impl std::fmt::Display for Error {
             Error::NotPlayable => "clip has no playable file source",
             Error::InUse => "layer or column is not empty",
             Error::InvalidValue => "value out of range",
+            Error::MonitorInUse => "that monitor already shows another screen",
         })
     }
 }
@@ -1334,7 +1337,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                         && matches!(&o.device, vjc_model::OutputDevice::Monitor { name: n } if n == name)
                 })
             {
-                return Err(Error::InvalidValue);
+                return Err(Error::MonitorInUse);
             }
             let s = screen_mut(p, screen)?;
             let prev = std::mem::replace(&mut s.device, device);
@@ -4203,6 +4206,24 @@ mod tests {
             dev(&p, bid),
             vjc_model::OutputDevice::Monitor { name: "3".into() }
         );
+    }
+
+    #[test]
+    fn duplicate_monitor_is_rejected_with_its_own_error() {
+        let mut p = Project::new("t");
+        let mon = vjc_model::OutputDevice::Monitor { name: "1".into() };
+        let mut ids = vec![];
+        for n in ["A", "B"] {
+            let s = mapping::new_screen(n, 100, 100);
+            ids.push(s.id);
+            p.output.screens.push(s);
+        }
+        let set = |screen| Command::SetScreenDevice {
+            screen,
+            device: mon.clone(),
+        };
+        apply(&mut p, set(ids[0])).unwrap();
+        assert_eq!(apply(&mut p, set(ids[1])).unwrap_err(), Error::MonitorInUse);
     }
 
     #[test]

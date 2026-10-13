@@ -215,6 +215,23 @@ mod tests {
     }
 
     #[test]
+    fn normalize_groups_fixes_dangling_and_split_groups() {
+        let (mut p, ids) = setup();
+        let mut h = History::new();
+        let g = create(&mut p, &mut h, &[ids[2], ids[1]]).unwrap();
+        assert_eq!(p.normalize_groups(), 0);
+        // Dangling id.
+        p.composition.layers[0].group = Some(Uuid::new_v4());
+        assert_eq!(p.normalize_groups(), 1);
+        assert_eq!(p.composition.layers[0].group, None);
+        // Split group: members no longer adjacent.
+        p.composition.layers[0].group = Some(g);
+        p.composition.layers[1].group = None;
+        assert_eq!(p.normalize_groups(), 2);
+        assert!(p.composition.layers.iter().all(|l| l.group.is_none()));
+    }
+
+    #[test]
     fn validation() {
         let (mut p, ids) = setup();
         let mut h = History::new();

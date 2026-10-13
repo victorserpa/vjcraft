@@ -688,6 +688,36 @@ impl Project {
         changed
     }
 
+    /// Repairs groups from a file: a layer naming a group that does not exist, or a group
+    /// whose layers are not adjacent (effects would apply twice), is ungrouped. Returns how
+    /// many layers were changed.
+    pub fn normalize_groups(&mut self) -> usize {
+        let c = &mut self.composition;
+        let mut changed = 0;
+        for l in &mut c.layers {
+            if l.group.is_some_and(|g| !c.groups.iter().any(|x| x.id == g)) {
+                l.group = None;
+                changed += 1;
+            }
+        }
+        for g in &c.groups {
+            let idx: Vec<usize> = (0..c.layers.len())
+                .filter(|&i| c.layers[i].group == Some(g.id))
+                .collect();
+            if idx
+                .last()
+                .zip(idx.first())
+                .is_some_and(|(l, f)| l - f + 1 != idx.len())
+            {
+                for i in idx {
+                    c.layers[i].group = None;
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
     /// Minimal empty project with one deck.
     pub fn new(name: &str) -> Self {
         let deck = Deck {

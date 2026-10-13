@@ -131,7 +131,9 @@ impl TcRuntime {
                 if let Some(last) = self.last {
                     let new = last.add_frames(d);
                     self.last = Some(new);
-                    self.follower.shift(new.seconds() - last.seconds());
+                    let secs = new.seconds() - last.seconds();
+                    self.follower.shift(secs);
+                    self.cues.shift(secs);
                 }
             }
             Some(k) if k == key => {}
@@ -303,6 +305,26 @@ mod tests {
             rt.cues.step(std::slice::from_ref(&cue), cur).is_empty(),
             "cue refired"
         );
+    }
+
+    #[test]
+    fn large_backward_offset_drag_fires_cue_at_new_position() {
+        let (mut rt, _, _) = rt(0);
+        let mut p = TcPrefs::default();
+        let t0 = Instant::now();
+        rt.sync(&p, t0);
+        let cue = vjc_model::TimecodeCue {
+            time: Timecode::new(0, 0, 2, 23, TcFps::F25),
+            column: 0,
+            layer: None,
+        };
+        rt.accept(Timecode::new(0, 0, 5, 0, TcFps::F25), t0, &p);
+        let cur = rt.current(t0).unwrap();
+        rt.cues.step(std::slice::from_ref(&cue), cur);
+        p.offset_frames = -52;
+        rt.sync(&p, t0);
+        let cur = rt.current(t0).expect("signal kept");
+        assert_eq!(rt.cues.step(std::slice::from_ref(&cue), cur), vec![0]);
     }
 
     #[test]

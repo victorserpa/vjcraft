@@ -174,6 +174,15 @@ impl CueTracker {
             .collect()
     }
 
+    /// The timecode moved by `secs` without a seek (offset change). A small step keeps the
+    /// high-water mark so a cue one frame back does not refire; a large step backwards
+    /// re-arms at once, so a cue at the new position fires like on a first sample.
+    pub fn shift(&mut self, secs: f64) {
+        if secs < -SEEK_JUMP {
+            self.last = None;
+        }
+    }
+
     /// Signal lost: the next sample starts fresh.
     pub fn reset(&mut self) {
         self.last = None;
@@ -347,6 +356,22 @@ mod tests {
         let mut t = CueTracker::default();
         t.step(&cues, 4.9);
         assert_eq!(t.step(&cues, 5.0), vec![0]);
+    }
+
+    #[test]
+    fn large_backward_shift_rearms_for_a_cue_at_the_new_position() {
+        let cues = [cue(3)];
+        let mut t = CueTracker::default();
+        t.step(&cues, 5.1);
+        t.shift(-2.1);
+        assert_eq!(t.step(&cues, 3.0), vec![0]);
+        // A small shift keeps the high-water mark.
+        let cues = [cue(5)];
+        let mut t = CueTracker::default();
+        t.step(&cues, 4.9);
+        assert_eq!(t.step(&cues, 5.1), vec![0]);
+        t.shift(-0.2);
+        assert!(t.step(&cues, 4.9).is_empty());
     }
 
     #[test]

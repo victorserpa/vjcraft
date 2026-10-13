@@ -897,7 +897,7 @@ impl State {
             force_panels: false,
             win_size: egui::Vec2::ZERO,
             topbars_h: 0.0,
-            transport_h: 0.0,
+            transport_h: theme::TRANSPORT_H,
             save_layout: None,
             overwrite_layout: None,
             help_shown: None,
@@ -5000,9 +5000,10 @@ fn autopilot_playable(source: &vjc_model::Source) -> bool {
     )
 }
 
-/// True when the window got larger in either axis (zero `prev` = first frame, no growth).
+/// True when the window got larger in either axis. A zero `prev` (first frame, or a
+/// minimized window) counts: restoring from nothing must re-force clipped panels.
 fn window_grew(prev: egui::Vec2, now: egui::Vec2) -> bool {
-    prev.x > 0.0 && prev.y > 0.0 && (now.x > prev.x + 0.5 || now.y > prev.y + 0.5)
+    now.x > prev.x + 0.5 || now.y > prev.y + 0.5
 }
 
 #[cfg(test)]
@@ -5014,7 +5015,8 @@ mod tests {
         assert!(super::window_grew(v(800.0, 500.0), v(800.0, 700.0)));
         assert!(!super::window_grew(v(800.0, 500.0), v(800.0, 500.0)));
         assert!(!super::window_grew(v(800.0, 500.0), v(600.0, 400.0)));
-        assert!(!super::window_grew(v(0.0, 0.0), v(800.0, 500.0)));
+        assert!(super::window_grew(v(0.0, 0.0), v(800.0, 500.0)));
+        assert!(!super::window_grew(v(800.0, 500.0), v(0.0, 0.0)));
     }
 
     #[test]

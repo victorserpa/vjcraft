@@ -41,6 +41,9 @@ pub const SECTION_HEAD: Color32 = Color32::from_rgb(150, 160, 178);
 pub const FX_SLIDER_W: f32 = 120.0;
 pub const FX_BTN: Vec2 = vec2(22.0, 20.0);
 
+/// Transport bar height assumed until the first frame measures it.
+pub const TRANSPORT_H: f32 = 30.0;
+
 /// Status bar.
 pub const STATUS_H: f32 = 22.0;
 pub const CLOCK_TEXT: Color32 = Color32::from_rgb(170, 178, 192);

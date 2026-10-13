@@ -177,6 +177,13 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
             "{n} screen(s) shared a monitor with another screen and were set to a window"
         ));
     }
+    let n = project.normalize_groups();
+    if n > 0 {
+        warnings.push(format!(
+            "{n} layer(s) had an invalid group and were ungrouped"
+        ));
+    }
+    vjc_core::shortcuts::bind_legacy(&mut project);
     for m in media_paths(&mut project) {
         let joined = dir.join(&*m);
         if joined.exists() {
@@ -208,6 +215,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn open_binds_legacy_positional_effect_shortcuts() {
+        let d = tmp("legacyfx");
+        let mut p = Project::new("T");
+        let e = vjc_model::Effect {
+            id: Default::default(),
+            kind: "x".into(),
+            bypass: false,
+            dry_wet: 1.0,
+            params: vec![],
+        };
+        p.composition.master.effects.push(e.clone());
+        p.shortcuts.push(vjc_core::shortcuts::key_shortcut(
+            "Q",
+            "/comp/effect/1/drywet",
+            vjc_model::ShortcutMode::Toggle,
+            (0.0, 1.0),
+        ));
+        let f = d.join("p.vjc");
+        save(&p, &f).unwrap();
+        let (q, _) = open(&f).unwrap();
+        assert_eq!(q.shortcuts[0].effect, Some(e.id));
     }
 
     #[test]

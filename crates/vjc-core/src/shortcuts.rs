@@ -289,6 +289,24 @@ pub fn rebind(p: &mut Project) {
     }
 }
 
+/// Load-time migration: shortcuts saved before `effect` existed are still positional; bind
+/// each effect address to the effect it points at now, so later reorders keep it attached.
+/// Returns how many were bound.
+pub fn bind_legacy(p: &mut Project) -> usize {
+    let mut n = 0;
+    for i in 0..p.shortcuts.len() {
+        let s = &p.shortcuts[i];
+        if s.effect.is_some() || split_fx_target(&s.target).is_none() {
+            continue;
+        }
+        if let Some(id) = effect_of_target(p, &s.target) {
+            p.shortcuts[i].effect = Some(id);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// True for targets a knob sweeps (opacity and effect params / dry-wet) rather than flips.
 pub fn is_continuous(address: &str) -> bool {
     address.ends_with("/opacity")
@@ -718,5 +736,20 @@ mod effect_id_tests {
         h.undo(&mut p).unwrap().unwrap();
         assert!(!is_orphan(&p.shortcuts[0]));
         assert_eq!(p.shortcuts[0].target, "/comp/effect/2/drywet");
+    }
+
+    #[test]
+    fn bind_legacy_fills_effect_from_positional_address() {
+        let (mut p, mut h, _a, b) = setup();
+        p.shortcuts[0].effect = None; // as saved by an older version
+        assert_eq!(bind_legacy(&mut p), 1);
+        assert_eq!(p.shortcuts[0].effect, Some(b.id));
+        let mv = Command::MoveEffect {
+            target: EffectTarget::Master,
+            effect: b.id,
+            index: 0,
+        };
+        h.exec(&mut p, mv, Instant::now()).unwrap();
+        assert_eq!(p.shortcuts[0].target, "/comp/effect/1/drywet");
     }
 }
