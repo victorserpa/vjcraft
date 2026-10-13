@@ -4,8 +4,10 @@ mod fx;
 mod midi_io;
 mod monitors;
 mod osc_io;
+mod output_ui;
 mod params;
 mod prefs_ui;
+mod slice_render;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
@@ -21,8 +23,16 @@ use vjc_io::prefs::Prefs;
 use vjc_media::{Frame, Player};
 use vjc_model::{
     Autopilot, AutopilotMode, BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId,
-    PlayMode, Project, Track, Transition, Value,
+    OutputDevice, PlayMode, Project, Track, Transition, Value,
 };
+
+/// GPU target of one output screen with slices.
+struct ScreenRt {
+    _tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: (u32, u32),
+    id: egui::TextureId,
+}
 
 struct State {
     project: Project,
@@ -88,6 +98,17 @@ struct State {
     last_autosave: std::time::Instant,
     prefs: Prefs,
     prefs_open: bool,
+    output_setup_open: bool,
+    sel_screen: Option<Uuid>,
+    sel_slice: Option<Uuid>,
+    sel_pt_in: Option<usize>,
+    sel_pt_out: Option<usize>,
+    snap: bool,
+    /// Screens whose output window the user closed (runtime only).
+    closed_screens: std::collections::HashSet<Uuid>,
+    slice_r: Option<slice_render::SliceRenderer>,
+    /// Per-screen render target and its egui texture id.
+    screen_rt: HashMap<Uuid, ScreenRt>,
     prefs_tab: PrefsTab,
     prefs_dirty: bool,
     title: String,
@@ -523,6 +544,15 @@ impl State {
             dirty: false,
             last_autosave: std::time::Instant::now(),
             prefs_open: false,
+            output_setup_open: false,
+            sel_screen: None,
+            sel_slice: None,
+            sel_pt_in: None,
+            sel_pt_out: None,
+            snap: false,
+            closed_screens: Default::default(),
+            slice_r: None,
+            screen_rt: HashMap::new(),
             prefs_tab: PrefsTab::General,
             prefs_dirty: false,
             prefs,
@@ -622,7 +652,8 @@ impl State {
 
     fn load(&mut self, path: PathBuf) -> bool {
         match vjc_io::open(&path) {
-            Ok((project, warnings)) => {
+            Ok((mut project, warnings)) => {
+                vjc_core::mapping::normalize_output(&mut project.output);
                 self.project = project;
                 self.warnings = warnings;
                 self.status = format!("Opened {}", path.display());
@@ -1368,6 +1399,81 @@ impl State {
             vjc_core::anim::effective_number(&c.master.opacity, &actx) as f32
         };
         comp.render(&rs.device, &rs.queue, &draws, &master, master_opacity);
+        self.render_screens(rs);
+    }
+
+    /// Monitor-bound screens: (screen id, monitor index) for every screen whose output
+    /// window is open. Screens without slices show the composition as it is.
+    fn open_screens(&self) -> Vec<(Uuid, usize)> {
+        self.project
+            .output
+            .screens
+            .iter()
+            .filter(|s| !self.closed_screens.contains(&s.id))
+            .filter_map(|s| match &s.device {
+                OutputDevice::Monitor { name } => {
+                    let id = name.parse::<u32>().ok()?;
+                    Some((s.id, monitors::find(&self.monitors, id)?))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Renders the warped slices of each open screen into its own texture.
+    fn render_screens(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        let open = self.open_screens();
+        let gone: Vec<Uuid> = self
+            .screen_rt
+            .keys()
+            .filter(|id| !open.iter().any(|(o, _)| o == *id))
+            .copied()
+            .collect();
+        for id in gone {
+            if let Some(old) = self.screen_rt.remove(&id) {
+                rs.renderer.write().free_texture(&old.id);
+            }
+        }
+        let Some(comp) = self.comp.as_ref() else {
+            return;
+        };
+        for (id, _) in open {
+            let Some(scr) = self.project.output.screens.iter().find(|s| s.id == id) else {
+                continue;
+            };
+            if scr.slices.is_empty() {
+                if let Some(old) = self.screen_rt.remove(&id) {
+                    rs.renderer.write().free_texture(&old.id);
+                }
+                continue;
+            }
+            let size = (scr.width.max(1), scr.height.max(1));
+            let r = self
+                .slice_r
+                .get_or_insert_with(|| slice_render::SliceRenderer::new(&rs.device));
+            let fresh = self.screen_rt.get(&id).is_none_or(|t| t.size != size);
+            if fresh {
+                let (tex, view) = slice_render::make_screen_target(&rs.device, size.0, size.1);
+                let tid = rs.renderer.write().register_native_texture(
+                    &rs.device,
+                    &view,
+                    wgpu::FilterMode::Linear,
+                );
+                if let Some(old) = self.screen_rt.insert(
+                    id,
+                    ScreenRt {
+                        _tex: tex,
+                        view,
+                        size,
+                        id: tid,
+                    },
+                ) {
+                    rs.renderer.write().free_texture(&old.id);
+                }
+            }
+            let t = &self.screen_rt[&id];
+            r.render(&rs.device, &rs.queue, scr, &comp.target_view, &t.view);
+        }
     }
 
     /// Master row: bypass, Clear All (opacity and speed live in the Composition tab).
@@ -1807,15 +1913,34 @@ impl State {
                         .clicked()
                     {
                         ui.close();
-                        self.output = Some(m.id);
+                        if let Some(first) = self.project.output.screens.first().map(|s| s.id) {
+                            self.closed_screens.remove(&first);
+                            self.exec(Command::SetScreenDevice {
+                                screen: first,
+                                device: OutputDevice::Monitor {
+                                    name: m.id.to_string(),
+                                },
+                            });
+                        } else {
+                            self.output = Some(m.id);
+                        }
                     }
                 }
+                if ui.button("Setup...").clicked() {
+                    ui.close();
+                    self.output_setup_open = true;
+                }
                 if ui
-                    .add_enabled(self.output.is_some(), egui::Button::new("Close output"))
+                    .add_enabled(
+                        self.output.is_some() || !self.open_screens().is_empty(),
+                        egui::Button::new("Close output"),
+                    )
                     .clicked()
                 {
                     ui.close();
                     self.output = None;
+                    self.closed_screens
+                        .extend(self.project.output.screens.iter().map(|s| s.id));
                 }
             });
         });
@@ -1876,6 +2001,7 @@ impl State {
             self.prefs_open = true;
         }
         self.prefs_window(&ctx);
+        self.output_setup_window(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -2896,41 +3022,59 @@ impl State {
         }
     }
 
+    /// One fullscreen window per open output: the legacy single output (no screens in the
+    /// project) shows the whole composition; each monitor screen shows its sliced texture,
+    /// or the whole composition when it has no slices.
     fn output_window(&mut self, ctx: &egui::Context) {
-        let Some(mon) = self
-            .output
-            .and_then(|id| monitors::find(&self.monitors, id))
-        else {
-            return;
-        };
-        let Some(id) = self.comp_tex else { return };
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title("VJCraft Output")
-            .with_fullscreen(true)
-            .with_decorations(false);
-        builder.monitor = Some(mon);
-        let mut close = false;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("vjc-output"),
-            builder,
-            |ui, _class| {
-                let ctx = ui.ctx().clone();
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-                ui.painter().image(
-                    id,
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
-                {
-                    close = true;
+        let Some(comp_id) = self.comp_tex else { return };
+        let mut wins: Vec<(Uuid, usize, egui::TextureId)> = vec![];
+        if self.project.output.screens.is_empty() {
+            if let Some(mon) = self
+                .output
+                .and_then(|id| monitors::find(&self.monitors, id))
+            {
+                wins.push((Uuid::nil(), mon, comp_id));
+            }
+        } else {
+            for (id, mon) in self.open_screens() {
+                let tex = self.screen_rt.get(&id).map_or(comp_id, |t| t.id);
+                wins.push((id, mon, tex));
+            }
+        }
+        for (sid, mon, tex) in wins {
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("VJCraft Output")
+                .with_fullscreen(true)
+                .with_decorations(false);
+            builder.monitor = Some(mon);
+            let mut close = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("vjc-output", sid)),
+                builder,
+                |ui, _class| {
+                    let ctx = ui.ctx().clone();
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                    ui.painter().image(
+                        tex,
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    if ctx.input(|i| {
+                        i.key_pressed(egui::Key::Escape) || i.viewport().close_requested()
+                    }) {
+                        close = true;
+                    }
+                },
+            );
+            if close {
+                if sid.is_nil() {
+                    self.output = None;
+                } else {
+                    self.closed_screens.insert(sid);
                 }
-            },
-        );
-        if close {
-            self.output = None;
+            }
         }
     }
 }

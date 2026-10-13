@@ -7,6 +7,7 @@ pub mod blend;
 pub mod clock;
 pub mod crossfader;
 pub mod effects;
+pub mod mapping;
 pub mod midi;
 pub mod osc;
 pub mod playback;
@@ -171,6 +172,58 @@ pub enum Command {
     /// Crossfader fade law. Undoable.
     SetCrossfaderCurve {
         curve: crossfader::CrossfadeCurve,
+    },
+    /// Output screens and slices (all undoable; `SetSliceMesh` coalesces).
+    AddScreen {
+        screen: vjc_model::Screen,
+        index: usize,
+    },
+    RemoveScreen {
+        screen: Uuid,
+    },
+    SetScreenDevice {
+        screen: Uuid,
+        device: vjc_model::OutputDevice,
+    },
+    SetScreenSize {
+        screen: Uuid,
+        width: u32,
+        height: u32,
+    },
+    AddSlice {
+        screen: Uuid,
+        slice: vjc_model::Slice,
+        index: usize,
+    },
+    RemoveSlice {
+        screen: Uuid,
+        slice: Uuid,
+    },
+    SetSliceInput {
+        screen: Uuid,
+        slice: Uuid,
+        input: Vec<(f32, f32)>,
+    },
+    /// Whole mesh plus its column count (rows = len / cols).
+    SetSliceMesh {
+        screen: Uuid,
+        slice: Uuid,
+        mesh: Vec<(f32, f32)>,
+        cols: u32,
+    },
+    /// Inverse of `SetScreenSize`: exact size and slice meshes, in slice order.
+    RestoreScreen {
+        screen: Uuid,
+        width: u32,
+        height: u32,
+        meshes: Vec<Vec<(f32, f32)>>,
+    },
+    /// New grid size 2..=9 each; resamples the mesh keeping its shape.
+    SetSliceMeshSize {
+        screen: Uuid,
+        slice: Uuid,
+        cols: u32,
+        rows: u32,
     },
     SetCompositionName {
         name: String,
@@ -358,6 +411,9 @@ enum Target {
     GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
     Dial(u32),
     Anim(AnimTarget),
+    SliceMesh(Uuid),
+    SliceInput(Uuid, Uuid),
+    ScreenSize(Uuid),
 }
 
 impl Command {
@@ -365,6 +421,11 @@ impl Command {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
             Command::SetBpm { .. } => Some(Target::Bpm),
+            Command::SetScreenSize { screen, .. } => Some(Target::ScreenSize(*screen)),
+            Command::SetSliceMesh { slice, .. } => Some(Target::SliceMesh(*slice)),
+            Command::SetSliceInput { screen, slice, .. } => {
+                Some(Target::SliceInput(*screen, *slice))
+            }
             Command::SetDashboardDial { dial, .. } => Some(Target::Dial(*dial)),
             // Dragging an animation field emits one command per frame.
             Command::SetAnimation { target, .. } => Some(Target::Anim(*target)),
@@ -455,6 +516,8 @@ pub enum Error {
     NoClip,
     NoEffect,
     NoShortcut,
+    NoScreen,
+    NoSlice,
     /// Clip has no file source to play.
     NotPlayable,
     /// Layer/column still holds clips, or is not the last column.
@@ -467,6 +530,8 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Error::NoLayer => "layer not found",
+            Error::NoScreen => "screen not found",
+            Error::NoSlice => "slice not found",
             Error::NoColumn => "column not found",
             Error::NoDeck => "current deck not found",
             Error::NoClip => "no clip in cell",
@@ -538,6 +603,27 @@ fn undoable(inverse: Command, events: Vec<Event>) -> Result<Applied, Error> {
         inverse: Some(inverse),
         events,
     })
+}
+
+fn screen_idx(p: &Project, id: Uuid) -> Result<usize, Error> {
+    p.output
+        .screens
+        .iter()
+        .position(|s| s.id == id)
+        .ok_or(Error::NoScreen)
+}
+
+fn screen_mut(p: &mut Project, id: Uuid) -> Result<&mut vjc_model::Screen, Error> {
+    let i = screen_idx(p, id)?;
+    Ok(&mut p.output.screens[i])
+}
+
+fn slice_mut(p: &mut Project, screen: Uuid, slice: Uuid) -> Result<&mut vjc_model::Slice, Error> {
+    screen_mut(p, screen)?
+        .slices
+        .iter_mut()
+        .find(|s| s.id == slice)
+        .ok_or(Error::NoSlice)
 }
 
 fn deck_mut(p: &mut Project, id: DeckId) -> Result<&mut vjc_model::Deck, Error> {
@@ -1030,6 +1116,169 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = crossfader::CrossfadeCurve::from_name(&cf.curve);
             cf.curve = curve.name().to_string();
             undoable(Command::SetCrossfaderCurve { curve: prev }, vec![])
+        }
+        Command::AddScreen { screen, index } => {
+            let id = screen.id;
+            let at = index.min(p.output.screens.len());
+            p.output.screens.insert(at, screen);
+            undoable(Command::RemoveScreen { screen: id }, vec![])
+        }
+        Command::RemoveScreen { screen } => {
+            let i = screen_idx(p, screen)?;
+            let s = p.output.screens.remove(i);
+            undoable(
+                Command::AddScreen {
+                    screen: s,
+                    index: i,
+                },
+                vec![],
+            )
+        }
+        Command::SetScreenDevice { screen, device } => {
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.device, device);
+            undoable(
+                Command::SetScreenDevice {
+                    screen,
+                    device: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetScreenSize {
+            screen,
+            width,
+            height,
+        } => {
+            if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
+                return Err(Error::InvalidValue);
+            }
+            let s = screen_mut(p, screen)?;
+            let inverse = Command::RestoreScreen {
+                screen,
+                width: s.width,
+                height: s.height,
+                meshes: s.slices.iter().map(|x| x.output_mesh.clone()).collect(),
+            };
+            let (kx, ky) = (
+                width as f32 / s.width as f32,
+                height as f32 / s.height as f32,
+            );
+            for sl in &mut s.slices {
+                for q in &mut sl.output_mesh {
+                    *q = (q.0 * kx, q.1 * ky);
+                }
+            }
+            (s.width, s.height) = (width, height);
+            undoable(inverse, vec![])
+        }
+        Command::RestoreScreen {
+            screen,
+            width,
+            height,
+            meshes,
+        } => {
+            let s = screen_mut(p, screen)?;
+            let inverse = Command::SetScreenSize {
+                screen,
+                width: s.width,
+                height: s.height,
+            };
+            (s.width, s.height) = (width, height);
+            for (sl, m) in s.slices.iter_mut().zip(meshes) {
+                sl.output_mesh = m;
+            }
+            undoable(inverse, vec![])
+        }
+        Command::AddSlice {
+            screen,
+            slice,
+            index,
+        } => {
+            let s = screen_mut(p, screen)?;
+            let id = slice.id;
+            let at = index.min(s.slices.len());
+            s.slices.insert(at, slice);
+            undoable(Command::RemoveSlice { screen, slice: id }, vec![])
+        }
+        Command::RemoveSlice { screen, slice } => {
+            let s = screen_mut(p, screen)?;
+            let i = s
+                .slices
+                .iter()
+                .position(|x| x.id == slice)
+                .ok_or(Error::NoSlice)?;
+            let sl = s.slices.remove(i);
+            undoable(
+                Command::AddSlice {
+                    screen,
+                    slice: sl,
+                    index: i,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceInput {
+            screen,
+            slice,
+            input,
+        } => {
+            if input.len() < 3 || input.iter().any(|q| !q.0.is_finite() || !q.1.is_finite()) {
+                return Err(Error::InvalidValue);
+            }
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.input, input);
+            undoable(
+                Command::SetSliceInput {
+                    screen,
+                    slice,
+                    input: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceMesh {
+            screen,
+            slice,
+            mesh,
+            cols,
+        } => {
+            if !mapping::mesh_valid(&mesh, cols) {
+                return Err(Error::InvalidValue);
+            }
+            let s = slice_mut(p, screen, slice)?;
+            let inverse = Command::SetSliceMesh {
+                screen,
+                slice,
+                mesh: std::mem::replace(&mut s.output_mesh, mesh),
+                cols: s.mesh_cols,
+            };
+            s.mesh_cols = cols;
+            undoable(inverse, vec![])
+        }
+        Command::SetSliceMeshSize {
+            screen,
+            slice,
+            cols,
+            rows,
+        } => {
+            let r = mapping::MIN_GRID..=mapping::MAX_GRID;
+            if !r.contains(&cols) || !r.contains(&rows) {
+                return Err(Error::InvalidValue);
+            }
+            let s = slice_mut(p, screen, slice)?;
+            if !mapping::mesh_valid(&s.output_mesh, s.mesh_cols) {
+                return Err(Error::InvalidValue);
+            }
+            let new = mapping::resample_mesh(&s.output_mesh, s.mesh_cols, cols, rows);
+            let inverse = Command::SetSliceMesh {
+                screen,
+                slice,
+                mesh: std::mem::replace(&mut s.output_mesh, new),
+                cols: s.mesh_cols,
+            };
+            s.mesh_cols = cols;
+            undoable(inverse, vec![])
         }
         Command::SetCompositionName { name } => {
             let prev = std::mem::replace(&mut p.composition.name, name);
@@ -3220,5 +3469,175 @@ mod tests {
         // A playable clip after the gap is still reached.
         let a = step(&mut p, l1, Some(0)).unwrap();
         assert!(matches!(&a.events[0], Event::ClipStarted { column: 2, .. }));
+    }
+
+    #[test]
+    fn screens_and_slices_undo_redo() {
+        let (mut p, _) = setup();
+        let scr = mapping::new_screen("S1", 1920, 1080);
+        let sid = scr.id;
+        roundtrip(
+            &mut p,
+            Command::AddScreen {
+                screen: scr,
+                index: 0,
+            },
+        );
+        let mut h = History::new();
+        let now = Instant::now();
+        let sc = mapping::new_screen("S1", 1920, 1080);
+        let sid = if p.output.screens.is_empty() {
+            h.exec(
+                &mut p,
+                Command::AddScreen {
+                    screen: sc.clone(),
+                    index: 0,
+                },
+                now,
+            )
+            .unwrap();
+            sc.id
+        } else {
+            sid
+        };
+        let sl = mapping::new_slice(1920, 1080);
+        let lid = sl.id;
+        for c in [
+            Command::AddSlice {
+                screen: sid,
+                slice: sl,
+                index: 0,
+            },
+            Command::SetScreenSize {
+                screen: sid,
+                width: 1280,
+                height: 720,
+            },
+            Command::SetScreenDevice {
+                screen: sid,
+                device: vjc_model::OutputDevice::Monitor { name: "3".into() },
+            },
+            Command::SetSliceInput {
+                screen: sid,
+                slice: lid,
+                input: vec![(0.1, 0.1), (0.5, 0.1), (0.5, 0.5), (0.1, 0.5)],
+            },
+            Command::SetSliceMeshSize {
+                screen: sid,
+                slice: lid,
+                cols: 4,
+                rows: 3,
+            },
+        ] {
+            roundtrip(&mut p, c.clone());
+            h.exec(&mut p, c, now).unwrap();
+        }
+        let sl = &p.output.screens[0].slices[0];
+        assert_eq!((sl.mesh_cols, sl.output_mesh.len()), (4, 12));
+        // Bad size and unknown ids are rejected.
+        let bad = Command::SetSliceMeshSize {
+            screen: sid,
+            slice: lid,
+            cols: 10,
+            rows: 2,
+        };
+        assert!(h.exec(&mut p, bad, now).is_err());
+        let gone = Command::RemoveScreen {
+            screen: Uuid::new_v4(),
+        };
+        assert!(h.exec(&mut p, gone, now).is_err());
+        // Dragging a point coalesces into one undo step.
+        let mut mesh = p.output.screens[0].slices[0].output_mesh.clone();
+        let before = p.clone();
+        let mut h2 = History::new();
+        for k in 1..=5 {
+            mesh[0].0 = k as f32;
+            let c = Command::SetSliceMesh {
+                screen: sid,
+                slice: lid,
+                mesh: mesh.clone(),
+                cols: 4,
+            };
+            h2.exec(&mut p, c, now).unwrap();
+        }
+        assert_eq!(p.output.screens[0].slices[0].output_mesh[0].0, 5.0);
+        h2.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        roundtrip(
+            &mut p,
+            Command::RemoveSlice {
+                screen: sid,
+                slice: lid,
+            },
+        );
+        roundtrip(&mut p, Command::RemoveScreen { screen: sid });
+    }
+
+    fn one_screen_slice() -> (Project, Uuid, Uuid) {
+        let (mut p, _) = setup();
+        let mut scr = mapping::new_screen("S", 1000, 500);
+        let sl = mapping::new_slice(1000, 500);
+        let (sid, lid) = (scr.id, sl.id);
+        scr.slices.push(sl);
+        p.output.screens.push(scr);
+        (p, sid, lid)
+    }
+
+    #[test]
+    fn invalid_mesh_does_not_panic() {
+        let (mut p, sid, lid) = one_screen_slice();
+        for (cols, len) in [(0u32, 4usize), (1, 4), (3, 7)] {
+            let sl = &mut p.output.screens[0].slices[0];
+            sl.mesh_cols = cols;
+            sl.output_mesh = vec![(0.0, 0.0); len];
+            let c = Command::SetSliceMeshSize {
+                screen: sid,
+                slice: lid,
+                cols: 3,
+                rows: 3,
+            };
+            assert!(History::new().exec(&mut p, c, Instant::now()).is_err());
+        }
+        let mut out = p.output.clone();
+        mapping::normalize_output(&mut out);
+        let sl = &out.screens[0].slices[0];
+        assert_eq!((sl.mesh_cols, sl.output_mesh.len()), (2, 4));
+        assert_eq!(sl.output_mesh[3], (1000.0, 500.0));
+    }
+
+    #[test]
+    fn slice_input_coalesces() {
+        let (mut p, sid, lid) = one_screen_slice();
+        let before = p.clone();
+        let mut h = History::new();
+        let now = Instant::now();
+        for k in 1..=5 {
+            let x = k as f32 / 10.0;
+            let c = Command::SetSliceInput {
+                screen: sid,
+                slice: lid,
+                input: vec![(x, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            };
+            h.exec(&mut p, c, now).unwrap();
+        }
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn screen_size_rescales_meshes() {
+        let (mut p, sid, _) = one_screen_slice();
+        let before = p.clone();
+        let c = Command::SetScreenSize {
+            screen: sid,
+            width: 500,
+            height: 1000,
+        };
+        let mut h = History::new();
+        h.exec(&mut p, c, Instant::now()).unwrap();
+        let m = &p.output.screens[0].slices[0].output_mesh;
+        assert_eq!(m[3], (500.0, 1000.0));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
     }
 }
