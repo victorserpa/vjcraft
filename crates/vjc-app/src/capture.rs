@@ -11,41 +11,41 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use vjc_media::record::{Recorder, Summary};
 
-const MAX_INFLIGHT: usize = 3;
+pub(crate) const MAX_INFLIGHT: usize = 3;
 
-const PENDING: u8 = 0;
+pub(crate) const PENDING: u8 = 0;
 const OK: u8 = 1;
 const ERR: u8 = 2;
 
 /// Shared result of one buffer map: pending, ok or error.
-type MapState = Arc<AtomicU8>;
+pub(crate) type MapState = Arc<AtomicU8>;
 
 /// Called from the `map_async` callback: every outcome leaves `PENDING`.
-fn settle(state: &AtomicU8, ok: bool) {
+pub(crate) fn settle(state: &AtomicU8, ok: bool) {
     state.store(if ok { OK } else { ERR }, Ordering::Release);
 }
 
 /// In-order queue of readbacks in flight. GPU-free so it can be tested.
-struct Inflight<B> {
+pub(crate) struct Inflight<B> {
     q: VecDeque<(B, MapState)>,
 }
 
 impl<B> Inflight<B> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { q: VecDeque::new() }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.q.len()
     }
 
-    fn push(&mut self, buf: B, state: MapState) {
+    pub(crate) fn push(&mut self, buf: B, state: MapState) {
         self.q.push_back((buf, state));
     }
 
     /// Pops every settled entry at the front, in order, with whether its map succeeded.
     /// Failed maps are removed too, so they never block the frames behind them.
-    fn take_settled(&mut self) -> Vec<(B, bool)> {
+    pub(crate) fn take_settled(&mut self) -> Vec<(B, bool)> {
         let mut out = Vec::new();
         while self
             .q
@@ -67,12 +67,12 @@ pub struct Capture {
 }
 
 /// Row stride of the readback buffer (wgpu needs a multiple of 256).
-fn padded_row(w: u32) -> u32 {
+pub(crate) fn padded_row(w: u32) -> u32 {
     (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
 }
 
 /// Strips row padding from a mapped readback.
-fn unpad(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+pub(crate) fn unpad(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     let (row, stride) = (w as usize * 4, padded_row(w) as usize);
     let mut out = Vec::with_capacity(row * h as usize);
     for y in 0..h as usize {

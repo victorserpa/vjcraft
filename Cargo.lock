@@ -3902,6 +3902,7 @@ dependencies = [
  "vjc-io",
  "vjc-media",
  "vjc-model",
+ "vjc-net",
 ]
 
 [[package]]
@@ -3960,6 +3961,14 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "vjc-net"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libloading 0.8.9",
 ]
 
 [[package]]

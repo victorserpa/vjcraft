@@ -167,10 +167,58 @@ impl Player {
         }
     }
 
+    /// Runs a live source supplied by the caller (network feeds) on its own thread. `run`
+    /// gets a sink: `sink(width, height, rgba)` publishes a frame (an empty frame publishes
+    /// nothing) and returns false once the player was stopped, at which point `run` must return. `run` returning `Err` is
+    /// reported through `error()`. `label` is shown as the player path.
+    pub fn open_external<F>(label: &str, run: F) -> Player
+    where
+        F: FnOnce(&mut dyn FnMut(u32, u32, Vec<u8>) -> bool) -> Result<(), String> + Send + 'static,
+    {
+        let shared = Arc::new(Shared::new());
+        let s = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("vjc-external".into())
+            .spawn(move || {
+                let mut seq = 0u64;
+                let mut sink = |width: u32, height: u32, data: Vec<u8>| {
+                    if s.stop.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    // An empty frame is an idle probe: only reports whether to go on.
+                    if width == 0 || height == 0 || data.is_empty() {
+                        return true;
+                    }
+                    seq += 1;
+                    *s.latest.lock().unwrap() = Some(Frame {
+                        width,
+                        height,
+                        data: Arc::new(data),
+                        seq,
+                    });
+                    true
+                };
+                if let Err(e) = run(&mut sink) {
+                    *s.error.lock().unwrap() = Some(e);
+                }
+            })
+            .ok();
+        Player {
+            shared,
+            thread,
+            path: PathBuf::from(label),
+            audio: None,
+        }
+    }
+
     /// Starts decoding the file's audio stream into `engine`. No-op for images, captures and
     /// files without audio. Audio follows this player's position (see `audio` module docs).
     pub fn attach_audio(&mut self, engine: &audio::AudioEngine) {
-        if self.audio.is_none() && !is_image(&self.path) && !self.path.starts_with("camera:") {
+        if self.audio.is_none()
+            && !is_image(&self.path)
+            && !self.path.starts_with("camera:")
+            && !self.path.starts_with("net:")
+        {
             self.audio = audio::AudioPart::start(engine, &self.path, self.shared.clone());
         }
     }

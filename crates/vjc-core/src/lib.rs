@@ -479,6 +479,14 @@ pub enum Event {
         column: ColumnIdx,
         device: String,
     },
+    /// A network clip (Syphon/NDI) started on the layer; `name` is the server/source label.
+    NetworkStarted {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        protocol: vjc_model::NetProtocol,
+        name: String,
+    },
     /// A generator clip started on the layer (no player; the app renders it).
     GeneratorStarted {
         deck: DeckId,
@@ -785,6 +793,16 @@ fn trigger_event(
             column,
             device: device.clone(),
         }),
+        // Spout is Windows-only: such clips (from imports) stay placeholders.
+        Source::Network { protocol, name } if *protocol != vjc_model::NetProtocol::Spout => {
+            Ok(Event::NetworkStarted {
+                deck,
+                layer,
+                column,
+                protocol: protocol.clone(),
+                name: name.clone(),
+            })
+        }
         // Imported generators with no bundled equivalent are placeholders.
         Source::Generator { kind, .. } if vjc_fx::GENERATORS.iter().any(|(id, _)| id == kind) => {
             Ok(Event::GeneratorStarted {
@@ -2138,11 +2156,38 @@ mod tests {
     }
 
     #[test]
-    fn trigger_non_file_source_fails() {
+    fn trigger_network_source_starts_it() {
         let (mut p, l) = setup();
         let mut c = clip_from_path("/x/a.mov".into());
         c.source = Source::Network {
             protocol: vjc_model::NetProtocol::Ndi,
+            name: "feed".into(),
+        };
+        let set = Command::SetClip {
+            deck: A,
+            layer: l,
+            column: 0,
+            clip: c,
+        };
+        apply(&mut p, set).unwrap();
+        let a = apply(
+            &mut p,
+            Command::TriggerClip {
+                deck: A,
+                layer: l,
+                column: 0,
+            },
+        )
+        .unwrap();
+        assert!(matches!(&a.events[0], Event::NetworkStarted { name, .. } if name == "feed"));
+    }
+
+    #[test]
+    fn trigger_non_file_source_fails() {
+        let (mut p, l) = setup();
+        let mut c = clip_from_path("/x/a.mov".into());
+        c.source = Source::Network {
+            protocol: vjc_model::NetProtocol::Spout,
             name: "feed".into(),
         };
         apply(

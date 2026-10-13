@@ -189,19 +189,35 @@ impl State {
                 .iter()
                 .find(|m| m.id.to_string() == *name)
                 .map_or("Monitor (missing)".to_string(), |m| m.label()),
+            OutputDevice::Syphon => "Syphon".into(),
+            OutputDevice::Ndi => "NDI".into(),
             _ => "Window (none)".into(),
         };
         egui::ComboBox::from_label("Device")
             .selected_text(label)
             .show_ui(ui, |ui| {
                 if ui
-                    .selectable_label(!matches!(c.device, OutputDevice::Monitor { .. }), "None")
+                    .selectable_label(
+                        !matches!(
+                            c.device,
+                            OutputDevice::Monitor { .. } | OutputDevice::Syphon | OutputDevice::Ndi
+                        ),
+                        "None",
+                    )
                     .clicked()
                 {
                     cmds.push(Command::SetScreenDevice {
                         screen: c.id,
                         device: OutputDevice::Window,
                     });
+                }
+                for (dev, label) in [(OutputDevice::Syphon, "Syphon"), (OutputDevice::Ndi, "NDI")] {
+                    if ui.selectable_label(c.device == dev, label).clicked() {
+                        cmds.push(Command::SetScreenDevice {
+                            screen: c.id,
+                            device: dev,
+                        });
+                    }
                 }
                 for m in &self.monitors {
                     if ui.selectable_label(false, m.label()).clicked() {

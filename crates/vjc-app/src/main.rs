@@ -5,6 +5,7 @@ mod fx;
 mod link_io;
 mod midi_io;
 mod monitors;
+mod netout;
 mod osc_io;
 mod output_ui;
 mod params;
@@ -31,7 +32,7 @@ use vjc_model::{
 
 /// GPU target of one output screen with slices.
 struct ScreenRt {
-    _tex: wgpu::Texture,
+    tex: wgpu::Texture,
     view: wgpu::TextureView,
     size: (u32, u32),
     id: egui::TextureId,
@@ -67,6 +68,8 @@ struct State {
     comp_tex: Option<egui::TextureId>,
     /// Output recording in progress (runtime only).
     capture: Option<capture::Capture>,
+    /// Syphon / NDI publishers of the screens set to those devices (runtime only).
+    netout: netout::NetOut,
     /// Start/stop requested by a command, served in `compose` (it owns the GPU handles).
     rec_request: Option<bool>,
     /// Display id of the monitor the output window is on, while open.
@@ -410,6 +413,12 @@ fn browser_start(project: Option<&std::path::Path>, g: &vjc_io::prefs::General) 
     if movies.is_dir() { movies } else { home }
 }
 
+/// Starts receiving a Syphon/NDI feed as a player; failures show up as the player's error.
+fn open_network(protocol: vjc_net::Protocol, name: String) -> Player {
+    let label = format!("net:{}:{name}", protocol.label());
+    Player::open_external(&label, move |sink| vjc_net::receive(protocol, &name, sink))
+}
+
 /// Effects and generators offered by the browser.
 fn browser_fx() -> Vec<(String, browser::Item)> {
     let fx = vjc_fx::BUILTIN
@@ -534,6 +543,7 @@ impl State {
             panel_tab: PanelTab::Composition,
             comp_tex: None,
             capture: None,
+            netout: Default::default(),
             rec_request: None,
             output: None,
             monitors: monitors::list(),
@@ -845,6 +855,7 @@ impl State {
                     let landed = events.iter().find_map(|e| match e {
                         Event::ClipStarted { column, .. }
                         | Event::CaptureStarted { column, .. }
+                        | Event::NetworkStarted { column, .. }
                         | Event::GeneratorStarted { column, .. } => Some(*column),
                         _ => None,
                     });
@@ -923,6 +934,26 @@ impl State {
                     self.players
                         .insert(layer, (deck, column, Player::open_capture(&device)));
                     self.heads.remove(&layer);
+                }
+                Event::NetworkStarted {
+                    deck,
+                    layer,
+                    column,
+                    protocol,
+                    name,
+                } => {
+                    self.gens.remove(&layer);
+                    self.flow.loops.remove(&layer);
+                    self.flow.beat_loops.remove(&layer);
+                    self.cross_from_old(layer);
+                    match browser::net_backend(&protocol) {
+                        Some(p) => {
+                            self.players
+                                .insert(layer, (deck, column, open_network(p, name)));
+                            self.heads.remove(&layer);
+                        }
+                        None => self.status = "Spout is not available on macOS".into(),
+                    }
                 }
                 Event::GeneratorStarted {
                     deck,
@@ -1065,6 +1096,9 @@ impl State {
             .map(|c| {
                 vjc_core::clip_in(&self.project, deck, layer, c).is_some_and(|k| match &k.source {
                     vjc_model::Source::File { .. } => true,
+                    vjc_model::Source::Network { protocol, .. } => {
+                        *protocol != vjc_model::NetProtocol::Spout
+                    }
                     vjc_model::Source::Generator { kind, .. } => {
                         vjc_fx::GENERATORS.iter().any(|(id, _)| id == kind)
                     }
@@ -1236,6 +1270,25 @@ impl State {
                     });
                 }
                 _ => self.status = "Drop a generator on an empty cell".into(),
+            },
+            browser::Item::Network { protocol, name } => match cell {
+                Some(c) if c.empty => {
+                    let mut clip = vjc_core::clip_from_path(PathBuf::new());
+                    clip.name = name.clone();
+                    clip.source = vjc_model::Source::Network { protocol, name };
+                    self.exec(Command::SetClip {
+                        deck,
+                        layer: c.layer,
+                        column: c.col,
+                        clip,
+                    });
+                    self.exec(Command::TriggerClip {
+                        deck,
+                        layer: c.layer,
+                        column: c.col,
+                    });
+                }
+                _ => self.status = "Drop a network source on an empty cell".into(),
             },
             browser::Item::Effect(id) => {
                 let target = if let Some(c) = cell {
@@ -1525,13 +1578,38 @@ impl State {
             .collect()
     }
 
-    /// Renders the warped slices of each open screen into its own texture.
+    /// Screens set to Syphon or NDI: what each publishes.
+    fn net_wants(&self) -> Vec<netout::Want> {
+        self.project
+            .output
+            .screens
+            .iter()
+            .filter_map(|s| {
+                let protocol = match s.device {
+                    OutputDevice::Syphon => vjc_net::Protocol::Syphon,
+                    OutputDevice::Ndi => vjc_net::Protocol::Ndi,
+                    _ => return None,
+                };
+                Some(netout::Want {
+                    id: s.id,
+                    protocol,
+                    name: format!("VJCraft {}", s.name),
+                })
+            })
+            .collect()
+    }
+
+    /// Renders the warped slices of each open screen into its own texture, and publishes
+    /// the Syphon / NDI screens.
     fn render_screens(&mut self, rs: &eframe::egui_wgpu::RenderState) {
-        let open = self.open_screens();
+        let wants = self.net_wants();
+        self.netout.sync(&wants);
+        let mut open: Vec<Uuid> = self.open_screens().into_iter().map(|(id, _)| id).collect();
+        open.extend(wants.iter().map(|w| w.id));
         let gone: Vec<Uuid> = self
             .screen_rt
             .keys()
-            .filter(|id| !open.iter().any(|(o, _)| o == *id))
+            .filter(|id| !open.iter().any(|o| o == *id))
             .copied()
             .collect();
         for id in gone {
@@ -1542,7 +1620,7 @@ impl State {
         let Some(comp) = self.comp.as_ref() else {
             return;
         };
-        for (id, _) in open {
+        for id in open {
             let Some(scr) = self.project.output.screens.iter().find(|s| s.id == id) else {
                 continue;
             };
@@ -1567,7 +1645,7 @@ impl State {
                 if let Some(old) = self.screen_rt.insert(
                     id,
                     ScreenRt {
-                        _tex: tex,
+                        tex,
                         view,
                         size,
                         id: tid,
@@ -1578,6 +1656,19 @@ impl State {
             }
             let t = &self.screen_rt[&id];
             r.render(&rs.device, &rs.queue, scr, &comp.target_view, &t.view);
+        }
+        // Publish: the screen's own target when it has slices, else the composition.
+        let fps = self.project.composition.fps;
+        for w in &wants {
+            let (tex, size) = match self.screen_rt.get(&w.id) {
+                Some(t) => (&t.tex, t.size),
+                None => (&comp.target, comp.size),
+            };
+            self.netout
+                .feed(&rs.device, &rs.queue, w.id, tex, size, fps);
+        }
+        for e in self.netout.poll(&rs.device) {
+            self.status = e;
         }
     }
 
@@ -2827,6 +2918,24 @@ impl State {
                     }
                 }
             }
+            vjc_model::Source::Network { protocol, name } => {
+                ui.label(format!("Source: {protocol:?} {name}"));
+                if let Some((_, _, p)) = self
+                    .players
+                    .get(&layer)
+                    .filter(|(d, c, _)| (*d, *c) == (deck, column))
+                {
+                    match (p.error(), p.latest_frame()) {
+                        (Some(e), _) => {
+                            ui.colored_label(egui::Color32::LIGHT_RED, e);
+                        }
+                        (None, None) => {
+                            ui.weak("Waiting for the source...");
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {
                 ui.label("Source: not supported yet");
             }
@@ -3280,6 +3389,47 @@ fn main() -> eframe::Result {
                 let l = s.project.composition.layers.last().map(|l| l.id);
                 if let Some(l) = l {
                     s.drop_file(l, 0, PathBuf::from(p));
+                }
+            }
+            // Debug aid: VJC_NETOUT=syphon|ndi publishes the composition on a new screen;
+            // VJC_NETIN=<server name> plays that Syphon server on the top layer, column 1.
+            if let Some(d) = std::env::var_os("VJC_NETOUT") {
+                let device = if d == "ndi" {
+                    OutputDevice::Ndi
+                } else {
+                    OutputDevice::Syphon
+                };
+                let (w, h) = (s.project.composition.width, s.project.composition.height);
+                let scr = vjc_core::mapping::new_screen("Screen 1", w, h);
+                let id = scr.id;
+                s.exec(Command::AddScreen {
+                    screen: scr,
+                    index: 0,
+                });
+                s.exec(Command::SetScreenDevice { screen: id, device });
+            }
+            if let Some(n) = std::env::var_os("VJC_NETIN") {
+                let top = s.project.composition.layers.first().map(|l| l.id);
+                let deck = s.project.composition.current_deck;
+                if let Some(layer) = top {
+                    let name = n.to_string_lossy().into_owned();
+                    let mut clip = vjc_core::clip_from_path(PathBuf::new());
+                    clip.name = name.clone();
+                    clip.source = vjc_model::Source::Network {
+                        protocol: vjc_model::NetProtocol::Syphon,
+                        name,
+                    };
+                    s.exec(Command::SetClip {
+                        deck,
+                        layer,
+                        column: 0,
+                        clip,
+                    });
+                    s.exec(Command::TriggerClip {
+                        deck,
+                        layer,
+                        column: 0,
+                    });
                 }
             }
             Ok(Box::new(s))

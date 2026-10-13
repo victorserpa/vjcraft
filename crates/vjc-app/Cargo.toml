@@ -22,6 +22,7 @@ pollster = "1"
 directories = "6"
 vjc-fx = { path = "../vjc-fx" }
 midir = "0.11.1"
+vjc-net = { path = "../vjc-net", default-features = false }
 rusty_link = { version = "0.4.9", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -30,5 +31,9 @@ core-graphics = "0.23"
 [dev-dependencies]
 
 [features]
-default = ["link"]
+default = ["link", "syphon", "ndi"]
 link = ["dep:rusty_link"]
+# Syphon in/out (macOS only; compiled from vendor/syphon).
+syphon = ["vjc-net/syphon"]
+# NDI in/out; needs libndi at runtime, otherwise reported as unavailable.
+ndi = ["vjc-net/ndi"]

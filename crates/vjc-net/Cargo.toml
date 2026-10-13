@@ -1,0 +1,18 @@
+[package]
+name = "vjc-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading = { version = "0.8", optional = true }
+
+[build-dependencies]
+cc = "1"
+
+[features]
+default = ["syphon", "ndi"]
+# Syphon (macOS only; compiled from vendor/syphon, Metal API).
+syphon = []
+# NDI through libndi loaded at runtime (never linked, never bundled).
+ndi = ["dep:libloading"]
