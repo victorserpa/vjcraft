@@ -19,6 +19,10 @@ pub struct Project {
     pub shortcuts: Vec<Shortcut>,
 }
 
+fn one() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Composition {
     pub id: Uuid,
@@ -33,6 +37,9 @@ pub struct Composition {
     pub decks: Vec<Deck>,
     pub current_deck: DeckId,
     pub master: Track,
+    /// Multiplies the speed of every clip, 0..=4.
+    #[serde(default = "one")]
+    pub master_speed: f64,
     pub crossfader: Option<Crossfader>,
     pub dashboard: Vec<Param>,
 }
@@ -497,6 +504,7 @@ impl Project {
                 current_deck: deck.id,
                 decks: vec![deck],
                 master: Track::new(BlendMode::Normal),
+                master_speed: 1.0,
                 crossfader: None,
                 dashboard: vec![],
             },

@@ -50,6 +50,10 @@ struct State {
     last_pointer: Option<egui::Pos2>,
     /// Cell selected by click; fallback target for drops.
     selected: Option<(LayerId, u32)>,
+    /// Column last triggered by a column command (target of Space and the arrow keys).
+    col_sel: Option<u32>,
+    /// Master bypass: black output (runtime only, not saved).
+    master_bypass: bool,
     /// Path of the open .vjc, if any.
     file: Option<PathBuf>,
     dirty: bool,
@@ -370,6 +374,8 @@ impl State {
             cells: vec![],
             last_pointer: None,
             selected: None,
+            col_sel: None,
+            master_bypass: false,
             file: None,
             dirty: false,
             last_autosave: std::time::Instant::now(),
@@ -566,12 +572,28 @@ impl State {
                 | Command::TriggerClip { .. }
                 | Command::ClearLayer { .. }
                 | Command::SelectDeck { .. }
+                | Command::TriggerColumn { .. }
+                | Command::StepColumn { .. }
+                | Command::StepClip { .. }
+                | Command::ClearAll
+                | Command::SetMasterBypass { .. }
         );
+        let ncols = self.project.composition.columns.len() as i64;
+        let col_after = match &cmd {
+            Command::TriggerColumn { column, .. } => Some(*column),
+            Command::StepColumn { from, delta, .. } => Some(from.map_or(0, |c| {
+                (i64::from(c) + i64::from(*delta)).clamp(0, (ncols - 1).max(0)) as u32
+            })),
+            _ => None,
+        };
         match self
             .history
             .exec(&mut self.project, cmd, std::time::Instant::now())
         {
             Ok(events) => {
+                if col_after.is_some() {
+                    self.col_sel = col_after;
+                }
                 if !runtime {
                     self.dirty = true;
                 }
@@ -639,6 +661,17 @@ impl State {
                     self.players.remove(&layer);
                     self.gens.remove(&layer);
                 }
+                Event::Skipped { layer, column } => {
+                    let name = self
+                        .project
+                        .composition
+                        .layers
+                        .iter()
+                        .find(|l| l.id == layer)
+                        .map_or("?", |l| l.name.as_str());
+                    self.status = format!("Skipped {name}, column {}: not playable", column + 1);
+                }
+                Event::MasterBypass { bypass } => self.master_bypass = bypass,
                 Event::Tap { at } => {
                     if let Some(bpm) = self.clock.tap(at) {
                         self.exec(Command::SetBpm { bpm });
@@ -694,6 +727,7 @@ impl State {
             .saturating_duration_since(self.last_head_tick)
             .as_secs_f64();
         self.last_head_tick = now;
+        let master_speed = self.project.composition.master_speed;
         let mut finished = vec![];
         for (layer, (deck, col, player)) in &self.players {
             let Some(clip) = vjc_core::clip_in(&self.project, *deck, *layer, *col) else {
@@ -704,9 +738,10 @@ impl State {
                 (Some(n), Some(d)) => beat_sync_rate(d, n, bpm),
                 _ => 1.0,
             };
+            let rate = vjc_core::playback_rate(tr.speed, sync, master_speed);
             // Play modes: the playhead picks the position, the player serves the frame.
             if let (Some(d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
-                let t = head.tick(dt, tr.play_mode, tr.direction, tr.speed * sync, d);
+                let t = head.tick(dt, tr.play_mode, tr.direction, rate, d);
                 player.set_position(t.position);
                 if t.finished {
                     finished.push(*layer);
@@ -723,7 +758,7 @@ impl State {
                     Direction::Pause => 0.0,
                     _ => 1.0,
                 };
-                *t += dt * tr.speed * dir;
+                *t += dt * vjc_core::playback_rate(tr.speed, 1.0, master_speed) * dir;
             }
         }
         // Once: clear the layer after the last frame.
@@ -847,7 +882,79 @@ impl State {
             });
         }
         let master = draw_chain(&mut self.fx, &c.master.effects, time, (w, h));
-        comp.render(&rs.device, &rs.queue, &draws, &master);
+        let master_opacity = if self.master_bypass {
+            0.0
+        } else {
+            match c.master.opacity.value {
+                vjc_model::Value::Number(n) => n as f32,
+                _ => 1.0,
+            }
+        };
+        comp.render(&rs.device, &rs.queue, &draws, &master, master_opacity);
+    }
+
+    /// Master row: opacity, speed, bypass, Clear All.
+    fn master_bar(&mut self, ui: &mut egui::Ui) {
+        let mut cmds = vec![];
+        ui.horizontal(|ui| {
+            ui.label("Master");
+            let mut op = match self.project.composition.master.opacity.value {
+                vjc_model::Value::Number(n) => n,
+                _ => 1.0,
+            };
+            if ui
+                .add(egui::Slider::new(&mut op, 0.0..=1.0).text("Opacity"))
+                .changed()
+            {
+                cmds.push(Command::SetMasterOpacity { value: op });
+            }
+            let mut sp = self.project.composition.master_speed;
+            if ui
+                .add(egui::Slider::new(&mut sp, 0.0..=4.0).text("Speed"))
+                .changed()
+            {
+                cmds.push(Command::SetMasterSpeed { value: sp });
+            }
+            let mut bypass = self.master_bypass;
+            if ui.toggle_value(&mut bypass, "Bypass").changed() {
+                cmds.push(Command::SetMasterBypass { bypass });
+            }
+            if ui.button("Clear All").clicked() {
+                cmds.push(Command::ClearAll);
+            }
+        });
+        for c in cmds {
+            self.exec(c);
+        }
+    }
+
+    /// Provisional shortcuts (configurable mapping is issue #15): Left/Right = previous/next
+    /// column, Space = trigger the selected column. Ignored while a text field has focus.
+    fn column_keys(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let deck = self.project.composition.current_deck;
+        let (left, right, space) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Space),
+            )
+        });
+        if left || right {
+            let delta = if right { 1 } else { -1 };
+            self.exec(Command::StepColumn {
+                deck,
+                from: self.col_sel,
+                delta,
+            });
+        } else if space {
+            self.exec(Command::TriggerColumn {
+                deck,
+                column: self.col_sel.unwrap_or(0),
+            });
+        }
     }
 
     /// Tempo row: BPM, tap, nudge (hold), resync, half/double, beat lights, metronome.
@@ -1003,6 +1110,8 @@ impl State {
             });
         });
         self.time_bar(ui);
+        self.master_bar(ui);
+        self.column_keys(&ctx);
 
         // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).
         let redo_key = egui::KeyboardShortcut::new(
@@ -1148,8 +1257,15 @@ impl State {
             .show(ui, |ui| {
                 egui::Grid::new("grid").spacing([4.0, 4.0]).show(ui, |ui| {
                     ui.label("");
-                    for n in &names {
-                        ui.label(n);
+                    for (ci, n) in names.iter().enumerate() {
+                        let b = egui::Button::new(format!("\u{25b6} {n}"))
+                            .selected(self.col_sel == Some(ci as u32));
+                        if ui.add(b).clicked() {
+                            cmds.push(Command::TriggerColumn {
+                                deck: cur,
+                                column: ci as u32,
+                            });
+                        }
                     }
                     ui.label("Opacity");
                     ui.label("Blend");
@@ -1165,6 +1281,21 @@ impl State {
                             self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
                         }
                         name.context_menu(|ui| {
+                            let from = active_of(&self.players, &self.gens, lid)
+                                .filter(|(d, _)| *d == cur)
+                                .map(|(_, c)| c);
+                            for (label, delta) in [("Previous clip", -1), ("Next clip", 1)] {
+                                if ui.button(label).clicked() {
+                                    cmds.push(Command::StepClip {
+                                        deck: cur,
+                                        layer: lid,
+                                        from,
+                                        delta,
+                                    });
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
                             add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
                         });
                         for ci in 0..ncols {

@@ -360,6 +360,8 @@ pub struct Compositor {
     sampler: wgpu::Sampler,
     /// 1x1 texture bound as the (unused) input image of generators.
     blank: wgpu::TextureView,
+    /// Opaque black 1x1 texture, its uniform and bind group: draws the master fade.
+    fade: (wgpu::Texture, wgpu::Buffer, wgpu::BindGroup),
     slots: HashMap<LayerId, Slot>,
     fx: Fx,
     pub target: wgpu::Texture,
@@ -523,6 +525,45 @@ impl Compositor {
                 view_formats: &[],
             })
             .create_view(&Default::default());
+        let fade_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fade"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let fade_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fade_u"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fade_view = fade_tex.create_view(&Default::default());
+        let fade_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fade_bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fade_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&fade_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
         let fx = Fx {
             vs: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fx_vs"),
@@ -549,6 +590,7 @@ impl Compositor {
             base_bind,
             sampler,
             blank,
+            fade: (fade_tex, fade_buf, fade_bind),
             slots: HashMap::new(),
             fx,
             target,
@@ -616,13 +658,15 @@ impl Compositor {
         }
     }
 
-    /// `master` runs over the finished composition.
+    /// `master` runs over the finished composition, then the master fade: black drawn with
+    /// alpha `1 - master_opacity` (0 = black output, used by bypass too).
     pub fn render(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layers_bottom_to_top: &[LayerDraw],
         master: &[EffectDraw],
+        master_opacity: f32,
     ) {
         self.fx.next = 0;
         self.fx.used.clear();
@@ -851,6 +895,58 @@ impl Compositor {
                 extent,
             );
         }
+        let fade = 1.0 - master_opacity.clamp(0.0, 1.0);
+        if fade > 0.0 {
+            queue.write_texture(
+                self.fade.0.as_image_copy(),
+                &[0, 0, 0, 255],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.write_buffer(
+                &self.fade.1,
+                0,
+                bytemuck::bytes_of(&[
+                    fade.to_bits(),
+                    shader_id(&BlendMode::Normal),
+                    1.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                ]),
+            );
+            enc.copy_texture_to_texture(
+                self.target.as_image_copy(),
+                self.base.as_image_copy(),
+                extent,
+            );
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("master_fade"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipe);
+            pass.set_bind_group(0, &self.fade.2, &[]);
+            pass.set_bind_group(1, &self.base_bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
         let used = std::mem::take(&mut self.fx.used);
         self.fx.scratch.retain(|k, _| used.contains(k));
         queue.submit(Some(enc.finish()));
@@ -919,7 +1015,7 @@ mod tests {
                     generator: None,
                 },
             ];
-            comp.render(&device, &queue, &layers, &[]);
+            comp.render(&device, &queue, &layers, &[], 1.0);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 256 * 4,
@@ -992,7 +1088,7 @@ mod tests {
                 generator: None,
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
-            comp.render(&device, &queue, &layer, &master);
+            comp.render(&device, &queue, &layer, &master, 1.0);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 256,
@@ -1061,7 +1157,7 @@ mod tests {
                 uniforms: isf.pack(&params, 0.0, (1, 1)),
             }),
         }];
-        comp.render(&device, &queue, &layer, &[]);
+        comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 256,

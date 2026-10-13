@@ -67,6 +67,43 @@ pub enum Command {
     ClearLayer {
         layer: LayerId,
     },
+    /// Triggers every clip of the column in each layer. Layers with no clip in the column
+    /// are cleared (the column replaces the whole stage, like Resolume). Placeholder or
+    /// otherwise unplayable clips are skipped (`Event::Skipped`), the rest still plays.
+    /// Runtime only: not undoable.
+    TriggerColumn {
+        deck: DeckId,
+        column: ColumnIdx,
+    },
+    /// Triggers the column `delta` away from `from` (None = nothing playing: starts at the
+    /// first column). Clamped at the ends, no wrap. Runtime only.
+    StepColumn {
+        deck: DeckId,
+        from: Option<ColumnIdx>,
+        delta: i32,
+    },
+    /// Triggers the nearest clip of the layer `delta` columns away from `from` (empty cells
+    /// are passed over; at the ends nothing changes and `NoClip` is returned). Runtime only.
+    StepClip {
+        deck: DeckId,
+        layer: LayerId,
+        from: Option<ColumnIdx>,
+        delta: i32,
+    },
+    /// Stops every layer. Runtime only: not undoable.
+    ClearAll,
+    /// Master bypass: black output while set. Runtime only: not in the project.
+    SetMasterBypass {
+        bypass: bool,
+    },
+    /// Master opacity 0..=1 (coalesces).
+    SetMasterOpacity {
+        value: f64,
+    },
+    /// Master speed 0..=4, multiplies every clip speed (coalesces).
+    SetMasterSpeed {
+        value: f64,
+    },
     SetOpacity {
         layer: LayerId,
         value: f64,
@@ -200,6 +237,8 @@ enum Target {
     Opacity(LayerId),
     Speed(DeckId, LayerId, ColumnIdx),
     Bpm,
+    MasterOpacity,
+    MasterSpeed,
     EffectParam(EffectId, usize),
     GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
 }
@@ -209,6 +248,8 @@ impl Command {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
             Command::SetBpm { .. } => Some(Target::Bpm),
+            Command::SetMasterOpacity { .. } => Some(Target::MasterOpacity),
+            Command::SetMasterSpeed { .. } => Some(Target::MasterSpeed),
             Command::SetEffectParam { effect, param, .. } => {
                 Some(Target::EffectParam(*effect, *param))
             }
@@ -247,6 +288,14 @@ pub enum Event {
     },
     LayerCleared {
         layer: LayerId,
+    },
+    /// A column trigger skipped this clip (placeholder / not playable).
+    Skipped {
+        layer: LayerId,
+        column: ColumnIdx,
+    },
+    MasterBypass {
+        bypass: bool,
     },
     /// The clip in this cell was replaced or removed.
     CellChanged {
@@ -432,6 +481,61 @@ fn set_clip(
     )
 }
 
+/// Event that starts the clip in the cell, or `NoClip` / `NotPlayable`.
+fn trigger_event(
+    p: &Project,
+    deck: DeckId,
+    layer: LayerId,
+    column: ColumnIdx,
+) -> Result<Event, Error> {
+    deck_idx(p, deck)?;
+    let clip = clip_in(p, deck, layer, column).ok_or(Error::NoClip)?;
+    match &clip.source {
+        Source::File { path } => Ok(Event::ClipStarted {
+            deck,
+            layer,
+            column,
+            path: path.clone(),
+        }),
+        // Imported generators with no bundled equivalent are placeholders.
+        Source::Generator { kind, .. } if vjc_fx::GENERATORS.iter().any(|(id, _)| id == kind) => {
+            Ok(Event::GeneratorStarted {
+                deck,
+                layer,
+                column,
+            })
+        }
+        _ => Err(Error::NotPlayable),
+    }
+}
+
+fn trigger_column(p: &Project, deck: DeckId, column: ColumnIdx) -> Result<Applied, Error> {
+    if (column as usize) >= p.composition.columns.len() {
+        return Err(Error::NoColumn);
+    }
+    deck_idx(p, deck)?;
+    let mut events = vec![];
+    for l in &p.composition.layers {
+        match trigger_event(p, deck, l.id, column) {
+            Ok(e) => events.push(e),
+            Err(Error::NoClip) => events.push(Event::LayerCleared { layer: l.id }),
+            Err(_) => events.push(Event::Skipped {
+                layer: l.id,
+                column,
+            }),
+        }
+    }
+    Ok(Applied {
+        inverse: None,
+        events,
+    })
+}
+
+/// Playback rate: clip speed x beat-sync factor x master speed.
+pub fn playback_rate(clip_speed: f64, sync: f64, master_speed: f64) -> f64 {
+    clip_speed * sync * master_speed
+}
+
 /// Applies a command to the project. Pure: no I/O, no UI, no players.
 pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
     match cmd {
@@ -478,35 +582,76 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             column,
         } => {
             check_cell(p, layer, column)?;
-            let deck = deck_mut(p, deck)?;
-            let deck_id = deck.id;
-            let clip = deck.clip_at(layer, column).cloned().ok_or(Error::NoClip)?;
-            match clip.source {
-                Source::File { path } => Ok(Applied {
-                    inverse: None,
-                    events: vec![Event::ClipStarted {
-                        deck: deck_id,
-                        layer,
-                        column,
-                        path,
-                    }],
-                }),
-                // Imported generators with no bundled equivalent are placeholders.
-                Source::Generator { kind, .. }
-                    if !vjc_fx::GENERATORS.iter().any(|(id, _)| *id == kind) =>
-                {
-                    Err(Error::NotPlayable)
-                }
-                Source::Generator { .. } => Ok(Applied {
-                    inverse: None,
-                    events: vec![Event::GeneratorStarted {
-                        deck: deck_id,
-                        layer,
-                        column,
-                    }],
-                }),
-                _ => Err(Error::NotPlayable),
+            let ev = trigger_event(p, deck, layer, column)?;
+            Ok(Applied {
+                inverse: None,
+                events: vec![ev],
+            })
+        }
+        Command::TriggerColumn { deck, column } => trigger_column(p, deck, column),
+        Command::StepColumn { deck, from, delta } => {
+            let n = p.composition.columns.len() as i64;
+            if n == 0 {
+                return Err(Error::NoColumn);
             }
+            let to = from.map_or(0, |c| i64::from(c) + i64::from(delta));
+            trigger_column(p, deck, to.clamp(0, n - 1) as ColumnIdx)
+        }
+        Command::StepClip {
+            deck,
+            layer,
+            from,
+            delta,
+        } => {
+            layer_idx(p, layer)?;
+            let n = p.composition.columns.len() as i64;
+            let sign = if delta < 0 { -1 } else { 1 };
+            let mut c = match from {
+                Some(f) => i64::from(f) + sign,
+                None if sign > 0 => 0,
+                None => n - 1,
+            };
+            while (0..n).contains(&c) {
+                let col = c as ColumnIdx;
+                if clip_in(p, deck, layer, col).is_some() {
+                    let ev = trigger_event(p, deck, layer, col)?;
+                    return Ok(Applied {
+                        inverse: None,
+                        events: vec![ev],
+                    });
+                }
+                c += sign;
+            }
+            Err(Error::NoClip)
+        }
+        Command::ClearAll => Ok(Applied {
+            inverse: None,
+            events: p
+                .composition
+                .layers
+                .iter()
+                .map(|l| Event::LayerCleared { layer: l.id })
+                .collect(),
+        }),
+        Command::SetMasterBypass { bypass } => Ok(Applied {
+            inverse: None,
+            events: vec![Event::MasterBypass { bypass }],
+        }),
+        Command::SetMasterOpacity { value } => {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Error::InvalidValue);
+            }
+            let op = &mut p.composition.master.opacity;
+            let prev = number(&op.value);
+            op.set_number(value);
+            undoable(Command::SetMasterOpacity { value: prev }, vec![])
+        }
+        Command::SetMasterSpeed { value } => {
+            if !value.is_finite() || !(0.0..=4.0).contains(&value) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = std::mem::replace(&mut p.composition.master_speed, value);
+            undoable(Command::SetMasterSpeed { value: prev }, vec![])
         }
         Command::SetGenerator {
             deck,
@@ -2002,5 +2147,164 @@ mod tests {
         assert!(clip_in(&p, A, l, 0).is_none());
         h.redo(&mut p).unwrap().unwrap();
         assert!(clip_in(&p, A, l, 0).is_some());
+    }
+
+    /// Two layers, three columns: layer 1 has clips in columns 0 and 2 (2 is a placeholder
+    /// in layer 2), layer 2 has a clip in column 0 and a placeholder in column 2.
+    fn grid() -> (Project, LayerId, LayerId) {
+        let (mut p, l1) = setup();
+        let l2 = layer(2);
+        let l2id = l2.id;
+        p.composition.layers.push(l2);
+        for n in 2..=3 {
+            p.composition.columns.push(Column {
+                id: Uuid::new_v4(),
+                name: n.to_string(),
+            });
+        }
+        let d = &mut p.composition.decks[0];
+        d.set_clip(l1, 0, clip_from_path("/x/a.mov".into()));
+        d.set_clip(l1, 2, clip_from_path("/x/c.mov".into()));
+        d.set_clip(l2id, 0, clip_from_path("/x/d.mov".into()));
+        let mut ph = clip_from_path(PathBuf::new());
+        ph.source = Source::Generator {
+            kind: "nope".into(),
+            params: vec![],
+        };
+        d.set_clip(l2id, 2, ph);
+        (p, l1, l2id)
+    }
+
+    #[test]
+    fn trigger_column_plays_clears_and_skips() {
+        let (mut p, l1, l2) = grid();
+        let ev = apply(&mut p, Command::TriggerColumn { deck: A, column: 0 })
+            .unwrap()
+            .events;
+        assert_eq!(ev.len(), 2);
+        assert!(matches!(&ev[0], Event::ClipStarted { layer, .. } if *layer == l1));
+        assert!(matches!(&ev[1], Event::ClipStarted { layer, .. } if *layer == l2));
+        // Column 1 is empty: every layer is cleared.
+        let ev = apply(&mut p, Command::TriggerColumn { deck: A, column: 1 })
+            .unwrap()
+            .events;
+        assert_eq!(
+            ev,
+            vec![
+                Event::LayerCleared { layer: l1 },
+                Event::LayerCleared { layer: l2 }
+            ]
+        );
+        // Column 2: placeholder skipped, the other layer still plays.
+        let a = apply(&mut p, Command::TriggerColumn { deck: A, column: 2 }).unwrap();
+        assert!(a.inverse.is_none());
+        assert!(matches!(&a.events[0], Event::ClipStarted { .. }));
+        assert_eq!(
+            a.events[1],
+            Event::Skipped {
+                layer: l2,
+                column: 2
+            }
+        );
+        assert_eq!(
+            apply(&mut p, Command::TriggerColumn { deck: A, column: 9 }),
+            Err(Error::NoColumn)
+        );
+    }
+
+    #[test]
+    fn step_column_and_clip_respect_limits() {
+        let (mut p, l1, _) = grid();
+        let col_of = |p: &mut Project, from, delta| {
+            let ev = apply(
+                p,
+                Command::StepColumn {
+                    deck: A,
+                    from,
+                    delta,
+                },
+            )
+            .unwrap()
+            .events;
+            // Column 1 clears; others start something.
+            match &ev[0] {
+                Event::ClipStarted { column, .. } | Event::Skipped { column, .. } => *column,
+                _ => 1,
+            }
+        };
+        assert_eq!(col_of(&mut p, None, 1), 0);
+        assert_eq!(col_of(&mut p, Some(0), -1), 0);
+        assert_eq!(col_of(&mut p, Some(2), 1), 2);
+        let clip = |p: &mut Project, from, delta| {
+            apply(
+                p,
+                Command::StepClip {
+                    deck: A,
+                    layer: l1,
+                    from,
+                    delta,
+                },
+            )
+        };
+        let col = |a: Applied| match &a.events[0] {
+            Event::ClipStarted { column, .. } => *column,
+            _ => unreachable!(),
+        };
+        assert_eq!(col(clip(&mut p, Some(0), 1).unwrap()), 2); // skips empty column 1
+        assert_eq!(col(clip(&mut p, Some(2), -1).unwrap()), 0);
+        assert_eq!(clip(&mut p, Some(2), 1), Err(Error::NoClip));
+        assert_eq!(clip(&mut p, Some(0), -1), Err(Error::NoClip));
+        assert_eq!(col(clip(&mut p, None, 1).unwrap()), 0);
+    }
+
+    #[test]
+    fn clear_all_and_bypass_are_runtime() {
+        let (mut p, _, _) = grid();
+        let mut h = History::new();
+        let ev = h.exec(&mut p, Command::ClearAll, Instant::now()).unwrap();
+        assert_eq!(ev.len(), 2);
+        let ev = h
+            .exec(
+                &mut p,
+                Command::SetMasterBypass { bypass: true },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ev, vec![Event::MasterBypass { bypass: true }]);
+        assert!(!h.can_undo());
+    }
+
+    #[test]
+    fn master_opacity_and_speed_undo_and_coalesce() {
+        let (mut p, _, _) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        for v in [0.9, 0.5, 0.2] {
+            h.exec(&mut p, Command::SetMasterOpacity { value: v }, t)
+                .unwrap();
+        }
+        for v in [2.0, 3.0] {
+            h.exec(&mut p, Command::SetMasterSpeed { value: v }, t)
+                .unwrap();
+        }
+        assert_eq!(p.composition.master_speed, 3.0);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.master_speed, 1.0);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(number(&p.composition.master.opacity.value), 1.0);
+        assert!(!h.can_undo());
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(number(&p.composition.master.opacity.value), 0.2);
+        for bad in [-0.1, 1.1, f64::NAN] {
+            assert!(apply(&mut p, Command::SetMasterOpacity { value: bad }).is_err());
+        }
+        assert!(apply(&mut p, Command::SetMasterSpeed { value: 4.5 }).is_err());
+    }
+
+    #[test]
+    fn master_speed_scales_playback_rate() {
+        assert_eq!(playback_rate(1.0, 1.0, 1.0), 1.0);
+        assert_eq!(playback_rate(2.0, 0.5, 2.0), 2.0);
+        assert_eq!(playback_rate(1.5, 1.0, 0.0), 0.0);
     }
 }
