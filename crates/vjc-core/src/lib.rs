@@ -130,6 +130,11 @@ pub enum Command {
     },
     /// Stops every layer. Runtime only: not undoable.
     ClearAll,
+    /// Starts recording the composition output to a file. Runtime only: not undoable,
+    /// not in the project.
+    StartRecording,
+    /// Stops the recording and finalizes the file. Runtime only.
+    StopRecording,
     /// Master bypass: black output while set. Runtime only: not in the project.
     SetMasterBypass {
         bypass: bool,
@@ -486,6 +491,10 @@ pub enum Event {
     MasterBypass {
         bypass: bool,
     },
+    /// Output recording was requested to start.
+    RecordingStarted,
+    /// Output recording was requested to stop.
+    RecordingStopped,
     /// The clip in this cell was replaced or removed.
     CellChanged {
         deck: DeckId,
@@ -993,6 +1002,14 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 .iter()
                 .map(|l| Event::LayerCleared { layer: l.id })
                 .collect(),
+        }),
+        Command::StartRecording => Ok(Applied {
+            inverse: None,
+            events: vec![Event::RecordingStarted],
+        }),
+        Command::StopRecording => Ok(Applied {
+            inverse: None,
+            events: vec![Event::RecordingStopped],
         }),
         Command::SetMasterBypass { bypass } => Ok(Applied {
             inverse: None,
@@ -3148,6 +3165,21 @@ mod tests {
         )
         .unwrap();
         assert!(q.composition.crossfader.is_some());
+    }
+
+    #[test]
+    fn recording_commands_are_runtime() {
+        let (mut p, _, _) = grid();
+        let mut h = History::new();
+        let ev = h
+            .exec(&mut p, Command::StartRecording, Instant::now())
+            .unwrap();
+        assert_eq!(ev, vec![Event::RecordingStarted]);
+        let ev = h
+            .exec(&mut p, Command::StopRecording, Instant::now())
+            .unwrap();
+        assert_eq!(ev, vec![Event::RecordingStopped]);
+        assert!(!h.can_undo());
     }
 
     #[test]

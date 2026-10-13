@@ -1,0 +1,272 @@
+//! Output recording on the app side: asynchronous GPU readback of the composition
+//! texture feeding `vjc_media::record::Recorder`. Nothing here blocks the frame: the
+//! copy is queued, the buffer map completes on a later poll, and a bounded number of
+//! readbacks are in flight (extra frames are counted as dropped).
+
+use eframe::egui_wgpu::wgpu;
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
+use vjc_media::record::{Recorder, Summary};
+
+const MAX_INFLIGHT: usize = 3;
+
+const PENDING: u8 = 0;
+const OK: u8 = 1;
+const ERR: u8 = 2;
+
+/// Shared result of one buffer map: pending, ok or error.
+type MapState = Arc<AtomicU8>;
+
+/// Called from the `map_async` callback: every outcome leaves `PENDING`.
+fn settle(state: &AtomicU8, ok: bool) {
+    state.store(if ok { OK } else { ERR }, Ordering::Release);
+}
+
+/// In-order queue of readbacks in flight. GPU-free so it can be tested.
+struct Inflight<B> {
+    q: VecDeque<(B, MapState)>,
+}
+
+impl<B> Inflight<B> {
+    fn new() -> Self {
+        Self { q: VecDeque::new() }
+    }
+
+    fn len(&self) -> usize {
+        self.q.len()
+    }
+
+    fn push(&mut self, buf: B, state: MapState) {
+        self.q.push_back((buf, state));
+    }
+
+    /// Pops every settled entry at the front, in order, with whether its map succeeded.
+    /// Failed maps are removed too, so they never block the frames behind them.
+    fn take_settled(&mut self) -> Vec<(B, bool)> {
+        let mut out = Vec::new();
+        while self
+            .q
+            .front()
+            .is_some_and(|(_, s)| s.load(Ordering::Acquire) != PENDING)
+        {
+            let (b, s) = self.q.pop_front().unwrap();
+            out.push((b, s.load(Ordering::Acquire) == OK));
+        }
+        out
+    }
+}
+
+pub struct Capture {
+    rec: Recorder,
+    inflight: Inflight<wgpu::Buffer>,
+    period: Duration,
+    next_due: Instant,
+}
+
+/// Row stride of the readback buffer (wgpu needs a multiple of 256).
+fn padded_row(w: u32) -> u32 {
+    (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+}
+
+/// Strips row padding from a mapped readback.
+fn unpad(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (row, stride) = (w as usize * 4, padded_row(w) as usize);
+    let mut out = Vec::with_capacity(row * h as usize);
+    for y in 0..h as usize {
+        out.extend_from_slice(&src[y * stride..y * stride + row]);
+    }
+    out
+}
+
+impl Capture {
+    pub fn start(path: PathBuf, size: (u32, u32), fps: f32) -> Result<Self, String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let fps = fps.round().clamp(1.0, 240.0) as u32;
+        let rec = Recorder::start(&path, size.0, size.1, fps)?;
+        Ok(Self {
+            rec,
+            inflight: Inflight::new(),
+            period: Duration::from_secs_f64(1.0 / f64::from(fps)),
+            next_due: Instant::now(),
+        })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        self.rec.size()
+    }
+
+    pub fn failed(&self) -> bool {
+        self.rec.failed()
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.rec.dropped()
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.rec.path()
+    }
+
+    /// Hands finished readbacks (in order) to the encoder. Never waits.
+    pub fn poll(&mut self, device: &wgpu::Device) {
+        let _ = device.poll(wgpu::PollType::Poll);
+        let (w, h) = self.rec.size();
+        for (buf, ok) in self.inflight.take_settled() {
+            let data = if ok {
+                buf.slice(..)
+                    .get_mapped_range()
+                    .map(|m| unpad(&m, w, h))
+                    .ok()
+            } else {
+                None
+            };
+            if ok {
+                buf.unmap();
+            }
+            match data {
+                Some(d) => {
+                    self.rec.push(d);
+                }
+                None => self.rec.skip(),
+            }
+        }
+    }
+
+    /// Queues a copy of `tex` (Rgba8Unorm, the recorder's size) when a frame is due.
+    pub fn capture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) {
+        let now = Instant::now();
+        if now < self.next_due {
+            return;
+        }
+        self.next_due += self.period;
+        if self.next_due < now {
+            self.next_due = now + self.period;
+        }
+        if self.inflight.len() >= MAX_INFLIGHT {
+            self.rec.skip();
+            return;
+        }
+        let (w, h) = self.rec.size();
+        let stride = padded_row(w);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("record readback"),
+            size: u64::from(stride) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        let state: MapState = Arc::new(AtomicU8::new(PENDING));
+        let flag = state.clone();
+        buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            settle(&flag, r.is_ok());
+        });
+        self.inflight.push(buf, state);
+    }
+
+    /// Finalizes the file. Waits for the encoder to flush (called from a button press).
+    pub fn stop(mut self, device: &wgpu::Device) -> Result<Summary, String> {
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        self.poll(device);
+        self.rec.finish()
+    }
+}
+
+/// `~/Movies/VJCraft/<UTC timestamp>.mp4` (the platform's video folder when known).
+pub fn default_path() -> PathBuf {
+    let base = directories::UserDirs::new()
+        .and_then(|d| d.video_dir().map(|p| p.to_path_buf()))
+        .unwrap_or_else(std::env::temp_dir);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    base.join("VJCraft")
+        .join(format!("{}.mp4", timestamp(secs)))
+}
+
+/// `YYYYMMDD-HHMMSS` (UTC) from unix seconds.
+fn timestamp(secs: u64) -> String {
+    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_map_does_not_block_later_frames() {
+        let mut q: Inflight<u32> = Inflight::new();
+        let states: Vec<MapState> = (0..MAX_INFLIGHT)
+            .map(|i| {
+                let s: MapState = Arc::new(AtomicU8::new(PENDING));
+                q.push(i as u32, s.clone());
+                s
+            })
+            .collect();
+        settle(&states[0], false); // map error on the oldest
+        settle(&states[1], true);
+        assert_eq!(q.take_settled(), vec![(0, false), (1, true)]);
+        assert_eq!(q.len(), 1);
+        // Later frames keep flowing once slots are free.
+        let s = Arc::new(AtomicU8::new(PENDING));
+        q.push(10, s.clone());
+        settle(&states[2], true);
+        settle(&s, true);
+        assert_eq!(q.take_settled(), vec![(2, true), (10, true)]);
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn timestamp_formats_utc() {
+        assert_eq!(timestamp(0), "19700101-000000");
+        assert_eq!(timestamp(1_700_000_000), "20231114-221320");
+    }
+
+    #[test]
+    fn unpad_strips_row_padding() {
+        let (w, h) = (3u32, 2u32);
+        let stride = padded_row(w) as usize;
+        let mut src = vec![0u8; stride * 2];
+        src[..12].fill(1);
+        src[stride..stride + 12].fill(2);
+        let out = unpad(&src, w, h);
+        assert_eq!(out.len(), 24);
+        assert_eq!((out[0], out[12]), (1, 2));
+    }
+}

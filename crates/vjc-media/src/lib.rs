@@ -9,6 +9,8 @@
 //!
 //! FFmpeg decodes H264, ProRes, MJPEG and HAP.
 
+pub mod record;
+
 use ffmpeg_next as ff;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

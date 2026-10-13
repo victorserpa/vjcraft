@@ -1,4 +1,5 @@
 mod browser;
+mod capture;
 mod compositor;
 mod fx;
 mod midi_io;
@@ -59,6 +60,10 @@ struct State {
     /// Tab of the bottom parameter panel.
     panel_tab: PanelTab,
     comp_tex: Option<egui::TextureId>,
+    /// Output recording in progress (runtime only).
+    capture: Option<capture::Capture>,
+    /// Start/stop requested by a command, served in `compose` (it owns the GPU handles).
+    rec_request: Option<bool>,
     /// Display id of the monitor the output window is on, while open.
     output: Option<u32>,
     monitors: Vec<monitors::MonitorInfo>,
@@ -519,6 +524,8 @@ impl State {
             fx_epoch: std::time::Instant::now(),
             panel_tab: PanelTab::Composition,
             comp_tex: None,
+            capture: None,
+            rec_request: None,
             output: None,
             monitors: monitors::list(),
             monitors_polled: None,
@@ -784,6 +791,8 @@ impl State {
                 | Command::StepColumn { .. }
                 | Command::StepClip { .. }
                 | Command::ClearAll
+                | Command::StartRecording
+                | Command::StopRecording
                 | Command::SetMasterBypass { .. }
                 | Command::JumpToCue { .. }
         );
@@ -910,6 +919,8 @@ impl State {
                     self.status = format!("Skipped {name}, column {}: not playable", column + 1);
                 }
                 Event::MasterBypass { bypass } => self.master_bypass = bypass,
+                Event::RecordingStarted => self.rec_request = Some(true),
+                Event::RecordingStopped => self.rec_request = Some(false),
                 Event::Tap { at } => {
                     if let Some(bpm) = self.clock.tap(at) {
                         self.exec(Command::SetBpm { bpm });
@@ -1399,6 +1410,45 @@ impl State {
             vjc_core::anim::effective_number(&c.master.opacity, &actx) as f32
         };
         comp.render(&rs.device, &rs.queue, &draws, &master, master_opacity);
+        match self.rec_request.take() {
+            Some(true) if self.capture.is_none() => {
+                let size = comp.size;
+                match capture::Capture::start(capture::default_path(), size, c.fps) {
+                    Ok(cap) => {
+                        self.status = format!("Recording to {}", cap.path().display());
+                        self.capture = Some(cap);
+                    }
+                    Err(e) => self.status = format!("Record failed: {e}"),
+                }
+            }
+            Some(false) => {
+                if let Some(cap) = self.capture.take() {
+                    self.status = match cap.stop(&rs.device) {
+                        Ok(s) => format!(
+                            "Saved {} ({} frames, {} dropped, {})",
+                            s.path.display(),
+                            s.encoded,
+                            s.dropped,
+                            s.codec
+                        ),
+                        Err(e) => format!("Record failed: {e}"),
+                    };
+                }
+            }
+            _ => {}
+        }
+        if let Some(cap) = self.capture.as_mut() {
+            if cap.failed() || cap.size() != comp.size {
+                let cap = self.capture.take().unwrap();
+                self.status = match cap.stop(&rs.device) {
+                    Ok(s) => format!("Recording stopped, saved {}", s.path.display()),
+                    Err(e) => format!("Record failed: {e}"),
+                };
+            } else {
+                cap.poll(&rs.device);
+                cap.capture(&rs.device, &rs.queue, &comp.target);
+            }
+        }
         self.render_screens(rs);
     }
 
@@ -1489,6 +1539,18 @@ impl State {
             }
             if ui.button("Clear All").clicked() {
                 cmds.push(Command::ClearAll);
+            }
+            let recording = self.capture.is_some();
+            let label = if recording { "Stop rec" } else { "Record" };
+            if ui.selectable_label(recording, label).clicked() {
+                cmds.push(if recording {
+                    Command::StopRecording
+                } else {
+                    Command::StartRecording
+                });
+            }
+            if let Some(cap) = &self.capture {
+                ui.label(format!("{} dropped", cap.dropped()));
             }
             ui.separator();
             let dials = self.dials();
