@@ -95,6 +95,8 @@ pub struct Lib {
     send_create: unsafe extern "C" fn(*const SendCreate) -> *mut c_void,
     send_destroy: unsafe extern "C" fn(*mut c_void),
     send_video: unsafe extern "C" fn(*mut c_void, *const VideoFrameV2),
+    /// Optional: absent in old runtimes.
+    send_connections: Option<unsafe extern "C" fn(*mut c_void, u32) -> i32>,
     recv_create: unsafe extern "C" fn(*const RecvCreateV3) -> *mut c_void,
     recv_destroy: unsafe extern "C" fn(*mut c_void),
     recv_capture:
@@ -156,6 +158,13 @@ impl Lib {
             send_create: sym!(lib, b"NDIlib_send_create\0"),
             send_destroy: sym!(lib, b"NDIlib_send_destroy\0"),
             send_video: sym!(lib, b"NDIlib_send_send_video_v2\0"),
+            send_connections: unsafe {
+                lib.get::<unsafe extern "C" fn(*mut c_void, u32) -> i32>(
+                    b"NDIlib_send_get_no_connections\0",
+                )
+            }
+            .ok()
+            .map(|f| *f),
             recv_create: sym!(lib, b"NDIlib_recv_create_v3\0"),
             recv_destroy: sym!(lib, b"NDIlib_recv_destroy\0"),
             recv_capture: sym!(lib, b"NDIlib_recv_capture_v2\0"),
@@ -279,6 +288,21 @@ fn list_while(alive: &mut dyn FnMut() -> bool) -> Result<Option<Vec<NetSource>>,
     Ok(Some(out))
 }
 
+/// Frame rate as a fraction; NTSC rates get their exact 1001 denominator.
+pub fn fps_ratio(fps: f32) -> (i32, i32) {
+    let fps = if fps.is_finite() {
+        fps.clamp(1.0, 240.0)
+    } else {
+        60.0
+    };
+    let ntsc = fps.fract() != 0.0 && ((fps * 1.001).round() - fps * 1.001).abs() < 0.005;
+    if ntsc {
+        ((fps * 1.001).round() as i32 * 1000, 1001)
+    } else {
+        ((fps * 1000.0).round() as i32, 1000)
+    }
+}
+
 pub struct Sender {
     lib: Arc<Lib>,
     inst: *mut c_void,
@@ -303,19 +327,35 @@ impl Sender {
         Ok(Sender { lib, inst })
     }
 
-    pub fn send(&mut self, w: u32, h: u32, stride: u32, rgba: &[u8]) -> Result<(), String> {
+    /// False when the runtime reports zero receivers; true if it cannot tell.
+    pub fn wants_frames(&self) -> bool {
+        match self.lib.send_connections {
+            Some(f) => unsafe { f(self.inst, 0) != 0 },
+            None => true,
+        }
+    }
+
+    pub fn send(
+        &mut self,
+        w: u32,
+        h: u32,
+        stride: u32,
+        rgba: &[u8],
+        fps: f32,
+    ) -> Result<(), String> {
         if stride < w.saturating_mul(4)
             || (rgba.len() as u64)
                 < u64::from(stride) * u64::from(h.saturating_sub(1)) + u64::from(w) * 4
         {
             return Err("Frame buffer smaller than its geometry".into());
         }
+        let (fr_n, fr_d) = fps_ratio(fps);
         let frame = VideoFrameV2 {
             xres: w as i32,
             yres: h as i32,
             fourcc: FOURCC_RGBA,
-            frame_rate_n: 60,
-            frame_rate_d: 1,
+            frame_rate_n: fr_n,
+            frame_rate_d: fr_d,
             picture_aspect_ratio: w as f32 / h.max(1) as f32,
             frame_format_type: FRAME_PROGRESSIVE,
             timecode: TIMECODE_SYNTHESIZE,
@@ -437,6 +477,15 @@ pub fn receive(name: &str, sink: &mut dyn FnMut(u32, u32, Vec<u8>) -> bool) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fps_ratio_values() {
+        use super::fps_ratio;
+        assert_eq!(fps_ratio(30.0), (30000, 1000));
+        assert_eq!(fps_ratio(29.97), (30000, 1001));
+        assert_eq!(fps_ratio(23.976), (24000, 1001));
+        assert_eq!(fps_ratio(f32::NAN), (60000, 1000));
+    }
+
     use super::*;
 
     #[test]

@@ -4,7 +4,7 @@
 
 use ffmpeg_next as ff;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -16,12 +16,24 @@ struct Job {
     /// Presentation index in frame periods: gaps left by dropped frames keep timing right.
     pts: i64,
     data: Vec<u8>,
+    /// Counts the job as queued until the encoder is done with it (dropped).
+    _pending: Pending,
+}
+
+struct Pending(Arc<AtomicUsize>);
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Bounded, never-blocking frame queue with a drop counter.
 pub struct FrameQueue {
     tx: SyncSender<Job>,
     dropped: AtomicU64,
+    /// Jobs queued or being encoded.
+    pending: Arc<AtomicUsize>,
 }
 
 impl FrameQueue {
@@ -31,6 +43,7 @@ impl FrameQueue {
             Self {
                 tx,
                 dropped: AtomicU64::new(0),
+                pending: Arc::new(AtomicUsize::new(0)),
             },
             rx,
         )
@@ -38,7 +51,13 @@ impl FrameQueue {
 
     /// Queues the frame; returns false (and counts a drop) when the queue is full or closed.
     fn push(&self, pts: i64, data: Vec<u8>) -> bool {
-        match self.tx.try_send(Job { pts, data }) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        let job = Job {
+            pts,
+            data,
+            _pending: Pending(self.pending.clone()),
+        };
+        match self.tx.try_send(job) {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -272,6 +291,11 @@ impl Recorder {
         self.queue.dropped()
     }
 
+    /// Frames still waiting for (or in) the encoder.
+    pub fn pending(&self) -> usize {
+        self.queue.pending.load(Ordering::Relaxed)
+    }
+
     /// True once the encoder thread died (open or encode error).
     pub fn failed(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| h.is_finished())
@@ -306,6 +330,7 @@ impl Recorder {
 
     /// Like `finish` but waits at most `timeout` for the encoder to flush (app shutdown).
     pub fn finish_timeout(self, timeout: std::time::Duration) -> Result<Summary, String> {
+        let path = self.path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("vjc-record-finish".into())
@@ -313,8 +338,12 @@ impl Recorder {
                 let _ = tx.send(self.finish());
             })
             .map_err(|e| e.to_string())?;
-        rx.recv_timeout(timeout)
-            .map_err(|_| "recording did not finish in time".to_string())?
+        rx.recv_timeout(timeout).map_err(|_| {
+            format!(
+                "recording did not finish in time; {} may be missing its end (unplayable)",
+                path.display()
+            )
+        })?
     }
 
     /// Flushes the queue, finalizes the file and joins the thread.
@@ -365,6 +394,43 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("vjc-rec-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn pending_counts_queued_frames_until_encoded() {
+        let path = tmp("pend.mp4");
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut r = Recorder::spawn(&path, 4, 4, 8, move |rx, _| {
+            let _ = gate_rx.recv(); // hold the worker until released
+            let mut n = 0;
+            while rx.recv().is_ok() {
+                n += 1;
+            }
+            Ok(n)
+        })
+        .unwrap();
+        for _ in 0..3 {
+            assert!(r.push(vec![0; 4 * 4 * 4]));
+        }
+        assert_eq!(r.pending(), 3);
+        gate_tx.send(()).unwrap();
+        assert_eq!(r.finish().unwrap().encoded, 3);
+    }
+
+    #[test]
+    fn finish_timeout_reports_the_file_when_the_encoder_hangs() {
+        let path = tmp("hang.mp4");
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let r = Recorder::spawn(&path, 4, 4, 8, move |_rx, _| {
+            let _ = gate_rx.recv();
+            Ok(0)
+        })
+        .unwrap();
+        let e = r
+            .finish_timeout(std::time::Duration::from_millis(50))
+            .unwrap_err();
+        assert!(e.contains("hang.mp4") && e.contains("unplayable"), "{e}");
+        let _ = gate_tx.send(());
     }
 
     #[test]

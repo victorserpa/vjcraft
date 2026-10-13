@@ -67,6 +67,15 @@ pub struct Capture {
     /// Last presentation index handed out (-1 = none): pts follow real elapsed time, so a
     /// render slower than the recording fps leaves gaps instead of speeding the video up.
     last_pts: i64,
+    /// Kept from `poll` so `shutdown` can settle the readbacks still in flight.
+    device: Option<wgpu::Device>,
+}
+
+/// How long the app waits at exit for the encoder: a base, plus time for each frame still
+/// queued (a long queue of big frames takes more than a fixed 3 s), capped.
+pub(crate) fn exit_timeout(pending: usize) -> Duration {
+    (Duration::from_secs(3) + Duration::from_millis(150) * pending as u32)
+        .min(Duration::from_secs(30))
 }
 
 /// Presentation index for a frame taken `elapsed` after the start, or None when that slot
@@ -175,6 +184,7 @@ impl Capture {
             fps: f64::from(fps),
             t0: Instant::now(),
             last_pts: -1,
+            device: None,
         })
     }
 
@@ -197,6 +207,9 @@ impl Capture {
     /// Hands finished readbacks (in order) to the encoder. Never waits.
     pub fn poll(&mut self, device: &wgpu::Device) {
         let _ = device.poll(wgpu::PollType::Poll);
+        if self.device.is_none() {
+            self.device = Some(device.clone());
+        }
         let (w, h) = self.rec.size();
         for ((buf, pts), ok) in self.inflight.take_settled() {
             let data = if ok {
@@ -263,10 +276,19 @@ impl Capture {
         self.inflight.push((buf, pts), state);
     }
 
-    /// App shutdown: no device to poll, so readbacks still in flight are abandoned; the
-    /// file is finalized (trailer written), waiting at most ~3 s.
-    pub fn shutdown(self) -> Result<Summary, String> {
-        self.rec.finish_timeout(Duration::from_secs(3))
+    /// App shutdown: settles the readbacks in flight (bounded wait) so the last frames
+    /// are kept, then finalizes the file (trailer written). The wait grows with the
+    /// frames still queued; an error means the file may be unplayable.
+    pub fn shutdown(mut self) -> Result<Summary, String> {
+        if let Some(d) = self.device.clone() {
+            let _ = d.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(2)),
+            });
+            self.poll(&d);
+        }
+        let t = exit_timeout(self.rec.pending());
+        self.rec.finish_timeout(t)
     }
 
     /// Finalizes the file. Waits for the encoder to flush (called from a button press).
@@ -345,6 +367,13 @@ mod tests {
         settle(&s, true);
         assert_eq!(q.take_settled(), vec![(2, true), (10, true)]);
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn exit_timeout_grows_with_the_queue_and_is_capped() {
+        assert_eq!(exit_timeout(0), Duration::from_secs(3));
+        assert!(exit_timeout(6) > Duration::from_secs(3));
+        assert_eq!(exit_timeout(10_000), Duration::from_secs(30));
     }
 
     #[test]

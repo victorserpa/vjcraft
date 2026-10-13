@@ -88,6 +88,22 @@ pub fn net_backend(p: &vjc_model::NetProtocol) -> Option<vjc_net::Protocol> {
     }
 }
 
+/// State of the discovery worker. `Lost`: it died (panic) without sending a result.
+#[derive(Debug, PartialEq)]
+enum NetPoll {
+    Pending,
+    Done(NetListing),
+    Lost,
+}
+
+fn poll_net(rx: &Receiver<NetListing>) -> NetPoll {
+    match rx.try_recv() {
+        Ok(l) => NetPoll::Done(l),
+        Err(std::sync::mpsc::TryRecvError::Empty) => NetPoll::Pending,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => NetPoll::Lost,
+    }
+}
+
 fn discover_all() -> NetListing {
     net_listing(
         [vjc_net::Protocol::Syphon, vjc_net::Protocol::Ndi]
@@ -351,11 +367,21 @@ impl Browser {
                 "browser-network",
             );
         });
-        if let Some(rx) = &self.net_rx
-            && let Ok(l) = rx.try_recv()
-        {
-            self.net = l;
-            self.net_rx = None;
+        if let Some(rx) = &self.net_rx {
+            match poll_net(rx) {
+                NetPoll::Pending => {}
+                NetPoll::Done(l) => {
+                    self.net = l;
+                    self.net_rx = None;
+                }
+                NetPoll::Lost => {
+                    self.net = NetListing {
+                        sources: vec![],
+                        notes: vec!["Discovery failed; press Refresh".into()],
+                    };
+                    self.net_rx = None;
+                }
+            }
         }
         if self.tab == Tab::Network {
             let stale = self
@@ -538,6 +564,18 @@ impl Browser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dead_discovery_worker_is_lost_not_pending() {
+        let (tx, rx) = std::sync::mpsc::channel::<NetListing>();
+        assert_eq!(poll_net(&rx), NetPoll::Pending);
+        let h = std::thread::spawn(move || {
+            let _tx = tx;
+            panic!("discovery panic");
+        });
+        let _ = h.join();
+        assert_eq!(poll_net(&rx), NetPoll::Lost);
+    }
+
     use super::*;
 
     fn e(name: &str, dir: bool) -> Entry {

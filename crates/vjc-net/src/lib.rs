@@ -113,20 +113,33 @@ impl Sender {
         match self {
             #[cfg(all(feature = "syphon", target_os = "macos"))]
             Sender::Syphon(s) => s.has_clients(),
+            #[cfg(feature = "ndi")]
+            Sender::Ndi(s) => s.wants_frames(),
             #[allow(unreachable_patterns)]
             _ => true,
         }
     }
 
-    /// Publishes one RGBA8 frame with `stride` bytes per row.
-    pub fn send(&mut self, w: u32, h: u32, stride: u32, rgba: &[u8]) -> Result<(), String> {
+    /// Publishes one RGBA8 frame with `stride` bytes per row. `fps` is the project rate
+    /// (declared to NDI receivers; Syphon ignores it).
+    pub fn send(
+        &mut self,
+        w: u32,
+        h: u32,
+        stride: u32,
+        rgba: &[u8],
+        fps: f32,
+    ) -> Result<(), String> {
         match self {
             #[cfg(all(feature = "syphon", target_os = "macos"))]
             Sender::Syphon(s) => s.publish(w, h, stride, rgba),
             #[cfg(feature = "ndi")]
-            Sender::Ndi(s) => s.send(w, h, stride, rgba),
+            Sender::Ndi(s) => s.send(w, h, stride, rgba, fps),
             #[allow(unreachable_patterns)]
-            _ => Err("no backend".into()),
+            _ => {
+                let _ = fps;
+                Err("no backend".into())
+            }
         }
     }
 }

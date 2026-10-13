@@ -18,13 +18,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Ring capacity per voice, in seconds of audio.
 const RING_SECONDS: f64 = 0.5;
 /// Decoder keeps the ring filled up to this much audio (the audio latency vs the video).
 const TARGET_LEAD: f64 = 0.15;
 /// Frames mixed per pass in the cpal callback (scratch is preallocated for this).
+/// How long a producer waits for the callback to apply a flush before doing it itself.
+const FLUSH_WAIT: Duration = Duration::from_millis(50);
 const SCRATCH_FRAMES: usize = 4096;
 const PACKED_F32: ff::format::Sample = ff::format::Sample::F32(ff::format::sample::Type::Packed);
 
@@ -73,6 +75,13 @@ impl Ring {
         Some([l, rr])
     }
 
+    /// Producer: drops everything buffered while no consumer is running. `fetch_max` keeps a
+    /// racing consumer from underflowing the ring (worst case a few stale frames survive).
+    pub fn discard_from_producer(&self) {
+        let w = self.write.load(Ordering::Acquire);
+        self.read.fetch_max(w, Ordering::AcqRel);
+    }
+
     /// Consumer: drops everything buffered.
     pub fn skip_all(&self) {
         self.read
@@ -115,6 +124,11 @@ impl Voice {
 
     fn audible(&self) -> bool {
         self.audible.load(Ordering::Relaxed)
+    }
+
+    /// True while a requested flush has not been applied by the consumer yet.
+    pub fn flush_pending(&self) -> bool {
+        self.flush.load(Ordering::Acquire)
     }
 
     /// Asks the consumer to drop what is buffered (used before a re-seek).
@@ -162,6 +176,22 @@ pub fn mix_stereo(out: &mut [f32], voices: &[Arc<Voice>]) {
     }
 }
 
+/// Producer side of a re-seek: appends `buf[off..]` unless a flush is still pending. The
+/// consumer applies the flush by dropping everything in the ring, so data pushed before it
+/// does would be thrown away with the stale audio. None = wait and retry.
+/// If the flush is still pending after `waited` >= `FLUSH_WAIT` the output stream is not
+/// running (no callback to apply it), so the producer applies the flush itself.
+pub fn push_after_flush(voice: &Voice, buf: &[f32], off: usize, waited: Duration) -> Option<usize> {
+    if voice.flush_pending() {
+        if waited < FLUSH_WAIT {
+            return None;
+        }
+        voice.ring.discard_from_producer();
+        voice.flush.store(false, Ordering::Release);
+    }
+    Some(voice.ring.push(&buf[off..]))
+}
+
 type VoiceList = Arc<Mutex<Vec<Arc<Voice>>>>;
 
 struct Guard {
@@ -183,7 +213,7 @@ impl Drop for Guard {
 #[derive(Clone)]
 pub struct AudioEngine {
     voices: VoiceList,
-    rate: u32,
+    rate: Arc<AtomicU32>,
     _guard: Arc<Guard>,
 }
 
@@ -194,15 +224,20 @@ impl AudioEngine {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let v = voices.clone();
+        let shared_rate = Arc::new(AtomicU32::new(0));
+        let sr = shared_rate.clone();
         let thread = std::thread::Builder::new()
             .name("vjc-audio-out".into())
             .spawn(move || {
                 // The cpal stream is not Send: it lives and dies on this thread.
-                match open_stream(v) {
+                let failed = Arc::new(AtomicBool::new(false));
+                let open = || open_stream(v.clone(), failed.clone());
+                match open() {
                     Ok((stream, rate)) => {
+                        sr.store(rate, Ordering::Release);
                         let _ = ready_tx.send(Ok(rate));
-                        let _ = stop_rx.recv(); // returns when the engine is dropped
-                        drop(stream);
+                        // Returns when the engine is dropped; reopens the device if it dies.
+                        supervise(stream, open, &sr, &failed, &stop_rx, REOPEN, REOPEN_POLL);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -210,12 +245,12 @@ impl AudioEngine {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let rate = ready_rx
+        ready_rx
             .recv()
             .map_err(|_| "audio thread ended unexpectedly".to_string())??;
         Ok(AudioEngine {
             voices,
-            rate,
+            rate: shared_rate,
             _guard: Arc::new(Guard {
                 stop: Some(stop_tx),
                 thread: Some(thread),
@@ -225,11 +260,13 @@ impl AudioEngine {
 
     /// Device sample rate in Hz.
     pub fn sample_rate(&self) -> u32 {
-        self.rate
+        self.rate.load(Ordering::Acquire)
     }
 
     fn add_voice(&self) -> Arc<Voice> {
-        let v = Arc::new(Voice::new((self.rate as f64 * RING_SECONDS) as usize));
+        let v = Arc::new(Voice::new(
+            (self.sample_rate() as f64 * RING_SECONDS) as usize,
+        ));
         self.voices.lock().unwrap().push(v.clone());
         v
     }
@@ -239,7 +276,48 @@ impl AudioEngine {
     }
 }
 
-fn open_stream(voices: VoiceList) -> Result<(cpal::Stream, u32), String> {
+/// Pause between attempts to reopen a lost output device.
+const REOPEN: Duration = Duration::from_secs(2);
+/// How often the supervisor looks at the stream's error flag.
+const REOPEN_POLL: Duration = Duration::from_millis(100);
+
+/// Keeps `stream` alive until `stop` closes. When `failed` is raised (the device was
+/// unplugged or changed) the stream is dropped and `open` is retried every `retry` until it
+/// works. `S` is a cpal stream in the app and a fake in tests.
+fn supervise<S>(
+    stream: S,
+    mut open: impl FnMut() -> Result<(S, u32), String>,
+    rate: &AtomicU32,
+    failed: &AtomicBool,
+    stop: &mpsc::Receiver<()>,
+    retry: Duration,
+    poll: Duration,
+) {
+    let mut stream = Some(stream);
+    loop {
+        let wait = if stream.is_some() { poll } else { retry };
+        if !matches!(
+            stop.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            return;
+        }
+        if stream.is_some() && failed.swap(false, Ordering::Relaxed) {
+            eprintln!("vjc-media: audio device lost, reopening");
+            stream = None;
+        }
+        if stream.is_none()
+            && let Ok((s, new_rate)) = open()
+        {
+            // The new device may run at another rate: decoders follow this value.
+            rate.store(new_rate, Ordering::Release);
+            failed.store(false, Ordering::Relaxed);
+            stream = Some(s);
+        }
+    }
+}
+
+fn open_stream(voices: VoiceList, failed: Arc<AtomicBool>) -> Result<(cpal::Stream, u32), String> {
     let device = cpal::default_host()
         .default_output_device()
         .ok_or("No audio output device")?;
@@ -249,10 +327,10 @@ fn open_stream(voices: VoiceList) -> Result<(cpal::Stream, u32), String> {
     let cfg = supported.config();
     let rate = cfg.sample_rate;
     let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, cfg, voices),
-        cpal::SampleFormat::I16 => build::<i16>(&device, cfg, voices),
-        cpal::SampleFormat::U16 => build::<u16>(&device, cfg, voices),
-        cpal::SampleFormat::I32 => build::<i32>(&device, cfg, voices),
+        cpal::SampleFormat::F32 => build::<f32>(&device, cfg, voices, failed),
+        cpal::SampleFormat::I16 => build::<i16>(&device, cfg, voices, failed),
+        cpal::SampleFormat::U16 => build::<u16>(&device, cfg, voices, failed),
+        cpal::SampleFormat::I32 => build::<i32>(&device, cfg, voices, failed),
         other => return Err(format!("Unsupported audio sample format {other}")),
     }
     .map_err(|e| format!("Audio output: {e}"))?;
@@ -264,6 +342,7 @@ fn build<T>(
     device: &cpal::Device,
     cfg: cpal::StreamConfig,
     voices: VoiceList,
+    failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -292,7 +371,10 @@ where
                 }
             }
         },
-        |e| eprintln!("vjc-media: audio stream error: {e}"),
+        move |e| {
+            eprintln!("vjc-media: audio stream error: {e}");
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )
 }
@@ -333,6 +415,20 @@ impl AudioDecoder {
             pos: 0.0,
             eof: false,
         }))
+    }
+
+    /// Output rate currently produced.
+    pub fn out_rate(&self) -> u32 {
+        self.out_rate
+    }
+
+    /// Switches the output rate (device changed). Rebuilds the resampler; the caller must
+    /// flush and re-seek to the playhead.
+    pub fn set_out_rate(&mut self, rate: u32) {
+        if rate != self.out_rate {
+            self.out_rate = rate;
+            self.resampler = None;
+        }
     }
 
     /// Media time (seconds) after the last chunk returned by `read_chunk`.
@@ -444,6 +540,16 @@ pub fn needs_resync(dec: f64, want: f64) -> bool {
     !(-0.2..=TARGET_LEAD + 0.4).contains(&lead)
 }
 
+/// Makes `dec` follow the device rate; true when it changed.
+pub fn follow_rate(dec: &mut AudioDecoder, rate: &AtomicU32) -> bool {
+    let r = rate.load(Ordering::Acquire);
+    if r == 0 || r == dec.out_rate() {
+        return false;
+    }
+    dec.set_out_rate(r);
+    true
+}
+
 /// Audio state owned by a `Player`: voice, decode thread, engine handle.
 pub struct AudioPart {
     pub(crate) voice: Arc<Voice>,
@@ -464,11 +570,11 @@ impl AudioPart {
             voice.clone(),
             stop.clone(),
             path.to_path_buf(),
-            engine.sample_rate(),
+            engine.rate.clone(),
         );
         let thread = std::thread::Builder::new()
             .name("vjc-audio-dec".into())
-            .spawn(move || run_audio(&p, rate, &v, &shared, &s))
+            .spawn(move || run_audio(&p, &rate, &v, &shared, &s))
             .ok();
         if thread.is_none() {
             engine.remove_voice(&voice);
@@ -502,8 +608,8 @@ impl Drop for AudioPart {
     }
 }
 
-fn run_audio(path: &Path, rate: u32, voice: &Voice, shared: &Shared, stop: &AtomicBool) {
-    let mut dec = match AudioDecoder::open(path, rate) {
+fn run_audio(path: &Path, rate: &AtomicU32, voice: &Voice, shared: &Shared, stop: &AtomicBool) {
+    let mut dec = match AudioDecoder::open(path, rate.load(Ordering::Acquire)) {
         Ok(Some(d)) => d,
         Ok(None) => return,
         Err(e) => {
@@ -512,11 +618,20 @@ fn run_audio(path: &Path, rate: u32, voice: &Voice, shared: &Shared, stop: &Atom
         }
     };
     let nap = |ms| std::thread::sleep(Duration::from_millis(ms));
-    let target = (rate as f64 * TARGET_LEAD) as usize;
     let mut buf: Vec<f32> = Vec::new();
     let mut off = 0usize;
     let mut synced = false;
+    let mut flush_since: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed) {
+        if follow_rate(&mut dec, rate) {
+            // Device rate changed: old-rate audio is wrong, drop it and resync.
+            voice.request_flush();
+            flush_since = Some(Instant::now());
+            buf.clear();
+            off = 0;
+            synced = false;
+        }
+        let target = (dec.out_rate() as f64 * TARGET_LEAD) as usize;
         let dur = f64::from_bits(shared.duration.load(Ordering::Relaxed));
         if !voice.audible() || dur <= 0.0 {
             voice.request_flush();
@@ -539,12 +654,18 @@ fn run_audio(path: &Path, rate: u32, voice: &Voice, shared: &Shared, stop: &Atom
                 continue;
             }
             voice.request_flush();
+            flush_since = Some(Instant::now());
             buf.clear();
             off = 0;
             synced = true;
         }
         if off < buf.len() {
-            off += voice.ring.push(&buf[off..]);
+            let waited = flush_since.map_or(FLUSH_WAIT, |t| t.elapsed());
+            let Some(n) = push_after_flush(voice, &buf, off, waited) else {
+                nap(2);
+                continue;
+            };
+            off += n;
             if off < buf.len() {
                 nap(5);
                 continue;
@@ -639,6 +760,138 @@ mod tests {
         assert_eq!(r.pop_frame(), Some([3.0, 4.0]));
         assert_eq!(r.pop_frame(), Some([7.0, 8.0]));
         assert_eq!(r.pop_frame(), None);
+    }
+
+    #[test]
+    fn push_waits_for_the_pending_flush_so_fresh_audio_survives() {
+        let v = Arc::new(Voice::new(64));
+        v.set(1.0, 0.0, true);
+        v.ring.push(&[0.9, 0.9]); // stale audio from before the seek
+        v.request_flush();
+        // The decoder has new audio but must not push until the flush is applied.
+        let fresh = [0.5f32, 0.5];
+        assert_eq!(push_after_flush(&v, &fresh, 0, Duration::ZERO), None);
+        let mut out = [1.0f32; 2];
+        mix_stereo(&mut out, std::slice::from_ref(&v)); // consumer applies the flush
+        assert_eq!(out, [0.0, 0.0]);
+        assert_eq!(push_after_flush(&v, &fresh, 0, Duration::ZERO), Some(2));
+        mix_stereo(&mut out, std::slice::from_ref(&v));
+        assert_eq!(out, [0.5, 0.5]); // not eaten by a late flush
+    }
+
+    #[test]
+    fn supervisor_reopens_a_lost_device_with_retry() {
+        use std::sync::atomic::AtomicUsize;
+        let failed = Arc::new(AtomicBool::new(false));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (f2, o2) = (failed.clone(), opens.clone());
+        let h = std::thread::spawn(move || {
+            supervise(
+                0u32,
+                || {
+                    // First reopen attempt fails, the next ones work.
+                    if o2.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err("no device".into())
+                    } else {
+                        Ok((1u32, 48000))
+                    }
+                },
+                &AtomicU32::new(0),
+                &f2,
+                &stop_rx,
+                Duration::from_millis(10),
+                Duration::from_millis(5),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(opens.load(Ordering::SeqCst), 0); // healthy: nothing reopened
+        failed.store(true, Ordering::Relaxed); // the cpal error callback
+        for _ in 0..200 {
+            if opens.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 2); // failed once, retried, opened
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(opens.load(Ordering::SeqCst), 2); // and stays open
+        drop(stop_tx);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn flush_without_callback_does_not_block_past_timeout() {
+        let v = Voice::new(64);
+        v.ring.push(&[0.9, 0.9]); // stale audio
+        v.request_flush(); // no cpal callback will ever apply it
+        assert_eq!(push_after_flush(&v, &[0.1, 0.1], 0, Duration::ZERO), None);
+        let t = Instant::now();
+        let n = loop {
+            if let Some(n) = push_after_flush(&v, &[0.1, 0.1], 0, t.elapsed()) {
+                break n;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(t.elapsed() < Duration::from_secs(1), "blocked");
+        };
+        assert_eq!(n, 2);
+        assert!(!v.flush_pending());
+        assert_eq!(v.ring.pop_frame(), Some([0.1, 0.1])); // stale frame dropped
+        assert_eq!(v.ring.pop_frame(), None);
+    }
+
+    #[test]
+    fn decoder_follows_reopened_device_rate() {
+        let Some(p) = make_media(
+            "rate.mkv",
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=1",
+                "-c:a",
+                "pcm_s16le",
+            ],
+        ) else {
+            eprintln!("ffmpeg CLI missing: skipped");
+            return;
+        };
+        let rate = Arc::new(AtomicU32::new(44100));
+        let mut d = AudioDecoder::open(&p, 44100).unwrap().expect("audio");
+        assert!(!follow_rate(&mut d, &rate));
+        // Device lost, reopened at 48 kHz by the supervisor.
+        let failed = Arc::new(AtomicBool::new(true));
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (r2, f2) = (rate.clone(), failed.clone());
+        let h = std::thread::spawn(move || {
+            supervise(
+                0u32,
+                || Ok((1u32, 48000)),
+                &r2,
+                &f2,
+                &stop_rx,
+                Duration::from_millis(5),
+                Duration::from_millis(5),
+            )
+        });
+        for _ in 0..200 {
+            if rate.load(Ordering::Acquire) == 48000 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(stop_tx);
+        h.join().unwrap();
+        assert!(follow_rate(&mut d, &rate));
+        d.seek(0.0).unwrap();
+        let mut out = vec![];
+        while d.read_chunk(&mut out).unwrap() > 0 {}
+        let frames = out.len() / 2;
+        assert!(
+            (47000..=49000).contains(&frames),
+            "expected ~48000 frames per second of media, got {frames}"
+        );
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

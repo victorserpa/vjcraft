@@ -4569,8 +4569,12 @@ impl eframe::App for State {
         if self.prefs_dirty {
             self.save_prefs();
         }
-        if let Some(cap) = self.capture.take() {
-            let _ = cap.shutdown();
+        if let Some(cap) = self.capture.take()
+            && let Err(e) = cap.shutdown()
+        {
+            // The window is gone: stderr is the only place left to say it.
+            eprintln!("Record failed on exit: {e}");
+            self.status = format!("Record failed on exit: {e}");
         }
     }
 }

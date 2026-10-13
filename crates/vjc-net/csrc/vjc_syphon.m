@@ -54,6 +54,7 @@ typedef struct {
     void *server;      // retained SyphonMetalServer
     void *queue;       // retained id<MTLCommandQueue>
     void *tex;         // retained id<MTLTexture>
+    void *last_cb;     // retained id<MTLCommandBuffer> of the previous publish
     uint32_t w, h;
 } VjcServer;
 
@@ -87,6 +88,13 @@ int vjc_syphon_server_publish(void *p, const uint8_t *rgba, uint32_t w, uint32_t
     if (!v || !rgba || w == 0 || h == 0) return 1;
     @autoreleasepool {
         id<MTLDevice> d = dev();
+        // The previous frame's GPU reads must finish before the texture is rewritten or
+        // replaced (otherwise Syphon clients can see a torn frame).
+        if (v->last_cb) {
+            [(__bridge id<MTLCommandBuffer>)v->last_cb waitUntilCompleted];
+            CFRelease(v->last_cb);
+            v->last_cb = NULL;
+        }
         if (!v->tex || v->w != w || v->h != h) {
             if (v->tex) CFRelease(v->tex);
             MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -104,6 +112,7 @@ int vjc_syphon_server_publish(void *p, const uint8_t *rgba, uint32_t w, uint32_t
         [(__bridge SyphonMetalServer *)v->server publishFrameTexture:t onCommandBuffer:cb
                                                           imageRegion:NSMakeRect(0, 0, w, h) flipped:NO];
         [cb commit];
+        v->last_cb = (void *)CFBridgingRetain(cb);
         return 0;
     }
 }
@@ -112,6 +121,10 @@ void vjc_syphon_server_free(void *p) {
     VjcServer *v = p;
     if (!v) return;
     [(__bridge SyphonMetalServer *)v->server stop];
+    if (v->last_cb) {
+        [(__bridge id<MTLCommandBuffer>)v->last_cb waitUntilCompleted];
+        CFRelease(v->last_cb);
+    }
     if (v->tex) CFRelease(v->tex);
     CFRelease(v->queue);
     CFRelease(v->server);
