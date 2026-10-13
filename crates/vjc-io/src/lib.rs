@@ -81,12 +81,32 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut f, bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        sync_parent(path);
+        Ok(())
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// Best effort: flushes the directory entry so the rename survives a power cut.
+/// Directories cannot be opened for sync on Windows, where this does nothing.
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Saves `project` to `path`. Media inside the project folder become relative.
@@ -123,6 +143,14 @@ fn find_by_name(dir: &Path, name: &std::ffi::OsStr, depth: u32) -> Option<PathBu
         .find_map(|d| find_by_name(&d, name, depth - 1))
 }
 
+/// `format_version` as an integer; accepts `1.0` (some writers emit floats), not `1.5`.
+fn version_number(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        let f = v.as_f64()?;
+        (f >= 0.0 && f.fract() == 0.0 && f <= u32::MAX as f64).then_some(f as u64)
+    })
+}
+
 /// Opens a project. Media are resolved as: relative to the project folder,
 /// then as stored (absolute), then by file name inside the project folder.
 /// Returns the project and warnings for media that could not be found.
@@ -130,10 +158,11 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
     let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let version = value
         .get("format_version")
-        .and_then(Value::as_u64)
+        .and_then(version_number)
         .and_then(|v| u32::try_from(v).ok())
         .ok_or(Error::BadVersion)?;
-    let value = migrate(value, version)?;
+    let mut value = migrate(value, version)?;
+    value["format_version"] = Value::from(version);
     let mut project: Project = serde_json::from_value(value)?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut warnings = vec![];
@@ -251,6 +280,21 @@ mod tests {
         assert!(!d.join("dir.vjc.tmp").exists());
         assert!(!d.join("p.vjc.tmp").exists());
         assert_eq!(open(&f).unwrap().0.composition.name, "one");
+    }
+
+    #[test]
+    fn float_format_version_is_accepted() {
+        let d = tmp("float");
+        let f = d.join("p.vjc");
+        save(&Project::new("f"), &f).unwrap();
+        let raw = std::fs::read_to_string(&f).unwrap();
+        let patched = raw.replacen("\"format_version\": 1", "\"format_version\": 1.0", 1);
+        assert_ne!(raw, patched);
+        std::fs::write(&f, patched).unwrap();
+        assert_eq!(open(&f).unwrap().0.composition.name, "f");
+        let frac = raw.replacen("\"format_version\": 1", "\"format_version\": 1.5", 1);
+        std::fs::write(&f, frac).unwrap();
+        assert!(matches!(open(&f), Err(Error::BadVersion)));
     }
 
     #[test]

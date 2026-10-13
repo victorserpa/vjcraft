@@ -471,6 +471,57 @@ impl Scrubber {
     }
 }
 
+/// Duration of a clip without container duration: first pts to last pts plus one frame.
+fn unknown_duration(start: f64, last: f64, fps: f64) -> f64 {
+    (last + 1.0 / fps - start).max(0.0)
+}
+
+type Learned = (f64, Option<(Vec<(f64, Frame)>, u64)>);
+
+/// Learns the duration of a clip that has none in its container by decoding it. Short
+/// clips (under `cap` bytes) come back cached; longer ones are measured to the end without
+/// keeping frames, so they are not truncated. None if the player was stopped meanwhile.
+fn learn_duration(
+    sc: &mut Scrubber,
+    start: f64,
+    first: Frame,
+    shared: &Shared,
+    cap: u64,
+) -> Option<Learned> {
+    let mut bytes = first.data.len() as u64;
+    let mut frames = vec![(start, first)];
+    let mut capped = false;
+    loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        if bytes >= cap {
+            capped = true;
+            break;
+        }
+        match sc.next() {
+            Some(x) => {
+                bytes += x.1.data.len() as u64;
+                frames.push(x);
+            }
+            None => break,
+        }
+    }
+    if !capped {
+        let last = frames.last().map_or(start, |(t, _)| *t);
+        return Some((unknown_duration(start, last, sc.fps), Some((frames, bytes))));
+    }
+    let mut last = frames.last().map_or(start, |(t, _)| *t);
+    drop(frames);
+    while let Some((t, _)) = sc.next() {
+        if shared.stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        last = last.max(t);
+    }
+    Some((unknown_duration(start, last, sc.fps), None))
+}
+
 /// Index into `frames` (sorted by pts) of the frame nearest to `target`.
 fn nearest(frames: &[(f64, Frame)], target: f64) -> usize {
     let i = frames.partition_point(|(t, _)| *t < target);
@@ -508,25 +559,20 @@ fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
     let mut cache: Option<Cache> = None;
     // Unknown duration: decode once to learn it (bounded), then it is always cached.
     if sc.duration <= 0.0 {
-        let mut frames = vec![(start, first)];
-        let mut bytes = frame_bytes;
-        while bytes < UNKNOWN_DURATION_CAP {
-            if shared.stop.load(Ordering::Relaxed) {
-                return Ok(());
+        match learn_duration(&mut sc, start, first, shared, UNKNOWN_DURATION_CAP) {
+            None => return Ok(()),
+            Some((d, Some((frames, bytes)))) => {
+                sc.duration = d;
+                cache = Some(Cache {
+                    frames,
+                    _res: Reservation::forced(bytes),
+                });
             }
-            match sc.next() {
-                Some(x) => {
-                    bytes += x.1.data.len() as u64;
-                    frames.push(x);
-                }
-                None => break,
+            Some((d, None)) => {
+                sc.duration = d;
+                sc.last_t = f64::NAN;
             }
         }
-        sc.duration = frames.last().map_or(0.0, |(t, _)| t + 1.0 / sc.fps - start);
-        cache = Some(Cache {
-            frames,
-            _res: Reservation::forced(bytes),
-        });
     }
     // Publish the duration only once frames can be served, so the
     // playhead does not advance (or finish a Once clip) while loading.
@@ -867,6 +913,26 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn unknown_duration_beyond_cap_is_not_truncated() {
+        let dir = std::env::temp_dir().join(format!("vjc-unk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("u.mp4");
+        if !encode(&out, &[]) {
+            eprintln!("skip: cannot encode");
+            return;
+        }
+        let shared = Shared::new();
+        let mut sc = Scrubber::open(&out).unwrap();
+        let (start, first) = sc.next().unwrap();
+        // Cap of a few frames: the clip (20 frames, 2 s) must still be measured whole.
+        let cap = first.data.len() as u64 * 3;
+        let (d, cached) = learn_duration(&mut sc, start, first, &shared, cap).unwrap();
+        assert!(cached.is_none());
+        assert!((d - 2.0).abs() < 0.15, "duration {d}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

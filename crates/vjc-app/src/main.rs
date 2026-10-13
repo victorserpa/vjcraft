@@ -16,7 +16,7 @@ use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vjc_core::clock::{Clock, LinkSync, beat_sync_rate};
 use vjc_core::effects::EffectTarget;
@@ -448,6 +448,25 @@ fn prefs_path() -> Option<PathBuf> {
     Some(project_dirs()?.config_dir().join("prefs.json"))
 }
 
+/// Removes the recovery file (Don't Save, saved, discarded). Missing file is fine.
+fn clear_recovery(path: Option<PathBuf>) {
+    if let Some(r) = path {
+        let _ = std::fs::remove_file(r);
+    }
+}
+
+/// Keeps an unreadable recovery file aside (`recovery.bad.vjc`, then
+/// `recovery.bad-2.vjc`, ...) instead of deleting it. Never overwrites an earlier one.
+fn quarantine_recovery(r: &Path) {
+    let mut dest = r.with_file_name("recovery.bad.vjc");
+    let mut n = 2;
+    while dest.exists() {
+        dest = r.with_file_name(format!("recovery.bad-{n}.vjc"));
+        n += 1;
+    }
+    let _ = std::fs::rename(r, dest);
+}
+
 /// Offers to restore a recovery file newer than the last saved project.
 fn offer_recovery(s: &mut State) {
     let Some(r) = recovery_path() else { return };
@@ -462,14 +481,18 @@ fn offer_recovery(s: &mut State) {
             "Discard".into(),
         ))
         .show();
-    if matches!(ask, rfd::MessageDialogResult::Custom(ref l) if l == "Restore") && s.load(r.clone())
-    {
+    let restore = matches!(ask, rfd::MessageDialogResult::Custom(ref l) if l == "Restore");
+    if restore && s.load(r.clone()) {
         s.file = None;
         s.dirty = true;
+        // Restored state now lives in memory (and is re-autosaved while dirty).
+        clear_recovery(Some(r));
+    } else if restore {
+        // Unreadable: do not offer it again, but do not destroy the user's work either.
+        quarantine_recovery(&r);
+    } else {
+        clear_recovery(Some(r));
     }
-    // Restored state now lives in memory (and is re-autosaved while dirty);
-    // a discarded or unreadable file must not be offered again.
-    let _ = std::fs::remove_file(r);
 }
 
 /// Empty decks go without asking; a deck with clips needs a yes.
@@ -662,9 +685,7 @@ impl State {
         match r {
             rfd::MessageDialogResult::Custom(l) if l == "Save" => self.save(),
             rfd::MessageDialogResult::Custom(l) if l == "Don't Save" => {
-                if let Some(r) = self.recovery_path() {
-                    let _ = std::fs::remove_file(r);
-                }
+                clear_recovery(self.recovery_path());
                 true
             }
             _ => false,
@@ -3535,6 +3556,30 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_cleanup_and_quarantine() {
+        let d = std::env::temp_dir().join(format!("vjc-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let r = d.join("recovery.vjc");
+        std::fs::write(&r, b"x").unwrap();
+        clear_recovery(Some(r.clone()));
+        assert!(!r.exists());
+        clear_recovery(Some(r.clone())); // already gone: no panic
+        clear_recovery(None);
+        std::fs::write(&r, b"bad").unwrap();
+        quarantine_recovery(&r);
+        assert!(!r.exists());
+        assert_eq!(std::fs::read(d.join("recovery.bad.vjc")).unwrap(), b"bad");
+        std::fs::write(&r, b"bad2").unwrap();
+        quarantine_recovery(&r);
+        assert_eq!(std::fs::read(d.join("recovery.bad.vjc")).unwrap(), b"bad");
+        assert_eq!(
+            std::fs::read(d.join("recovery.bad-2.vjc")).unwrap(),
+            b"bad2"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     fn cell(x: f32, layer: LayerId, col: u32, empty: bool) -> CellInfo {
         CellInfo {
