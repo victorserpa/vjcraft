@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use vjc_model::{FitMode, TcFps};
+use vjc_model::{FitMode, Fixture, TcFps};
 
 pub const PREFS_VERSION: u32 = 1;
 
@@ -104,6 +104,36 @@ impl Default for Osc {
     }
 }
 
+/// DMX / Art-Net input (off by default) and the user's fixture library.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Dmx {
+    pub enabled: bool,
+    /// Local IPv4 to listen on: 127.0.0.1 (this computer only), 0.0.0.0 (all interfaces),
+    /// or the address of one network interface.
+    pub interface: String,
+    pub port: u16,
+    /// First universe (port-address, 0..=32767) accepted.
+    pub universe: u16,
+    /// How many consecutive universes are accepted.
+    pub universes: u16,
+    /// Fixtures saved by the user (the predefined ones live in code).
+    pub fixtures: Vec<Fixture>,
+}
+
+impl Default for Dmx {
+    fn default() -> Self {
+        Dmx {
+            enabled: false,
+            interface: "127.0.0.1".into(),
+            port: 6454,
+            universe: 0,
+            universes: 1,
+            fixtures: vec![],
+        }
+    }
+}
+
 /// Remote HTTP/WebSocket API (no authentication: loopback unless the user exposes it).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -164,6 +194,7 @@ pub struct Prefs {
     pub control: Control,
     pub audio: Audio,
     pub osc: Osc,
+    pub dmx: Dmx,
     pub api: Api,
     pub timecode: Timecode,
 }
@@ -177,6 +208,7 @@ impl Default for Prefs {
             control: Control::default(),
             audio: Audio::default(),
             osc: Osc::default(),
+            dmx: Dmx::default(),
             api: Api::default(),
             timecode: Timecode::default(),
         }
@@ -197,6 +229,10 @@ impl Prefs {
         self.osc.in_port = self.osc.in_port.max(1);
         self.osc.out_port = self.osc.out_port.max(1);
         self.osc.out_host = self.osc.out_host.trim().to_owned();
+        self.dmx.port = self.dmx.port.max(1);
+        self.dmx.universe = self.dmx.universe.min(0x7FFF);
+        self.dmx.universes = self.dmx.universes.clamp(1, 64);
+        self.dmx.interface = self.dmx.interface.trim().to_owned();
     }
 
     pub fn from_json(text: &str) -> (Prefs, Option<String>) {
@@ -357,6 +393,21 @@ mod tests {
         p.api.port = 65535;
         p.sanitize();
         assert_eq!(p.api.port, 65534);
+    }
+
+    #[test]
+    fn dmx_is_off_by_default_and_roundtrips_fixtures() {
+        let mut p = Prefs::default();
+        assert!(!p.dmx.enabled);
+        assert_eq!((p.dmx.port, p.dmx.interface.as_str()), (6454, "127.0.0.1"));
+        p.dmx.fixtures.push(Fixture::default());
+        p.dmx.universe = 60000;
+        p.dmx.universes = 0;
+        p.sanitize();
+        assert_eq!((p.dmx.universe, p.dmx.universes), (0x7FFF, 1));
+        let (back, w) = Prefs::from_json(&serde_json::to_string(&p).unwrap());
+        assert!(w.is_none());
+        assert_eq!(back.dmx, p.dmx);
     }
 
     #[test]

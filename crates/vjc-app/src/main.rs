@@ -1,7 +1,9 @@
 mod api_io;
+mod artnet_out;
 mod browser;
 mod capture;
 mod compositor;
+mod dmx_io;
 mod fx;
 mod link_io;
 mod midi_io;
@@ -74,6 +76,7 @@ struct State {
     capture: Option<capture::Capture>,
     /// Syphon / NDI publishers of the screens set to those devices (runtime only).
     netout: netout::NetOut,
+    artnet: artnet_out::ArtNetOut,
     /// Start/stop requested by a command, served in `compose` (it owns the GPU handles).
     rec_request: Option<bool>,
     /// Display id of the monitor the output window is on, while open.
@@ -111,6 +114,9 @@ struct State {
     osc_cfg: Option<osc_io::Cfg>,
     osc_prev: HashMap<String, f64>,
     osc_limit: vjc_core::osc::RateLimit,
+    /// Art-Net input thread and the config last sent to it.
+    dmx: dmx_io::Dmx,
+    dmx_cfg: Option<dmx_io::Cfg>,
     api: api_io::Api,
     api_cfg: Option<api_io::Cfg>,
     /// Mappable widgets drawn this frame, for learn clicks and the key overlay.
@@ -182,6 +188,7 @@ enum PrefsTab {
     Video,
     Control,
     Osc,
+    Dmx,
     Api,
     Timecode,
 }
@@ -753,6 +760,7 @@ impl State {
             comp_tex: None,
             capture: None,
             netout: Default::default(),
+            artnet: Default::default(),
             rec_request: None,
             output: None,
             monitors: if live { monitors::list() } else { vec![] },
@@ -785,6 +793,12 @@ impl State {
             osc_cfg: None,
             osc_prev: HashMap::new(),
             osc_limit: Default::default(),
+            dmx: if live {
+                dmx_io::Dmx::spawn()
+            } else {
+                dmx_io::Dmx::idle()
+            },
+            dmx_cfg: None,
             api: if live {
                 api_io::Api::spawn()
             } else {
@@ -1975,13 +1989,38 @@ impl State {
             .collect()
     }
 
+    /// Screens set to Art-Net: what each sends.
+    fn artnet_wants(&self) -> Vec<artnet_out::Want> {
+        self.project
+            .output
+            .screens
+            .iter()
+            .filter_map(|s| match &s.device {
+                OutputDevice::ArtNet {
+                    ip,
+                    universe,
+                    fixture,
+                } => Some(artnet_out::Want {
+                    id: s.id,
+                    ip: ip.clone(),
+                    universe: *universe,
+                    fixture: fixture.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Renders the warped slices of each open screen into its own texture, and publishes
     /// the Syphon / NDI screens.
     fn render_screens(&mut self, rs: &eframe::egui_wgpu::RenderState) {
         let wants = self.net_wants();
         self.netout.sync(&wants);
+        let art = self.artnet_wants();
+        self.artnet.sync(&art);
         let mut open: Vec<Uuid> = self.open_screens().into_iter().map(|(id, _)| id).collect();
         open.extend(wants.iter().map(|w| w.id));
+        open.extend(art.iter().map(|w| w.id));
         let gone: Vec<Uuid> = self
             .screen_rt
             .keys()
@@ -2044,6 +2083,16 @@ impl State {
                 .feed(&rs.device, &rs.queue, w.id, tex, size, fps);
         }
         for e in self.netout.poll(&rs.device) {
+            self.status = e;
+        }
+        for w in &art {
+            let (tex, size) = match self.screen_rt.get(&w.id) {
+                Some(t) => (&t.tex, t.size),
+                None => (&comp.target, comp.size),
+            };
+            self.artnet.feed(&rs.device, &rs.queue, w.id, tex, size);
+        }
+        for e in self.artnet.poll(&rs.device) {
             self.status = e;
         }
     }
@@ -2265,6 +2314,43 @@ impl State {
         }
     }
 
+    /// Art-Net input, once per frame and never blocking: changed channels learn (first one
+    /// only) or fire their shortcuts.
+    fn dmx_pump(&mut self) {
+        use vjc_core::dmx as d;
+        let cfg = dmx_io::Cfg::from_prefs(&self.prefs.dmx);
+        if self.dmx_cfg.as_ref() != Some(&cfg) {
+            self.dmx.configure(cfg.clone());
+            self.dmx_cfg = Some(cfg);
+        }
+        let mut learned = false;
+        while let Ok(ev) = self.dmx.rx.try_recv() {
+            if self.learn {
+                if self.learn_midi
+                    && !learned
+                    && let Some(target) = self.learn_target.clone()
+                {
+                    learned = true;
+                    self.status = format!("DMX {}.{} -> {target}", ev.universe, ev.channel);
+                    for c in d::learn(&self.project, &target, d::source_of(&ev)) {
+                        self.exec(c);
+                    }
+                }
+                continue;
+            }
+            let rt = self.rt_ctx();
+            let cmds: Vec<Command> = self
+                .project
+                .shortcuts
+                .iter()
+                .filter_map(|s| d::command_for(&self.project, &rt, s, &ev))
+                .collect();
+            for c in cmds {
+                self.exec(c);
+            }
+        }
+    }
+
     /// Remote API, once per frame: applies the config, then answers the queued requests
     /// (the server threads wait for the reply, the render loop never waits for them).
     fn api_pump(&mut self, ctx: &egui::Context) {
@@ -2296,6 +2382,7 @@ impl State {
         self.status = format!("Unmapped {target}");
         let mut cmds = vjc_core::midi::unlearn(&self.project, &target);
         cmds.extend(vjc_core::osc::unlearn(&self.project, &target));
+        cmds.extend(vjc_core::dmx::unlearn(&self.project, &target));
         for c in cmds {
             self.exec(c);
         }
@@ -2341,7 +2428,7 @@ impl State {
         {
             self.learn_target = Some(a.clone());
             self.status = if self.learn_midi {
-                format!("{a}: move a MIDI or OSC control (Delete unmaps, Esc leaves)")
+                format!("{a}: move a MIDI, OSC or DMX control (Delete unmaps, Esc leaves)")
             } else {
                 format!("{a}: press a key (Delete unmaps, Esc leaves)")
             };
@@ -2360,6 +2447,7 @@ impl State {
             let label = if self.learn_midi {
                 vjc_core::midi::label_for(&self.project, addr)
                     .or_else(|| vjc_core::osc::label_for(&self.project, addr))
+                    .or_else(|| vjc_core::dmx::label_for(&self.project, addr))
             } else {
                 vjc_core::shortcuts::key_for(&self.project, addr).map(str::to_owned)
             };
@@ -2558,7 +2646,7 @@ impl State {
                         self.status = match (self.learn, midi) {
                             (false, _) => "Shortcut editing off".into(),
                             (true, false) => "Click a cell, column, opacity, Tap or Bypass, then press a key (Esc leaves)".into(),
-                            (true, true) => "Click a cell, column, opacity, Tap or Bypass, then move a MIDI or OSC control (Delete unmaps, Esc leaves)".into(),
+                            (true, true) => "Click a cell, column, opacity, Tap or Bypass, then move a MIDI, OSC or DMX control (Delete unmaps, Esc leaves)".into(),
                         };
                     }
                 }
@@ -2642,6 +2730,7 @@ impl State {
         self.shortcut_keys(&ctx);
         self.midi_pump();
         self.osc_pump();
+        self.dmx_pump();
         self.api_pump(&ctx);
 
         // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).

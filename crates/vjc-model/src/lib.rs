@@ -457,11 +457,72 @@ pub struct Screen {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OutputDevice {
-    Monitor { name: String },
+    Monitor {
+        name: String,
+    },
     Window,
     Syphon,
     Ndi,
-    ArtNet { ip: String },
+    /// Art-Net: ArtDmx sent to `ip` ("host" or "host:port", default port 6454), the pixels
+    /// of the screen sampled on the fixture grid, from `universe` upward.
+    ArtNet {
+        ip: String,
+        #[serde(default)]
+        universe: u16,
+        #[serde(default)]
+        fixture: Fixture,
+    },
+}
+
+/// Channels of one fixture pixel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PixelFormat {
+    #[default]
+    Rgb,
+    Rgbw,
+    /// Single white channel (luminance).
+    W,
+}
+
+/// Order of the colour channels in a pixel (RGBW keeps W last).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelOrder {
+    #[default]
+    Rgb,
+    Rbg,
+    Grb,
+    Gbr,
+    Brg,
+    Bgr,
+}
+
+/// A DMX pixel fixture: a `width` x `height` grid, row-major from the top-left.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fixture {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub order: ChannelOrder,
+    /// Output = input^gamma on 0..1 (1.0 = off, 2.2 typical for LEDs).
+    pub gamma: f32,
+    /// Odd rows run right to left (zig-zag wired matrices).
+    pub serpentine: bool,
+}
+
+impl Default for Fixture {
+    fn default() -> Self {
+        Fixture {
+            name: "Strip 1x16 RGB".into(),
+            width: 16,
+            height: 1,
+            format: PixelFormat::Rgb,
+            order: ChannelOrder::Rgb,
+            gamma: 1.0,
+            serpentine: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

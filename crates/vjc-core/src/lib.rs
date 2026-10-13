@@ -6,6 +6,7 @@ pub mod anim;
 pub mod blend;
 pub mod clock;
 pub mod crossfader;
+pub mod dmx;
 pub mod effects;
 pub mod groups;
 pub mod ltc;
@@ -508,6 +509,7 @@ enum Target {
     SliceSoftEdge(Uuid),
     SliceInput(Uuid, Uuid),
     ScreenSize(Uuid),
+    ScreenDevice(Uuid),
 }
 
 impl Command {
@@ -524,6 +526,8 @@ impl Command {
                 ..
             } => Some(Target::TimecodeStart(*deck, *layer, *column)),
             Command::SetScreenSize { screen, .. } => Some(Target::ScreenSize(*screen)),
+            // Typing / dragging in the Art-Net setup emits one command per change.
+            Command::SetScreenDevice { screen, .. } => Some(Target::ScreenDevice(*screen)),
             Command::SetSliceMesh { slice, .. } => Some(Target::SliceMesh(*slice)),
             Command::SetSliceMask { slice, .. } => Some(Target::SliceMask(*slice)),
             Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),

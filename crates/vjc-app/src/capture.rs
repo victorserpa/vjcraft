@@ -81,14 +81,85 @@ pub(crate) fn padded_row(w: u32) -> u32 {
     (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
 }
 
+/// Queues a copy of `tex` (Rgba8Unorm, `size`) into a fresh MAP_READ buffer and starts its
+/// asynchronous map. The returned state settles when the map completes (see `settle`).
+pub(crate) fn start_readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    (w, h): (u32, u32),
+    label: &str,
+) -> (wgpu::Buffer, MapState) {
+    let buf = readback_buffer(device, (w, h), label);
+    let state = start_readback_into(device, queue, tex, (w, h), &buf);
+    (buf, state)
+}
+
+/// A MAP_READ buffer sized for a `size` readback (padded rows).
+pub(crate) fn readback_buffer(
+    device: &wgpu::Device,
+    (w, h): (u32, u32),
+    label: &str,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: u64::from(padded_row(w)) * u64::from(h),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    })
+}
+
+/// Like `start_readback` but into an existing (unmapped) buffer from `readback_buffer`,
+/// so callers can reuse buffers instead of allocating per frame.
+pub(crate) fn start_readback_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    (w, h): (u32, u32),
+    buf: &wgpu::Buffer,
+) -> MapState {
+    let stride = padded_row(w);
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        tex.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(enc.finish()));
+    let state: MapState = Arc::new(AtomicU8::new(PENDING));
+    let flag = state.clone();
+    buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        settle(&flag, r.is_ok());
+    });
+    state
+}
+
 /// Strips row padding from a mapped readback.
 pub(crate) fn unpad(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    unpad_into(src, w, h, &mut out);
+    out
+}
+
+/// `unpad` into a reusable buffer (cleared first).
+pub(crate) fn unpad_into(src: &[u8], w: u32, h: u32, out: &mut Vec<u8>) {
     let (row, stride) = (w as usize * 4, padded_row(w) as usize);
-    let mut out = Vec::with_capacity(row * h as usize);
+    out.clear();
+    out.reserve(row * h as usize);
     for y in 0..h as usize {
         out.extend_from_slice(&src[y * stride..y * stride + row]);
     }
-    out
 }
 
 impl Capture {

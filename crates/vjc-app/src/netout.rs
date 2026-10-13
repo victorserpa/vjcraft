@@ -6,10 +6,10 @@
 //! pending; extra frames are dropped. Syphon with no connected client skips the readback.
 //! (A zero-copy path through the wgpu-hal MTLTexture is not implemented.)
 
-use crate::capture::{Inflight, MAX_INFLIGHT, MapState, PENDING, padded_row, settle, unpad};
+use crate::capture::{Inflight, MAX_INFLIGHT, start_readback, unpad};
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -182,37 +182,7 @@ impl NetOut {
             return;
         }
         p.size = size;
-        let (w, h) = size;
-        let stride = padded_row(w);
-        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("net out readback"),
-            size: u64::from(stride) * u64::from(h),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = device.create_command_encoder(&Default::default());
-        enc.copy_texture_to_buffer(
-            tex.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(stride),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(Some(enc.finish()));
-        let state: MapState = Arc::new(AtomicU8::new(PENDING));
-        let flag = state.clone();
-        buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            settle(&flag, r.is_ok());
-        });
+        let (buf, state) = start_readback(device, queue, tex, size, "net out readback");
         p.inflight.push(buf, state);
     }
 }

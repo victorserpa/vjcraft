@@ -539,6 +539,29 @@ fn output_setup_add_screen_and_slice() {
 }
 
 #[test]
+fn output_setup_artnet_device_shows_fixture_editor() {
+    let mut h = app();
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    click(&mut h, "Add");
+    let id = h.state().project.output.screens[0].id;
+    h.state_mut().exec(Command::SetScreenDevice {
+        screen: id,
+        device: vjc_model::OutputDevice::ArtNet {
+            ip: "127.0.0.1".into(),
+            universe: 2,
+            fixture: vjc_core::dmx::presets()[2].clone(),
+        },
+    });
+    settle(&mut h);
+    assert!(exists(&h, "Save to library"));
+    assert!(exists(&h, "Serpentine (odd rows reversed)"));
+    click(&mut h, "Save to library");
+    assert_eq!(h.state().prefs.dmx.fixtures.len(), 1);
+    assert_eq!(h.state().prefs.dmx.fixtures[0].name, "Matrix 8x8 RGB");
+}
+
+#[test]
 fn output_setup_soft_edge_and_mask() {
     use egui_kittest::kittest::NodeT;
     let mut h = app();

@@ -25,6 +25,7 @@ impl State {
                         (PrefsTab::Video, "Video"),
                         (PrefsTab::Control, "Control"),
                         (PrefsTab::Osc, "OSC"),
+                        (PrefsTab::Dmx, "DMX"),
                         (PrefsTab::Api, "Remote API"),
                         (PrefsTab::Timecode, "Timecode"),
                     ] {
@@ -134,6 +135,58 @@ impl State {
                             });
                         });
                         ui.weak("Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
+                    }
+                    PrefsTab::Dmx => {
+                        let d = &mut p.dmx;
+                        ui.checkbox(&mut d.enabled, "Receive Art-Net (DMX in)");
+                        ui.add_enabled_ui(d.enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Interface IP");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.interface).desired_width(110.0),
+                                );
+                                ui.label("Port");
+                                ui.add(egui::DragValue::new(&mut d.port).range(1..=65535));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("First universe");
+                                ui.add(egui::DragValue::new(&mut d.universe).range(0..=32767));
+                                ui.label("Count");
+                                ui.add(egui::DragValue::new(&mut d.universes).range(1..=64));
+                            });
+                        });
+                        if d.enabled {
+                            match self.dmx.status() {
+                                crate::dmx_io::Status::Listening(addr) => {
+                                    ui.weak(format!("Listening on {addr}"));
+                                }
+                                crate::dmx_io::Status::Failed(e) => {
+                                    ui.colored_label(ui.visuals().error_fg_color, e);
+                                }
+                                crate::dmx_io::Status::Off => {
+                                    ui.weak("Starting...");
+                                }
+                            }
+                        }
+                        ui.weak("127.0.0.1 = this computer only; 0.0.0.0 = every interface (anyone on the network can then send). Channels map to shortcuts in Shortcuts > Edit MIDI (move a fader to learn), value 0..255 = range.");
+                        ui.separator();
+                        ui.label(format!("Saved fixtures: {}", d.fixtures.len()));
+                        let mut gone = None;
+                        for (i, f) in d.fixtures.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{} ({}x{}, {:?})",
+                                    f.name, f.width, f.height, f.format
+                                ));
+                                if ui.small_button("Remove").clicked() {
+                                    gone = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(i) = gone {
+                            d.fixtures.remove(i);
+                        }
+                        ui.weak("Add fixtures from Output > Setup (device Art-Net).");
                     }
                     PrefsTab::Timecode => {
                         use vjc_io::prefs::{OnLoss, TcSource};

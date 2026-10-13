@@ -1,9 +1,10 @@
 //! "Output setup" window (Output > Setup...): screens, slice input quads and warp meshes.
 
 use crate::State;
+use crate::artnet_out;
 use eframe::egui;
-use vjc_core::{Command, mapping};
-use vjc_model::{OutputDevice, Screen};
+use vjc_core::{Command, dmx, mapping};
+use vjc_model::{ChannelOrder, Fixture, OutputDevice, PixelFormat, Screen};
 
 const HANDLE_R: f32 = 6.0;
 const SNAP_PX: f32 = 10.0;
@@ -192,6 +193,7 @@ impl State {
                 .map_or("Monitor (missing)".to_string(), |m| m.label()),
             OutputDevice::Syphon => "Syphon".into(),
             OutputDevice::Ndi => "NDI".into(),
+            OutputDevice::ArtNet { .. } => "Art-Net".into(),
             _ => "Window (none)".into(),
         };
         egui::ComboBox::from_label("Device")
@@ -201,7 +203,10 @@ impl State {
                     .selectable_label(
                         !matches!(
                             c.device,
-                            OutputDevice::Monitor { .. } | OutputDevice::Syphon | OutputDevice::Ndi
+                            OutputDevice::Monitor { .. }
+                                | OutputDevice::Syphon
+                                | OutputDevice::Ndi
+                                | OutputDevice::ArtNet { .. }
                         ),
                         "None",
                     )
@@ -219,6 +224,17 @@ impl State {
                             device: dev,
                         });
                     }
+                }
+                let is_art = matches!(c.device, OutputDevice::ArtNet { .. });
+                if ui.selectable_label(is_art, "Art-Net").clicked() && !is_art {
+                    cmds.push(Command::SetScreenDevice {
+                        screen: c.id,
+                        device: OutputDevice::ArtNet {
+                            ip: "127.0.0.1".into(),
+                            universe: 0,
+                            fixture: Default::default(),
+                        },
+                    });
                 }
                 for m in &self.monitors {
                     if ui.selectable_label(false, m.label()).clicked() {
@@ -241,6 +257,172 @@ impl State {
                 height: h,
             });
         }
+        self.artnet_setup(ui, c, cmds);
+    }
+
+    /// Art-Net device: target IP, first universe and the fixture (pick, edit, save to the
+    /// library in the preferences).
+    fn artnet_setup(&mut self, ui: &mut egui::Ui, scr: &Screen, cmds: &mut Vec<Command>) {
+        let OutputDevice::ArtNet {
+            ip,
+            universe,
+            fixture,
+        } = &scr.device
+        else {
+            return;
+        };
+        ui.separator();
+        ui.strong("Art-Net");
+        let set = |ip: String, universe: u16, fixture: Fixture| Command::SetScreenDevice {
+            screen: scr.id,
+            device: OutputDevice::ArtNet {
+                ip,
+                universe,
+                fixture,
+            },
+        };
+        // The text is applied when the field loses focus, not on every key.
+        let ip_id = egui::Id::new(("artnet_ip", scr.id));
+        let mut text = ui
+            .data_mut(|d| d.get_temp::<String>(ip_id))
+            .unwrap_or_else(|| ip.clone());
+        ui.horizontal(|ui| {
+            ui.label("IP");
+            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(110.0));
+            if r.lost_focus() && text.trim() != ip {
+                cmds.push(set(text.trim().to_owned(), *universe, fixture.clone()));
+            }
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(ip_id, text.clone()));
+            } else {
+                ui.data_mut(|d| d.remove_temp::<String>(ip_id));
+            }
+        });
+        ui.weak("host or host:port (default port 6454)");
+        let mut u = i32::from(*universe);
+        if ui
+            .add(
+                egui::DragValue::new(&mut u)
+                    .range(0..=32767)
+                    .prefix("Universe "),
+            )
+            .changed()
+        {
+            cmds.push(set(ip.clone(), u as u16, fixture.clone()));
+        }
+        let mut f = fixture.clone();
+        let library: Vec<Fixture> = dmx::presets()
+            .into_iter()
+            .chain(self.prefs.dmx.fixtures.iter().cloned())
+            .collect();
+        egui::ComboBox::from_label("Fixture")
+            .selected_text(&f.name)
+            .show_ui(ui, |ui| {
+                for l in &library {
+                    if ui.selectable_label(l == fixture, &l.name).clicked() {
+                        f = l.clone();
+                    }
+                }
+            });
+        self.fixture_editor(ui, &mut f, egui::Id::new(("artnet_fx_name", scr.id)));
+        if f != *fixture {
+            cmds.push(set(ip.clone(), *universe, f));
+        }
+        let cpp = dmx::channels_per_pixel(fixture.format);
+        let channels = u64::from(fixture.width) * u64::from(fixture.height) * cpp as u64;
+        let per = dmx::universe_chunk(fixture.format) as u64;
+        ui.weak(format!(
+            "{} channels, {} universe(s), up to {} Hz",
+            channels,
+            channels.div_ceil(per.max(1)),
+            artnet_out::MAX_HZ
+        ));
+        ui.horizontal(|ui| {
+            let saved = self
+                .prefs
+                .dmx
+                .fixtures
+                .iter()
+                .position(|l| l.name == fixture.name);
+            if ui.button("Save to library").clicked() {
+                match saved {
+                    Some(i) => self.prefs.dmx.fixtures[i] = fixture.clone(),
+                    None => self.prefs.dmx.fixtures.push(fixture.clone()),
+                }
+                self.save_prefs();
+            }
+            if ui
+                .add_enabled(saved.is_some(), egui::Button::new("Remove from library"))
+                .clicked()
+                && let Some(i) = saved
+            {
+                self.prefs.dmx.fixtures.remove(i);
+                self.save_prefs();
+            }
+        });
+    }
+
+    /// Basic fixture fields: name, pixel grid, channels per pixel, order, gamma, wiring.
+    /// The name is applied on Enter / losing focus, not on every key; `name_id` keeps the
+    /// text being typed.
+    fn fixture_editor(&mut self, ui: &mut egui::Ui, f: &mut Fixture, name_id: egui::Id) {
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            let mut text = ui
+                .data_mut(|d| d.get_temp::<String>(name_id))
+                .unwrap_or_else(|| f.name.clone());
+            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(140.0));
+            if r.lost_focus() && !text.trim().is_empty() {
+                f.name = text.trim().to_owned();
+            }
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(name_id, text));
+            } else {
+                ui.data_mut(|d| d.remove_temp::<String>(name_id));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut f.width)
+                    .range(1..=1024)
+                    .prefix("W "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut f.height)
+                    .range(1..=1024)
+                    .prefix("H "),
+            );
+            while !dmx::valid(f) {
+                // Keep the grid within what the mapper accepts.
+                f.height = (f.height / 2).max(1);
+                f.width = (f.width / 2).max(1);
+            }
+        });
+        egui::ComboBox::from_label("Channels")
+            .selected_text(format!("{:?}", f.format).to_uppercase())
+            .show_ui(ui, |ui| {
+                for v in [PixelFormat::Rgb, PixelFormat::Rgbw, PixelFormat::W] {
+                    ui.selectable_value(&mut f.format, v, format!("{v:?}").to_uppercase());
+                }
+            });
+        ui.add_enabled_ui(f.format != PixelFormat::W, |ui| {
+            egui::ComboBox::from_label("Order")
+                .selected_text(format!("{:?}", f.order).to_uppercase())
+                .show_ui(ui, |ui| {
+                    for v in [
+                        ChannelOrder::Rgb,
+                        ChannelOrder::Rbg,
+                        ChannelOrder::Grb,
+                        ChannelOrder::Gbr,
+                        ChannelOrder::Brg,
+                        ChannelOrder::Bgr,
+                    ] {
+                        ui.selectable_value(&mut f.order, v, format!("{v:?}").to_uppercase());
+                    }
+                });
+        });
+        ui.add(egui::Slider::new(&mut f.gamma, 0.5..=3.0).text("Gamma"));
+        ui.checkbox(&mut f.serpentine, "Serpentine (odd rows reversed)");
     }
 
     fn slice_editor(&mut self, ui: &mut egui::Ui, scr: &Screen, cmds: &mut Vec<Command>) {
