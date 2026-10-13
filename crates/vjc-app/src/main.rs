@@ -869,6 +869,8 @@ impl State {
             // Play modes: the playhead picks the position, the player serves the frame.
             if let (Some(d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
                 let t = head.tick(dt, tr.play_mode, tr.direction, rate, d);
+                // Forward playback streams; everything else needs random access.
+                player.set_sequential(is_sequential(tr.play_mode, tr.direction, rate));
                 player.set_position(t.position);
                 if t.finished {
                     finished.push(*layer);
@@ -2284,5 +2286,34 @@ mod tests {
             Some((bot, 0, DropWhere::FirstCell))
         );
         assert_eq!(resolve_drop(&[], None, None), None);
+    }
+}
+
+/// True when the playhead only moves forward (Loop/Once/OnceHold, forward, speed > 0), so
+/// the player can stream instead of caching the clip.
+fn is_sequential(mode: vjc_model::PlayMode, dir: Direction, rate: f64) -> bool {
+    use vjc_model::PlayMode;
+    // A paused playhead (Pause or rate 0) holds its frame; the stream can
+    // serve that without caching the whole clip.
+    matches!(mode, PlayMode::Loop | PlayMode::Once | PlayMode::OnceHold)
+        && (matches!(dir, Direction::Pause) || (matches!(dir, Direction::Forward) && rate >= 0.0))
+}
+
+#[cfg(test)]
+mod sequential_tests {
+    use super::*;
+    use vjc_model::PlayMode;
+
+    #[test]
+    fn only_forward_modes_stream() {
+        assert!(is_sequential(PlayMode::Loop, Direction::Forward, 1.0));
+        assert!(is_sequential(PlayMode::OnceHold, Direction::Forward, 2.0));
+        assert!(!is_sequential(PlayMode::Bounce, Direction::Forward, 1.0));
+        assert!(!is_sequential(PlayMode::Loop, Direction::Backward, 1.0));
+        assert!(!is_sequential(PlayMode::Loop, Direction::Forward, -1.0));
+        assert!(!is_sequential(PlayMode::Unknown, Direction::Forward, 1.0));
+        // Pausing must not pull the whole clip into RAM.
+        assert!(is_sequential(PlayMode::Loop, Direction::Forward, 0.0));
+        assert!(is_sequential(PlayMode::Loop, Direction::Pause, 1.0));
     }
 }
