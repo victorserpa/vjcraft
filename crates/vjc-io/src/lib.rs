@@ -1,6 +1,8 @@
 //! Save/open of `.vjc` project files (JSON, `format_version`), with relative
 //! media paths, missing-media warnings, migration and atomic writes.
 
+pub mod prefs;
+
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use vjc_model::{Project, Source};

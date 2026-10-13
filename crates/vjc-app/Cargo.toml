@@ -19,6 +19,7 @@ vjc-media = { path = "../vjc-media" }
 bytemuck = { version = "1", features = ["derive"] }
 uuid.workspace = true
 pollster = "1"
+directories = "6"
 vjc-fx = { path = "../vjc-fx" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

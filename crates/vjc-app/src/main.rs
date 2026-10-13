@@ -3,6 +3,7 @@ mod compositor;
 mod fx;
 mod monitors;
 mod params;
+mod prefs_ui;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
@@ -14,6 +15,7 @@ use vjc_core::clock::{Clock, beat_sync_rate};
 use vjc_core::effects::EffectTarget;
 use vjc_core::playhead::Playhead;
 use vjc_core::{Command, Event, History};
+use vjc_io::prefs::Prefs;
 use vjc_media::{Frame, Player};
 use vjc_model::{
     BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId, PlayMode, Project, Track,
@@ -70,6 +72,10 @@ struct State {
     file: Option<PathBuf>,
     dirty: bool,
     last_autosave: std::time::Instant,
+    prefs: Prefs,
+    prefs_open: bool,
+    prefs_tab: PrefsTab,
+    prefs_dirty: bool,
     title: String,
     /// Master clock (runtime only; BPM lives in the project, phase here).
     clock: Clock,
@@ -79,6 +85,14 @@ struct State {
     nudge_dir: i8,
     /// Visual only for now. TODO(#9): click sound (see build-log).
     metronome: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PrefsTab {
+    General,
+    Audio,
+    Video,
+    Control,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -297,8 +311,11 @@ fn resolve_drop(
     row.next().map(|c| (c.layer, c.col, DropWhere::FirstCell))
 }
 
-/// Browser start folder: the project's folder, else ~/Movies, else home.
-fn browser_start(project: Option<&std::path::Path>) -> PathBuf {
+/// Browser start folder: the pref, else the project's folder, else ~/Movies, else home.
+fn browser_start(project: Option<&std::path::Path>, g: &vjc_io::prefs::General) -> PathBuf {
+    if let Some(d) = g.browser_folder.as_ref().filter(|d| d.is_dir()) {
+        return d.clone();
+    }
     if let Some(d) = project.and_then(|p| p.parent()).filter(|d| d.is_dir()) {
         return d.to_path_buf();
     }
@@ -320,10 +337,18 @@ fn browser_fx() -> Vec<(String, browser::Item)> {
     fx.chain(gens).collect()
 }
 
-/// ~/Library/Application Support/VJCraft/recovery.vjc
+fn project_dirs() -> Option<directories::ProjectDirs> {
+    directories::ProjectDirs::from("", "", "VJCraft")
+}
+
+/// Per-user data dir (macOS: ~/Library/Application Support/VJCraft) + recovery.vjc
 fn recovery_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/VJCraft/recovery.vjc"))
+    Some(project_dirs()?.data_dir().join("recovery.vjc"))
+}
+
+/// Per-user config dir (macOS: ~/Library/Application Support/VJCraft) + prefs.json
+fn prefs_path() -> Option<PathBuf> {
+    Some(project_dirs()?.config_dir().join("prefs.json"))
 }
 
 /// Offers to restore a recovery file newer than the last saved project.
@@ -380,21 +405,32 @@ fn new_layer(n: usize) -> Layer {
     }
 }
 
-impl State {
-    fn new() -> Self {
-        let mut project = Project::new("Untitled");
-        let c = &mut project.composition;
-        // Layers are listed top to bottom; the bottom one is "Layer 1".
-        for i in (1..=2).rev() {
-            c.layers.push(new_layer(i));
-        }
-        for i in 1..=4 {
-            c.columns.push(Column {
-                id: Uuid::new_v4(),
-                name: format!("{i}"),
-            });
-        }
+/// New project: default grid plus the user's composition and shortcut prefs.
+fn fresh_project(prefs: &Prefs) -> Project {
+    let mut project = Project::new("Untitled");
+    let c = &mut project.composition;
+    c.width = prefs.video.width;
+    c.height = prefs.video.height;
+    c.fps = prefs.video.fps;
+    // Layers are listed top to bottom; the bottom one is "Layer 1".
+    for i in (1..=2).rev() {
+        c.layers.push(new_layer(i));
+    }
+    for i in 1..=4 {
+        c.columns.push(Column {
+            id: Uuid::new_v4(),
+            name: format!("{i}"),
+        });
+    }
+    if prefs.control.default_shortcuts {
         project.shortcuts = vjc_core::shortcuts::default_shortcuts();
+    }
+    project
+}
+
+impl State {
+    fn new(prefs: Prefs) -> Self {
+        let project = fresh_project(&prefs);
         State {
             project,
             history: History::new(),
@@ -415,7 +451,7 @@ impl State {
             cells: vec![],
             layer_rects: vec![],
             master_rect: None,
-            browser: browser::Browser::new(browser_start(None)),
+            browser: browser::Browser::new(browser_start(None, &prefs.general)),
             last_pointer: None,
             selected: None,
             col_sel: None,
@@ -426,6 +462,10 @@ impl State {
             file: None,
             dirty: false,
             last_autosave: std::time::Instant::now(),
+            prefs_open: false,
+            prefs_tab: PrefsTab::General,
+            prefs_dirty: false,
+            prefs,
             title: String::new(),
             clock: Clock::new(120.0, std::time::Instant::now()),
             beat: 0,
@@ -473,13 +513,37 @@ impl State {
         if !self.confirm_discard() {
             return;
         }
-        let fresh = State::new();
-        self.project = fresh.project;
+        self.project = fresh_project(&self.prefs);
         self.file = None;
         self.dirty = false;
         self.warnings.clear();
         self.reset_players();
         self.status = "New project".into();
+    }
+
+    fn save_prefs(&mut self) {
+        let Some(p) = prefs_path() else { return };
+        self.prefs.sanitize();
+        if let Err(e) = self.prefs.save(&p) {
+            self.status = format!("Saving preferences failed: {e}");
+        }
+        self.prefs_dirty = false;
+    }
+
+    /// Old project without shortcuts: offers the default preset (not undoable, marks dirty).
+    fn offer_shortcuts(&mut self) {
+        if !self.prefs.control.offer_shortcuts || !self.project.shortcuts.is_empty() {
+            return;
+        }
+        let ask = rfd::MessageDialog::new()
+            .set_title("Keyboard shortcuts")
+            .set_description("This project has no shortcuts. Apply the default preset?")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if ask == rfd::MessageDialogResult::Yes {
+            self.project.shortcuts = vjc_core::shortcuts::default_shortcuts();
+            self.dirty = true;
+        }
     }
 
     fn open_project(&mut self) {
@@ -501,9 +565,12 @@ impl State {
                 self.project = project;
                 self.warnings = warnings;
                 self.status = format!("Opened {}", path.display());
+                self.prefs.general.last_project = Some(path.clone());
+                self.save_prefs();
                 self.file = Some(path);
                 self.dirty = false;
                 self.reset_players();
+                self.offer_shortcuts();
                 true
             }
             Err(e) => {
@@ -553,9 +620,10 @@ impl State {
         }
     }
 
-    /// Every 60 s while dirty, writes the recovery file.
+    /// Every `autosave_secs` while dirty (if enabled), writes the recovery file.
     fn autosave(&mut self) {
-        if !self.dirty || self.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
+        let every = std::time::Duration::from_secs(self.prefs.general.autosave_secs.into());
+        if !self.prefs.general.autosave || !self.dirty || self.last_autosave.elapsed() < every {
             return;
         }
         self.last_autosave = std::time::Instant::now();
@@ -889,6 +957,14 @@ impl State {
             column,
             path,
         });
+        if self.prefs.video.fit != FitMode::default() {
+            self.exec(Command::SetFit {
+                deck,
+                layer,
+                column,
+                fit: self.prefs.video.fit,
+            });
+        }
         self.exec(Command::TriggerClip {
             deck,
             layer,
@@ -1249,6 +1325,14 @@ impl State {
                     ui.close();
                     self.import();
                 }
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("Preferences...").shortcut_text("Cmd+,"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.prefs_open = true;
+                }
             });
             ui.menu_button("Edit", |ui| {
                 if ui
@@ -1362,6 +1446,10 @@ impl State {
         } else if ctx.input_mut(|i| i.consume_shortcut(&key(egui::Key::N))) {
             self.new_project();
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.prefs_open = true;
+        }
+        self.prefs_window(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -2120,12 +2208,31 @@ impl eframe::App for State {
 }
 
 fn main() -> eframe::Result {
+    let (prefs, warn) = match prefs_path() {
+        Some(p) => Prefs::load(&p),
+        None => (Prefs::default(), None),
+    };
+    let mut options = eframe::NativeOptions::default();
+    if !prefs.video.vsync {
+        options.wgpu_options.surface.present_mode = wgpu::PresentMode::AutoNoVsync;
+    }
     eframe::run_native(
         "VJCraft",
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| {
-            let mut s = State::new();
+        options,
+        Box::new(move |_cc| {
+            let mut s = State::new(prefs);
+            if let Some(w) = warn {
+                s.status = w.clone();
+                s.warnings.push(w);
+            }
             offer_recovery(&mut s);
+            if s.file.is_none()
+                && !s.dirty
+                && s.prefs.general.open_last_project
+                && let Some(p) = s.prefs.general.last_project.clone().filter(|p| p.is_file())
+            {
+                s.load(p);
+            }
             // Debug aid: VJC_AUTOPLAY=/path/video.mov loads it in the bottom layer, column 1.
             if let Some(p) = std::env::var_os("VJC_AUTOPLAY") {
                 let l = s.project.composition.layers.last().map(|l| l.id);
