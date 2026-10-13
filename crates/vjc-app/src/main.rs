@@ -119,6 +119,9 @@ struct State {
     sel_pt_in: Option<usize>,
     sel_pt_out: Option<usize>,
     snap: bool,
+    /// Output canvas edits the slice mask polygon instead of the warp mesh.
+    edit_mask: bool,
+    sel_mask_pt: Option<usize>,
     /// Screens whose output window the user closed (runtime only).
     closed_screens: std::collections::HashSet<Uuid>,
     slice_r: Option<slice_render::SliceRenderer>,
@@ -629,6 +632,8 @@ impl State {
             sel_pt_in: None,
             sel_pt_out: None,
             snap: false,
+            edit_mask: false,
+            sel_mask_pt: None,
             closed_screens: Default::default(),
             slice_r: None,
             screen_rt: HashMap::new(),

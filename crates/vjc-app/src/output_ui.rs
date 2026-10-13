@@ -305,6 +305,7 @@ impl State {
                     });
                 }
             });
+            self.mask_and_edge_row(ui, scr, sl, cmds);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.label("Input (composition)");
@@ -315,6 +316,90 @@ impl State {
                     self.output_canvas(ui, scr, sl, cmds);
                 });
             });
+        });
+    }
+
+    /// Mask polygon buttons and soft-edge sliders of the selected slice.
+    fn mask_and_edge_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        scr: &Screen,
+        sl: &vjc_model::Slice,
+        cmds: &mut Vec<Command>,
+    ) {
+        let set_mask = |m: Option<Vec<(f32, f32)>>| Command::SetSliceMask {
+            screen: scr.id,
+            slice: sl.id,
+            mask: m,
+        };
+        ui.horizontal(|ui| {
+            ui.strong("Mask");
+            if sl.mask.is_none() {
+                self.edit_mask = false;
+                if ui.button("Create mask").clicked() {
+                    self.edit_mask = true;
+                    self.sel_mask_pt = None;
+                    cmds.push(set_mask(Some(vec![
+                        (0.1, 0.1),
+                        (0.9, 0.1),
+                        (0.9, 0.9),
+                        (0.1, 0.9),
+                    ])));
+                }
+            } else if let Some(m) = &sl.mask {
+                ui.checkbox(&mut self.edit_mask, "Edit points");
+                let can_rm = m.len() > 3 && self.sel_mask_pt.is_some_and(|i| i < m.len());
+                if ui
+                    .add_enabled(can_rm, egui::Button::new("Remove point"))
+                    .clicked()
+                    && let Some(i) = self.sel_mask_pt.take()
+                {
+                    let mut m = m.clone();
+                    m.remove(i);
+                    cmds.push(set_mask(Some(m)));
+                }
+                if ui.button("Clear mask").clicked() {
+                    self.edit_mask = false;
+                    self.sel_mask_pt = None;
+                    cmds.push(set_mask(None));
+                }
+                if self.edit_mask {
+                    ui.weak("click empty space to add a point");
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Soft edge");
+            let mut on = sl.soft_edge.is_some();
+            if ui.checkbox(&mut on, "Enabled").changed() {
+                cmds.push(Command::SetSliceSoftEdge {
+                    screen: scr.id,
+                    slice: sl.id,
+                    soft_edge: on.then_some(vjc_model::SoftEdge {
+                        left: 0.1,
+                        right: 0.1,
+                        top: 0.0,
+                        bottom: 0.0,
+                        gamma: 1.0,
+                    }),
+                });
+            }
+            let Some(e) = &sl.soft_edge else { return };
+            let mut n = e.clone();
+            let w = 0.0..=mapping::MAX_SOFT_WIDTH;
+            ui.add(egui::Slider::new(&mut n.left, w.clone()).text("Edge left"));
+            ui.add(egui::Slider::new(&mut n.right, w.clone()).text("Edge right"));
+            ui.add(egui::Slider::new(&mut n.top, w.clone()).text("Edge top"));
+            ui.add(egui::Slider::new(&mut n.bottom, w).text("Edge bottom"));
+            let g = mapping::GAMMA_RANGE.0..=mapping::GAMMA_RANGE.1;
+            ui.add(egui::Slider::new(&mut n.gamma, g).text("Edge gamma"));
+            if n != *e {
+                cmds.push(Command::SetSliceSoftEdge {
+                    screen: scr.id,
+                    slice: sl.id,
+                    soft_edge: Some(n),
+                });
+            }
         });
     }
 
@@ -404,6 +489,12 @@ impl State {
                 }
             }
         }
+        if self.edit_mask
+            && let Some(m) = &sl.mask
+        {
+            self.mask_canvas(ui, scr, sl, m, rect, cmds);
+            return;
+        }
         let id = egui::Id::new(("slice-out", sl.id));
         let snap = if self.snap { SNAP_PX } else { 0.0 };
         let space = (scr.width as f32, scr.height as f32);
@@ -420,5 +511,59 @@ impl State {
                 cols: sl.mesh_cols,
             });
         }
+    }
+
+    /// Mask polygon over the output canvas (normalized screen coordinates).
+    fn mask_canvas(
+        &mut self,
+        ui: &mut egui::Ui,
+        scr: &Screen,
+        sl: &vjc_model::Slice,
+        m: &[(f32, f32)],
+        rect: egui::Rect,
+        cmds: &mut Vec<Command>,
+    ) {
+        let px = |q: (f32, f32)| {
+            egui::pos2(
+                rect.min.x + q.0 * rect.width(),
+                rect.min.y + q.1 * rect.height(),
+            )
+        };
+        let col = ui.visuals().selection.stroke.color;
+        let pts: Vec<egui::Pos2> = m.iter().map(|q| px(*q)).collect();
+        ui.painter_at(rect)
+            .add(egui::Shape::closed_line(pts, egui::Stroke::new(2.0, col)));
+        let id = egui::Id::new(("slice-mask", sl.id));
+        // The selection may come from another slice's mask: drop it if out of range.
+        let mut sel = self.sel_mask_pt.filter(|&i| i < m.len());
+        let moved = handles(ui, id, (rect, (1.0, 1.0)), m, &mut sel, 0.0, true);
+        let set = |mask: Vec<(f32, f32)>| Command::SetSliceMask {
+            screen: scr.id,
+            slice: sl.id,
+            mask: Some(mask),
+        };
+        if let Some((i, q)) = moved.filter(|&(i, _)| i < m.len()) {
+            let mut mask = m.to_vec();
+            mask[i] = q;
+            cmds.push(set(mask));
+        } else if let Some(at) = ui.input(|i| {
+            (i.pointer.primary_clicked() && ui.rect_contains_pointer(rect))
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        }) {
+            let q = (
+                (at.x - rect.min.x) / rect.width(),
+                (at.y - rect.min.y) / rect.height(),
+            );
+            let radius = HANDLE_R * 1.5 / rect.width();
+            if mapping::hit_test(m, q, radius).is_none() && m.len() < mapping::MAX_MASK_POINTS {
+                let i = mapping::nearest_edge_insert(m, q);
+                let mut mask = m.to_vec();
+                mask.insert(i, q);
+                sel = Some(i);
+                cmds.push(set(mask));
+            }
+        }
+        self.sel_mask_pt = sel;
     }
 }

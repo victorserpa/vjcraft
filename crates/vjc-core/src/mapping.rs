@@ -167,12 +167,20 @@ pub fn node_uv(input: &[Pt], i: u32, j: u32, cols: u32, rows: u32) -> Pt {
 
 /// Triangle list (2 per cell) for a slice on a `w` x `h` screen.
 pub fn slice_vertices(w: u32, h: u32, s: &Slice) -> Vec<Vertex> {
+    slice_vertices_st(w, h, s)
+        .iter()
+        .map(|v| [v[0], v[1], v[2], v[3]])
+        .collect()
+}
+
+/// Like `slice_vertices` plus the slice-surface coordinate `(s, t)` in 0..1 (for soft edge).
+pub fn slice_vertices_st(w: u32, h: u32, s: &Slice) -> Vec<[f32; 6]> {
     let cols = s.mesh_cols;
     if !mesh_valid(&s.output_mesh, cols) {
         return vec![];
     }
     let rows = rows_of(s.output_mesh.len(), cols);
-    let v = |i: u32, j: u32| -> Vertex {
+    let v = |i: u32, j: u32| -> [f32; 6] {
         let p = s.output_mesh[(j * cols + i) as usize];
         let uv = node_uv(&s.input, i, j, cols, rows);
         [
@@ -180,6 +188,8 @@ pub fn slice_vertices(w: u32, h: u32, s: &Slice) -> Vec<Vertex> {
             1.0 - 2.0 * p.1 / h as f32,
             uv.0,
             uv.1,
+            i as f32 / (cols - 1) as f32,
+            j as f32 / (rows - 1) as f32,
         ]
     };
     let mut out = Vec::new();
@@ -190,6 +200,81 @@ pub fn slice_vertices(w: u32, h: u32, s: &Slice) -> Vec<Vertex> {
         }
     }
     out
+}
+
+/// Most points a slice mask may have (the shader holds them in a fixed uniform array).
+pub const MAX_MASK_POINTS: usize = 32;
+pub const MAX_SOFT_WIDTH: f32 = 0.5;
+pub const GAMMA_RANGE: (f32, f32) = (0.1, 5.0);
+
+/// Mask polygon in normalized screen coordinates: 3..=32 finite points.
+pub fn mask_valid(m: &[Pt]) -> bool {
+    (3..=MAX_MASK_POINTS).contains(&m.len()) && m.iter().all(|p| p.0.is_finite() && p.1.is_finite())
+}
+
+/// Soft edge with widths clamped to 0..=0.5 and gamma to 0.1..=5; `None` if not finite.
+pub fn clamp_soft_edge(s: &vjc_model::SoftEdge) -> Option<vjc_model::SoftEdge> {
+    let all = [s.left, s.right, s.top, s.bottom, s.gamma];
+    if !all.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let w = |v: f32| v.clamp(0.0, MAX_SOFT_WIDTH);
+    Some(vjc_model::SoftEdge {
+        left: w(s.left),
+        right: w(s.right),
+        top: w(s.top),
+        bottom: w(s.bottom),
+        gamma: s.gamma.clamp(GAMMA_RANGE.0, GAMMA_RANGE.1),
+    })
+}
+
+/// Even-odd point-in-polygon test (the shader runs the same algorithm).
+pub fn point_in_polygon(poly: &[Pt], p: Pt) -> bool {
+    let mut inside = false;
+    let mut j = poly.len().wrapping_sub(1);
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a.1 > p.1) != (b.1 > p.1) && p.0 < (b.0 - a.0) * (p.1 - a.1) / (b.1 - a.1) + a.0 {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Index where a new polygon point `p` should be inserted: after the vertex that starts the
+/// nearest edge, so the outline stays simple.
+pub fn nearest_edge_insert(poly: &[Pt], p: Pt) -> usize {
+    let n = poly.len();
+    let dist = |a: Pt, b: Pt| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l2 = dx * dx + dy * dy;
+        let t = if l2 > 0.0 {
+            (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+    };
+    (0..n)
+        .min_by(|&i, &j| {
+            dist(poly[i], poly[(i + 1) % n]).total_cmp(&dist(poly[j], poly[(j + 1) % n]))
+        })
+        .map_or(0, |i| i + 1)
+}
+
+/// Brightness factor of a soft edge at slice-surface coordinate `(s, t)`:
+/// product of the linear edge ramps, raised to `gamma`.
+pub fn edge_ramp(e: &vjc_model::SoftEdge, s: f32, t: f32) -> f32 {
+    let r = |d: f32, w: f32| {
+        if w > 0.0 {
+            (d / w).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    };
+    let lin = r(s, e.left) * r(1.0 - s, e.right) * r(t, e.top) * r(1.0 - t, e.bottom);
+    lin.powf(e.gamma)
 }
 
 #[cfg(test)]
@@ -243,6 +328,70 @@ mod tests {
         let tri = [(0.1, 0.1), (0.9, 0.2), (0.5, 0.7)];
         assert_eq!(input_quad(&tri)[0], (0.1, 0.1));
         assert_eq!(input_quad(&tri)[2], (0.9, 0.7));
+    }
+
+    #[test]
+    fn polygon_membership() {
+        let tri = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)];
+        assert!(point_in_polygon(&tri, (0.2, 0.2)));
+        assert!(!point_in_polygon(&tri, (0.8, 0.8)));
+        assert!(!point_in_polygon(&tri, (-0.1, 0.5)));
+        // Concave "L": the notch is outside.
+        let l = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 0.5),
+            (0.5, 0.5),
+            (0.5, 1.0),
+            (0.0, 1.0),
+        ];
+        assert!(point_in_polygon(&l, (0.25, 0.75)));
+        assert!(!point_in_polygon(&l, (0.75, 0.75)));
+    }
+
+    #[test]
+    fn insert_goes_on_nearest_edge() {
+        let sq = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        assert_eq!(nearest_edge_insert(&sq, (0.5, -0.1)), 1);
+        assert_eq!(nearest_edge_insert(&sq, (1.1, 0.5)), 2);
+        assert_eq!(nearest_edge_insert(&sq, (-0.1, 0.5)), 4);
+    }
+
+    #[test]
+    fn edge_ramp_and_validation() {
+        let e = vjc_model::SoftEdge {
+            left: 0.25,
+            right: 0.0,
+            top: 0.0,
+            bottom: 0.0,
+            gamma: 1.0,
+        };
+        assert_eq!(edge_ramp(&e, 0.0, 0.5), 0.0);
+        assert!((edge_ramp(&e, 0.125, 0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(edge_ramp(&e, 0.25, 0.5), 1.0);
+        assert_eq!(edge_ramp(&e, 1.0, 0.5), 1.0);
+        let g = vjc_model::SoftEdge {
+            gamma: 2.0,
+            ..e.clone()
+        };
+        assert!((edge_ramp(&g, 0.125, 0.5) - 0.25).abs() < 1e-6);
+        let c = clamp_soft_edge(&vjc_model::SoftEdge {
+            left: 0.9,
+            right: -1.0,
+            top: 0.1,
+            bottom: 0.0,
+            gamma: 99.0,
+        })
+        .unwrap();
+        assert_eq!((c.left, c.right, c.top, c.gamma), (0.5, 0.0, 0.1, 5.0));
+        let nan = vjc_model::SoftEdge {
+            gamma: f32::NAN,
+            ..e
+        };
+        assert!(clamp_soft_edge(&nan).is_none());
+        assert!(!mask_valid(&[(0.0, 0.0), (1.0, 1.0)]));
+        assert!(!mask_valid(&[(0.0, 0.0), (1.0, f32::NAN), (0.0, 1.0)]));
+        assert!(mask_valid(&[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]));
     }
 
     #[test]

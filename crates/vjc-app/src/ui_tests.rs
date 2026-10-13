@@ -538,6 +538,40 @@ fn output_setup_add_screen_and_slice() {
     snap(&mut h, "10-output-setup");
 }
 
+#[test]
+fn output_setup_soft_edge_and_mask() {
+    use egui_kittest::kittest::NodeT;
+    let mut h = app();
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    click(&mut h, "Add");
+    click(&mut h, "Add slice");
+    let sl = |h: &Harness<'_, State>| h.state().project.output.screens[0].slices[0].clone();
+    assert!(sl(&h).soft_edge.is_none() && sl(&h).mask.is_none());
+    click(&mut h, "Enabled");
+    assert_eq!(sl(&h).soft_edge.unwrap().left, 0.1);
+    // Drag the left slider to about half of its 0..0.5 range.
+    let rect = h
+        .query_all_by_role(egui::accesskit::Role::Slider)
+        .find(|n| n.accesskit_node().label().as_deref() == Some("Edge left"))
+        .expect("Edge left slider")
+        .rect();
+    drag_to_slider_pct(&mut h, rect, 0.8);
+    let left = sl(&h).soft_edge.unwrap().left;
+    assert!(left > 0.25 && left <= 0.5, "{left}");
+    // The drag is undoable (it may coalesce with the toggle that enabled the edge).
+    h.state_mut().undo();
+    settle(&mut h);
+    assert!(sl(&h).soft_edge.is_none_or(|e| e.left == 0.1));
+    click(&mut h, "Create mask");
+    assert_eq!(sl(&h).mask.unwrap().len(), 4);
+    assert!(h.state().edit_mask);
+    // Mask lifecycle.
+    click(&mut h, "Clear mask");
+    assert!(sl(&h).mask.is_none());
+    snap(&mut h, "10-output-soft-edge");
+}
+
 // 11
 #[test]
 fn panel_tabs_switch() {

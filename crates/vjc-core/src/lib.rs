@@ -209,6 +209,19 @@ pub enum Command {
         slice: Uuid,
         input: Vec<(f32, f32)>,
     },
+    /// Mask polygon in normalized screen coordinates (3..=32 points); `None` clears it.
+    /// Coalesces.
+    SetSliceMask {
+        screen: Uuid,
+        slice: Uuid,
+        mask: Option<Vec<(f32, f32)>>,
+    },
+    /// Soft edge (widths clamped to 0..=0.5, gamma to 0.1..=5); `None` clears it. Coalesces.
+    SetSliceSoftEdge {
+        screen: Uuid,
+        slice: Uuid,
+        soft_edge: Option<vjc_model::SoftEdge>,
+    },
     /// Whole mesh plus its column count (rows = len / cols).
     SetSliceMesh {
         screen: Uuid,
@@ -428,6 +441,8 @@ enum Target {
     Dial(u32),
     Anim(AnimTarget),
     SliceMesh(Uuid),
+    SliceMask(Uuid),
+    SliceSoftEdge(Uuid),
     SliceInput(Uuid, Uuid),
     ScreenSize(Uuid),
 }
@@ -439,6 +454,8 @@ impl Command {
             Command::SetBpm { .. } => Some(Target::Bpm),
             Command::SetScreenSize { screen, .. } => Some(Target::ScreenSize(*screen)),
             Command::SetSliceMesh { slice, .. } => Some(Target::SliceMesh(*slice)),
+            Command::SetSliceMask { slice, .. } => Some(Target::SliceMask(*slice)),
+            Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),
             Command::SetSliceInput { screen, slice, .. } => {
                 Some(Target::SliceInput(*screen, *slice))
             }
@@ -1303,6 +1320,50 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     screen,
                     slice,
                     input: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceMask {
+            screen,
+            slice,
+            mask,
+        } => {
+            if mask.as_ref().is_some_and(|m| !mapping::mask_valid(m)) {
+                return Err(Error::InvalidValue);
+            }
+            let mask = mask.map(|m| {
+                m.into_iter()
+                    .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
+                    .collect()
+            });
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.mask, mask);
+            undoable(
+                Command::SetSliceMask {
+                    screen,
+                    slice,
+                    mask: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceSoftEdge {
+            screen,
+            slice,
+            soft_edge,
+        } => {
+            let soft_edge = match soft_edge {
+                Some(e) => Some(mapping::clamp_soft_edge(&e).ok_or(Error::InvalidValue)?),
+                None => None,
+            };
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.soft_edge, soft_edge);
+            undoable(
+                Command::SetSliceSoftEdge {
+                    screen,
+                    slice,
+                    soft_edge: prev,
                 },
                 vec![],
             )
@@ -4048,6 +4109,65 @@ mod tests {
         }
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn slice_mask_and_soft_edge_undo_and_validate() {
+        let (mut p, sid, lid) = one_screen_slice();
+        let before = p.clone();
+        let mut h = History::new();
+        let now = Instant::now();
+        let tri = vec![(0.0, 0.0), (1.0, 0.0), (0.0, 2.0)];
+        let mask = |m| Command::SetSliceMask {
+            screen: sid,
+            slice: lid,
+            mask: m,
+        };
+        assert!(
+            h.exec(&mut p, mask(Some(vec![(0.0, 0.0), (1.0, 1.0)])), now)
+                .is_err()
+        );
+        let nan = vec![(0.0, 0.0), (1.0, f32::NAN), (0.0, 1.0)];
+        assert!(h.exec(&mut p, mask(Some(nan)), now).is_err());
+        assert_eq!(p, before);
+        h.exec(&mut p, mask(Some(tri)), now).unwrap();
+        // Out-of-range points are clamped.
+        assert_eq!(
+            p.output.screens[0].slices[0].mask.as_ref().unwrap()[2],
+            (0.0, 1.0)
+        );
+        let edge = |l, g| Command::SetSliceSoftEdge {
+            screen: sid,
+            slice: lid,
+            soft_edge: Some(vjc_model::SoftEdge {
+                left: l,
+                right: 0.0,
+                top: 0.0,
+                bottom: 0.0,
+                gamma: g,
+            }),
+        };
+        assert!(h.exec(&mut p, edge(f32::INFINITY, 1.0), now).is_err());
+        h.exec(&mut p, edge(0.9, 0.0), now).unwrap();
+        let e = p.output.screens[0].slices[0].soft_edge.clone().unwrap();
+        assert_eq!((e.left, e.gamma), (0.5, 0.1));
+        // Mask and edge are different targets: two undo steps back to the start.
+        h.undo(&mut p).unwrap().unwrap();
+        assert!(p.output.screens[0].slices[0].soft_edge.is_none());
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        h.redo(&mut p).unwrap().unwrap();
+        assert!(p.output.screens[0].slices[0].mask.is_some());
+        // Dragging a slider coalesces into one undo step; None clears.
+        let mut h2 = History::new();
+        let mid = p.clone();
+        for k in 1..=5 {
+            h2.exec(&mut p, edge(k as f32 / 20.0, 1.0), now).unwrap();
+        }
+        h2.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, mid);
+        h2.exec(&mut p, mask(None), now).unwrap();
+        assert!(p.output.screens[0].slices[0].mask.is_none());
     }
 
     #[test]
