@@ -61,9 +61,19 @@ impl<B> Inflight<B> {
 
 pub struct Capture {
     rec: Recorder,
-    inflight: Inflight<wgpu::Buffer>,
-    period: Duration,
-    next_due: Instant,
+    inflight: Inflight<(wgpu::Buffer, i64)>,
+    fps: f64,
+    t0: Instant,
+    /// Last presentation index handed out (-1 = none): pts follow real elapsed time, so a
+    /// render slower than the recording fps leaves gaps instead of speeding the video up.
+    last_pts: i64,
+}
+
+/// Presentation index for a frame taken `elapsed` after the start, or None when that slot
+/// was already used (the render is faster than `fps`).
+pub(crate) fn next_pts(elapsed: Duration, fps: f64, last: i64) -> Option<i64> {
+    let pts = (elapsed.as_secs_f64() * fps).round() as i64;
+    (pts > last).then_some(pts)
 }
 
 /// Row stride of the readback buffer (wgpu needs a multiple of 256).
@@ -91,8 +101,9 @@ impl Capture {
         Ok(Self {
             rec,
             inflight: Inflight::new(),
-            period: Duration::from_secs_f64(1.0 / f64::from(fps)),
-            next_due: Instant::now(),
+            fps: f64::from(fps),
+            t0: Instant::now(),
+            last_pts: -1,
         })
     }
 
@@ -116,7 +127,7 @@ impl Capture {
     pub fn poll(&mut self, device: &wgpu::Device) {
         let _ = device.poll(wgpu::PollType::Poll);
         let (w, h) = self.rec.size();
-        for (buf, ok) in self.inflight.take_settled() {
+        for ((buf, pts), ok) in self.inflight.take_settled() {
             let data = if ok {
                 buf.slice(..)
                     .get_mapped_range()
@@ -130,7 +141,7 @@ impl Capture {
             }
             match data {
                 Some(d) => {
-                    self.rec.push(d);
+                    self.rec.push_at(pts, d);
                 }
                 None => self.rec.skip(),
             }
@@ -139,14 +150,10 @@ impl Capture {
 
     /// Queues a copy of `tex` (Rgba8Unorm, the recorder's size) when a frame is due.
     pub fn capture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) {
-        let now = Instant::now();
-        if now < self.next_due {
+        let Some(pts) = next_pts(self.t0.elapsed(), self.fps, self.last_pts) else {
             return;
-        }
-        self.next_due += self.period;
-        if self.next_due < now {
-            self.next_due = now + self.period;
-        }
+        };
+        self.last_pts = pts;
         if self.inflight.len() >= MAX_INFLIGHT {
             self.rec.skip();
             return;
@@ -182,7 +189,13 @@ impl Capture {
         buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             settle(&flag, r.is_ok());
         });
-        self.inflight.push(buf, state);
+        self.inflight.push((buf, pts), state);
+    }
+
+    /// App shutdown: no device to poll, so readbacks still in flight are abandoned; the
+    /// file is finalized (trailer written), waiting at most ~3 s.
+    pub fn shutdown(self) -> Result<Summary, String> {
+        self.rec.finish_timeout(Duration::from_secs(3))
     }
 
     /// Finalizes the file. Waits for the encoder to flush (called from a button press).
@@ -201,8 +214,19 @@ pub fn default_path() -> PathBuf {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    base.join("VJCraft")
-        .join(format!("{}.mp4", timestamp(secs)))
+    unique_path(&base.join("VJCraft"), &timestamp(secs))
+}
+
+/// `<dir>/<stem>.mp4`, or `<stem>-2.mp4`, `-3`... when the name is taken (1 s resolution).
+pub(crate) fn unique_path(dir: &std::path::Path, stem: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.mp4"));
+    if !first.exists() {
+        return first;
+    }
+    (2u32..)
+        .map(|n| dir.join(format!("{stem}-{n}.mp4")))
+        .find(|p| !p.exists())
+        .unwrap()
 }
 
 /// `YYYYMMDD-HHMMSS` (UTC) from unix seconds.
@@ -250,6 +274,48 @@ mod tests {
         settle(&s, true);
         assert_eq!(q.take_settled(), vec![(2, true), (10, true)]);
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn shutdown_leaves_a_playable_file() {
+        let path = std::env::temp_dir().join(format!("vjc-sd-{}.mp4", std::process::id()));
+        let mut cap = Capture::start(path.clone(), (64, 48), 30.0).unwrap();
+        for pts in 0..5 {
+            assert!(cap.rec.push_at(pts, vec![90; 64 * 48 * 4]));
+        }
+        let s = cap.shutdown().unwrap();
+        assert_eq!(s.encoded, 5);
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-f", "null", "-"])
+            .output();
+        let _ = std::fs::remove_file(&path);
+        match ok {
+            Ok(o) => assert!(o.status.success() && o.stderr.is_empty(), "{o:?}"),
+            Err(_) => eprintln!("ffmpeg CLI missing: reopen check skipped"),
+        }
+    }
+
+    #[test]
+    fn pts_follows_elapsed_time_with_gaps() {
+        let ms = Duration::from_millis;
+        assert_eq!(next_pts(ms(0), 30.0, -1), Some(0));
+        assert_eq!(next_pts(ms(5), 30.0, 0), None); // same slot
+        // A 100 ms stall at 30 fps: pts jumps by 3, not 1.
+        assert_eq!(next_pts(ms(100), 30.0, 0), Some(3));
+    }
+
+    #[test]
+    fn unique_path_adds_suffix() {
+        let d = std::env::temp_dir().join(format!("vjc-up-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(unique_path(&d, "a"), d.join("a.mp4"));
+        std::fs::write(d.join("a.mp4"), b"").unwrap();
+        assert_eq!(unique_path(&d, "a"), d.join("a-2.mp4"));
+        std::fs::write(d.join("a-2.mp4"), b"").unwrap();
+        assert_eq!(unique_path(&d, "a"), d.join("a-3.mp4"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

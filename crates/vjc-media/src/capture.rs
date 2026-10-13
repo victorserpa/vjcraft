@@ -12,7 +12,7 @@ use crate::{Frame, Shared, frame_to_rgba};
 use ffmpeg_next as ff;
 use std::ffi::CString;
 use std::ptr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A video capture device as listed by avfoundation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,23 +80,49 @@ fn open_error(device: &str, e: ff::Error) -> String {
     )
 }
 
-fn open_avfoundation(
-    device: &str,
-    framerate: Option<&str>,
+/// FFmpeg interrupt callback: a non-zero return aborts the blocking open/read in progress.
+/// `opaque` points at the player's `stop` flag.
+unsafe extern "C" fn interrupt_on_stop(opaque: *mut std::ffi::c_void) -> std::ffi::c_int {
+    // SAFETY: opaque is the `&AtomicBool` given to `open_input`, which outlives the context.
+    let stop = unsafe { &*(opaque as *const AtomicBool) };
+    i32::from(stop.load(Ordering::Relaxed))
+}
+
+/// Opens `url` with an interrupt callback tied to `stop`, so setting `stop` aborts a
+/// blocked open, probe or read (a stalled camera) within a few ms. The returned context
+/// keeps a pointer to `stop`: it must not outlive it.
+pub(crate) fn open_input(
+    url: &str,
+    format: Option<&str>,
+    opts: ff::Dictionary,
+    stop: &AtomicBool,
 ) -> Result<ff::format::context::Input, ff::Error> {
-    // "<video>:none" skips the audio device.
-    let url = CString::new(format!("{device}:none")).map_err(|_| ff::Error::InvalidData)?;
-    let mut opts = ff::Dictionary::new();
-    if let Some(fr) = framerate {
-        opts.set("framerate", fr);
-    }
+    let url = CString::new(url).map_err(|_| ff::Error::InvalidData)?;
+    let format = format
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| ff::Error::InvalidData)?;
     unsafe {
-        let fmt = ff::ffi::av_find_input_format(c"avfoundation".as_ptr());
-        if fmt.is_null() {
-            return Err(ff::Error::DemuxerNotFound);
+        let fmt = match &format {
+            Some(f) => {
+                let p = ff::ffi::av_find_input_format(f.as_ptr());
+                if p.is_null() {
+                    return Err(ff::Error::DemuxerNotFound);
+                }
+                p
+            }
+            None => ptr::null(),
+        };
+        let mut ps = ff::ffi::avformat_alloc_context();
+        if ps.is_null() {
+            return Err(ff::Error::Unknown);
         }
-        let mut ps = ptr::null_mut();
+        (*ps).interrupt_callback = ff::ffi::AVIOInterruptCB {
+            callback: Some(interrupt_on_stop),
+            opaque: stop as *const AtomicBool as *mut std::ffi::c_void,
+        };
         let mut raw = opts.disown();
+        // On failure avformat_open_input frees `ps`.
         let r = ff::ffi::avformat_open_input(&mut ps, url.as_ptr(), fmt, &mut raw);
         drop(ff::Dictionary::own(raw));
         if r < 0 {
@@ -109,6 +135,19 @@ fn open_avfoundation(
         }
         Ok(ff::format::context::Input::wrap(ps))
     }
+}
+
+fn open_avfoundation(
+    device: &str,
+    framerate: Option<&str>,
+    stop: &AtomicBool,
+) -> Result<ff::format::context::Input, ff::Error> {
+    // "<video>:none" skips the audio device.
+    let mut opts = ff::Dictionary::new();
+    if let Some(fr) = framerate {
+        opts.set("framerate", fr);
+    }
+    open_input(&format!("{device}:none"), Some("avfoundation"), opts, stop)
 }
 
 /// Capture loop: publishes RGBA frames until `shared.stop`, a read error or a decode setup
@@ -124,8 +163,8 @@ pub(crate) fn run_capture(device: &str, shared: &Shared) -> Result<(), String> {
         device.trim()
     };
     // Some cameras reject a fixed rate: retry with the device default.
-    let mut ictx = open_avfoundation(device, Some("30"))
-        .or_else(|_| open_avfoundation(device, None))
+    let mut ictx = open_avfoundation(device, Some("30"), &shared.stop)
+        .or_else(|_| open_avfoundation(device, None, &shared.stop))
         .map_err(|e| open_error(device, e))?;
     let (idx, params) = {
         let st = ictx
@@ -200,6 +239,28 @@ mod tests {
         assert_eq!((d[0].index, d[0].name.as_str()), (2, "USB Cam"));
         assert!(parse_avfoundation_list("").is_empty());
         assert!(parse_avfoundation_list("garbage [0] x").is_empty());
+    }
+
+    /// A source that never produces data (TCP listener nobody connects to) must not keep
+    /// the thread blocked once `stop` is set: this is the stalled-camera case.
+    #[test]
+    fn stop_interrupts_a_blocked_open_quickly() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let t = std::thread::spawn(move || {
+            let mut o = ff::Dictionary::new();
+            o.set("listen_timeout", "3000"); // safety net: the test fails instead of hanging
+            let r = open_input("tcp://127.0.0.1:47931?listen=1", None, o, &s).map(|_| ());
+            (r, Instant::now())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let t0 = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        let (r, done) = t.join().unwrap();
+        assert!(r.is_err());
+        assert!(done - t0 < Duration::from_millis(300), "{:?}", done - t0);
     }
 
     #[test]

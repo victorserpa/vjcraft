@@ -214,11 +214,7 @@ impl Player {
     /// Starts decoding the file's audio stream into `engine`. No-op for images, captures and
     /// files without audio. Audio follows this player's position (see `audio` module docs).
     pub fn attach_audio(&mut self, engine: &audio::AudioEngine) {
-        if self.audio.is_none()
-            && !is_image(&self.path)
-            && !self.path.starts_with("camera:")
-            && !self.path.starts_with("net:")
-        {
+        if self.audio.is_none() && !is_image(&self.path) && !is_live_label(&self.path) {
             self.audio = audio::AudioPart::start(engine, &self.path, self.shared.clone());
         }
     }
@@ -277,6 +273,12 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Camera and network players carry a `camera:`/`net:` label as path, not a file.
+fn is_live_label(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with("camera:") || s.starts_with("net:")
 }
 
 fn is_image(path: &Path) -> bool {
@@ -659,6 +661,14 @@ pub fn decode_n(path: &Path, n: usize) -> Result<Vec<Frame>, ff::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_labels_are_not_files() {
+        assert!(is_live_label(Path::new("camera:0")));
+        assert!(is_live_label(Path::new("net:syphon")));
+        assert!(!is_live_label(Path::new("/tmp/camera:0.mp4")));
+        assert!(!Path::new("camera:0").starts_with("camera:")); // the old guard never matched
+    }
     use std::time::Instant;
 
     #[test]

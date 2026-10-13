@@ -63,8 +63,9 @@ pub struct Summary {
 
 pub struct Recorder {
     queue: FrameQueue,
-    /// Frames offered so far (queued or dropped): the next pts.
-    offered: i64,
+    /// Last presentation index handed to the queue (-1 = none). One meaning only: `push`
+    /// continues from it and `push_at` rejects anything not strictly after it.
+    last_pts: i64,
     width: u32,
     height: u32,
     path: PathBuf,
@@ -215,7 +216,7 @@ fn run(
 
 impl Recorder {
     /// Starts recording `width x height` RGBA frames at `fps` into `path` (.mp4).
-    /// Odd sizes are cropped by one pixel (yuv420p needs even dimensions).
+    /// Odd sizes are rescaled to the next lower even size (yuv420p needs even dimensions).
     pub fn start(path: &Path, width: u32, height: u32, fps: u32) -> Result<Self, String> {
         Self::start_with_queue(path, width, height, fps, QUEUE_FRAMES)
     }
@@ -230,16 +231,27 @@ impl Recorder {
         if width < 2 || height < 2 || fps == 0 {
             return Err("invalid recording size or fps".into());
         }
+        let p = path.to_path_buf();
+        Self::spawn(path, width, height, queue, move |rx, c| {
+            run(rx, &p, width, height, fps, c)
+        })
+    }
+
+    /// Starts the worker thread running `body` over the frame queue.
+    fn spawn<F>(path: &Path, width: u32, height: u32, queue: usize, body: F) -> Result<Self, String>
+    where
+        F: FnOnce(Receiver<Job>, &Mutex<String>) -> Result<u64, String> + Send + 'static,
+    {
         let (q, rx) = FrameQueue::new(queue);
         let codec = Arc::new(Mutex::new(String::new()));
-        let (p, c) = (path.to_path_buf(), codec.clone());
+        let c = codec.clone();
         let handle = std::thread::Builder::new()
             .name("vjc-record".into())
-            .spawn(move || run(rx, &p, width, height, fps, &c))
+            .spawn(move || body(rx, &c))
             .map_err(|e| e.to_string())?;
         Ok(Self {
             queue: q,
-            offered: 0,
+            last_pts: -1,
             width,
             height,
             path: path.to_path_buf(),
@@ -270,15 +282,39 @@ impl Recorder {
         if rgba.len() != self.width as usize * self.height as usize * 4 {
             return false;
         }
-        let pts = self.offered;
-        self.offered += 1;
+        let pts = self.last_pts + 1;
+        self.last_pts = pts;
         self.queue.push(pts, rgba)
     }
 
-    /// Counts a frame that could not even be captured: keeps timing, adds a drop.
+    /// Offers a frame at an explicit presentation index (frame periods since the start,
+    /// from real elapsed time). Indices must increase: a stale one is dropped and counted.
+    pub fn push_at(&mut self, pts: i64, rgba: Vec<u8>) -> bool {
+        if rgba.len() != self.width as usize * self.height as usize * 4 || pts <= self.last_pts {
+            self.queue.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.last_pts = pts;
+        self.queue.push(pts, rgba)
+    }
+
+    /// Counts a frame that could not even be captured. Only adds a drop: it must not move
+    /// `last_pts`, or older frames still in flight would be rejected as stale.
     pub fn skip(&mut self) {
-        self.offered += 1;
         self.queue.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Like `finish` but waits at most `timeout` for the encoder to flush (app shutdown).
+    pub fn finish_timeout(self, timeout: std::time::Duration) -> Result<Summary, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("vjc-record-finish".into())
+            .spawn(move || {
+                let _ = tx.send(self.finish());
+            })
+            .map_err(|e| e.to_string())?;
+        rx.recv_timeout(timeout)
+            .map_err(|_| "recording did not finish in time".to_string())?
     }
 
     /// Flushes the queue, finalizes the file and joins the thread.
@@ -309,11 +345,16 @@ impl Recorder {
 }
 
 impl Drop for Recorder {
-    /// Dropping mid-recording still finalizes the file (trailer written).
+    /// Dropping mid-recording still finalizes the file (trailer written), but the join
+    /// happens on a background thread so the caller (UI) never waits for the queue.
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
             self.close_channel();
-            let _ = h.join();
+            let _ = std::thread::Builder::new()
+                .name("vjc-record-join".into())
+                .spawn(move || {
+                    let _ = h.join();
+                });
         }
     }
 }
@@ -366,7 +407,86 @@ mod tests {
             assert!(r.push(vec![i * 40; (w * h * 4) as usize]));
         }
         drop(r);
-        let mut ictx = ff::format::input(&path).expect("mp4 must reopen after drop");
+        // The join runs in the background now: wait for the trailer.
+        let mut ictx = None;
+        for _ in 0..100 {
+            if let Ok(i) = ff::format::input(&path) {
+                ictx = Some(i);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let mut ictx = ictx.expect("mp4 must reopen after drop");
+        let idx = ictx.streams().best(ff::media::Type::Video).unwrap().index();
+        assert_eq!(ictx.packets().filter(|(s, _)| s.index() == idx).count(), 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn drop_does_not_block_on_slow_encoder() {
+        let mut r = Recorder::spawn(&tmp("slow.mp4"), 2, 2, 4, |rx, _| {
+            while rx.recv().is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            Ok(0)
+        })
+        .unwrap();
+        for _ in 0..4 {
+            r.push(vec![0; 16]);
+        }
+        let t = std::time::Instant::now();
+        drop(r);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(300),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn push_at_keeps_real_time_gaps() {
+        let mut r = Recorder::spawn(&tmp("gap.mp4"), 2, 2, 8, |rx, _| {
+            let v: Vec<i64> = rx.iter().map(|j| j.pts).collect();
+            assert_eq!(v, vec![0, 3, 4]);
+            Ok(v.len() as u64)
+        })
+        .unwrap();
+        assert!(r.push_at(0, vec![0; 16]));
+        assert!(r.push_at(3, vec![0; 16]));
+        assert!(!r.push_at(3, vec![0; 16])); // stale
+        assert!(r.push_at(4, vec![0; 16]));
+        assert_eq!(r.finish().unwrap().encoded, 3);
+    }
+
+    #[test]
+    fn skip_does_not_stale_inflight_frames() {
+        let mut r = Recorder::spawn(&tmp("skip.mp4"), 2, 2, 8, |rx, _| {
+            let v: Vec<i64> = rx.iter().map(|j| j.pts).collect();
+            assert_eq!(v, vec![0, 1, 2]);
+            Ok(v.len() as u64)
+        })
+        .unwrap();
+        // Three frames in flight (pts 0..=2), the fourth capture is skipped, then the
+        // in-flight ones are delivered: all accepted, only the skip is a drop.
+        r.skip();
+        for pts in 0..3 {
+            assert!(r.push_at(pts, vec![0; 16]), "pts {pts} wrongly stale");
+        }
+        assert!(!r.push_at(2, vec![0; 16])); // truly stale
+        assert_eq!(r.dropped(), 2);
+        assert_eq!(r.finish().unwrap().encoded, 3);
+    }
+
+    #[test]
+    fn finish_timeout_finalizes_file() {
+        let path = tmp("ft.mp4");
+        let mut r = Recorder::start_with_queue(&path, 64, 48, 30, 64).unwrap();
+        for i in 0..5u8 {
+            assert!(r.push(vec![i * 40; 64 * 48 * 4]));
+        }
+        let s = r.finish_timeout(std::time::Duration::from_secs(3)).unwrap();
+        assert_eq!(s.encoded, 5);
+        let mut ictx = ff::format::input(&path).unwrap();
         let idx = ictx.streams().best(ff::media::Type::Video).unwrap().index();
         assert_eq!(ictx.packets().filter(|(s, _)| s.index() == idx).count(), 5);
         let _ = std::fs::remove_file(&path);

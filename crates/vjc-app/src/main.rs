@@ -145,6 +145,8 @@ struct Outgoing {
     player: Player,
     fit: vjc_model::FitMode,
     state: vjc_core::transition::State,
+    /// The outgoing clip, kept so its audio follows layer/master mix and fades out.
+    clip: Option<vjc_model::Clip>,
 }
 
 #[derive(Default)]
@@ -1056,10 +1058,11 @@ impl State {
     /// only in the second case.
     fn cross_from_old(&mut self, layer: LayerId) {
         self.flow.outgoing.remove(&layer);
-        let fit = self
+        let old_clip = self
             .active(layer)
             .and_then(|(d, c)| vjc_core::clip_in(&self.project, d, layer, c))
-            .map(|k| k.fit);
+            .cloned();
+        let fit = old_clip.as_ref().map(|k| k.fit);
         let Some((_, _, old)) = self.players.remove(&layer) else {
             return;
         };
@@ -1082,6 +1085,7 @@ impl State {
                     player: old,
                     fit: fit.unwrap_or_default(),
                     state,
+                    clip: old_clip,
                 },
             );
         }
@@ -1185,6 +1189,17 @@ impl State {
         self.flow
             .outgoing
             .retain(|_, o| o.state != vjc_core::transition::State::Idle);
+        // Outgoing audio keeps following the mix and fades out with the transition.
+        for (layer, o) in &self.flow.outgoing {
+            if let Some(clip) = &o.clip {
+                let (vol, pan) = audio_mix(&self.project, *layer, clip);
+                let fade = o
+                    .state
+                    .current()
+                    .map_or(0.0, |(_, p)| 1.0 - p.clamp(0.0, 1.0));
+                o.player.set_audio(vol * fade, pan, fade > 0.0);
+            }
+        }
         for (layer, (deck, col, player)) in &self.players {
             let Some(clip) = vjc_core::clip_in(&self.project, *deck, *layer, *col) else {
                 continue;
@@ -3404,6 +3419,13 @@ impl eframe::App for State {
         // Video is live: keep repainting.
         ctx.request_repaint();
     }
+
+    /// Closing the app mid-recording still writes the mp4 trailer (bounded wait).
+    fn on_exit(&mut self) {
+        if let Some(cap) = self.capture.take() {
+            let _ = cap.shutdown();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3543,6 +3565,19 @@ fn is_sequential(mode: vjc_model::PlayMode, dir: Direction, rate: f64) -> bool {
 #[cfg(test)]
 mod sequential_tests {
     use super::*;
+
+    #[test]
+    fn non_number_param_uses_default() {
+        let p = vjc_model::Param {
+            name: "v".into(),
+            value: vjc_model::Value::Bool(true),
+            default: vjc_model::Value::Bool(true),
+            range: None,
+            animation: None,
+        };
+        assert_eq!(num_or(&p, 1.0), 1.0);
+        assert_eq!(num_or(&p, 0.0), 0.0);
+    }
     use vjc_model::PlayMode;
 
     #[test]
@@ -3559,23 +3594,29 @@ mod sequential_tests {
     }
 }
 
+/// Numeric value of a param; `default` when it holds anything else (volume: unity, not mute).
+fn num_or(param: &vjc_model::Param, default: f64) -> f64 {
+    match param.value {
+        vjc_model::Value::Number(n) => n,
+        _ => default,
+    }
+}
+
 /// Linear volume and pan for a clip on a layer: volumes multiply (clip, layer, master), pans
 /// add (clamped). Opacity does not affect audio.
 fn audio_mix(p: &Project, layer: LayerId, clip: &vjc_model::Clip) -> (f32, f32) {
-    let num = |param: &vjc_model::Param| match param.value {
-        vjc_model::Value::Number(n) => n,
-        _ => 0.0,
-    };
+    let num = |param: &vjc_model::Param| num_or(param, 0.0);
+    let vnum = |param: &vjc_model::Param| num_or(param, 1.0);
     let lt = p
         .composition
         .layers
         .iter()
         .find(|l| l.id == layer)
         .map(|l| &l.track);
-    let mut vol = num(&clip.track.volume) * num(&p.composition.master.volume);
+    let mut vol = vnum(&clip.track.volume) * vnum(&p.composition.master.volume);
     let mut pan = num(&clip.track.pan) + num(&p.composition.master.pan);
     if let Some(t) = lt {
-        vol *= num(&t.volume);
+        vol *= vnum(&t.volume);
         pan += num(&t.pan);
     }
     (vol.max(0.0) as f32, pan.clamp(-1.0, 1.0) as f32)
