@@ -591,6 +591,45 @@ fn rerate(last_t: f64, anchor: f64, cur_rate: f64) -> (Duration, f64) {
     )
 }
 
+/// First frame of a video or the image itself, shrunk so the longest side is at most
+/// `max_side` (box-free nearest sampling; enough for browser thumbnails).
+pub fn thumbnail(path: &Path, max_side: u32) -> Result<Frame, String> {
+    let frame = if is_image(path) {
+        load_image(path)?
+    } else {
+        decode_n(path, 1)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("no frames")?
+    };
+    Ok(downscale(&frame, max_side))
+}
+
+fn downscale(f: &Frame, max_side: u32) -> Frame {
+    let long = f.width.max(f.height);
+    if long <= max_side || f.width == 0 || f.height == 0 {
+        return f.clone();
+    }
+    let w = (f.width as u64 * max_side as u64 / long as u64).max(1) as u32;
+    let h = (f.height as u64 * max_side as u64 / long as u64).max(1) as u32;
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        let sy = (y as u64 * f.height as u64 / h as u64) as usize;
+        for x in 0..w {
+            let sx = (x as u64 * f.width as u64 / w as u64) as usize;
+            let i = (sy * f.width as usize + sx) * 4;
+            out.extend_from_slice(&f.data[i..i + 4]);
+        }
+    }
+    Frame {
+        width: w,
+        height: h,
+        data: Arc::new(out),
+        seq: 1,
+    }
+}
+
 /// Decodes up to `n` frames as fast as possible (no pacing, no loop). For tests/benchmarks.
 pub fn decode_n(path: &Path, n: usize) -> Result<Vec<Frame>, ff::Error> {
     let mut out = vec![];
@@ -618,6 +657,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn thumbnail_of_generated_png_is_shrunk() {
+        let dir = std::env::temp_dir().join(format!("vjc-thumb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.png");
+        let img = image::RgbaImage::from_pixel(320, 160, image::Rgba([255, 0, 0, 255]));
+        if img.save(&p).is_err() {
+            return; // cannot write here: skip
+        }
+        let t = thumbnail(&p, 160).unwrap();
+        assert_eq!((t.width, t.height), (160, 80));
+        assert_eq!(&t.data[..4], &[255, 0, 0, 255]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn fake(ts: &[f64]) -> Vec<(f64, Frame)> {
         ts.iter()

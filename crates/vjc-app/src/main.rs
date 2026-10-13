@@ -1,3 +1,4 @@
+mod browser;
 mod compositor;
 mod fx;
 mod monitors;
@@ -47,6 +48,10 @@ struct State {
     monitors_polled: Option<std::time::Instant>,
     /// Cell rects from the last frame, for hit-testing file drops.
     cells: Vec<CellInfo>,
+    /// Layer name and master bar rects from the last frame, for browser effect drops.
+    layer_rects: Vec<(egui::Rect, LayerId)>,
+    master_rect: Option<egui::Rect>,
+    browser: browser::Browser,
     last_pointer: Option<egui::Pos2>,
     /// Cell selected by click; fallback target for drops.
     selected: Option<(LayerId, u32)>,
@@ -286,6 +291,29 @@ fn resolve_drop(
     row.next().map(|c| (c.layer, c.col, DropWhere::FirstCell))
 }
 
+/// Browser start folder: the project's folder, else ~/Movies, else home.
+fn browser_start(project: Option<&std::path::Path>) -> PathBuf {
+    if let Some(d) = project.and_then(|p| p.parent()).filter(|d| d.is_dir()) {
+        return d.to_path_buf();
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let movies = home.join("Movies");
+    if movies.is_dir() { movies } else { home }
+}
+
+/// Effects and generators offered by the browser.
+fn browser_fx() -> Vec<(String, browser::Item)> {
+    let fx = vjc_fx::BUILTIN
+        .iter()
+        .map(|(id, _)| (fx_label(id), browser::Item::Effect(id.to_string())));
+    let gens = vjc_fx::GENERATORS
+        .iter()
+        .map(|(id, _)| (fx_label(id), browser::Item::Generator(id.to_string())));
+    fx.chain(gens).collect()
+}
+
 /// ~/Library/Application Support/VJCraft/recovery.vjc
 fn recovery_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -379,6 +407,9 @@ impl State {
             monitors: monitors::list(),
             monitors_polled: None,
             cells: vec![],
+            layer_rects: vec![],
+            master_rect: None,
+            browser: browser::Browser::new(browser_start(None)),
             last_pointer: None,
             selected: None,
             col_sel: None,
@@ -789,6 +820,61 @@ impl State {
         }
     }
 
+    /// Browser drop at `pos`: files and generators go to a cell, effects to a cell,
+    /// layer name or the master bar. The deck is always the current one.
+    fn browser_drop(&mut self, item: browser::Item, pos: egui::Pos2) {
+        let deck = self.project.composition.current_deck;
+        let cell = self.cells.iter().find(|c| c.rect.contains(pos)).copied();
+        match item {
+            browser::Item::File(path) => match cell {
+                Some(c) => self.drop_file(c.layer, c.col, path),
+                None => self.status = "Drop the file on a grid cell".into(),
+            },
+            browser::Item::Generator(id) => match cell {
+                Some(c) if c.empty => {
+                    self.exec(Command::SetGenerator {
+                        deck,
+                        layer: c.layer,
+                        column: c.col,
+                        kind: id.clone(),
+                        name: fx_label(&id),
+                        params: vjc_fx::generator_params(&id).unwrap_or_default(),
+                    });
+                    self.exec(Command::TriggerClip {
+                        deck,
+                        layer: c.layer,
+                        column: c.col,
+                    });
+                }
+                _ => self.status = "Drop a generator on an empty cell".into(),
+            },
+            browser::Item::Effect(id) => {
+                let target = if let Some(c) = cell {
+                    Some(EffectTarget::Clip {
+                        deck,
+                        layer: c.layer,
+                        column: c.col,
+                    })
+                } else if let Some((_, l)) = self.layer_rects.iter().find(|(r, _)| r.contains(pos))
+                {
+                    Some(EffectTarget::Layer(*l))
+                } else if self.master_rect.is_some_and(|r| r.contains(pos)) {
+                    Some(EffectTarget::Master)
+                } else {
+                    None
+                };
+                match (target, vjc_fx::new_effect(&id)) {
+                    (Some(target), Some(effect)) => self.exec(Command::AddEffect {
+                        target,
+                        effect,
+                        index: usize::MAX,
+                    }),
+                    _ => self.status = "Drop an effect on a cell, layer name or Master".into(),
+                }
+            }
+        }
+    }
+
     fn drop_file(&mut self, layer: LayerId, column: u32, path: PathBuf) {
         let deck = self.project.composition.current_deck;
         self.exec(Command::ImportMedia {
@@ -918,7 +1004,7 @@ impl State {
     /// Master row: opacity, speed, bypass, Clear All.
     fn master_bar(&mut self, ui: &mut egui::Ui) {
         let mut cmds = vec![];
-        ui.horizontal(|ui| {
+        let bar = ui.horizontal(|ui| {
             ui.label("Master");
             let mut op = match self.project.composition.master.opacity.value {
                 vjc_model::Value::Number(n) => n,
@@ -947,6 +1033,7 @@ impl State {
                 cmds.push(Command::ClearAll);
             }
         });
+        self.master_rect = Some(bar.response.rect);
         if self.learn {
             cmds.clear();
         }
@@ -1235,6 +1322,24 @@ impl State {
                 }
             });
         });
+        let fxs = browser_fx();
+        let mut opened = None;
+        egui::Panel::right("browser")
+            .default_size(260.0)
+            .show(ui, |ui| opened = self.browser.show(ui, &fxs));
+        if let Some(path) = opened {
+            match self.selected {
+                Some((l, c)) => self.drop_file(l, c, path),
+                None => self.status = "Select a cell to load the file".into(),
+            }
+        }
+        if ctx.input(|i| i.pointer.any_released())
+            && let Some(item) = egui::DragAndDrop::payload::<browser::Item>(&ctx)
+            && let Some(pos) = ctx.pointer_latest_pos()
+        {
+            self.browser_drop((*item).clone(), pos);
+        }
+        self.layer_rects.clear();
         self.targets.clear();
         self.time_bar(ui);
         self.master_bar(ui);
@@ -1407,6 +1512,7 @@ impl State {
                         let name = ui.add(
                             egui::Label::new(&comp.layers[li].name).sense(egui::Sense::click()),
                         );
+                        self.layer_rects.push((name.rect, lid));
                         if name.clicked() || name.secondary_clicked() {
                             self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
                         }
