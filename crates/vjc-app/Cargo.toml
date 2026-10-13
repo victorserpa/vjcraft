@@ -29,6 +29,7 @@ rusty_link = { version = "0.4.9", optional = true }
 core-graphics = "0.23"
 
 [dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["wgpu"] }
 
 [features]
 default = ["link", "syphon", "ndi"]

@@ -36,6 +36,14 @@ impl Midi {
         Midi { rx, out }
     }
 
+    /// No thread, no devices (UI tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn idle() -> Midi {
+        let (_tx, rx) = channel();
+        let (out, _out_rx) = channel();
+        Midi { rx, out }
+    }
+
     pub fn send(&self, device: &str, bytes: [u8; 3]) {
         let _ = self.out.send((device.to_owned(), bytes));
     }

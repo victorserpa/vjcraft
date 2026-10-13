@@ -55,6 +55,15 @@ impl Osc {
         Osc { rx, cfg, out }
     }
 
+    /// No thread, no sockets (UI tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn idle() -> Osc {
+        let (_tx, rx) = channel();
+        let (cfg, _cfg_rx) = channel();
+        let (out, _out_rx) = channel();
+        Osc { rx, cfg, out }
+    }
+
     pub fn configure(&self, cfg: Cfg) {
         let _ = self.cfg.send(cfg);
     }

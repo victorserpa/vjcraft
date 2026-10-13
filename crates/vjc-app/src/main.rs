@@ -49,6 +49,8 @@ struct State {
     /// Audio output, opened on the first clip start (None until then or when unavailable).
     audio: Option<AudioEngine>,
     audio_failed: bool,
+    /// Writes prefs and the recovery file (false in UI tests).
+    persist: bool,
     /// Playing generator clip per layer: (deck, column, own TIME in seconds). The time
     /// follows the clip transport (speed, direction, pause); a layer has a player or a
     /// generator, never both.
@@ -524,6 +526,22 @@ fn fresh_project(prefs: &Prefs) -> Project {
 
 impl State {
     fn new(prefs: Prefs) -> Self {
+        Self::build(prefs, true)
+    }
+
+    /// State for UI tests: no MIDI/OSC threads, no monitors, no audio, and nothing written
+    /// to the user's preferences or recovery file.
+    #[cfg(test)]
+    fn headless(prefs: Prefs) -> Self {
+        Self::build(prefs, false)
+    }
+
+    /// Recovery file, only for the live app.
+    fn recovery_path(&self) -> Option<PathBuf> {
+        self.persist.then(recovery_path).flatten()
+    }
+
+    fn build(prefs: Prefs, live: bool) -> Self {
         let project = fresh_project(&prefs);
         State {
             project,
@@ -532,7 +550,6 @@ impl State {
             status: "Drop video files on the grid cells.".into(),
             players: HashMap::new(),
             audio: None,
-            audio_failed: false,
             gens: HashMap::new(),
             heads: HashMap::new(),
             flow: Flow::default(),
@@ -546,8 +563,10 @@ impl State {
             netout: Default::default(),
             rec_request: None,
             output: None,
-            monitors: monitors::list(),
-            monitors_polled: None,
+            monitors: if live { monitors::list() } else { vec![] },
+            monitors_polled: (!live).then(std::time::Instant::now),
+            persist: live,
+            audio_failed: !live,
             cells: vec![],
             layer_rects: vec![],
             master_rect: None,
@@ -558,8 +577,16 @@ impl State {
             learn: false,
             learn_target: None,
             learn_midi: false,
-            midi: midi_io::Midi::spawn(),
-            osc: osc_io::Osc::spawn(),
+            midi: if live {
+                midi_io::Midi::spawn()
+            } else {
+                midi_io::Midi::idle()
+            },
+            osc: if live {
+                osc_io::Osc::spawn()
+            } else {
+                osc_io::Osc::idle()
+            },
             osc_cfg: None,
             osc_prev: HashMap::new(),
             osc_limit: Default::default(),
@@ -633,7 +660,7 @@ impl State {
         match r {
             rfd::MessageDialogResult::Custom(l) if l == "Save" => self.save(),
             rfd::MessageDialogResult::Custom(l) if l == "Don't Save" => {
-                if let Some(r) = recovery_path() {
+                if let Some(r) = self.recovery_path() {
                     let _ = std::fs::remove_file(r);
                 }
                 true
@@ -655,7 +682,10 @@ impl State {
     }
 
     fn save_prefs(&mut self) {
-        let Some(p) = prefs_path() else { return };
+        let Some(p) = self.persist.then(prefs_path).flatten() else {
+            self.prefs_dirty = false;
+            return;
+        };
         self.prefs.sanitize();
         if let Err(e) = self.prefs.save(&p) {
             self.status = format!("Saving preferences failed: {e}");
@@ -742,7 +772,7 @@ impl State {
                 self.status = format!("Saved {}", path.display());
                 self.file = Some(path);
                 self.dirty = false;
-                if let Some(r) = recovery_path() {
+                if let Some(r) = self.recovery_path() {
                     let _ = std::fs::remove_file(r);
                 }
                 true
@@ -761,7 +791,7 @@ impl State {
             return;
         }
         self.last_autosave = std::time::Instant::now();
-        if let Some(r) = recovery_path() {
+        if let Some(r) = self.recovery_path() {
             if let Some(d) = r.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
@@ -3357,6 +3387,9 @@ impl eframe::App for State {
         ctx.request_repaint();
     }
 }
+
+#[cfg(test)]
+mod ui_tests;
 
 fn main() -> eframe::Result {
     let (prefs, warn) = match prefs_path() {
