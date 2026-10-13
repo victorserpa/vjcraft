@@ -3427,6 +3427,166 @@ mod tests {
         Ctx::new(sel, bypass)
     }
 
+    fn fx_project() -> (Project, EffectId, EffectId, EffectId) {
+        let (mut p, l1, l2) = grid();
+        let mk = |kind: &str| Effect {
+            id: Uuid::new_v4(),
+            kind: kind.into(),
+            bypass: false,
+            dry_wet: 1.0,
+            params: vec![
+                vjc_model::Param::number("amt", 5.0, Some((0.0, 10.0))),
+                vjc_model::Param {
+                    name: "on".into(),
+                    value: Value::Bool(false),
+                    default: Value::Bool(false),
+                    range: None,
+                    animation: None,
+                },
+                vjc_model::Param {
+                    name: "mode".into(),
+                    value: Value::Choice {
+                        selected: 0,
+                        options: vec!["a".into(), "b".into(), "c".into()],
+                    },
+                    default: Value::Choice {
+                        selected: 0,
+                        options: vec!["a".into(), "b".into(), "c".into()],
+                    },
+                    range: None,
+                    animation: None,
+                },
+            ],
+        };
+        let (m, l, c) = (mk("m"), mk("l"), mk("c"));
+        let ids = (m.id, l.id, c.id);
+        p.composition.master.effects.push(m);
+        // Layer 1 (bottom) is l2.
+        let li = p
+            .composition
+            .layers
+            .iter()
+            .position(|x| x.id == l2)
+            .unwrap();
+        p.composition.layers[li].track.effects.push(l);
+        let _ = l1;
+        let d = &mut p.composition.decks[0];
+        d.clips
+            .iter_mut()
+            .find(|k| k.layer == l2 && k.column == 0)
+            .unwrap()
+            .clip
+            .track
+            .effects
+            .push(c);
+        (p, ids.0, ids.1, ids.2)
+    }
+
+    #[test]
+    fn effect_addresses_resolve_and_apply() {
+        let (mut p, m, l, c) = fx_project();
+        let l2 = p.composition.layers.last().unwrap().id;
+        let ctx = Ctx::new(None, false).with_active(vec![(l2, A, 0)]);
+        // Each scope: param (number, bool, choice), drywet, bypass.
+        for (base, id) in [
+            ("/comp/effect/1", m),
+            ("/comp/layer/1/effect/1", l),
+            ("/comp/layer/1/clip/effect/1", c),
+        ] {
+            let cmd = sc::resolve_with(&p, &ctx, &format!("{base}/param/amt"), 0.25).unwrap();
+            assert!(matches!(&cmd, Command::SetEffectParam { effect, param: 0,
+                value: Value::Number(v), .. } if *effect == id && (*v - 2.5).abs() < 1e-9));
+            let cmd = sc::resolve_with(&p, &ctx, &format!("{base}/param/on"), 1.0).unwrap();
+            assert!(matches!(
+                cmd,
+                Command::SetEffectParam {
+                    value: Value::Bool(true),
+                    ..
+                }
+            ));
+            let cmd = sc::resolve_with(&p, &ctx, &format!("{base}/param/mode"), 1.0).unwrap();
+            assert!(matches!(
+                cmd,
+                Command::SetEffectParam {
+                    value: Value::Choice { selected: 2, .. },
+                    ..
+                }
+            ));
+            let cmd = sc::resolve_with(&p, &ctx, &format!("{base}/drywet"), 2.0).unwrap();
+            assert!(matches!(cmd, Command::SetEffectDryWet { dry_wet, .. } if dry_wet == 1.0));
+            let cmd = sc::resolve_with(&p, &ctx, &format!("{base}/bypass"), 1.0).unwrap();
+            assert!(matches!(cmd, Command::SetEffectBypass { bypass: true, .. }));
+            assert_eq!(
+                sc::current(&p, &ctx, &format!("{base}/param/amt")),
+                Some(0.5)
+            );
+            // Out of range / unknown: None, never a panic.
+            for bad in [
+                format!("{base}/../x"),
+                format!("{base}/param/nope"),
+                format!("{base}/param/amt/x"),
+                format!("{base}/nope"),
+            ] {
+                assert!(sc::resolve_with(&p, &ctx, &bad, 1.0).is_none(), "{bad}");
+            }
+        }
+        for bad in [
+            "/comp/effect/0/drywet",
+            "/comp/effect/2/drywet",
+            "/comp/effect/x/drywet",
+            "/comp/effect/99999999999999999999/bypass",
+            "/comp/layer/0/effect/1/drywet",
+            "/comp/layer/3/effect/1/drywet",
+            "/comp/layer/1/effect/2/bypass",
+            "/comp/layer/1/clip/effect/2/bypass",
+            "/comp/layer/2/clip/effect/1/bypass",
+            "/comp/layer/9/clip/effect/1/bypass",
+        ] {
+            assert!(sc::resolve_with(&p, &ctx, bad, 1.0).is_none(), "{bad}");
+            assert_eq!(sc::current(&p, &ctx, bad), None, "{bad}");
+        }
+        // Clip form needs an active clip.
+        assert!(sc::resolve(&p, "/comp/layer/1/clip/effect/1/bypass", 1.0).is_none());
+        // Existing clip connect form still works.
+        assert!(sc::resolve(&p, "/comp/layer/1/clip/3/connect", 1.0).is_some());
+        // Apply through history and read back.
+        let mut h = History::default();
+        let cmd = sc::resolve_with(&p, &ctx, "/comp/layer/1/effect/1/param/amt", 1.0).unwrap();
+        h.exec(&mut p, cmd, Instant::now()).unwrap();
+        let e = &effects::chain(&p, EffectTarget::Layer(l2)).unwrap()[0];
+        assert_eq!(number(&e.params[0].value), 10.0);
+    }
+
+    #[test]
+    fn osc_and_key_shortcut_drive_effect_param() {
+        use crate::osc;
+        let (mut p, m, _, _) = fx_project();
+        let ctx = ctx(None, false);
+        let mut h = History::default();
+        let ev = osc::Event {
+            address: "/comp/effect/1/param/amt".into(),
+            value: Some(0.8),
+        };
+        let cmd = osc::direct(&p, &ctx, &ev).unwrap();
+        h.exec(&mut p, cmd, Instant::now()).unwrap();
+        assert!((number(&p.composition.master.effects[0].params[0].value) - 8.0).abs() < 1e-9);
+        // Learned key (toggle 0..1) on drywet flips it.
+        let s = sc::key_shortcut(
+            "D",
+            "/comp/effect/1/drywet",
+            vjc_model::ShortcutMode::Toggle,
+            (0.0, 1.0),
+        );
+        let cmd = sc::activate(&p, &ctx, &s).unwrap();
+        h.exec(&mut p, cmd, Instant::now()).unwrap();
+        assert_eq!(p.composition.master.effects[0].dry_wet, 0.0);
+        assert_eq!(p.composition.master.effects[0].id, m);
+        // A learned CC on a param is absolute over 0..1.
+        assert!(sc::is_continuous("/comp/effect/1/param/amt"));
+        assert!(sc::is_continuous("/comp/layer/1/effect/2/drywet"));
+        assert!(!sc::is_continuous("/comp/effect/1/bypass"));
+    }
+
     #[test]
     fn resolve_every_address() {
         let (p, l1, l2) = grid();

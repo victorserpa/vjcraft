@@ -124,14 +124,14 @@ pub fn command_for(p: &Project, ctx: &Ctx, s: &Shortcut, device: &str, m: Msg) -
 /// target's range; everything else follows the key defaults.
 fn default_for(target: &str, src: &ControlSource) -> (ShortcutMode, (f64, f64)) {
     let cc = matches!(src, ControlSource::MidiCc { .. });
-    if cc && target.ends_with("/opacity") {
+    if cc && shortcuts::is_continuous(target) {
         (ShortcutMode::Absolute, (0.0, 1.0))
     } else if cc && target.ends_with("/bpm") {
         (
             ShortcutMode::Absolute,
             (crate::clock::MIN_BPM, crate::clock::MAX_BPM),
         )
-    } else if target.ends_with("/bypass") || target.ends_with("/opacity") {
+    } else if target.ends_with("/bypass") || shortcuts::is_continuous(target) {
         (ShortcutMode::Toggle, (0.0, 1.0))
     } else {
         (ShortcutMode::Trigger, (0.0, 1.0))

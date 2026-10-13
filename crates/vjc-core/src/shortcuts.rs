@@ -2,17 +2,22 @@
 //! `resolve` that turns an address plus a value into a `Command`. Layers are numbered from
 //! the bottom (Layer 1 is the last one listed), columns from 1, on the current deck.
 
+use super::effects::{self, EffectTarget};
 use super::{Applied, Command, Error, number, undoable};
 use std::time::Instant;
 use uuid::Uuid;
-use vjc_model::{ColumnIdx, ControlSource, LayerId, Project, Shortcut, ShortcutMode};
+use vjc_model::{
+    ColumnIdx, ControlSource, DeckId, Effect, LayerId, Project, Shortcut, ShortcutMode, Value,
+};
 
 /// Runtime state `resolve` needs and the project does not hold.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Ctx {
     pub col_sel: Option<ColumnIdx>,
     pub master_bypass: bool,
     pub now: Instant,
+    /// Clip playing on each layer; "/comp/layer/N/clip/effect/..." addresses follow it.
+    pub active: Vec<(LayerId, DeckId, ColumnIdx)>,
 }
 
 impl Ctx {
@@ -21,8 +26,167 @@ impl Ctx {
             col_sel,
             master_bypass,
             now: Instant::now(),
+            active: vec![],
         }
     }
+
+    pub fn with_active(mut self, active: Vec<(LayerId, DeckId, ColumnIdx)>) -> Self {
+        self.active = active;
+        self
+    }
+}
+
+/// Effect addresses: "/comp/effect/K/..." (master), "/comp/layer/N/effect/K/..." (layer) and
+/// "/comp/layer/N/clip/effect/K/..." (clip playing on the layer); K counts from 1 in chain
+/// order. Tails: "param/NAME", "drywet", "bypass".
+pub fn effect_address(
+    p: &Project,
+    target: EffectTarget,
+    k: usize,
+    tail: &str,
+    active: Option<(DeckId, ColumnIdx)>,
+) -> Option<String> {
+    match target {
+        EffectTarget::Master => Some(format!("/comp/effect/{}/{tail}", k + 1)),
+        EffectTarget::Layer(l) => layer_address(p, l, &format!("effect/{}/{tail}", k + 1)),
+        EffectTarget::Clip {
+            deck,
+            layer,
+            column,
+        } => (active == Some((deck, column)))
+            .then(|| layer_address(p, layer, &format!("clip/effect/{}/{tail}", k + 1)))?,
+    }
+}
+
+enum FxTail<'a> {
+    Param(&'a str),
+    DryWet,
+    Bypass,
+}
+
+/// Splits an effect address into its chain target, effect and tail. Outer None: not an
+/// effect address; inner None: an effect address that points at nothing.
+#[allow(clippy::type_complexity)]
+fn parse_fx<'a>(
+    p: &'a Project,
+    ctx: &Ctx,
+    parts: &[&'a str],
+) -> Option<Option<(EffectTarget, &'a Effect, FxTail<'a>)>> {
+    let (scope, k, rest): (Option<EffectTarget>, &str, &[&'a str]) = match parts {
+        ["comp", "effect", k, rest @ ..] => (Some(EffectTarget::Master), k, rest),
+        ["comp", "layer", n, "effect", k, rest @ ..] => (
+            number_of(n)
+                .and_then(|n| layer_by_number(p, n))
+                .map(EffectTarget::Layer),
+            k,
+            rest,
+        ),
+        ["comp", "layer", n, "clip", "effect", k, rest @ ..] => (
+            number_of(n)
+                .and_then(|n| layer_by_number(p, n))
+                .and_then(|layer| {
+                    let (_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+                    Some(EffectTarget::Clip {
+                        deck: *deck,
+                        layer,
+                        column: *column,
+                    })
+                }),
+            k,
+            rest,
+        ),
+        _ => return None,
+    };
+    let tail = match rest {
+        ["param", name] => FxTail::Param(name),
+        ["drywet"] => FxTail::DryWet,
+        ["bypass"] => FxTail::Bypass,
+        _ => return Some(None),
+    };
+    Some((|| {
+        let target = scope?;
+        let i = number_of(k)?.checked_sub(1)?;
+        let e = effects::chain(p, target)?.get(i)?;
+        Some((target, e, tail))
+    })())
+}
+
+/// Normalized (0..1) reading of a param value; None for kinds that cannot be mapped.
+fn param_norm(v: &vjc_model::Param) -> Option<f64> {
+    match &v.value {
+        Value::Number(n) => Some(match v.range {
+            Some((lo, hi)) if hi > lo => ((n - lo) / (hi - lo)).clamp(0.0, 1.0),
+            _ => n.clamp(0.0, 1.0),
+        }),
+        Value::Bool(b) => Some(f64::from(u8::from(*b))),
+        Value::Choice { selected, options } => Some(if options.len() > 1 {
+            f64::from(*selected) / (options.len() - 1) as f64
+        } else {
+            0.0
+        }),
+        _ => None,
+    }
+}
+
+/// The value a normalized `x` stands for in `prm`'s own type and range.
+fn param_value(prm: &vjc_model::Param, x: f64) -> Option<Value> {
+    let x = if x.is_finite() { x } else { return None };
+    match &prm.value {
+        Value::Number(_) => Some(Value::Number(match prm.range {
+            Some((lo, hi)) => lo + x.clamp(0.0, 1.0) * (hi - lo),
+            None => x.clamp(0.0, 1.0),
+        })),
+        Value::Bool(_) => Some(Value::Bool(x >= 0.5)),
+        Value::Choice { options, .. } if !options.is_empty() => Some(Value::Choice {
+            selected: (x.clamp(0.0, 1.0) * (options.len() - 1) as f64).round() as u32,
+            options: options.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn fx_current(p: &Project, ctx: &Ctx, parts: &[&str]) -> Option<Option<f64>> {
+    let r = parse_fx(p, ctx, parts)?;
+    Some(r.and_then(|(_, e, tail)| match tail {
+        FxTail::Bypass => Some(f64::from(u8::from(e.bypass))),
+        FxTail::DryWet => Some(f64::from(e.dry_wet)),
+        FxTail::Param(name) => param_norm(e.params.iter().find(|q| q.name == name)?),
+    }))
+}
+
+fn fx_resolve(p: &Project, ctx: &Ctx, parts: &[&str], value: f64) -> Option<Option<Command>> {
+    let r = parse_fx(p, ctx, parts)?;
+    Some(r.and_then(|(target, e, tail)| {
+        let effect = e.id;
+        match tail {
+            FxTail::Bypass => value.is_finite().then_some(Command::SetEffectBypass {
+                target,
+                effect,
+                bypass: value >= 0.5,
+            }),
+            FxTail::DryWet => value.is_finite().then(|| Command::SetEffectDryWet {
+                target,
+                effect,
+                dry_wet: value.clamp(0.0, 1.0) as f32,
+            }),
+            FxTail::Param(name) => {
+                let param = e.params.iter().position(|q| q.name == name)?;
+                Some(Command::SetEffectParam {
+                    target,
+                    effect,
+                    param,
+                    value: param_value(&e.params[param], value)?,
+                })
+            }
+        }
+    }))
+}
+
+/// True for targets a knob sweeps (opacity and effect params / dry-wet) rather than flips.
+pub fn is_continuous(address: &str) -> bool {
+    address.ends_with("/opacity")
+        || address.ends_with("/drywet")
+        || (address.contains("/effect/") && address.contains("/param/"))
 }
 
 pub fn layer_address(p: &Project, layer: LayerId, tail: &str) -> Option<String> {
@@ -51,6 +215,9 @@ fn number_of(s: &str) -> Option<usize> {
 /// Current value of a continuous or boolean address (None for triggers).
 pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
     let parts: Vec<&str> = address.trim_start_matches('/').split('/').collect();
+    if let Some(r) = fx_current(p, ctx, &parts) {
+        return r;
+    }
     match parts.as_slice() {
         ["comp", "layer", n, "opacity"] => {
             let l = layer_by_number(p, number_of(n)?)?;
@@ -87,6 +254,9 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
     let deck = p.composition.current_deck;
     let parts: Vec<&str> = address.trim_start_matches('/').split('/').collect();
     let fire = value > 0.0;
+    if let Some(r) = fx_resolve(p, ctx, &parts, value) {
+        return r;
+    }
     match parts.as_slice() {
         ["comp", "layer", n, "clip", m, "connect"] => {
             let layer = layer_by_number(p, number_of(n)?)?;
@@ -208,7 +378,7 @@ pub fn key_of(s: &Shortcut) -> Option<&str> {
 
 /// Default mode for a target when learned: triggers fire, switches and opacity toggle.
 fn default_mode(address: &str) -> (ShortcutMode, (f64, f64)) {
-    if address.ends_with("/bypass") || address.ends_with("/opacity") {
+    if address.ends_with("/bypass") || is_continuous(address) {
         (ShortcutMode::Toggle, (0.0, 1.0))
     } else {
         (ShortcutMode::Trigger, (0.0, 1.0))

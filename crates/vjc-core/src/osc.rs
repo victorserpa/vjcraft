@@ -123,7 +123,7 @@ pub fn learn(p: &Project, target: &str, source: ControlSource) -> Vec<Command> {
         .filter(|s| (s.target == target && is_osc(&s.source)) || s.source == source)
         .map(|s| Command::RemoveShortcut { id: s.id })
         .collect();
-    let (mode, range) = if target.ends_with("/opacity") {
+    let (mode, range) = if shortcuts::is_continuous(target) {
         (ShortcutMode::Absolute, (0.0, 1.0))
     } else if target.ends_with("/bpm") {
         (

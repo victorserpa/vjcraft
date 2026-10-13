@@ -1188,6 +1188,17 @@ impl State {
     }
 
     /// Deck and column of the clip playing on the layer (video or generator).
+    fn rt_ctx(&self) -> vjc_core::shortcuts::Ctx {
+        let active = self
+            .project
+            .composition
+            .layers
+            .iter()
+            .filter_map(|l| active_of(&self.players, &self.gens, l.id).map(|(d, c)| (l.id, d, c)))
+            .collect();
+        vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass).with_active(active)
+    }
+
     fn active(&self, layer: LayerId) -> Option<(DeckId, u32)> {
         active_of(&self.players, &self.gens, layer)
     }
@@ -1853,7 +1864,7 @@ impl State {
         if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
-        let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+        let rt = self.rt_ctx();
         for key in pressed {
             let name = key.name();
             let cmds: Vec<Command> = self
@@ -1896,7 +1907,7 @@ impl State {
                 }
                 continue;
             }
-            let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+            let rt = self.rt_ctx();
             let cmds: Vec<Command> = self
                 .project
                 .shortcuts
@@ -1907,7 +1918,7 @@ impl State {
                 self.exec(c);
             }
         }
-        let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+        let rt = self.rt_ctx();
         let active = |l| active_of(&self.players, &self.gens, l);
         let next = m::led_states(&self.project, &rt, &active);
         for ((device, ch, note), on) in m::feedback_diff(&self.led_prev, &next) {
@@ -1939,7 +1950,7 @@ impl State {
                 }
                 continue;
             }
-            let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+            let rt = self.rt_ctx();
             let mut cmds: Vec<Command> = o::direct(&self.project, &rt, &ev).into_iter().collect();
             cmds.extend(
                 self.project
@@ -1956,7 +1967,7 @@ impl State {
             return;
         }
         let now = std::time::Instant::now();
-        let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+        let rt = self.rt_ctx();
         let active = |l| active_of(&self.players, &self.gens, l);
         let beat = self.clock.phase(now).floor() as i64;
         let next = o::out_states(&self.project, &rt, &active, beat);
@@ -3203,6 +3214,18 @@ impl State {
         );
     }
 
+    /// Registers an effect control as a mappable (learn) target.
+    fn fx_target(&mut self, rect: egui::Rect, target: EffectTarget, k: usize, tail: &str) {
+        let active = match target {
+            EffectTarget::Clip { layer, .. } => active_of(&self.players, &self.gens, layer),
+            _ => None,
+        };
+        if let Some(a) = vjc_core::shortcuts::effect_address(&self.project, target, k, tail, active)
+        {
+            self.targets.push((rect, a));
+        }
+    }
+
     /// Effect chain of a target with per-effect controls.
     fn chain_ui(&mut self, ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
         ui.menu_button("Add effect", |ui| add_effect_menu(ui, target, cmds));
@@ -3220,7 +3243,9 @@ impl State {
             };
             ui.horizontal(|ui| {
                 let mut on = !e.bypass;
-                if ui.checkbox(&mut on, "").on_hover_text("Enabled").changed() {
+                let en = ui.checkbox(&mut on, "").on_hover_text("Enabled");
+                self.fx_target(en.rect, target, i, "bypass");
+                if en.changed() {
                     cmds.push(Command::SetEffectBypass {
                         target,
                         effect: e.id,
@@ -3255,16 +3280,25 @@ impl State {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("disabled: {why}"));
                 }
             });
-            let dw = ui
+            let (dw, dw_rect) = ui
                 .push_id((e.id, "dry_wet"), |ui| {
                     ui.horizontal(|ui| {
                         ui.add_space(24.0);
                         ui.label("Dry/Wet");
-                        params::param_slider(ui, "dry_wet", "", e.dry_wet as f64, 1.0, (0.0, 1.0))
+                        let v = params::param_slider(
+                            ui,
+                            "dry_wet",
+                            "",
+                            e.dry_wet as f64,
+                            1.0,
+                            (0.0, 1.0),
+                        );
+                        (v, ui.min_rect())
                     })
                     .inner
                 })
                 .inner;
+            self.fx_target(dw_rect, target, i, "drywet");
             if let Some(v) = dw {
                 cmds.push(Command::SetEffectDryWet {
                     target,
@@ -3278,9 +3312,15 @@ impl State {
                 };
                 // Scope ids per effect so equal param names do not share edit state.
                 let mut an = None;
-                let r = ui
-                    .push_id((e.id, pi), |ui| param_widget(ui, p, kind, &actx, &mut an))
+                let (r, prect) = ui
+                    .push_id((e.id, pi), |ui| {
+                        let r = param_widget(ui, p, kind, &actx, &mut an);
+                        (r, ui.min_rect())
+                    })
                     .inner;
+                if !p.name.contains('/') && !p.name.contains(' ') {
+                    self.fx_target(prect, target, i, &format!("param/{}", p.name));
+                }
                 if let Some(animation) = an {
                     cmds.push(Command::SetAnimation {
                         target: vjc_core::AnimTarget::Effect {
@@ -3440,6 +3480,9 @@ impl State {
                 .with_decorations(false);
             builder.monitor = Some(mon);
             let mut close = false;
+            let mut leave_learn = false;
+            // Esc leaves learn mode first; it must not also close the output.
+            let learning = self.learn;
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of(monitors::viewport_key(sid, ids[mon])),
                 builder,
@@ -3453,13 +3496,19 @@ impl State {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
-                    if ctx.input(|i| {
-                        i.key_pressed(egui::Key::Escape) || i.viewport().close_requested()
-                    }) {
+                    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                    if esc && learning {
+                        // The main window never sees this viewport's keys.
+                        leave_learn = true;
+                    }
+                    if (esc && !learning) || ctx.input(|i| i.viewport().close_requested()) {
                         close = true;
                     }
                 },
             );
+            if leave_learn {
+                self.learn_key(egui::Key::Escape);
+            }
             if close {
                 if sid.is_nil() {
                     self.output = None;
