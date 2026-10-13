@@ -75,8 +75,45 @@ impl std::error::Error for AvcError {}
 
 pub struct Import {
     pub project: Project,
-    /// Unsupported or approximated features, human readable.
+    /// Unsupported or approximated features, one line per kind with its count.
     pub warnings: Vec<String>,
+    /// Same information, `kind -> occurrences`.
+    pub warning_counts: BTreeMap<String, usize>,
+    /// Effects that made it into the project (clip, layer and composition chains).
+    pub effects_imported: usize,
+}
+
+/// Collects warnings grouped by kind: a count plus a few distinct examples.
+#[derive(Default)]
+struct Warns {
+    kinds: BTreeMap<String, (usize, BTreeSet<String>)>,
+}
+
+impl Warns {
+    fn add(&mut self, kind: &str, detail: &str) {
+        let e = self.kinds.entry(kind.to_string()).or_default();
+        e.0 += 1;
+        if !detail.is_empty() {
+            e.1.insert(detail.to_string());
+        }
+    }
+    fn lines(&self) -> Vec<String> {
+        self.kinds
+            .iter()
+            .map(|(k, (n, ex))| {
+                let shown: Vec<&str> = ex.iter().take(6).map(String::as_str).collect();
+                let more = if ex.len() > shown.len() { ", ..." } else { "" };
+                if shown.is_empty() {
+                    format!("{n}x {k}")
+                } else {
+                    format!("{n}x {k}: {}{more}", shown.join(", "))
+                }
+            })
+            .collect()
+    }
+    fn counts(&self) -> BTreeMap<String, usize> {
+        self.kinds.iter().map(|(k, v)| (k.clone(), v.0)).collect()
+    }
 }
 
 fn node_from(e: &BytesStart) -> Result<Node, AvcError> {
@@ -138,8 +175,9 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     if root.tag != "Composition" {
         return Err(AvcError::NotAComposition);
     }
-    let mut warnings = vec![];
+    let mut warnings = Warns::default();
     collect_unsupported(&root, &mut warnings);
+    let mut effects_imported = 0;
 
     let info = root.child("CompositionInfo");
     let name = info
@@ -163,10 +201,19 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     {
         comp.tempo.bpm = t;
     }
-    if let Some(m) = root.child("VideoTrack")
-        && let Some(o) = find_opacity(m)
+    if let Some(sp) = root
+        .child("Params")
+        .and_then(|p| range_param(p, "Speed"))
+        .and_then(|p| p.num("value"))
     {
-        comp.master.opacity.set_number(o);
+        comp.master_speed = sp.clamp(0.0, 4.0);
+    }
+    if let Some(m) = root.child("VideoTrack") {
+        if let Some(o) = track_opacity(m) {
+            set_opacity(&mut comp.master, o, &mut warnings);
+        }
+        comp.master.effects = import_chain(m, &mut warnings);
+        effects_imported += comp.master.effects.len();
     }
 
     // Layers, ordered by layerIndex.
@@ -179,8 +226,12 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
         layer_ids.insert(idx, id);
         let vt = l.child("VideoTrack");
         let mut track = Track::new(vt.map(blend_of).unwrap_or(BlendMode::Normal));
-        if let Some(o) = vt.and_then(find_opacity) {
-            track.opacity.set_number(o);
+        if let Some(vt) = vt {
+            if let Some(o) = track_opacity(vt) {
+                set_opacity(&mut track, o, &mut warnings);
+            }
+            track.effects = import_chain(vt, &mut warnings);
+            effects_imported += track.effects.len();
         }
         comp.layers.push(Layer {
             id,
@@ -231,7 +282,6 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
         .map(|i| i.kids("DeckInfo").collect())
         .unwrap_or_default();
     let mut decks = vec![];
-    let mut skipped_routers = 0;
     for (di, d) in root.kids("Deck").enumerate() {
         let name = param_text(d, "Name")
             .or_else(|| {
@@ -250,29 +300,33 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
             let li = c.num("layerIndex").unwrap_or(0.0) as u32;
             let ci = c.num("columnIndex").unwrap_or(0.0) as u32;
             let Some(&layer) = layer_ids.get(&li) else {
-                warnings.push(format!(
-                    "clip at layer {li} column {ci} refers to a missing layer; skipped"
-                ));
+                warnings.add(
+                    "clip refers to a missing layer, skipped",
+                    &format!("{li}/{ci}"),
+                );
                 continue;
             };
             match import_clip(c, &mut warnings) {
-                Some(clip) => deck.set_clip(layer, ci, clip),
-                None => skipped_routers += 1,
+                Some(clip) => {
+                    effects_imported += clip.track.effects.len();
+                    deck.set_clip(layer, ci, clip)
+                }
+                None => warnings.add("clip with unsupported source skipped (router/other)", ""),
             }
         }
         decks.push(deck);
-    }
-    if skipped_routers > 0 {
-        warnings.push(format!(
-            "{skipped_routers} clip(s) with unsupported source (router/other) skipped"
-        ));
     }
     if !decks.is_empty() {
         let cur = root.num("currentDeckIndex").unwrap_or(0.0) as usize;
         comp.current_deck = decks[cur.min(decks.len() - 1)].id;
         comp.decks = decks;
     }
-    Ok(Import { project, warnings })
+    Ok(Import {
+        project,
+        warnings: warnings.lines(),
+        warning_counts: warnings.counts(),
+        effects_imported,
+    })
 }
 
 fn param_text(n: &Node, name: &str) -> Option<String> {
@@ -284,12 +338,129 @@ fn param_text(n: &Node, name: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn find_opacity(vt: &Node) -> Option<f64> {
-    vt.find(
-        &|n| n.tag == "ParamRange" && n.attr("name") == Some("Opacity"),
-        &["PrimarySource"],
-    )
-    .and_then(|p| p.num("value"))
+fn range_param<'a>(params: &'a Node, name: &str) -> Option<&'a Node> {
+    params
+        .kids("ParamRange")
+        .find(|p| p.attr("name") == Some(name))
+}
+
+/// Opacity of a layer/clip/master track. Lives in the track's own `Params`, or in the
+/// `Params` of the Blend mixer's RenderPass. Never searched deeper: effects (dry/wet) and
+/// sources carry their own unrelated "Opacity" params.
+fn track_opacity(vt: &Node) -> Option<f64> {
+    let direct = vt.child("Params").and_then(|p| range_param(p, "Opacity"));
+    let mixer = || {
+        vt.kids("ChoosableMixer")
+            .find(|m| m.attr("name") == Some("Blend"))
+            .and_then(|m| m.child("RenderPass"))
+            .and_then(|r| r.child("Params"))
+            .and_then(|p| range_param(p, "Opacity"))
+    };
+    direct.or_else(mixer).and_then(|p| p.num("value"))
+}
+
+fn set_opacity(t: &mut Track, v: f64, w: &mut Warns) {
+    if !(0.0..=1.0).contains(&v) {
+        w.add("opacity out of range, clamped", &format!("{v}"));
+    }
+    t.opacity.set_number(v);
+}
+
+fn norm(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Our built-in effect for a Resolume effect type/name.
+fn map_effect(name: &str) -> Option<&'static str> {
+    Some(match norm(name).as_str() {
+        "invertrgb" | "invert" => "invert",
+        "mirror" => "mirror",
+        "tile" => "tile",
+        "kaleidoscope" | "kaleido" => "kaleido",
+        "shiftrgb" => "rgb_split",
+        "lorez" | "pixelate" => "pixelate",
+        "vignette" => "vignette",
+        "blur" => "blur",
+        "huerotate" => "hue_shift",
+        "brightcontrast" | "brightnesscontrast" => "brightness_contrast",
+        _ => return None,
+    })
+}
+
+/// Effects of a track's own RenderPassChain (not the source's chain).
+fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
+    let Some(chain) = vt
+        .kids("RenderPass")
+        .find(|r| r.attr("baseType") == Some("RenderPassChain"))
+    else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for rp in chain.kids("RenderPass") {
+        let (inner, wet) = match rp.attr("baseType") {
+            Some("DryWetEffect") => (
+                rp.kids("RenderPass")
+                    .find(|r| r.attr("baseType") == Some("Effect")),
+                rp.child("Params")
+                    .and_then(|p| range_param(p, "Opacity"))
+                    .and_then(|p| p.num("value")),
+            ),
+            Some("Effect") => (Some(rp), None),
+            _ => continue,
+        };
+        let Some(inner) = inner else { continue };
+        let name = inner.attr("type").or(inner.attr("name")).unwrap_or("?");
+        if name == "TransformEffect" {
+            continue;
+        }
+        let Some(mut fx) = map_effect(name).and_then(vjc_fx::new_effect) else {
+            w.add("effect not imported", name);
+            continue;
+        };
+        // Dry/wet comes from the wrapper's Opacity; fully dry means the effect does nothing.
+        if let Some(v) = wet {
+            fx.dry_wet = v.clamp(0.0, 1.0) as f32;
+            fx.bypass = v <= 0.0;
+        }
+        if let Some(params) = inner.child("Params") {
+            for sp in params.kids("ParamRange") {
+                map_param(&mut fx, name, sp, w);
+            }
+        }
+        out.push(fx);
+    }
+    out
+}
+
+/// Same-name param whose range matches (or, with no source range, whose value fits ours).
+fn map_param(fx: &mut Effect, effect: &str, sp: &Node, w: &mut Warns) {
+    let sname = sp.attr("name").unwrap_or("");
+    let detail = format!("{effect}.{sname}");
+    let Some(v) = sp.num("value") else { return };
+    let src_range = sp
+        .child("ValueRange")
+        .and_then(|r| Some((r.num("min")?, r.num("max")?)));
+    let target = fx
+        .params
+        .iter_mut()
+        .find(|p| norm(&p.name) == norm(sname) && matches!(p.value, Value::Number(_)));
+    let Some(t) = target else {
+        w.add("effect param not mapped (default used)", &detail);
+        return;
+    };
+    let fits = match (src_range, t.range) {
+        (Some((a, b)), Some((c, d))) => (a - c).abs() < 1e-6 && (b - d).abs() < 1e-6,
+        (None, Some((c, d))) => (c..=d).contains(&v),
+        (_, None) => true,
+    };
+    if fits {
+        t.set_number(v);
+    } else {
+        w.add("effect param range differs (default used)", &detail);
+    }
 }
 
 /// Blend from the mixer's RenderPass type. Unknown names map to `BlendMode::Unknown`;
@@ -347,7 +518,7 @@ fn blend_from_name(name: &str) -> BlendMode {
     }
 }
 
-fn import_clip(c: &Node, warnings: &mut Vec<String>) -> Option<Clip> {
+fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
     let vt = c.child("VideoTrack")?;
     let vs = vt.child("PrimarySource")?.child("VideoSource")?;
     let source = if let Some(f) = vs.child("VideoFormatReaderSource") {
@@ -370,7 +541,7 @@ fn import_clip(c: &Node, warnings: &mut Vec<String>) -> Option<Clip> {
             },
             // Kept as a placeholder so the grid layout survives; it renders nothing.
             None => {
-                warnings.push(format!("generator not imported: {avc_name}"));
+                warnings.add("generator not imported", avc_name);
                 Source::Generator {
                     kind: avc_name.to_string(),
                     params: rp
@@ -387,16 +558,11 @@ fn import_clip(c: &Node, warnings: &mut Vec<String>) -> Option<Clip> {
         .or_else(|| c.attr("name").map(String::from))
         .unwrap_or_else(|| "Clip".into());
     let mut track = Track::new(blend_of(vt));
-    if let Some(o) = find_opacity(vt) {
-        track.opacity.set_number(o);
+    if let Some(o) = track_opacity(vt) {
+        set_opacity(&mut track, o, warnings);
     }
-    let mut transport = Transport::default();
-    if let Some(b) = c.find(&|n| n.tag == "Beats_d", &[])
-        && let (Some(n), Some(0.0)) = (b.num("numManualBeats"), b.num("mode"))
-        && n > 0.0
-    {
-        transport.beat_sync = Some(n);
-    }
+    track.effects = import_chain(vt, warnings);
+    let transport = import_transport(c, warnings);
     Some(Clip {
         id: Uuid::new_v4(),
         name,
@@ -406,6 +572,63 @@ fn import_clip(c: &Node, warnings: &mut Vec<String>) -> Option<Clip> {
         blend_override: None,
         fit: Default::default(),
     })
+}
+
+/// Clip transport: play mode, direction, speed and BPM sync. Enum codes are inferred (not in
+/// the spec); anything outside the known codes keeps the default and raises a warning.
+fn import_transport(c: &Node, w: &mut Warns) -> Transport {
+    let mut t = Transport::default();
+    let Some(tn) = c.child("Transport") else {
+        return t;
+    };
+    let mut synced = false;
+    tn.walk(&mut |n| {
+        let (Some(name), Some(v)) = (n.attr("name"), n.num("value")) else {
+            return;
+        };
+        match (n.tag.as_str(), name) {
+            // Choice order as listed by the original's public REST API
+            // (playmode options: Loop, Bounce, Random, Once & Clear, Once & Hold;
+            // playdirection options: <, ||, >). Random is a direction here.
+            ("ParamChoice", "PlayMode") => match v as i64 {
+                0 => t.play_mode = PlayMode::Loop,
+                1 => t.play_mode = PlayMode::Bounce,
+                2 => {
+                    t.play_mode = PlayMode::Loop;
+                    t.direction = Direction::Random;
+                }
+                3 => t.play_mode = PlayMode::Once,
+                4 => t.play_mode = PlayMode::OnceHold,
+                _ => w.add("transport value not imported", &format!("PlayMode={v}")),
+            },
+            ("ParamChoice", "PlayDirection") => match v as i64 {
+                // A Random play mode wins regardless of node order.
+                0..=2 if t.direction == Direction::Random => {}
+                0 => t.direction = Direction::Backward,
+                1 => t.direction = Direction::Pause,
+                2 => t.direction = Direction::Forward,
+                _ => w.add(
+                    "transport value not imported",
+                    &format!("PlayDirection={v}"),
+                ),
+            },
+            ("ParamRange", "Speed") => t.speed = v.clamp(0.0, 4.0),
+            ("Param", "TempoSynced") => synced = v != 0.0,
+            ("ParamRange", "Position" | "Max Distance" | "BPM")
+            | ("Param", "DurationIsScalable") => {}
+            ("Param" | "ParamRange" | "ParamChoice", other) => {
+                w.add("transport param not imported", other)
+            }
+            _ => {}
+        }
+    });
+    if synced && let Some(b) = tn.find(&|n| n.tag == "Beats_d", &[]) {
+        match (b.num("mode"), b.num("numManualBeats")) {
+            (Some(0.0), Some(n)) if n > 0.0 => t.beat_sync = Some(n),
+            _ => w.add("transport beat sync mode not imported", ""),
+        }
+    }
+    t
 }
 
 /// Our generator for a Resolume one, by name (case and spaces ignored).
@@ -457,9 +680,7 @@ fn generator_params(p: &Node) -> Vec<Param> {
     out
 }
 
-fn collect_unsupported(root: &Node, w: &mut Vec<String>) {
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut effects: BTreeSet<String> = BTreeSet::new();
+fn collect_unsupported(root: &Node, w: &mut Warns) {
     root.walk(&mut |n| {
         let key = match n.tag.as_str() {
             "Notes" => Some("Notes ignored"),
@@ -474,29 +695,44 @@ fn collect_unsupported(root: &Node, w: &mut Vec<String>) {
             _ => None,
         };
         if let Some(k) = key {
-            *counts.entry(k).or_default() += 1;
-        }
-        if n.tag == "RenderPass" && matches!(n.attr("baseType"), Some("Effect" | "DryWetEffect")) {
-            let t = n.attr("type").unwrap_or("?");
-            if t != "TransformEffect" {
-                effects.insert(t.to_string());
-                *counts.entry("effects ignored").or_default() += 1;
-            }
+            w.add(k, "");
         }
     });
-    for (k, c) in counts {
-        w.push(format!("{c}x {k}"));
-    }
-    if !effects.is_empty() {
-        w.push(format!(
-            "effect types not imported: {}",
-            effects.into_iter().collect::<Vec<_>>().join(", ")
-        ));
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transport_choice_codes() {
+        let mk = |m: u32, d: u32| {
+            format!(
+                r#"<Composition name="x" numColumns="1"><Layer layerIndex="0"/><Deck><Clip layerIndex="0" columnIndex="0"><Transport><Params name="Params"><ParamRange name="Position"><PhaseSourceTransportTimeline><Params name="Params"><ParamChoice name="PlayMode" value="{m}"/><ParamChoice name="PlayDirection" value="{d}"/></Params></PhaseSourceTransportTimeline></ParamRange></Params></Transport><VideoTrack><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/a.mov"/></VideoSource></PrimarySource></VideoTrack></Clip></Deck></Composition>"#
+            )
+        };
+        let t = |m, d| {
+            let i = super::import_str(&mk(m, d)).unwrap();
+            let t = i.project.composition.decks[0].clips[0]
+                .clip
+                .transport
+                .clone();
+            (t.play_mode, t.direction)
+        };
+        use vjc_model::{Direction as D, PlayMode as P};
+        assert_eq!(t(2, 2), (P::Loop, D::Random));
+        assert_eq!(t(3, 2), (P::Once, D::Forward));
+        assert_eq!(t(4, 1), (P::OnceHold, D::Pause));
+        // Direction after a Random play mode does not override it.
+        let x = mk(2, 0);
+        let i = super::import_str(&x).unwrap();
+        assert_eq!(
+            i.project.composition.decks[0].clips[0]
+                .clip
+                .transport
+                .direction,
+            D::Random
+        );
+    }
+
     #[test]
     fn avc_alpha_imports_as_normal() {
         assert_eq!(
@@ -604,5 +840,106 @@ mod tests {
         assert!(i.warnings.iter().any(|w| w.contains("Plasma")));
         assert_eq!(map_generator("Checkered"), Some("checker"));
         assert_eq!(map_generator("Gradient"), Some("linear_gradient"));
+    }
+
+    fn imports() -> Vec<Import> {
+        FILES
+            .iter()
+            .map(Path::new)
+            .filter(|p| p.exists())
+            .map(|p| import_file(p).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn examples_opacity_effects_transport_warnings() {
+        for i in imports() {
+            let c = &i.project.composition;
+            // Layer 1 sets Opacity 0.5 in its Blend mixer params; effects' dry/wet
+            // Opacity (0 in the file) must not leak into the track.
+            let ops: Vec<_> = c
+                .layers
+                .iter()
+                .map(|l| l.track.opacity.value.clone())
+                .collect();
+            assert_eq!(
+                ops,
+                vec![Value::Number(1.0), Value::Number(0.5), Value::Number(0.5)]
+            );
+            assert_eq!(c.master.opacity.value, Value::Number(1.0));
+            assert_eq!(c.tempo.bpm, 128.0);
+            assert!((c.master_speed - 1.0).abs() < 1e-9);
+            // Only HueRotate and ShiftRGB have equivalents; the rest warn.
+            let in_tracks: usize = c.master.effects.len()
+                + c.layers
+                    .iter()
+                    .map(|l| l.track.effects.len())
+                    .sum::<usize>()
+                + c.decks
+                    .iter()
+                    .flat_map(|d| &d.clips)
+                    .map(|x| x.clip.track.effects.len())
+                    .sum::<usize>();
+            assert_eq!(i.effects_imported, in_tracks);
+            assert!(c.master.effects.iter().any(|e| e.kind == "rgb_split"));
+            assert_eq!(i.warning_counts["effect not imported"], 7);
+            // Grouped: one line per kind, never one per occurrence.
+            assert!(i.warnings.len() <= i.warning_counts.len());
+            assert!(i.warnings.len() < 20);
+        }
+        let all = imports();
+        if all.len() == FILES.len() {
+            assert_eq!(all[0].effects_imported, 5);
+            assert_eq!(all[1].effects_imported, 2);
+        }
+    }
+
+    #[test]
+    fn example_clip_transport_beat_sync() {
+        let p = Path::new(FILES[1]);
+        if !p.exists() {
+            return;
+        }
+        let i = import_file(p).unwrap();
+        let c = &i.project.composition;
+        let clip = &c
+            .decks
+            .iter()
+            .flat_map(|d| &d.clips)
+            .find(|x| x.clip.name == "Beat 001")
+            .unwrap()
+            .clip;
+        // Transport XML: TempoSynced=1, Beats_d mode 0, numManualBeats 16.
+        assert_eq!(clip.transport.beat_sync, Some(16.0));
+        assert_eq!(clip.transport.play_mode, PlayMode::Loop);
+    }
+
+    #[test]
+    fn opacity_comes_from_track_not_effects() {
+        let xml = r#"<Composition name="x" numColumns="1"><VideoTrack name="VideoTrack">
+<RenderPass baseType="RenderPassChain"><RenderPass type="DryWetEffect" baseType="DryWetEffect"><Params name="Params"><ParamRange name="Opacity" value="0"/></Params>
+<RenderPass type="Invert RGB" baseType="Effect"><Params name="Params"><ParamRange name="amount" value="0.25"><ValueRange name="minMax" min="0" max="1"/></ParamRange></Params></RenderPass></RenderPass>
+<RenderPass type="Weird" baseType="Effect"/></RenderPass></VideoTrack>
+<Layer layerIndex="0"><VideoTrack><Params name="Params"><ParamRange name="Opacity" value="0.3"/></Params></VideoTrack></Layer>
+<Deck><Clip layerIndex="0" columnIndex="0"><Transport><Params name="Params"><ParamRange name="Position"><PhaseSourceTransportTimeline><Params name="Params">
+<ParamChoice name="PlayMode" value="1"/><ParamChoice name="PlayDirection" value="0"/><ParamRange name="Speed" value="2"/><Param name="TempoSynced" T="BOOL" value="1"/><ParamRange name="Odd" value="1"/></Params>
+<Beats_d mode="0" numManualBeats="8"/></PhaseSourceTransportTimeline></ParamRange></Params></Transport>
+<VideoTrack><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/a.mov"/></VideoSource></PrimarySource></VideoTrack></Clip></Deck></Composition>"#;
+        let i = import_str(xml).unwrap();
+        let c = &i.project.composition;
+        assert_eq!(c.layers[0].track.opacity.value, Value::Number(0.3));
+        assert_eq!(c.master.opacity.value, Value::Number(1.0));
+        let fx = &c.master.effects;
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].kind, "invert");
+        assert!(fx[0].bypass && fx[0].dry_wet == 0.0);
+        assert_eq!(fx[0].params[0].value, Value::Number(0.25));
+        assert_eq!(i.warning_counts["effect not imported"], 1);
+        let t = &c.decks[0].clips[0].clip.transport;
+        assert_eq!(
+            (t.play_mode, t.direction, t.speed, t.beat_sync),
+            (PlayMode::Bounce, Direction::Backward, 2.0, Some(8.0))
+        );
+        assert_eq!(i.warning_counts["transport param not imported"], 1);
     }
 }
