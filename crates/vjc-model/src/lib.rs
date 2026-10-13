@@ -129,7 +129,8 @@ pub struct Track {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BlendMode {
-    Normal, Add, Subtract, Multiply, Screen, Overlay, Lighten, Darken, Difference, Alpha,
+    // Generic compositing and transition modes; see docs/03-catalogo.md.
+    Normal, Add, Burn, Darken, Difference, Dodge, Exclusion, HardLight, Lighten, Multiply, Overlay, Screen, SoftLight, Subtract, Dissolve, Cut, LumaKey, LumaIsAlpha, ToBlack, ToWhite, ToColor, PushUp, PushDown, PushLeft, PushRight, ZoomIn, ZoomOut, WipeEllipse, RotateX, RotateY, SideBySide, PictureInPicture, Rgb, BlackWhite, Alpha,
     #[serde(other)] Unknown,
 }
 

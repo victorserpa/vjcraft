@@ -1,0 +1,209 @@
+# Catálogo levantado via API REST local (Arena 7.28.1, só leitura)
+
+Fonte: GET /api/v1/effects, /api/v1/sources, /api/v1/composition em 127.0.0.1:8080. Nomes são referência de paridade; nomes criativos (marcados *) devem ser renomeados no clone. Câmeras do usuário omitidas.
+
+## Blend modes / transições (52) — mesma lista serve para blend de layer e transição
+
+- Add
+- Alpha
+- B&W
+- Burn
+- Cube *
+- Cut
+- Darken
+- Depth *
+- Difference
+- Difference I *
+- Displace *
+- Dissolve
+- Dodge
+- Exclusion
+- Hard Light
+- JitterBug *
+- Layer Determined *
+- Lighten
+- LoRez *
+- Luma Is Alpha
+- Luma Key
+- Luma Key I *
+- Meta Mix *
+- Multi Task *
+- Multiply
+- Noisy *
+- Overlay
+- Parts *
+- PiP
+- Push Down
+- Push Left
+- Push Right
+- Push Up
+- RGB
+- Rotate X
+- Rotate Y
+- Screen
+- Shift RGB *
+- Side by Side
+- Soft Light
+- Static *
+- Subtract
+- Tile *
+- TimeSwitcher *
+- Twitch *
+- Video Bumper *
+- Wipe Ellipse
+- Zoom In
+- Zoom Out
+- to Black
+- to Color
+- to White
+
+## Efeitos de vídeo (113)
+
+- Acuarela
+- Add Subtract
+- Auto Mask
+- Background Removal
+- Bendoscope
+- Bloom
+- Blow
+- Blur
+- Bright.Contrast
+- CRT
+- ChromaKey
+- Circles
+- Color Pass
+- Colorize
+- Crop
+- Cube Tiles
+- Delay RGB
+- Depth Blur
+- Depth Displace
+- Depth Estimation
+- Depth Field
+- Depth Pixelation
+- Depth Shift
+- Dilate
+- Displace
+- Distortion
+- Dither
+- Dot Screen
+- Drop Shadow
+- Edge Detection
+- Exposure
+- Fish Eye
+- Flip
+- Fragment
+- Freeze
+- Goo
+- Grid
+- Grid Cloner
+- Hatched
+- Heat
+- Hue Rotate
+- Infinite Zoom
+- Invert RGB
+- Iterate
+- Kaleidoscope
+- Keystone
+- Keystone Crop
+- Keystone Mask
+- Kuwahara
+- LUT
+- Levels
+- Linear Cloner
+- LoRez
+- Mask
+- Meta Shape
+- Mirror
+- Mirror Quad
+- Noisy
+- Particle System
+- Pixel Blur
+- Pixel High Pass
+- Point Grid
+- PolarKaleido
+- Polkadot
+- Posterize
+- Radar
+- Radial Cloner
+- RadialBlur
+- Raster
+- Recolor
+- Reveal
+- Ripples
+- Saturation
+- SearchLight
+- Shape Mask
+- Shaper
+- Sharpen
+- Shift Glitch
+- Shift RGB
+- Slice Delay
+- Slice Transform
+- Slide
+- Snow
+- Snowy
+- Solid Color
+- Sparkles
+- Sphere
+- Static
+- Stingy Sphere
+- Stop Motion
+- Stripper
+- Strobe
+- Strokes
+- Suckr
+- Terrain
+- Text Animator
+- Text Block
+- Threshold
+- Tile
+- Tilt Shift
+- Tint
+- Trails
+- Transform
+- Triangulate
+- Tunnel
+- Twisted
+- Twitch
+- UV Map
+- Vibrance
+- VideoWall
+- Vignette
+- WarpSpeed
+- Wave Warp
+
+## Efeitos de áudio (6)
+
+- Bitcrusher
+- Distortion
+- EQ
+- Flanger
+- High-Pass
+- Low-Pass
+
+## Sources / geradores (21)
+
+- Abstract Field
+- Blank
+- Checkered
+- Feedback
+- Gradient
+- Line Scape
+- Lines
+- Metaballs
+- Rings
+- Shaper
+- Sine Wave
+- Slice Outline
+- Solid Color
+- Spiral
+- Static
+- Stroboscope
+- Test Card
+- Text Animator
+- Text Block
+- Tunnelines
+- Video Router
+
+Nota: o app instalado é 7.28.1 (recon dizia 7.15, que era a versão da composição do usuário).
