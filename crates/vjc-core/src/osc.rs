@@ -261,6 +261,7 @@ mod tests {
                 duration_beats: None,
                 duration_secs: 0.0,
             },
+            autopilot: Default::default(),
             crossfader_bus: None,
             group: None,
         }

@@ -7,8 +7,10 @@ pub mod clock;
 pub mod effects;
 pub mod midi;
 pub mod osc;
+pub mod playback;
 pub mod playhead;
 pub mod shortcuts;
+pub mod transition;
 
 pub use effects::EffectTarget;
 use std::path::PathBuf;
@@ -93,6 +95,35 @@ pub enum Command {
         layer: LayerId,
         from: Option<ColumnIdx>,
         delta: i32,
+    },
+    /// Layer transition between clips (kind = a `BlendMode` name, see `transition::Kind`).
+    SetLayerTransition {
+        layer: LayerId,
+        transition: vjc_model::Transition,
+    },
+    SetLayerAutopilot {
+        layer: LayerId,
+        autopilot: vjc_model::Autopilot,
+    },
+    /// Adds a cue point (normalised clip position 0..=1; kept sorted, no duplicates).
+    AddCue {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        pos: f64,
+    },
+    RemoveCue {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        pos: f64,
+    },
+    /// Seeks the playing clip to cue `index`. Runtime only.
+    JumpToCue {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        index: usize,
     },
     /// Stops every layer. Runtime only: not undoable.
     ClearAll,
@@ -327,6 +358,13 @@ pub enum Event {
     },
     LayerCleared {
         layer: LayerId,
+    },
+    /// Jump the playing clip (if it is this cell) to a normalised position.
+    Seek {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        pos: f64,
     },
     /// A column trigger skipped this clip (placeholder / not playable).
     Skipped {
@@ -668,6 +706,102 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 c += sign;
             }
             Err(Error::NoClip)
+        }
+        Command::SetLayerTransition { layer, transition } => {
+            let i = layer_idx(p, layer)?;
+            if !transition.duration_secs.is_finite()
+                || transition
+                    .duration_beats
+                    .is_some_and(|b| !b.is_finite() || b < 0.0)
+            {
+                return Err(Error::InvalidValue);
+            }
+            let prev = std::mem::replace(&mut p.composition.layers[i].transition, transition);
+            undoable(
+                Command::SetLayerTransition {
+                    layer,
+                    transition: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetLayerAutopilot { layer, autopilot } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].autopilot, autopilot);
+            undoable(
+                Command::SetLayerAutopilot {
+                    layer,
+                    autopilot: prev,
+                },
+                vec![],
+            )
+        }
+        Command::AddCue {
+            deck,
+            layer,
+            column,
+            pos,
+        } => {
+            if !pos.is_finite() || !(0.0..=1.0).contains(&pos) {
+                return Err(Error::InvalidValue);
+            }
+            let cues = &mut transport_mut(p, deck, layer, column)?.cue_points;
+            if cues.contains(&pos) {
+                return Err(Error::InvalidValue);
+            }
+            cues.push(pos);
+            cues.sort_by(f64::total_cmp);
+            undoable(
+                Command::RemoveCue {
+                    deck,
+                    layer,
+                    column,
+                    pos,
+                },
+                vec![],
+            )
+        }
+        Command::RemoveCue {
+            deck,
+            layer,
+            column,
+            pos,
+        } => {
+            let cues = &mut transport_mut(p, deck, layer, column)?.cue_points;
+            let i = cues
+                .iter()
+                .position(|c| *c == pos)
+                .ok_or(Error::InvalidValue)?;
+            cues.remove(i);
+            undoable(
+                Command::AddCue {
+                    deck,
+                    layer,
+                    column,
+                    pos,
+                },
+                vec![],
+            )
+        }
+        Command::JumpToCue {
+            deck,
+            layer,
+            column,
+            index,
+        } => {
+            let pos = *transport_mut(p, deck, layer, column)?
+                .cue_points
+                .get(index)
+                .ok_or(Error::InvalidValue)?;
+            Ok(Applied {
+                inverse: None,
+                events: vec![Event::Seek {
+                    deck,
+                    layer,
+                    column,
+                    pos,
+                }],
+            })
         }
         Command::ClearAll => Ok(Applied {
             inverse: None,
@@ -1201,6 +1335,77 @@ impl History {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn transition_autopilot_cues_undo_and_jump_is_runtime() {
+        let (mut p, l) = setup();
+        let mut h = History::default();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let before = p.clone();
+        let cmds = [
+            Command::SetLayerTransition {
+                layer: l,
+                transition: vjc_model::Transition {
+                    kind: "Dissolve".into(),
+                    duration_beats: Some(2.0),
+                    duration_secs: 0.5,
+                },
+            },
+            Command::SetLayerAutopilot {
+                layer: l,
+                autopilot: vjc_model::Autopilot {
+                    mode: vjc_model::AutopilotMode::Random,
+                    every_loops: 3,
+                },
+            },
+            Command::AddCue {
+                deck: A,
+                layer: l,
+                column: 0,
+                pos: 0.7,
+            },
+            Command::AddCue {
+                deck: A,
+                layer: l,
+                column: 0,
+                pos: 0.2,
+            },
+        ];
+        for c in cmds {
+            h.exec(&mut p, c, t).unwrap();
+        }
+        let cues = clip_in(&p, A, l, 0).unwrap().transport.cue_points.clone();
+        assert_eq!(cues, vec![0.2, 0.7]);
+        let ev = h
+            .exec(
+                &mut p,
+                Command::JumpToCue {
+                    deck: A,
+                    layer: l,
+                    column: 0,
+                    index: 1,
+                },
+                t,
+            )
+            .unwrap();
+        assert!(matches!(ev[..], [Event::Seek { pos, .. }] if pos == 0.7));
+        h.exec(
+            &mut p,
+            Command::RemoveCue {
+                deck: A,
+                layer: l,
+                column: 0,
+                pos: 0.2,
+            },
+            t,
+        )
+        .unwrap();
+        for _ in 0..5 {
+            h.undo(&mut p).unwrap().unwrap();
+        }
+        assert_eq!(p, before);
+    }
+
+    #[test]
     fn panel_commands_undo_redo() {
         let (mut p, l) = setup();
         let mut h = History::default();
@@ -1304,6 +1509,7 @@ mod tests {
                 duration_beats: None,
                 duration_secs: 0.0,
             },
+            autopilot: Default::default(),
             crossfader_bus: None,
             group: None,
         }

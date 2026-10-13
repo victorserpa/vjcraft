@@ -244,6 +244,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
                 duration_beats: None,
                 duration_secs: 0.0,
             },
+            autopilot: Default::default(),
             crossfader_bus: None,
             group: None,
         });

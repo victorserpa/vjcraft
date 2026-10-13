@@ -20,8 +20,8 @@ use vjc_core::{Command, Event, History};
 use vjc_io::prefs::Prefs;
 use vjc_media::{Frame, Player};
 use vjc_model::{
-    BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId, PlayMode, Project, Track,
-    Transition, Value,
+    Autopilot, AutopilotMode, BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId,
+    PlayMode, Project, Track, Transition, Value,
 };
 
 struct State {
@@ -41,6 +41,8 @@ struct State {
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
     heads: HashMap<LayerId, Playhead>,
     last_head_tick: std::time::Instant,
+    /// Runtime-only playback flow per layer (transitions, loop counts, beat loops).
+    flow: Flow,
     comp: Option<Compositor>,
     fx: fx::FxLib,
     fx_epoch: std::time::Instant,
@@ -98,6 +100,27 @@ struct State {
     /// Visual only for now. TODO(#9): click sound (see build-log).
     metronome: bool,
 }
+
+/// Old clip kept alive while a layer transition crosses to the new one (frozen on its
+/// last frame: only the incoming clip advances).
+struct Outgoing {
+    player: Player,
+    fit: vjc_model::FitMode,
+    state: vjc_core::transition::State,
+}
+
+#[derive(Default)]
+struct Flow {
+    outgoing: HashMap<LayerId, Outgoing>,
+    loops: HashMap<LayerId, vjc_core::playback::LoopCounter>,
+    /// Beat loop per layer: (beats, normalised window).
+    beat_loops: HashMap<LayerId, (f64, (f64, f64))>,
+    /// Last playhead position per layer.
+    pos: HashMap<LayerId, f64>,
+}
+
+/// Outgoing draws use this id mask so they get their own compositor slot.
+const OUT_MASK: u128 = 0x6f75_745f_736c_6f74;
 
 #[derive(Clone, Copy, PartialEq)]
 enum PrefsTab {
@@ -413,6 +436,7 @@ fn new_layer(n: usize) -> Layer {
             duration_beats: None,
             duration_secs: 0.0,
         },
+        autopilot: Default::default(),
         crossfader_bus: None,
         group: None,
     }
@@ -452,6 +476,7 @@ impl State {
             players: HashMap::new(),
             gens: HashMap::new(),
             heads: HashMap::new(),
+            flow: Flow::default(),
             last_head_tick: std::time::Instant::now(),
             comp: None,
             fx: fx::FxLib::new(),
@@ -497,6 +522,7 @@ impl State {
     }
 
     fn reset_players(&mut self) {
+        self.flow = Flow::default();
         self.players.clear();
         self.gens.clear();
         self.history.clear();
@@ -687,6 +713,7 @@ impl State {
                 self.warnings = i.warnings;
                 self.project = i.project;
                 self.history.clear();
+                self.flow = Flow::default();
                 self.players.clear();
                 self.gens.clear();
                 self.file = None;
@@ -712,6 +739,7 @@ impl State {
                 | Command::StepClip { .. }
                 | Command::ClearAll
                 | Command::SetMasterBypass { .. }
+                | Command::JumpToCue { .. }
         );
         let ncols = self.project.composition.columns.len() as i64;
         let col_after = match &cmd {
@@ -783,7 +811,9 @@ impl State {
                 } => {
                     if path.exists() {
                         self.gens.remove(&layer);
-                        self.players.remove(&layer); // joins the old decode thread
+                        self.flow.loops.remove(&layer);
+                        self.flow.beat_loops.remove(&layer);
+                        self.cross_from_old(layer);
                         self.players
                             .insert(layer, (deck, column, Player::open_scrub(&path)));
                         let tr = self.transport(deck, layer, column);
@@ -802,9 +832,24 @@ impl State {
                     column,
                 } => {
                     self.players.remove(&layer);
+                    self.flow.outgoing.remove(&layer);
+                    self.flow.loops.remove(&layer);
+                    self.flow.beat_loops.remove(&layer);
                     self.gens.insert(layer, (deck, column, 0.0));
                 }
+                Event::Seek {
+                    deck,
+                    layer,
+                    column,
+                    pos,
+                } => {
+                    if self.active(layer) == Some((deck, column)) {
+                        self.seek(layer, pos);
+                    }
+                }
                 Event::LayerCleared { layer } => {
+                    self.flow.outgoing.remove(&layer);
+                    self.flow.beat_loops.remove(&layer);
                     self.players.remove(&layer);
                     self.gens.remove(&layer);
                 }
@@ -837,11 +882,100 @@ impl State {
                     }
                 }
                 Event::DeckRemoved { deck } => {
+                    self.flow.outgoing.clear();
                     self.players.retain(|_, (d, _, _)| *d != deck);
                     self.gens.retain(|_, (d, _, _)| *d != deck);
                 }
             }
         }
+    }
+
+    /// Moves the playing clip of `layer` (if any) into `flow.outgoing` when the layer's
+    /// transition asks for a crossing; otherwise drops it. Joins the old decode thread
+    /// only in the second case.
+    fn cross_from_old(&mut self, layer: LayerId) {
+        self.flow.outgoing.remove(&layer);
+        let fit = self
+            .active(layer)
+            .and_then(|(d, c)| vjc_core::clip_in(&self.project, d, layer, c))
+            .map(|k| k.fit);
+        let Some((_, _, old)) = self.players.remove(&layer) else {
+            return;
+        };
+        let state = self
+            .project
+            .composition
+            .layers
+            .iter()
+            .find(|l| l.id == layer)
+            .map_or(vjc_core::transition::State::Idle, |l| {
+                vjc_core::transition::State::start(
+                    &l.transition,
+                    self.project.composition.tempo.bpm,
+                )
+            });
+        if state != vjc_core::transition::State::Idle {
+            self.flow.outgoing.insert(
+                layer,
+                Outgoing {
+                    player: old,
+                    fit: fit.unwrap_or_default(),
+                    state,
+                },
+            );
+        }
+    }
+
+    /// Jumps the layer's playhead and player to a normalised position.
+    fn seek(&mut self, layer: LayerId, pos: f64) {
+        if let Some(h) = self.heads.get_mut(&layer) {
+            h.seek(pos);
+        }
+        if let Some((_, _, p)) = self.players.get(&layer) {
+            p.set_position(pos);
+        }
+        self.flow.pos.insert(layer, pos);
+    }
+
+    /// Beat loop: repeat `beats` beats from the current position (None clears it).
+    fn set_beat_loop(&mut self, layer: LayerId, beats: Option<f64>) {
+        let dur = self.players.get(&layer).and_then(|(_, _, p)| p.duration());
+        let win = beats.and_then(|b| {
+            let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
+            vjc_core::playback::beat_window(pos, b, self.project.composition.tempo.bpm, dur?)
+                .map(|w| (b, w))
+        });
+        match win {
+            Some(w) => self.flow.beat_loops.insert(layer, w),
+            None => self.flow.beat_loops.remove(&layer),
+        };
+    }
+
+    /// Column the layer's autopilot would play next, if any.
+    fn autopilot_target(&self, layer: LayerId) -> Option<(DeckId, u32)> {
+        let l = self
+            .project
+            .composition
+            .layers
+            .iter()
+            .find(|l| l.id == layer)?;
+        let (deck, cur) = self.active(layer)?;
+        let n = self.project.composition.columns.len();
+        let playable: Vec<bool> = (0..n as u32)
+            .map(|c| {
+                vjc_core::clip_in(&self.project, deck, layer, c).is_some_and(|k| match &k.source {
+                    vjc_model::Source::File { .. } => true,
+                    vjc_model::Source::Generator { kind, .. } => {
+                        vjc_fx::GENERATORS.iter().any(|(id, _)| id == kind)
+                    }
+                    _ => false,
+                })
+            })
+            .collect();
+        let rand = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64);
+        vjc_core::playback::next_clip(l.autopilot.mode, cur, &playable, rand).map(|c| (deck, c))
     }
 
     /// Deck and column of the clip playing on the layer (video or generator).
@@ -876,6 +1010,13 @@ impl State {
         self.last_head_tick = now;
         let master_speed = self.project.composition.master_speed;
         let mut finished = vec![];
+        let mut autopilot = vec![];
+        for o in self.flow.outgoing.values_mut() {
+            o.state = o.state.advance(dt);
+        }
+        self.flow
+            .outgoing
+            .retain(|_, o| o.state != vjc_core::transition::State::Idle);
         for (layer, (deck, col, player)) in &self.players {
             let Some(clip) = vjc_core::clip_in(&self.project, *deck, *layer, *col) else {
                 continue;
@@ -891,9 +1032,33 @@ impl State {
                 let t = head.tick(dt, tr.play_mode, tr.direction, rate, d);
                 // Forward playback streams; everything else needs random access.
                 player.set_sequential(is_sequential(tr.play_mode, tr.direction, rate));
-                player.set_position(t.position);
+                let mut position = t.position;
+                if let Some((_, w)) = self.flow.beat_loops.get(layer)
+                    && !t.finished
+                    && let Some(np) = vjc_core::playback::loop_wrap(position, *w)
+                {
+                    head.seek(np);
+                    position = np;
+                }
+                player.set_position(position);
+                self.flow.pos.insert(*layer, position);
                 if t.finished {
                     finished.push(*layer);
+                } else if tr.play_mode == PlayMode::Loop
+                    && let Some(l) = self
+                        .project
+                        .composition
+                        .layers
+                        .iter()
+                        .find(|l| l.id == *layer)
+                    && l.autopilot.mode != vjc_model::AutopilotMode::Off
+                {
+                    let c = self.flow.loops.entry(*layer).or_default();
+                    if c.observe(position, tr.direction)
+                        && vjc_core::playback::loops_reached(c.count, l.autopilot.every_loops)
+                    {
+                        autopilot.push(*layer);
+                    }
                 }
             }
         }
@@ -912,7 +1077,23 @@ impl State {
         }
         // Once: clear the layer after the last frame.
         for layer in finished {
-            self.exec(Command::ClearLayer { layer });
+            match self.autopilot_target(layer) {
+                Some((deck, column)) => self.exec(Command::TriggerClip {
+                    deck,
+                    layer,
+                    column,
+                }),
+                None => self.exec(Command::ClearLayer { layer }),
+            }
+        }
+        for layer in autopilot {
+            if let Some((deck, column)) = self.autopilot_target(layer) {
+                self.exec(Command::TriggerClip {
+                    deck,
+                    layer,
+                    column,
+                });
+            }
         }
     }
 
@@ -1038,6 +1219,12 @@ impl State {
                 )
             })
             .collect();
+        let out_frames: HashMap<LayerId, Frame> = self
+            .flow
+            .outgoing
+            .iter()
+            .filter_map(|(id, o)| Some((*id, o.player.latest_frame()?)))
+            .collect();
         // Fit comes from the deck the clip was triggered from, not the visible one.
         let (players, gens) = (&self.players, &self.gens);
         let fit_of = |l: &Layer| {
@@ -1078,12 +1265,33 @@ impl State {
             };
             let mut effects = draw_chain(&mut self.fx, clip_fx.unwrap_or_default(), time, size);
             effects.extend(draw_chain(&mut self.fx, &l.track.effects, time, size));
+            let cross = self
+                .flow
+                .outgoing
+                .get(&l.id)
+                .filter(|_| !l.bypass)
+                .and_then(|o| Some((o, o.state.current()?, out_frames.get(&l.id)?)));
+            let opacity = match l.track.opacity.value {
+                vjc_model::Value::Number(n) => n as f32,
+                _ => 1.0,
+            };
+            if let Some((o, (kind, prog), of)) = cross {
+                let fx = draw_chain(&mut self.fx, &l.track.effects, time, (of.width, of.height));
+                draws.push(LayerDraw {
+                    id: Uuid::from_u128(l.id.as_u128() ^ OUT_MASK),
+                    opacity,
+                    blend: l.track.blend.clone(),
+                    fit: o.fit,
+                    effects: fx,
+                    generator: None,
+                    transition: Some((kind.shader_id(), prog, true)),
+                    frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
+                });
+            }
             draws.push(LayerDraw {
                 id: l.id,
-                opacity: match l.track.opacity.value {
-                    vjc_model::Value::Number(n) => n as f32,
-                    _ => 1.0,
-                },
+                transition: cross.map(|(_, (k, p), _)| (k.shader_id(), p, false)),
+                opacity,
                 blend: l.track.blend.clone(),
                 fit: fit_of(l).unwrap_or_default(),
                 effects,
@@ -1992,6 +2200,97 @@ impl State {
             }
         });
         ui.separator();
+        let kinds: Vec<(String, String)> = [
+            "Cut",
+            "Dissolve",
+            "ToBlack",
+            "PushLeft",
+            "PushRight",
+            "ZoomIn",
+            "WipeEllipse",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), k.to_string()))
+        .collect();
+        let tr = l.transition.clone();
+        if let Some(kind) = params::combo(ui, ("ltk", lid), "Transition", &tr.kind, &kinds) {
+            let transition = Transition { kind, ..tr.clone() };
+            cmds.push(Command::SetLayerTransition {
+                layer: lid,
+                transition,
+            });
+        }
+        if let Some(secs) = params::param_slider(
+            ui,
+            ("ltd", lid),
+            "Duration (s)",
+            tr.duration_secs,
+            0.0,
+            (0.0, 8.0),
+        ) {
+            let transition = Transition {
+                duration_secs: secs,
+                ..tr.clone()
+            };
+            cmds.push(Command::SetLayerTransition {
+                layer: lid,
+                transition,
+            });
+        }
+        let beats: Vec<(Option<f64>, String)> = [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0)]
+            .into_iter()
+            .map(|b| {
+                (
+                    b,
+                    b.map_or("off (use seconds)".into(), |n| format!("{n} beats")),
+                )
+            })
+            .collect();
+        if let Some(duration_beats) = params::combo(
+            ui,
+            ("ltb", lid),
+            "Duration (beats)",
+            &tr.duration_beats,
+            &beats,
+        ) {
+            let transition = Transition {
+                duration_beats,
+                ..tr.clone()
+            };
+            cmds.push(Command::SetLayerTransition {
+                layer: lid,
+                transition,
+            });
+        }
+        let ap = l.autopilot.clone();
+        let modes = labeled(&[
+            (AutopilotMode::Off, "Off"),
+            (AutopilotMode::Next, "Next"),
+            (AutopilotMode::Random, "Random"),
+        ]);
+        if let Some(mode) = params::combo(ui, ("lap", lid), "Autopilot", &ap.mode, &modes) {
+            cmds.push(Command::SetLayerAutopilot {
+                layer: lid,
+                autopilot: Autopilot { mode, ..ap.clone() },
+            });
+        }
+        if let Some(n) = params::param_slider(
+            ui,
+            ("lapn", lid),
+            "Autopilot every N loops",
+            f64::from(ap.every_loops),
+            1.0,
+            (1.0, 16.0),
+        ) {
+            cmds.push(Command::SetLayerAutopilot {
+                layer: lid,
+                autopilot: Autopilot {
+                    every_loops: n.round() as u32,
+                    ..ap
+                },
+            });
+        }
+        ui.separator();
         self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
     }
 
@@ -2092,6 +2391,87 @@ impl State {
                 column,
                 beats,
             });
+        }
+        ui.separator();
+        let playing = self.active(layer) == Some((deck, column));
+        let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().min(400.0), 14.0),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+        let x_at = |p: f64| rect.left() + rect.width() * p as f32;
+        for c in &t.cue_points {
+            painter.line_segment(
+                [
+                    egui::pos2(x_at(*c), rect.top()),
+                    egui::pos2(x_at(*c), rect.bottom()),
+                ],
+                egui::Stroke::new(2.0, ui.visuals().warn_fg_color),
+            );
+        }
+        if let Some((_, (a, b))) = self.flow.beat_loops.get(&layer).filter(|_| playing) {
+            let r = egui::Rect::from_x_y_ranges(x_at(*a)..=x_at(*b), rect.y_range());
+            painter.rect_filled(r, 0.0, ui.visuals().selection.bg_fill.linear_multiply(0.5));
+        }
+        if playing {
+            painter.line_segment(
+                [
+                    egui::pos2(x_at(pos), rect.top()),
+                    egui::pos2(x_at(pos), rect.bottom()),
+                ],
+                egui::Stroke::new(1.0, ui.visuals().text_color()),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("Cues");
+            if ui.add_enabled(playing, egui::Button::new("Set")).clicked() {
+                cmds.push(Command::AddCue {
+                    deck,
+                    layer,
+                    column,
+                    pos,
+                });
+            }
+            for (i, c) in t.cue_points.iter().enumerate() {
+                if ui
+                    .add_enabled(playing, egui::Button::new(format!("Jump {}", i + 1)))
+                    .clicked()
+                {
+                    cmds.push(Command::JumpToCue {
+                        deck,
+                        layer,
+                        column,
+                        index: i,
+                    });
+                }
+                if ui.small_button("x").on_hover_text("Remove cue").clicked() {
+                    cmds.push(Command::RemoveCue {
+                        deck,
+                        layer,
+                        column,
+                        pos: *c,
+                    });
+                }
+            }
+        });
+        let active_loop = self.flow.beat_loops.get(&layer).map(|l| l.0);
+        let mut loop_pick = None;
+        ui.horizontal(|ui| {
+            ui.label("Beat loop");
+            for b in [1.0, 2.0, 4.0, 8.0] {
+                let on = playing && active_loop == Some(b);
+                if ui
+                    .add_enabled(playing, egui::Button::selectable(on, format!("{b}")))
+                    .clicked()
+                {
+                    loop_pick = Some(if on { None } else { Some(b) });
+                }
+            }
+        });
+        if let Some(b) = loop_pick {
+            self.set_beat_loop(layer, b);
         }
         let fits: Vec<(FitMode, String)> = FitMode::ALL
             .iter()

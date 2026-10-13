@@ -27,7 +27,9 @@ pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) 
 const SHADER: &str = r#"
 // scale = fraction of the composition frame covered by the video (1,1 = whole frame).
 // mode = index into vjc_core::blend::COMPOSITION_MODES.
-struct U { opacity: f32, mode: u32, scale: vec2<f32> };
+// tkind/prog/out: layer transition (see vjc_core::transition::Kind::shader_id); out = 1 for
+// the outgoing clip, which is drawn first. tkind 0 = none.
+struct U { opacity: f32, mode: u32, scale: vec2<f32>, prog: f32, tkind: u32, out: u32, pad: u32 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var smp: sampler;
@@ -103,11 +105,42 @@ fn channel(id: u32, cb: f32, cs: f32) -> f32 {
 @fragment
 fn fs(in: VO) -> @location(0) vec4<f32> {
     // Map frame uv to video uv; outside the video is letterbox (discard keeps the base).
-    let q = (in.uv - vec2(0.5)) / u.scale + vec2(0.5);
+    var q = (in.uv - vec2(0.5)) / u.scale + vec2(0.5);
+    var tmix = 1.0;
+    var tblack = 0.0;
+    let p = u.prog;
+    if (u.tkind == 1u) {
+        if (u.out == 0u) { tmix = p; }
+    } else if (u.tkind == 2u) {
+        if (u.out == 1u) {
+            if (p >= 0.5) { discard; }
+            tblack = min(2.0 * p, 1.0);
+        } else {
+            if (p < 0.5) { discard; }
+            tblack = 1.0 - (2.0 * p - 1.0);
+        }
+    } else if (u.tkind == 3u || u.tkind == 4u) {
+        let dir = select(-1.0, 1.0, u.tkind == 3u);
+        let shift = select(p - 1.0, p, u.out == 1u);
+        q.x = q.x + dir * shift;
+    } else if (u.tkind == 5u) {
+        if (u.out == 1u) {
+            q = (q - vec2(0.5)) / (1.0 + p) + vec2(0.5);
+            tmix = 1.0 - p;
+        } else {
+            tmix = p;
+        }
+    } else if (u.tkind == 6u) {
+        if (u.out == 0u) {
+            let e = length((in.uv - vec2(0.5)) * 2.0) / 1.41421356;
+            tmix = 1.0 - smoothstep(p * 1.1 - 0.1, p * 1.1, e);
+        }
+    }
     if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) {
         discard;
     }
-    let s = textureSample(tex, smp, q);
+    var s = textureSample(tex, smp, q);
+    s = vec4(mix(s.rgb, vec3(0.0), tblack), s.a * tmix);
     let b = textureLoad(base_tex, vec2<i32>(in.pos.xy), 0);
     let id = u.mode;
     var a = clamp(s.a * u.opacity, 0.0, 1.0);
@@ -340,6 +373,9 @@ pub struct LayerDraw<'a> {
     /// A generator clip: rendered at composition size instead of uploading a frame.
     /// `frame` must be `None` when this is set.
     pub generator: Option<EffectDraw>,
+    /// Layer transition: `(shader id, progress 0..1, outgoing)`. The outgoing source is a
+    /// second `LayerDraw` (own `id`) placed right below the incoming one.
+    pub transition: Option<(u32, f32, bool)>,
 }
 
 struct Slot {
@@ -541,7 +577,7 @@ impl Compositor {
         });
         let fade_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fade_u"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -702,7 +738,7 @@ impl Compositor {
                 });
                 let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("layer_u"),
-                    size: 16,
+                    size: 32,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -771,6 +807,10 @@ impl Compositor {
                     shader_id(&l.blend),
                     sx.to_bits(),
                     sy.to_bits(),
+                    l.transition.map_or(0.0f32, |t| t.1).to_bits(),
+                    l.transition.map_or(0, |t| t.0),
+                    u32::from(l.transition.is_some_and(|t| t.2)),
+                    0u32,
                 ]),
             );
         }
@@ -1004,6 +1044,7 @@ mod tests {
                     effects: vec![],
                     frame: Some((4, 4, &bd, 1)),
                     generator: None,
+                    transition: None,
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(2),
@@ -1013,6 +1054,7 @@ mod tests {
                     effects: vec![],
                     frame: Some((4, 4, &sd, 1)),
                     generator: None,
+                    transition: None,
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -1054,6 +1096,72 @@ mod tests {
         }
     }
 
+    /// Dissolve at 50% on one pixel: black outgoing, white incoming -> mid grey.
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_dissolve_half_one_pixel() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let draw = |n: u128, px: &'static [u8; 4], out: bool| LayerDraw {
+            id: uuid::Uuid::from_u128(n),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![],
+            frame: Some((1, 1, px, 1)),
+            generator: None,
+            transition: Some((vjc_core::transition::Kind::Dissolve.shader_id(), 0.5, out)),
+        };
+        let layers = [
+            draw(1, &[0, 0, 0, 255], true),
+            draw(2, &[255, 255, 255, 255], false),
+        ];
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.render(&device, &queue, &layers, &[], 1.0);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got: Vec<u8> = buf.slice(..).get_mapped_range().expect("map")[..4].to_vec();
+        buf.unmap();
+        for g in &got[..3] {
+            assert!(g.abs_diff(128) <= 2, "{got:?}");
+        }
+    }
+
     /// Invert on one pixel through the full chain (translate, pipeline, ping-pong), for a
     /// layer effect and for a master effect. Skipped when there is no adapter.
     #[test]
@@ -1086,6 +1194,7 @@ mod tests {
                 effects: if on_master { vec![] } else { vec![fx.clone()] },
                 frame: Some((1, 1, &src, 1)),
                 generator: None,
+                transition: None,
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
             comp.render(&device, &queue, &layer, &master, 1.0);
@@ -1156,6 +1265,7 @@ mod tests {
                 kind: "solid_color".into(),
                 uniforms: isf.pack(&params, 0.0, (1, 1)),
             }),
+            transition: None,
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {

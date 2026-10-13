@@ -41,6 +41,11 @@ impl Playhead {
         }
     }
 
+    /// Jumps to a normalised position (cue point / beat loop).
+    pub fn seek(&mut self, pos: f64) {
+        self.x = pos.clamp(0.0, 1.0);
+    }
+
     fn next_unit(&mut self) -> f64 {
         // splitmix64
         self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);

@@ -59,6 +59,8 @@ pub struct Layer {
     pub solo: bool,
     pub bypass: bool,
     pub transition: Transition,
+    #[serde(default)]
+    pub autopilot: Autopilot,
     pub crossfader_bus: Option<Bus>,
     pub group: Option<Uuid>,
 }
@@ -239,6 +241,30 @@ pub struct Transition {
     pub kind: String,
     pub duration_beats: Option<f64>,
     pub duration_secs: f64,
+}
+
+/// What a layer plays when its clip ends (Once) or after `every_loops` loops.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Autopilot {
+    pub mode: AutopilotMode,
+    /// Loop-based modes: switch after this many completed loops (min 1).
+    pub every_loops: u32,
+}
+
+impl Default for Autopilot {
+    fn default() -> Self {
+        Autopilot {
+            mode: AutopilotMode::Off,
+            every_loops: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutopilotMode {
+    Off,
+    Next,
+    Random,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -533,6 +559,7 @@ mod tests {
                 duration_beats: None,
                 duration_secs: 0.0,
             },
+            autopilot: Default::default(),
             crossfader_bus: None,
             group: None,
         });
