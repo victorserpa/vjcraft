@@ -5,6 +5,7 @@
 pub mod blend;
 pub mod clock;
 pub mod effects;
+pub mod midi;
 pub mod playhead;
 pub mod shortcuts;
 

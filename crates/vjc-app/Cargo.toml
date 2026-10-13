@@ -21,6 +21,7 @@ uuid.workspace = true
 pollster = "1"
 directories = "6"
 vjc-fx = { path = "../vjc-fx" }
+midir = "0.11.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"

@@ -1,6 +1,7 @@
 mod browser;
 mod compositor;
 mod fx;
+mod midi_io;
 mod monitors;
 mod params;
 mod prefs_ui;
@@ -64,6 +65,11 @@ struct State {
     learn: bool,
     /// Target (address) waiting for a key while learning.
     learn_target: Option<String>,
+    /// Learn waits for a MIDI control (Shortcuts > Edit MIDI) instead of a key; implies `learn`.
+    learn_midi: bool,
+    /// MIDI devices thread, and the LED state last sent to controllers.
+    midi: midi_io::Midi,
+    led_prev: HashMap<vjc_core::midi::Led, bool>,
     /// Mappable widgets drawn this frame, for learn clicks and the key overlay.
     targets: Vec<(egui::Rect, String)>,
     /// Master bypass: black output (runtime only, not saved).
@@ -457,6 +463,9 @@ impl State {
             col_sel: None,
             learn: false,
             learn_target: None,
+            learn_midi: false,
+            midi: midi_io::Midi::spawn(),
+            led_prev: HashMap::new(),
             targets: vec![],
             master_bypass: false,
             file: None,
@@ -1132,6 +1141,9 @@ impl State {
         });
         if self.learn {
             for key in pressed {
+                if self.learn_midi && key != egui::Key::Escape {
+                    continue;
+                }
                 self.learn_key(key);
             }
             return;
@@ -1155,14 +1167,62 @@ impl State {
         }
     }
 
+    /// MIDI, once per frame and never blocking: incoming messages learn or fire shortcuts,
+    /// then LEDs of mapped notes are updated where the state changed.
+    fn midi_pump(&mut self) {
+        use vjc_core::midi as m;
+        while let Ok(ev) = self.midi.rx.try_recv() {
+            let (device, bytes) = match ev {
+                midi_io::In::Connected(d) => {
+                    self.led_prev.retain(|(dev, _, _), _| *dev != d);
+                    continue;
+                }
+                midi_io::In::Msg(d, b) => (d, b),
+            };
+            let Some(msg) = m::parse(&bytes) else {
+                continue;
+            };
+            if self.learn {
+                if self.learn_midi
+                    && let Some(target) = self.learn_target.clone()
+                    && let Some(src) = m::source_of(&device, msg)
+                {
+                    self.status = format!("{device} -> {target}");
+                    for c in m::learn(&self.project, &target, src) {
+                        self.exec(c);
+                    }
+                }
+                continue;
+            }
+            let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+            let cmds: Vec<Command> = self
+                .project
+                .shortcuts
+                .iter()
+                .filter_map(|s| m::command_for(&self.project, &rt, s, &device, msg))
+                .collect();
+            for c in cmds {
+                self.exec(c);
+            }
+        }
+        let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+        let active = |l| active_of(&self.players, &self.gens, l);
+        let next = m::led_states(&self.project, &rt, &active);
+        for ((device, ch, note), on) in m::feedback_diff(&self.led_prev, &next) {
+            self.midi.send(&device, m::led_bytes(ch, note, on));
+        }
+        self.led_prev = next;
+    }
+
     /// One key press in learn mode: Esc leaves, Delete unmaps the target, any other key
     /// maps to it (replacing its old key and taking the key from any other target).
     fn learn_key(&mut self, key: egui::Key) {
         use egui::Key;
         if key == Key::Escape {
             self.learn = false;
+            self.learn_midi = false;
             self.learn_target = None;
-            self.status = "Keyboard editing off".into();
+            self.status = "Shortcut editing off".into();
             return;
         }
         let Some(target) = self.learn_target.clone() else {
@@ -1193,7 +1253,11 @@ impl State {
             && let Some((_, a)) = self.targets.iter().rev().find(|(r, _)| r.contains(pos))
         {
             self.learn_target = Some(a.clone());
-            self.status = format!("{a}: press a key (Delete unmaps, Esc leaves)");
+            self.status = if self.learn_midi {
+                format!("{a}: move a MIDI control (Esc leaves)")
+            } else {
+                format!("{a}: press a key (Delete unmaps, Esc leaves)")
+            };
         }
         let paint = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -1206,9 +1270,13 @@ impl State {
             if picked {
                 paint.rect_stroke(*rect, 3.0, v.selection.stroke, egui::StrokeKind::Outside);
             }
-            if let Some(k) = vjc_core::shortcuts::key_for(&self.project, addr) {
-                let galley =
-                    paint.layout_no_wrap(k.to_owned(), font.clone(), v.strong_text_color());
+            let label = if self.learn_midi {
+                vjc_core::midi::label_for(&self.project, addr)
+            } else {
+                vjc_core::shortcuts::key_for(&self.project, addr).map(str::to_owned)
+            };
+            if let Some(k) = label {
+                let galley = paint.layout_no_wrap(k, font.clone(), v.strong_text_color());
                 let r = egui::Rect::from_min_size(rect.min, galley.size() + egui::vec2(6.0, 2.0));
                 paint.rect_filled(r, 3.0, v.selection.bg_fill);
                 paint.galley(r.min + egui::vec2(3.0, 1.0), galley, v.strong_text_color());
@@ -1359,19 +1427,19 @@ impl State {
                 }
             });
             ui.menu_button("Shortcuts", |ui| {
-                if ui
-                    .selectable_label(self.learn, "Edit keyboard")
-                    .clicked()
-                {
-                    ui.close();
-                    self.learn = !self.learn;
-                    self.learn_target = None;
-                    self.status = if self.learn {
-                        "Click a cell, column, opacity, Tap or Bypass, then press a key (Esc leaves)"
-                            .into()
-                    } else {
-                        "Keyboard editing off".into()
-                    };
+                for (midi, label) in [(false, "Edit keyboard"), (true, "Edit MIDI")] {
+                    let on = self.learn && self.learn_midi == midi;
+                    if ui.selectable_label(on, label).clicked() {
+                        ui.close();
+                        self.learn = !on;
+                        self.learn_midi = midi && self.learn;
+                        self.learn_target = None;
+                        self.status = match (self.learn, midi) {
+                            (false, _) => "Shortcut editing off".into(),
+                            (true, false) => "Click a cell, column, opacity, Tap or Bypass, then press a key (Esc leaves)".into(),
+                            (true, true) => "Click a cell, column, opacity, Tap or Bypass, then move a MIDI control (Esc leaves)".into(),
+                        };
+                    }
                 }
             });
             ui.menu_button("Output", |ui| {
@@ -1427,6 +1495,7 @@ impl State {
         self.time_bar(ui);
         self.master_bar(ui);
         self.shortcut_keys(&ctx);
+        self.midi_pump();
 
         // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).
         let redo_key = egui::KeyboardShortcut::new(
