@@ -5,6 +5,7 @@
 pub mod anim;
 pub mod blend;
 pub mod clock;
+pub mod crossfader;
 pub mod effects;
 pub mod midi;
 pub mod osc;
@@ -157,6 +158,19 @@ pub enum Command {
     SetBlend {
         layer: LayerId,
         blend: BlendMode,
+    },
+    /// Assigns a layer to crossfader bus A or B (None = unaffected). Undoable.
+    SetLayerBus {
+        layer: LayerId,
+        bus: Option<vjc_model::Bus>,
+    },
+    /// Crossfader position 0 (A) ..= 1 (B); creates the crossfader on first use (coalesces).
+    SetCrossfader {
+        value: f64,
+    },
+    /// Crossfader fade law. Undoable.
+    SetCrossfaderCurve {
+        curve: crossfader::CrossfadeCurve,
     },
     SetCompositionName {
         name: String,
@@ -317,6 +331,7 @@ pub enum Command {
 pub enum AnimTarget {
     LayerOpacity(LayerId),
     MasterOpacity,
+    Crossfader,
     Effect {
         target: EffectTarget,
         effect: EffectId,
@@ -338,6 +353,7 @@ enum Target {
     Bpm,
     MasterOpacity,
     MasterSpeed,
+    Crossfader,
     EffectParam(EffectId, usize),
     GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
     Dial(u32),
@@ -354,6 +370,7 @@ impl Command {
             Command::SetAnimation { target, .. } => Some(Target::Anim(*target)),
             Command::SetMasterOpacity { .. } => Some(Target::MasterOpacity),
             Command::SetMasterSpeed { .. } => Some(Target::MasterSpeed),
+            Command::SetCrossfader { .. } => Some(Target::Crossfader),
             Command::SetEffectParam { effect, param, .. } => {
                 Some(Target::EffectParam(*effect, *param))
             }
@@ -474,6 +491,11 @@ pub struct Applied {
 fn anim_param_mut(p: &mut Project, t: AnimTarget) -> Result<&mut Param, Error> {
     match t {
         AnimTarget::MasterOpacity => Ok(&mut p.composition.master.opacity),
+        AnimTarget::Crossfader => Ok(&mut p
+            .composition
+            .crossfader
+            .get_or_insert_with(crossfader::new_crossfader)
+            .position),
         AnimTarget::LayerOpacity(l) => {
             let i = layer_idx(p, l)?;
             Ok(&mut p.composition.layers[i].track.opacity)
@@ -982,6 +1004,32 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let i = layer_idx(p, layer)?;
             let prev = std::mem::replace(&mut p.composition.layers[i].track.blend, blend);
             undoable(Command::SetBlend { layer, blend: prev }, vec![])
+        }
+        Command::SetLayerBus { layer, bus } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].crossfader_bus, bus);
+            undoable(Command::SetLayerBus { layer, bus: prev }, vec![])
+        }
+        Command::SetCrossfader { value } => {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(Error::InvalidValue);
+            }
+            let cf = p
+                .composition
+                .crossfader
+                .get_or_insert_with(crossfader::new_crossfader);
+            let prev = number(&cf.position.value);
+            cf.position.set_number(value);
+            undoable(Command::SetCrossfader { value: prev }, vec![])
+        }
+        Command::SetCrossfaderCurve { curve } => {
+            let cf = p
+                .composition
+                .crossfader
+                .get_or_insert_with(crossfader::new_crossfader);
+            let prev = crossfader::CrossfadeCurve::from_name(&cf.curve);
+            cf.curve = curve.name().to_string();
+            undoable(Command::SetCrossfaderCurve { curve: prev }, vec![])
         }
         Command::SetCompositionName { name } => {
             let prev = std::mem::replace(&mut p.composition.name, name);
@@ -2832,6 +2880,28 @@ mod tests {
     }
 
     #[test]
+    fn crossfader_address_resolves() {
+        let (p, _, _) = grid();
+        let ctx = shortcuts::Ctx::new(None, false);
+        assert_eq!(shortcuts::current(&p, &ctx, "/comp/crossfader"), Some(0.5));
+        assert_eq!(
+            shortcuts::resolve(&p, "/comp/crossfader", 2.0),
+            Some(Command::SetCrossfader { value: 1.0 })
+        );
+        let mut q = p.clone();
+        let t = AnimTarget::Crossfader;
+        apply(
+            &mut q,
+            Command::SetAnimation {
+                target: t,
+                animation: None,
+            },
+        )
+        .unwrap();
+        assert!(q.composition.crossfader.is_some());
+    }
+
+    #[test]
     fn clear_all_and_bypass_are_runtime() {
         let (mut p, _, _) = grid();
         let mut h = History::new();
@@ -2846,6 +2916,53 @@ mod tests {
             .unwrap();
         assert_eq!(ev, vec![Event::MasterBypass { bypass: true }]);
         assert!(!h.can_undo());
+    }
+
+    #[test]
+    fn crossfader_commands_undo_and_coalesce() {
+        use crate::crossfader::CrossfadeCurve;
+        let (mut p, l, _) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        h.exec(
+            &mut p,
+            Command::SetLayerBus {
+                layer: l,
+                bus: Some(vjc_model::Bus::B),
+            },
+            t,
+        )
+        .unwrap();
+        for v in [0.1, 0.7, 0.9] {
+            h.exec(&mut p, Command::SetCrossfader { value: v }, t)
+                .unwrap();
+        }
+        h.exec(
+            &mut p,
+            Command::SetCrossfaderCurve {
+                curve: CrossfadeCurve::Cut,
+            },
+            t,
+        )
+        .unwrap();
+        assert!(
+            apply(&mut p, Command::SetCrossfader { value: 1.5 }).is_err(),
+            "out of range"
+        );
+        let cf = |p: &Project| p.composition.crossfader.clone().unwrap();
+        assert_eq!(number(&cf(&p).position.value), 0.9);
+        assert_eq!(cf(&p).curve, "Cut");
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(cf(&p).curve, "ConstantPower");
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(number(&cf(&p).position.value), 0.5, "3 moves = 1 undo");
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.layers[0].crossfader_bus, None);
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(
+            p.composition.layers[0].crossfader_bus,
+            Some(vjc_model::Bus::B)
+        );
     }
 
     #[test]

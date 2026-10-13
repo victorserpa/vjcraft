@@ -1278,6 +1278,12 @@ impl State {
             self.fx.set_status(&done.kind, st);
         }
         let time = self.fx_epoch.elapsed().as_secs_f32();
+        let cf_pos = c
+            .crossfader
+            .as_ref()
+            .map_or(vjc_core::crossfader::CENTER, |x| {
+                vjc_core::anim::effective_number(&x.position, &actx)
+            });
         let mut draws: Vec<LayerDraw> = vec![];
         for (l, f) in &frames {
             // Clip chain first, then the layer chain.
@@ -1317,7 +1323,12 @@ impl State {
                 .get(&l.id)
                 .filter(|_| !l.bypass)
                 .and_then(|o| Some((o, o.state.current()?, out_frames.get(&l.id)?)));
-            let opacity = vjc_core::anim::effective_number(&l.track.opacity, &actx) as f32;
+            let opacity = (vjc_core::anim::effective_number(&l.track.opacity, &actx)
+                * vjc_core::crossfader::layer_gain(
+                    c.crossfader.as_ref(),
+                    l.crossfader_bus.as_ref(),
+                    cf_pos,
+                )) as f32;
             if let Some((o, (kind, prog), of)) = cross {
                 let fx = draw_chain(
                     &mut self.fx,
@@ -1372,6 +1383,28 @@ impl State {
             }
             if ui.button("Clear All").clicked() {
                 cmds.push(Command::ClearAll);
+            }
+            ui.separator();
+            let dials = self.dials();
+            let actx = self.anim_ctx(&dials);
+            let mut pos = self
+                .project
+                .composition
+                .crossfader
+                .as_ref()
+                .map_or(vjc_core::crossfader::CENTER, |x| {
+                    vjc_core::anim::effective_number(&x.position, &actx)
+                });
+            ui.label("A");
+            let cf = ui.add(
+                egui::Slider::new(&mut pos, 0.0..=1.0)
+                    .show_value(false)
+                    .smallest_positive(0.001),
+            );
+            ui.label("B");
+            self.targets.push((cf.rect, "/comp/crossfader".into()));
+            if cf.changed() {
+                cmds.push(Command::SetCrossfader { value: pos });
             }
         });
         self.master_rect = Some(bar.response.rect);
@@ -2098,6 +2131,20 @@ impl State {
                                 value: op as f64,
                             });
                         }
+                        ui.horizontal(|ui| {
+                            for (txt, bus) in [
+                                ("A", Some(vjc_model::Bus::A)),
+                                ("-", None),
+                                ("B", Some(vjc_model::Bus::B)),
+                            ] {
+                                if ui
+                                    .selectable_label(layer.crossfader_bus == bus, txt)
+                                    .clicked()
+                                {
+                                    cmds.push(Command::SetLayerBus { layer: lid, bus });
+                                }
+                            }
+                        });
                         let label = vjc_core::blend::COMPOSITION_MODES
                             .iter()
                             .find(|(m, _)| *m == layer.track.blend)
@@ -2225,6 +2272,51 @@ impl State {
         {
             cmds.push(Command::SetMasterSpeed { value });
         }
+        let (cf_val, cf_anim, cf_curve) = match &c.crossfader {
+            Some(x) => (
+                vjc_core::anim::effective_number(&x.position, &actx),
+                x.position.animation.clone(),
+                vjc_core::crossfader::CrossfadeCurve::from_name(&x.curve),
+            ),
+            None => (
+                vjc_core::crossfader::CENTER,
+                None,
+                vjc_core::crossfader::CrossfadeCurve::default(),
+            ),
+        };
+        let (v, a) = params::param_slider_anim(
+            ui,
+            "cfp",
+            "Crossfader A-B",
+            cf_val,
+            vjc_core::crossfader::CENTER,
+            (0.0, 1.0),
+            &cf_anim,
+        );
+        if let Some(value) = v {
+            cmds.push(Command::SetCrossfader { value });
+        }
+        if let Some(animation) = a {
+            cmds.push(Command::SetAnimation {
+                target: vjc_core::AnimTarget::Crossfader,
+                animation,
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("Crossfader curve");
+            egui::ComboBox::from_id_salt("cfcurve")
+                .selected_text(cf_curve.label())
+                .show_ui(ui, |ui| {
+                    for curve in vjc_core::crossfader::CrossfadeCurve::ALL {
+                        if ui
+                            .selectable_label(cf_curve == curve, curve.label())
+                            .clicked()
+                        {
+                            cmds.push(Command::SetCrossfaderCurve { curve });
+                        }
+                    }
+                });
+        });
         ui.separator();
         ui.strong("Dashboard");
         for (i, v) in dials.iter().enumerate() {

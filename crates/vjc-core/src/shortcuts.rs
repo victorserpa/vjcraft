@@ -60,6 +60,12 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
         ["comp", "master", "opacity"] => Some(number(&p.composition.master.opacity.value)),
         ["comp", "master", "bypass"] => Some(f64::from(u8::from(ctx.master_bypass))),
         ["comp", "tempo", "bpm"] => Some(p.composition.tempo.bpm),
+        ["comp", "crossfader"] => Some(
+            p.composition
+                .crossfader
+                .as_ref()
+                .map_or(super::crossfader::CENTER, |c| number(&c.position.value)),
+        ),
         ["comp", "dashboard", n] => {
             let i = number_of(n)?
                 .checked_sub(1)
@@ -122,6 +128,9 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
         }),
         ["comp", "master", "bypass"] => Some(Command::SetMasterBypass {
             bypass: value >= 0.5,
+        }),
+        ["comp", "crossfader"] => Some(Command::SetCrossfader {
+            value: value.clamp(0.0, 1.0),
         }),
         ["comp", "master", "opacity"] => Some(Command::SetMasterOpacity {
             value: value.clamp(0.0, 1.0),

@@ -686,6 +686,7 @@ fn collect_unsupported(root: &Node, w: &mut Warns) {
         let key = match n.tag.as_str() {
             "Notes" => Some("Notes ignored"),
             "AnimationSettings" => Some("parameter animation settings ignored"),
+            "CrossFader" => Some("crossfader and layer A/B buses ignored"),
             "EmbeddedThumbnail" => Some("embedded thumbnails ignored"),
             "ModifierEnvelope" => Some("envelopes ignored"),
             "WireRenderPass" => Some("output wiring ignored"),
