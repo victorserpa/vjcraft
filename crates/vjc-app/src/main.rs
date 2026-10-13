@@ -55,15 +55,15 @@ fn resolve_drop(
     pointer: Option<egui::Pos2>,
     selected: Option<(LayerId, u32)>,
 ) -> Option<(LayerId, u32, DropWhere)> {
-    if let Some(p) = pointer {
-        if let Some(c) = cells.iter().find(|c| c.rect.contains(p)) {
-            return Some((c.layer, c.col, DropWhere::Pointer));
-        }
+    if let Some(p) = pointer
+        && let Some(c) = cells.iter().find(|c| c.rect.contains(p))
+    {
+        return Some((c.layer, c.col, DropWhere::Pointer));
     }
-    if let Some((l, col)) = selected {
-        if cells.iter().any(|c| c.layer == l && c.col == col) {
-            return Some((l, col, DropWhere::Selected));
-        }
+    if let Some((l, col)) = selected
+        && cells.iter().any(|c| c.layer == l && c.col == col)
+    {
+        return Some((l, col, DropWhere::Selected));
     }
     let bottom = cells.last()?.layer;
     let mut row = cells.iter().filter(|c| c.layer == bottom);
@@ -196,15 +196,15 @@ impl State {
             self.comp = Some(comp);
         }
         let comp = self.comp.as_mut().unwrap();
-        if comp.resize(&rs.device, w, h) {
-            if let Some(id) = self.comp_tex {
-                rs.renderer.write().update_egui_texture_from_wgpu_texture(
-                    &rs.device,
-                    &comp.target_view,
-                    wgpu::FilterMode::Linear,
-                    id,
-                );
-            }
+        if comp.resize(&rs.device, w, h)
+            && let Some(id) = self.comp_tex
+        {
+            rs.renderer.write().update_egui_texture_from_wgpu_texture(
+                &rs.device,
+                &comp.target_view,
+                wgpu::FilterMode::Linear,
+                id,
+            );
         }
         // Layers are ordered top to bottom; draw bottom to top.
         let frames: Vec<(&Layer, Option<Frame>)> = c
@@ -332,8 +332,7 @@ impl State {
                 }
             });
         }
-        for (l, p) in self.players.values().map(|(_, p)| ((), p)) {
-            let _ = l;
+        for (_, p) in self.players.values() {
             if let Some(e) = p.error() {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
@@ -494,17 +493,16 @@ impl State {
                 });
             });
         self.cells = cells;
-        if let (Some((l, c, m)), Some(d)) = (set_fit, deck_idx) {
-            if let Some(k) = self.project.composition.decks[d]
+        if let (Some((l, c, m)), Some(d)) = (set_fit, deck_idx)
+            && let Some(k) = self.project.composition.decks[d]
                 .clips
                 .iter_mut()
                 .find(|k| k.layer == l && k.column == c)
-            {
-                k.clip.fit = m;
-            }
+        {
+            k.clip.fit = m;
         }
-        if let Some((l, c)) = pick {
-            if let Some(path) = rfd::FileDialog::new()
+        if let Some((l, c)) = pick
+            && let Some(path) = rfd::FileDialog::new()
                 .add_filter(
                     "Video / image",
                     &[
@@ -512,9 +510,8 @@ impl State {
                     ],
                 )
                 .pick_file()
-            {
-                self.drop_file(l, c, path);
-            }
+        {
+            self.drop_file(l, c, path);
         }
         if let Some(l) = clear {
             self.players.remove(&l);
@@ -534,11 +531,11 @@ impl State {
         }
         self.monitors_polled = Some(std::time::Instant::now());
         let fresh = monitors::list();
-        if let Some(id) = self.output {
-            if monitors::output_lost(&fresh, id) {
-                self.output = None;
-                self.status = "Output monitor disconnected: output window closed".into();
-            }
+        if let Some(id) = self.output
+            && monitors::output_lost(&fresh, id)
+        {
+            self.output = None;
+            self.status = "Output monitor disconnected: output window closed".into();
         }
         // Keep the last known list when enumeration transiently returns nothing.
         if !fresh.is_empty() {
@@ -597,6 +594,24 @@ impl eframe::App for State {
     }
 }
 
+fn main() -> eframe::Result {
+    eframe::run_native(
+        "VJCraft",
+        eframe::NativeOptions::default(),
+        Box::new(|_cc| {
+            let mut s = State::new();
+            // Debug aid: VJC_AUTOPLAY=/path/video.mov loads it in the bottom layer, column 1.
+            if let Some(p) = std::env::var_os("VJC_AUTOPLAY") {
+                let l = s.project.composition.layers.last().map(|l| l.id);
+                if let Some(l) = l {
+                    s.drop_file(l, 0, PathBuf::from(p));
+                }
+            }
+            Ok(Box::new(s))
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,22 +652,4 @@ mod tests {
         );
         assert_eq!(resolve_drop(&[], None, None), None);
     }
-}
-
-fn main() -> eframe::Result {
-    eframe::run_native(
-        "VJCraft",
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| {
-            let mut s = State::new();
-            // Debug aid: VJC_AUTOPLAY=/path/video.mov loads it in the bottom layer, column 1.
-            if let Some(p) = std::env::var_os("VJC_AUTOPLAY") {
-                let l = s.project.composition.layers.last().map(|l| l.id);
-                if let Some(l) = l {
-                    s.drop_file(l, 0, PathBuf::from(p));
-                }
-            }
-            Ok(Box::new(s))
-        }),
-    )
 }

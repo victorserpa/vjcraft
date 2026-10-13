@@ -163,10 +163,10 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     {
         comp.tempo.bpm = t;
     }
-    if let Some(m) = root.child("VideoTrack") {
-        if let Some(o) = find_opacity(m) {
-            comp.master.opacity.set_number(o);
-        }
+    if let Some(m) = root.child("VideoTrack")
+        && let Some(o) = find_opacity(m)
+    {
+        comp.master.opacity.set_number(o);
     }
 
     // Layers, ordered by layerIndex.
@@ -202,18 +202,18 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     let mut ncols = root.num("numColumns").unwrap_or(0.0) as u32;
     let mut col_names: BTreeMap<u32, String> = BTreeMap::new();
     root.walk(&mut |n| {
-        if n.tag == "Column" {
-            if let Some(i) = n.num("columnIndex") {
-                ncols = ncols.max(i as u32 + 1);
-                if let Some(nm) = n.attr("name") {
-                    col_names.insert(i as u32, nm.to_string());
-                }
-            }
-        }
-        if n.tag == "ColumnAttributes" {
-            if let (Some(i), Some(nm)) = (n.num("index"), n.attr("name")) {
+        if n.tag == "Column"
+            && let Some(i) = n.num("columnIndex")
+        {
+            ncols = ncols.max(i as u32 + 1);
+            if let Some(nm) = n.attr("name") {
                 col_names.insert(i as u32, nm.to_string());
             }
+        }
+        if n.tag == "ColumnAttributes"
+            && let (Some(i), Some(nm)) = (n.num("index"), n.attr("name"))
+        {
+            col_names.insert(i as u32, nm.to_string());
         }
     });
     comp.columns = (0..ncols)
@@ -373,12 +373,11 @@ fn import_clip(c: &Node) -> Option<Clip> {
         track.opacity.set_number(o);
     }
     let mut transport = Transport::default();
-    if let Some(b) = c.find(&|n| n.tag == "Beats_d", &[]) {
-        if let (Some(n), Some(0.0)) = (b.num("numManualBeats"), b.num("mode")) {
-            if n > 0.0 {
-                transport.beat_sync = Some(n);
-            }
-        }
+    if let Some(b) = c.find(&|n| n.tag == "Beats_d", &[])
+        && let (Some(n), Some(0.0)) = (b.num("numManualBeats"), b.num("mode"))
+        && n > 0.0
+    {
+        transport.beat_sync = Some(n);
     }
     Some(Clip {
         id: Uuid::new_v4(),
