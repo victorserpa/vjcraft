@@ -18,9 +18,10 @@ rfd = "0.17.2"
 vjc-media = { path = "../vjc-media" }
 bytemuck = { version = "1", features = ["derive"] }
 uuid.workspace = true
+pollster = "1"
+vjc-fx = { path = "../vjc-fx" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"
 
 [dev-dependencies]
-pollster = "1"

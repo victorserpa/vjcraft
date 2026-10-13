@@ -1,13 +1,15 @@
 mod compositor;
+mod fx;
 mod monitors;
 
-use compositor::{Compositor, LayerDraw};
+use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 use vjc_core::clock::{Clock, beat_sync_rate};
+use vjc_core::effects::EffectTarget;
 use vjc_core::playhead::Playhead;
 use vjc_core::{Command, Event, History};
 use vjc_media::{Frame, Player};
@@ -30,6 +32,10 @@ struct State {
     heads: HashMap<LayerId, Playhead>,
     last_head_tick: std::time::Instant,
     comp: Option<Compositor>,
+    fx: fx::FxLib,
+    fx_epoch: std::time::Instant,
+    /// Whose effect chain the effects panel shows.
+    fx_scope: FxScope,
     comp_tex: Option<egui::TextureId>,
     /// Display id of the monitor the output window is on, while open.
     output: Option<u32>,
@@ -53,6 +59,133 @@ struct State {
     nudge_dir: i8,
     /// Visual only for now. TODO(#9): click sound (see build-log).
     metronome: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FxScope {
+    Clip,
+    Layer,
+    Master,
+}
+
+/// Active effects of a chain with this frame's uniforms. Effects still compiling or that
+/// failed are skipped.
+fn draw_chain(
+    lib: &mut fx::FxLib,
+    chain: &[vjc_model::Effect],
+    time: f32,
+    size: (u32, u32),
+) -> Vec<EffectDraw> {
+    let mut out = vec![];
+    for e in chain.iter().filter(|e| !e.bypass) {
+        lib.request(&e.kind);
+        if lib.status(&e.kind) != Some(&fx::Status::Ready) {
+            continue;
+        }
+        if let Some(isf) = lib.isf(&e.kind) {
+            out.push(EffectDraw {
+                kind: e.kind.clone(),
+                uniforms: isf.pack(&e.params, time, size),
+            });
+        }
+    }
+    out
+}
+
+/// "hue_shift" -> "Hue Shift".
+fn fx_label(id: &str) -> String {
+    id.split('_')
+        .map(|w| {
+            if w == "rgb" {
+                return "RGB".to_string();
+            }
+            let mut c = w.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// "Add effect" submenu listing the bundled effects.
+fn add_effect_menu(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
+    ui.menu_button("Add effect", |ui| {
+        for (id, _) in vjc_fx::BUILTIN {
+            if ui.button(fx_label(id)).clicked()
+                && let Some(effect) = vjc_fx::new_effect(id)
+            {
+                cmds.push(Command::AddEffect {
+                    target,
+                    effect,
+                    index: usize::MAX,
+                });
+                ui.close();
+            }
+        }
+    });
+}
+
+/// Edits one effect param; returns the new value when the user changed it.
+fn param_widget(
+    ui: &mut egui::Ui,
+    name: &str,
+    kind: &vjc_fx::InputKind,
+    value: &vjc_model::Value,
+) -> Option<vjc_model::Value> {
+    use vjc_fx::InputKind as K;
+    use vjc_model::Value as V;
+    let mut out = None;
+    ui.horizontal(|ui| {
+        ui.add_space(24.0);
+        ui.label(name);
+        match (kind, value) {
+            (K::Float { min, max, .. }, V::Number(n)) => {
+                let mut x = *n;
+                if ui.add(egui::Slider::new(&mut x, *min..=*max)).changed() {
+                    out = Some(V::Number(x));
+                }
+            }
+            (K::Bool { .. }, V::Bool(b)) => {
+                let mut x = *b;
+                if ui.checkbox(&mut x, "").changed() {
+                    out = Some(V::Bool(x));
+                }
+            }
+            (K::Color { .. }, V::Color(c)) => {
+                let mut x = *c;
+                if ui.color_edit_button_rgba_unmultiplied(&mut x).changed() {
+                    out = Some(V::Color(x));
+                }
+            }
+            (K::Point2D { min, max, .. }, V::Color(c)) => {
+                let mut x = *c;
+                let a = ui.add(egui::Slider::new(&mut x[0], min[0] as f32..=max[0] as f32));
+                let b = ui.add(egui::Slider::new(&mut x[1], min[1] as f32..=max[1] as f32));
+                if a.changed() || b.changed() {
+                    out = Some(V::Color(x));
+                }
+            }
+            (K::Long { labels, .. }, V::Choice { selected, options }) => {
+                let mut sel = *selected;
+                egui::ComboBox::from_id_salt(("fxlong", name))
+                    .selected_text(labels.get(sel as usize).map_or("", String::as_str))
+                    .show_ui(ui, |ui| {
+                        for (i, l) in labels.iter().enumerate() {
+                            ui.selectable_value(&mut sel, i as u32, l);
+                        }
+                    });
+                if sel != *selected {
+                    out = Some(V::Choice {
+                        selected: sel,
+                        options: options.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    });
+    out
 }
 
 /// Grid cell geometry for hit-testing.
@@ -180,6 +313,9 @@ impl State {
             heads: HashMap::new(),
             last_head_tick: std::time::Instant::now(),
             comp: None,
+            fx: fx::FxLib::new(),
+            fx_epoch: std::time::Instant::now(),
+            fx_scope: FxScope::Layer,
             comp_tex: None,
             output: None,
             monitors: monitors::list(),
@@ -579,9 +715,28 @@ impl State {
             let (deck, col, _) = self.players.get(&l.id)?;
             Some(vjc_core::clip_in(&self.project, *deck, l.id, *col)?.fit)
         };
-        let draws: Vec<LayerDraw> = frames
-            .iter()
-            .map(|(l, f)| LayerDraw {
+        // Shaders compile on worker threads; install the ones that finished.
+        for done in self.fx.poll() {
+            let st = match done.result {
+                Ok(wgsl) => match comp.add_effect(&rs.device, &done.kind, &wgsl) {
+                    Ok(()) => fx::Status::Ready,
+                    Err(e) => fx::Status::Failed(e),
+                },
+                Err(e) => fx::Status::Failed(e),
+            };
+            self.fx.set_status(&done.kind, st);
+        }
+        let time = self.fx_epoch.elapsed().as_secs_f32();
+        let mut draws: Vec<LayerDraw> = vec![];
+        for (l, f) in &frames {
+            // Clip chain first, then the layer chain.
+            let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
+            let clip_fx = self.players.get(&l.id).and_then(|(d, col, _)| {
+                vjc_core::clip_in(&self.project, *d, l.id, *col).map(|k| k.track.effects.as_slice())
+            });
+            let mut effects = draw_chain(&mut self.fx, clip_fx.unwrap_or_default(), time, size);
+            effects.extend(draw_chain(&mut self.fx, &l.track.effects, time, size));
+            draws.push(LayerDraw {
                 id: l.id,
                 opacity: match l.track.opacity.value {
                     vjc_model::Value::Number(n) => n as f32,
@@ -589,12 +744,14 @@ impl State {
                 },
                 blend: l.track.blend.clone(),
                 fit: fit_of(l).unwrap_or_default(),
+                effects,
                 frame: f
                     .as_ref()
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
-            })
-            .collect();
-        comp.render(&rs.device, &rs.queue, &draws);
+            });
+        }
+        let master = draw_chain(&mut self.fx, &c.master.effects, time, (w, h));
+        comp.render(&rs.device, &rs.queue, &draws, &master);
     }
 
     /// Tempo row: BPM, tap, nudge (hold), resync, half/double, beat lights, metronome.
@@ -905,7 +1062,15 @@ impl State {
                     ui.end_row();
                     for li in 0..comp.layers.len() {
                         let lid = comp.layers[li].id;
-                        ui.label(&comp.layers[li].name);
+                        let name = ui.add(
+                            egui::Label::new(&comp.layers[li].name).sense(egui::Sense::click()),
+                        );
+                        if name.clicked() || name.secondary_clicked() {
+                            self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
+                        }
+                        name.context_menu(|ui| {
+                            add_effect_menu(ui, EffectTarget::Layer(lid), &mut cmds)
+                        });
                         for ci in 0..ncols {
                             let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
                             // Highlight only when playing from the deck being shown.
@@ -999,6 +1164,13 @@ impl State {
                                             ui.close();
                                         }
                                     }
+                                    ui.separator();
+                                    let t = EffectTarget::Clip {
+                                        deck: cur,
+                                        layer: lid,
+                                        column: ci,
+                                    };
+                                    add_effect_menu(ui, t, &mut cmds);
                                 });
                             }
                             cells.push(CellInfo {
@@ -1113,6 +1285,7 @@ impl State {
                 });
             });
         self.cells = cells;
+        self.effects_panel(ui, &mut cmds);
         if let Some((l, c)) = pick
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(
@@ -1127,6 +1300,96 @@ impl State {
         }
         for c in cmds {
             self.exec(c);
+        }
+    }
+
+    /// Chain of the selected layer, its playing clip or the master, with per-effect controls.
+    fn effects_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("Effects");
+            ui.selectable_value(&mut self.fx_scope, FxScope::Clip, "Clip");
+            ui.selectable_value(&mut self.fx_scope, FxScope::Layer, "Layer");
+            ui.selectable_value(&mut self.fx_scope, FxScope::Master, "Master");
+        });
+        let sel = self.selected.map(|s| s.0);
+        let target = match self.fx_scope {
+            FxScope::Master => Some(EffectTarget::Master),
+            FxScope::Layer => sel.map(EffectTarget::Layer),
+            FxScope::Clip => sel.and_then(|l| {
+                let (deck, column, _) = self.players.get(&l)?;
+                Some(EffectTarget::Clip {
+                    deck: *deck,
+                    layer: l,
+                    column: *column,
+                })
+            }),
+        };
+        let Some(target) = target else {
+            ui.label("Select a layer (click its name); Clip needs a playing clip.");
+            return;
+        };
+        ui.menu_button("Add effect", |ui| add_effect_menu(ui, target, cmds));
+        let chain = vjc_core::effects::chain(&self.project, target)
+            .unwrap_or_default()
+            .to_vec();
+        let n = chain.len();
+        for (i, e) in chain.iter().enumerate() {
+            let inputs = self.fx.isf(&e.kind).map(|f| f.inputs.clone());
+            let failure = match self.fx.status(&e.kind) {
+                Some(fx::Status::Failed(why)) => Some(why.clone()),
+                _ => None,
+            };
+            ui.horizontal(|ui| {
+                let mut on = !e.bypass;
+                if ui.checkbox(&mut on, "").on_hover_text("Enabled").changed() {
+                    cmds.push(Command::SetEffectBypass {
+                        target,
+                        effect: e.id,
+                        bypass: !on,
+                    });
+                }
+                ui.strong(fx_label(&e.kind));
+                if ui.add_enabled(i > 0, egui::Button::new("Up")).clicked() {
+                    cmds.push(Command::MoveEffect {
+                        target,
+                        effect: e.id,
+                        index: i - 1,
+                    });
+                }
+                if ui
+                    .add_enabled(i + 1 < n, egui::Button::new("Down"))
+                    .clicked()
+                {
+                    cmds.push(Command::MoveEffect {
+                        target,
+                        effect: e.id,
+                        index: i + 1,
+                    });
+                }
+                if ui.button("Remove").clicked() {
+                    cmds.push(Command::RemoveEffect {
+                        target,
+                        effect: e.id,
+                    });
+                }
+                if let Some(why) = failure {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("disabled: {why}"));
+                }
+            });
+            for (pi, p) in e.params.iter().enumerate() {
+                let Some(kind) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
+                    continue;
+                };
+                if let Some(value) = param_widget(ui, &p.name, kind, &p.value) {
+                    cmds.push(Command::SetEffectParam {
+                        target,
+                        effect: e.id,
+                        param: pi,
+                        value,
+                    });
+                }
+            }
         }
     }
 

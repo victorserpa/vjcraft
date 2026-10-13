@@ -4,14 +4,16 @@
 
 pub mod blend;
 pub mod clock;
+pub mod effects;
 pub mod playhead;
 
+pub use effects::EffectTarget;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vjc_model::{
-    BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, FitMode, Layer, LayerId, PlayMode,
-    Project, Source, Track, Transport, Value,
+    BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId, FitMode, Layer,
+    LayerId, PlayMode, Project, Source, Track, Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -133,6 +135,34 @@ pub enum Command {
         column: ColumnIdx,
         speed: f64,
     },
+    /// Inserts an effect at `index` of the target's chain (clamped to the end).
+    AddEffect {
+        target: EffectTarget,
+        effect: Effect,
+        index: usize,
+    },
+    RemoveEffect {
+        target: EffectTarget,
+        effect: EffectId,
+    },
+    /// Moves the effect to `index` in the chain.
+    MoveEffect {
+        target: EffectTarget,
+        effect: EffectId,
+        index: usize,
+    },
+    SetEffectBypass {
+        target: EffectTarget,
+        effect: EffectId,
+        bypass: bool,
+    },
+    /// Sets param number `param` of the effect (coalesces: slider drags are one undo step).
+    SetEffectParam {
+        target: EffectTarget,
+        effect: EffectId,
+        param: usize,
+        value: Value,
+    },
     /// Clock input (not undoable, not in history): the app forwards these to its `Clock`.
     Tap {
         at: Instant,
@@ -153,6 +183,7 @@ enum Target {
     Opacity(LayerId),
     Speed(DeckId, LayerId, ColumnIdx),
     Bpm,
+    EffectParam(EffectId, usize),
 }
 
 impl Command {
@@ -160,6 +191,9 @@ impl Command {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
             Command::SetBpm { .. } => Some(Target::Bpm),
+            Command::SetEffectParam { effect, param, .. } => {
+                Some(Target::EffectParam(*effect, *param))
+            }
             Command::SetSpeed {
                 deck,
                 layer,
@@ -211,6 +245,7 @@ pub enum Error {
     NoColumn,
     NoDeck,
     NoClip,
+    NoEffect,
     /// Clip has no file source to play.
     NotPlayable,
     /// Layer/column still holds clips, or is not the last column.
@@ -226,6 +261,7 @@ impl std::fmt::Display for Error {
             Error::NoColumn => "column not found",
             Error::NoDeck => "current deck not found",
             Error::NoClip => "no clip in cell",
+            Error::NoEffect => "effect not found",
             Error::NotPlayable => "clip has no playable file source",
             Error::InUse => "layer or column is not empty",
             Error::InvalidValue => "value out of range",
@@ -683,6 +719,11 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 events: vec![],
             })
         }
+        Command::AddEffect { .. }
+        | Command::RemoveEffect { .. }
+        | Command::MoveEffect { .. }
+        | Command::SetEffectBypass { .. }
+        | Command::SetEffectParam { .. } => effects::apply(p, cmd),
         Command::SetBpm { bpm } => {
             if !bpm.is_finite() || bpm <= 0.0 {
                 return Err(Error::InvalidValue);
@@ -1596,5 +1637,175 @@ mod tests {
             .unwrap();
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(p.composition.current_deck, bid);
+    }
+
+    fn fx(kind: &str) -> Effect {
+        Effect {
+            id: Uuid::new_v4(),
+            kind: kind.into(),
+            bypass: false,
+            dry_wet: 1.0,
+            params: vec![vjc_model::Param::number("amount", 1.0, Some((0.0, 1.0)))],
+        }
+    }
+
+    fn targets(p: &mut Project, l: LayerId) -> Vec<EffectTarget> {
+        let mut h = History::new();
+        import(p, &mut h, l, Instant::now());
+        vec![
+            EffectTarget::Master,
+            EffectTarget::Layer(l),
+            EffectTarget::Clip {
+                deck: A,
+                layer: l,
+                column: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn effect_chain_commands_undo_redo_on_every_target() {
+        let (mut p, l) = setup();
+        for t in targets(&mut p, l) {
+            let (a, b) = (fx("a"), fx("b"));
+            let (ia, ib) = (a.id, b.id);
+            roundtrip(
+                &mut p,
+                Command::AddEffect {
+                    target: t,
+                    effect: a,
+                    index: 0,
+                },
+            );
+            let mut h = History::new();
+            let now = Instant::now();
+            h.exec(
+                &mut p,
+                Command::AddEffect {
+                    target: t,
+                    effect: fx("z"),
+                    index: 0,
+                },
+                now,
+            )
+            .unwrap();
+            h.undo(&mut p).unwrap().unwrap();
+            h.exec(
+                &mut p,
+                Command::AddEffect {
+                    target: t,
+                    effect: b,
+                    index: 9,
+                },
+                now,
+            )
+            .unwrap();
+            let order = |p: &Project| -> Vec<EffectId> {
+                effects::chain(p, t).unwrap().iter().map(|e| e.id).collect()
+            };
+            assert_eq!(order(&p), [ia, ib]);
+            roundtrip(
+                &mut p,
+                Command::MoveEffect {
+                    target: t,
+                    effect: ib,
+                    index: 0,
+                },
+            );
+            roundtrip(
+                &mut p,
+                Command::SetEffectBypass {
+                    target: t,
+                    effect: ia,
+                    bypass: true,
+                },
+            );
+            roundtrip(
+                &mut p,
+                Command::SetEffectParam {
+                    target: t,
+                    effect: ia,
+                    param: 0,
+                    value: Value::Number(0.25),
+                },
+            );
+            roundtrip(
+                &mut p,
+                Command::RemoveEffect {
+                    target: t,
+                    effect: ia,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn effect_param_validates_clamps_and_coalesces() {
+        let (mut p, l) = setup();
+        let t = EffectTarget::Layer(l);
+        let e = fx("a");
+        let id = e.id;
+        let mut h = History::new();
+        let t0 = Instant::now();
+        h.exec(
+            &mut p,
+            Command::AddEffect {
+                target: t,
+                effect: e,
+                index: 0,
+            },
+            t0,
+        )
+        .unwrap();
+        let set = |value| Command::SetEffectParam {
+            target: t,
+            effect: id,
+            param: 0,
+            value,
+        };
+        assert_eq!(
+            h.exec(&mut p, set(Value::Bool(true)), t0),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(
+            h.exec(
+                &mut p,
+                Command::SetEffectParam {
+                    target: t,
+                    effect: id,
+                    param: 5,
+                    value: Value::Number(0.0)
+                },
+                t0
+            ),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(
+            h.exec(
+                &mut p,
+                Command::RemoveEffect {
+                    target: t,
+                    effect: Uuid::new_v4()
+                },
+                t0
+            ),
+            Err(Error::NoEffect)
+        );
+        for (i, v) in [0.9, 0.5, 5.0].into_iter().enumerate() {
+            let at = t0 + Duration::from_millis(100 * (i as u64 + 1));
+            h.exec(&mut p, set(Value::Number(v)), at).unwrap();
+        }
+        // Clamped to the range, and the whole drag is a single undo step.
+        assert_eq!(
+            effects::chain(&p, t).unwrap()[0].params[0].value,
+            Value::Number(1.0)
+        );
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(
+            effects::chain(&p, t).unwrap()[0].params[0].value,
+            Value::Number(1.0)
+        );
+        h.undo(&mut p).unwrap().unwrap();
+        assert!(effects::chain(&p, t).unwrap().is_empty());
     }
 }

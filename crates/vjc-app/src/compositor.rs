@@ -133,19 +133,168 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Vertex stage shared by all effect fragment shaders. `uv` is ISF-style (origin bottom-left).
+const FX_VS: &str = r#"
+struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> VO {
+    var p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    var o: VO;
+    o.pos = vec4(p[i], 0.0, 1.0);
+    o.uv = vec2((p[i].x + 1.0) * 0.5, (p[i].y + 1.0) * 0.5);
+    return o;
+}
+"#;
+
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// One active (non-bypassed) effect with its uniform block for this frame.
+#[derive(Clone)]
+pub struct EffectDraw {
+    pub kind: String,
+    pub uniforms: vjc_fx::Uniforms,
+}
+
+type Scratch = [(wgpu::Texture, wgpu::TextureView); 2];
+
+/// Effect pipelines and the ping-pong textures the chains render through.
+struct Fx {
+    vs: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    pipes: HashMap<String, wgpu::RenderPipeline>,
+    bufs: Vec<wgpu::Buffer>,
+    next: usize,
+    scratch: HashMap<(u32, u32), Scratch>,
+    used: Vec<(u32, u32)>,
+}
+
+fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
+    let mk = || {
+        let t = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fx_scratch"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let v = t.create_view(&Default::default());
+        (t, v)
+    };
+    [mk(), mk()]
+}
+
+impl Fx {
+    /// Runs `effects` in order, ping-ponging between two scratch textures of `size`.
+    /// Returns the scratch index holding the result, or None if no effect ran (effects
+    /// whose shader is not compiled yet are skipped).
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        input: &wgpu::TextureView,
+        size: (u32, u32),
+        effects: &[EffectDraw],
+    ) -> Option<usize> {
+        let mut cur: Option<usize> = None;
+        for e in effects {
+            let Some(pipe) = self.pipes.get(&e.kind) else {
+                continue;
+            };
+            if !self.used.contains(&size) {
+                self.used.push(size);
+            }
+            let scratch = self
+                .scratch
+                .entry(size)
+                .or_insert_with(|| make_scratch(device, size));
+            if self.bufs.len() <= self.next {
+                self.bufs
+                    .push(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("fx_u"),
+                        size: std::mem::size_of::<vjc_fx::Uniforms>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+            }
+            let buf = &self.bufs[self.next];
+            self.next += 1;
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(&e.uniforms));
+            let out = cur.map_or(0, |i| 1 - i);
+            let src = match cur {
+                None => input,
+                Some(i) => &scratch[i].1,
+            };
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fx_bg"),
+                layout: bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fx"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scratch[out].1,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+            cur = Some(out);
+        }
+        cur
+    }
+}
 
 pub struct LayerDraw<'a> {
     pub id: LayerId,
     pub opacity: f32,
     pub blend: BlendMode,
     pub fit: FitMode,
+    /// Clip chain followed by the layer chain, applied to the source before blending.
+    pub effects: Vec<EffectDraw>,
     /// `(width, height, rgba, seq)`; `None` = nothing playing (layer skipped).
     pub frame: Option<(u32, u32, &'a [u8], u64)>,
 }
 
 struct Slot {
     tex: wgpu::Texture,
+    view: wgpu::TextureView,
     size: (u32, u32),
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
@@ -160,6 +309,7 @@ pub struct Compositor {
     base_bind: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     slots: HashMap<LayerId, Slot>,
+    fx: Fx,
     pub target: wgpu::Texture,
     pub target_view: wgpu::TextureView,
     pub size: (u32, u32),
@@ -179,7 +329,8 @@ fn make_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
         format: FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let v = t.create_view(&Default::default());
@@ -304,6 +455,22 @@ impl Compositor {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let fx = Fx {
+            vs: device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("fx_vs"),
+                source: wgpu::ShaderSource::Wgsl(FX_VS.into()),
+            }),
+            layout: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fx_pl"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            }),
+            pipes: HashMap::new(),
+            bufs: vec![],
+            next: 0,
+            scratch: HashMap::new(),
+            used: vec![],
+        };
         let (target, target_view) = make_target(device, w, h);
         let (base, base_bind) = make_base(device, &base_bgl, w, h);
         Compositor {
@@ -314,6 +481,7 @@ impl Compositor {
             base_bind,
             sampler,
             slots: HashMap::new(),
+            fx,
             target,
             target_view,
             size: (w, h),
@@ -332,12 +500,63 @@ impl Compositor {
         true
     }
 
+    /// Installs a translated effect shader (WGSL from `vjc_fx::translate`). Returns the
+    /// validation error instead of panicking, so a bad shader only disables its effect.
+    pub fn add_effect(
+        &mut self,
+        device: &wgpu::Device,
+        kind: &str,
+        wgsl: &str,
+    ) -> Result<(), String> {
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(kind),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(kind),
+            layout: Some(&self.fx.layout),
+            vertex: wgpu::VertexState {
+                module: &self.fx.vs,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        match pollster::block_on(scope.pop()) {
+            Some(e) => Err(e.to_string()),
+            None => {
+                self.fx.pipes.insert(kind.to_string(), pipe);
+                Ok(())
+            }
+        }
+    }
+
+    /// `master` runs over the finished composition.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layers_bottom_to_top: &[LayerDraw],
+        master: &[EffectDraw],
     ) {
+        self.fx.next = 0;
+        self.fx.used.clear();
         let live: Vec<LayerId> = layers_bottom_to_top
             .iter()
             .filter(|l| l.frame.is_some())
@@ -392,6 +611,7 @@ impl Compositor {
                 self.slots.insert(
                     l.id,
                     Slot {
+                        view,
                         tex,
                         size: (w, h),
                         uniform,
@@ -465,6 +685,43 @@ impl Compositor {
             let Some(slot) = self.slots.get(&l.id) else {
                 continue;
             };
+            let out = self.fx.run(
+                device,
+                queue,
+                &mut enc,
+                &self.bgl,
+                &self.sampler,
+                &slot.view,
+                slot.size,
+                &l.effects,
+            );
+            let fx_bind;
+            let bind = match out {
+                None => &slot.bind,
+                Some(i) => {
+                    fx_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("layer_fx_bg"),
+                        layout: &self.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: slot.uniform.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &self.fx.scratch[&slot.size][i].1,
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    });
+                    &fx_bind
+                }
+            };
             enc.copy_texture_to_texture(
                 self.target.as_image_copy(),
                 self.base.as_image_copy(),
@@ -487,10 +744,28 @@ impl Compositor {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipe);
-            pass.set_bind_group(0, &slot.bind, &[]);
+            pass.set_bind_group(0, bind, &[]);
             pass.set_bind_group(1, &self.base_bind, &[]);
             pass.draw(0..3, 0..1);
         }
+        if let Some(i) = self.fx.run(
+            device,
+            queue,
+            &mut enc,
+            &self.bgl,
+            &self.sampler,
+            &self.target_view,
+            self.size,
+            master,
+        ) {
+            enc.copy_texture_to_texture(
+                self.fx.scratch[&self.size][i].0.as_image_copy(),
+                self.target.as_image_copy(),
+                extent,
+            );
+        }
+        let used = std::mem::take(&mut self.fx.used);
+        self.fx.scratch.retain(|k, _| used.contains(k));
         queue.submit(Some(enc.finish()));
     }
 }
@@ -543,6 +818,7 @@ mod tests {
                     opacity: 1.0,
                     blend: BlendMode::Normal,
                     fit: FitMode::Stretch,
+                    effects: vec![],
                     frame: Some((4, 4, &bd, 1)),
                 },
                 LayerDraw {
@@ -550,10 +826,11 @@ mod tests {
                     opacity,
                     blend: mode.clone(),
                     fit: FitMode::Stretch,
+                    effects: vec![],
                     frame: Some((4, 4, &sd, 1)),
                 },
             ];
-            comp.render(&device, &queue, &layers);
+            comp.render(&device, &queue, &layers, &[]);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 256 * 4,
@@ -588,6 +865,76 @@ mod tests {
             for i in 0..3 {
                 let g = got[i] as f32 / 255.0;
                 assert!((g - want[i]).abs() < 0.02, "{name}: {got:?} vs {want:?}");
+            }
+        }
+    }
+
+    /// Invert on one pixel through the full chain (translate, pipeline, ping-pong), for a
+    /// layer effect and for a master effect. Skipped when there is no adapter.
+    #[test]
+    fn gpu_invert_one_pixel() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("invert").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.add_effect(&device, "invert", &wgsl).unwrap();
+        let fx = EffectDraw {
+            kind: "invert".into(),
+            uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
+        };
+        let src = [51u8, 102, 204, 255];
+        for on_master in [false, true] {
+            let layer = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: if on_master { vec![] } else { vec![fx.clone()] },
+                frame: Some((1, 1, &src, 1)),
+            }];
+            let master = if on_master { vec![fx.clone()] } else { vec![] };
+            comp.render(&device, &queue, &layer, &master);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_texture_to_buffer(
+                comp.target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            let got: Vec<u8> = buf.slice(..).get_mapped_range().expect("map")[..4].to_vec();
+            buf.unmap();
+            for (g, w) in got.iter().zip([204u8, 153, 51]) {
+                assert!(g.abs_diff(w) <= 2, "master={on_master}: {got:?}");
             }
         }
     }

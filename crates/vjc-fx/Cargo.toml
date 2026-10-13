@@ -1,0 +1,11 @@
+[package]
+name = "vjc-fx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vjc-model = { path = "../vjc-model" }
+serde_json.workspace = true
+naga = { version = "30", features = ["glsl-in", "wgsl-in", "wgsl-out"] }
+uuid.workspace = true
