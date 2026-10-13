@@ -876,6 +876,8 @@ mod effect_id_tests {
             },
             autopilot: Default::default(),
             crossfader_bus: None,
+            audio: true,
+            video: true,
             group: None,
         });
         let ctx = Ctx::new(None, false);

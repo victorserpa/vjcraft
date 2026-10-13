@@ -249,6 +249,8 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
             },
             autopilot: Default::default(),
             crossfader_bus: None,
+            audio: true,
+            video: true,
             group: None,
         });
     }
@@ -596,6 +598,7 @@ fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
         transport,
         track,
         blend_override: None,
+        channels: Default::default(),
         fit: Default::default(),
     })
 }

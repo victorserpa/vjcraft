@@ -219,6 +219,30 @@ pub enum Command {
     SetCrossfaderCurve {
         curve: crossfader::CrossfadeCurve,
     },
+    /// Crossfader behaviour: fade along the curve or cut at the middle. Undoable.
+    SetCrossfaderBehaviour {
+        behaviour: vjc_model::CrossfadeBehaviour,
+    },
+    /// Blend mode of the layers on a crossfader bus (`None` = their own). Undoable.
+    SetCrossfaderBlend {
+        blend: Option<BlendMode>,
+    },
+    /// Layer audio / video enable toggles. Undoable.
+    SetLayerAudio {
+        layer: LayerId,
+        enabled: bool,
+    },
+    SetLayerVideo {
+        layer: LayerId,
+        enabled: bool,
+    },
+    /// R/G/B/A channel toggles of a clip's picture. Undoable.
+    SetClipChannels {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        channels: vjc_model::Channels,
+    },
     /// Output screens and slices (all undoable; `SetSliceMesh` coalesces).
     AddScreen {
         screen: vjc_model::Screen,
@@ -570,6 +594,8 @@ pub enum AnimTarget {
 /// Whose track `SetAudio` edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudioTarget {
+    /// The composition master.
+    Master,
     Layer(LayerId),
     Clip(DeckId, LayerId, ColumnIdx),
 }
@@ -950,6 +976,7 @@ pub fn clip_from_path(path: PathBuf) -> Clip {
         transport: Transport::default(),
         track: Track::new(BlendMode::Normal),
         blend_override: None,
+        channels: Default::default(),
         fit: FitMode::default(),
     }
 }
@@ -1487,6 +1514,67 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = crossfader::CrossfadeCurve::from_name(&cf.curve);
             cf.curve = curve.name().to_string();
             undoable(Command::SetCrossfaderCurve { curve: prev }, vec![])
+        }
+        Command::SetCrossfaderBehaviour { behaviour } => {
+            let cf = p
+                .composition
+                .crossfader
+                .get_or_insert_with(crossfader::new_crossfader);
+            let prev = std::mem::replace(&mut cf.behaviour, behaviour);
+            undoable(Command::SetCrossfaderBehaviour { behaviour: prev }, vec![])
+        }
+        Command::SetCrossfaderBlend { blend } => {
+            let cf = p
+                .composition
+                .crossfader
+                .get_or_insert_with(crossfader::new_crossfader);
+            let prev = std::mem::replace(&mut cf.blend, blend);
+            undoable(Command::SetCrossfaderBlend { blend: prev }, vec![])
+        }
+        Command::SetLayerAudio { layer, enabled } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].audio, enabled);
+            undoable(
+                Command::SetLayerAudio {
+                    layer,
+                    enabled: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetLayerVideo { layer, enabled } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].video, enabled);
+            undoable(
+                Command::SetLayerVideo {
+                    layer,
+                    enabled: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetClipChannels {
+            deck,
+            layer,
+            column,
+            channels,
+        } => {
+            check_cell(p, layer, column)?;
+            let k = deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .ok_or(Error::NoClip)?;
+            let prev = std::mem::replace(&mut k.clip.channels, channels);
+            undoable(
+                Command::SetClipChannels {
+                    deck,
+                    layer,
+                    column,
+                    channels: prev,
+                },
+                vec![],
+            )
         }
         Command::AddScreen { screen, index } => {
             let id = screen.id;
@@ -2040,6 +2128,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 return Err(Error::InvalidValue);
             }
             let track = match target {
+                AudioTarget::Master => &mut p.composition.master,
                 AudioTarget::Layer(l) => {
                     let i = layer_idx(p, l)?;
                     &mut p.composition.layers[i].track
@@ -2595,6 +2684,8 @@ mod tests {
             },
             autopilot: Default::default(),
             crossfader_bus: None,
+            audio: true,
+            video: true,
             group: None,
         }
     }
@@ -2973,7 +3064,11 @@ mod tests {
         let mut h = History::new();
         let t = Instant::now();
         import(&mut p, &mut h, l, t);
-        for target in [AudioTarget::Layer(l), AudioTarget::Clip(A, l, 0)] {
+        for target in [
+            AudioTarget::Master,
+            AudioTarget::Layer(l),
+            AudioTarget::Clip(A, l, 0),
+        ] {
             let set = |param, value| Command::SetAudio {
                 target,
                 param,
@@ -2987,6 +3082,7 @@ mod tests {
             );
             apply(&mut p, set(AudioParam::Volume, 9.0)).unwrap();
             let vol = |p: &Project| match target {
+                AudioTarget::Master => p.composition.master.volume.clone(),
                 AudioTarget::Layer(_) => p.composition.layers[0].track.volume.clone(),
                 AudioTarget::Clip(..) => clip(p, l).unwrap().track.volume,
             };
@@ -3011,6 +3107,68 @@ mod tests {
             value: 0.0,
         };
         assert!(apply(&mut p, bad).is_err());
+    }
+
+    #[test]
+    fn mixer_commands_set_and_undo() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        // The first crossfader command creates the crossfader (it stays after an undo).
+        apply(&mut p, Command::SetCrossfader { value: 0.5 }).unwrap();
+        roundtrip(
+            &mut p,
+            Command::SetCrossfaderBehaviour {
+                behaviour: vjc_model::CrossfadeBehaviour::Cut,
+            },
+        );
+        assert_eq!(
+            p.composition.crossfader.as_ref().unwrap().behaviour,
+            vjc_model::CrossfadeBehaviour::Cut
+        );
+        roundtrip(
+            &mut p,
+            Command::SetCrossfaderBlend {
+                blend: Some(BlendMode::Add),
+            },
+        );
+        roundtrip(
+            &mut p,
+            Command::SetLayerAudio {
+                layer: l,
+                enabled: false,
+            },
+        );
+        assert!(!p.composition.layers[0].audio);
+        roundtrip(
+            &mut p,
+            Command::SetLayerVideo {
+                layer: l,
+                enabled: false,
+            },
+        );
+        assert!(!p.composition.layers[0].video);
+        let channels = vjc_model::Channels {
+            g: false,
+            ..Default::default()
+        };
+        roundtrip(
+            &mut p,
+            Command::SetClipChannels {
+                deck: A,
+                layer: l,
+                column: 0,
+                channels,
+            },
+        );
+        assert_eq!(clip(&p, l).unwrap().channels, channels);
+        let missing = Command::SetClipChannels {
+            deck: A,
+            layer: l,
+            column: 3,
+            channels,
+        };
+        assert!(apply(&mut p, missing).is_err());
     }
 
     #[test]

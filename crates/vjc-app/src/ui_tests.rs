@@ -495,9 +495,10 @@ fn clip_panel_has_collapsible_sections() {
     settle(&mut h);
     click(&mut h, "- Audio");
     assert!(has_text(&h, "+ Audio"));
-    assert!(!has_text(&h, "Volume"), "collapsed section hides its rows");
+    // Only the Composition tab's master volume is left.
+    assert_eq!(all(&h, "Volume"), 1, "collapsed section hides its rows");
     click(&mut h, "+ Audio");
-    assert!(has_text(&h, "Volume"));
+    assert_eq!(all(&h, "Volume"), 2);
     snap(&mut h, "clip-panel-sections");
 }
 
@@ -2292,4 +2293,95 @@ fn output_presets_export_then_import_into_another_folder() {
     assert_eq!(vjc_io::output_presets::list(&b.join("mine")).len(), 1);
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
+}
+
+// 170
+#[test]
+fn mixer_toggles_crossfader_behaviour_and_master_audio() {
+    let mut h = app();
+    // Composition tab: master Audio and the crossfader behaviour / blend rows.
+    assert!(has_text(&h, "Crossfader behaviour"));
+    assert!(has_text(&h, "Crossfader blend"));
+    assert!(has_text(&h, "Volume"));
+    h.get_by_value("Fade").click();
+    settle(&mut h);
+    click(&mut h, "Cut");
+    let cf = h.state().project.composition.crossfader.clone().unwrap();
+    assert_eq!(cf.behaviour, vjc_model::CrossfadeBehaviour::Cut);
+    // Layer tab: video / audio toggles.
+    click(&mut h, "Layer");
+    h.query_all_by_value("Layer 2").next().unwrap().click();
+    settle(&mut h);
+    assert!(h.state().project.composition.layers[0].video);
+    click(&mut h, "Video");
+    assert!(!h.state().project.composition.layers[0].video);
+    click(&mut h, "Audio");
+    assert!(!h.state().project.composition.layers[0].audio);
+    // The header has the same toggles and the Add effect dropdown.
+    assert!(exists(&h, "Fx+"));
+    snap(&mut h, "170-mixer");
+}
+
+// 171
+#[test]
+fn browser_compositions_tab_opens_recent_project_on_double_click() {
+    let path = tmp_vjc("recent-browser.vjc");
+    let mut proj = Project::new("From recents");
+    proj.composition.name = "From recents".into();
+    vjc_io::save(&proj, &path).unwrap();
+    let mut p = prefs();
+    p.general.push_recent(&path);
+    p.general.push_recent(Path::new("/does/not/exist.vjc"));
+    // Fast frames, so two clicks land inside egui's double-click delay.
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_step_dt(0.02)
+        .build_ui_state(
+            |ui, st| {
+                st.tick_clock();
+                State::ui(st, ui);
+            },
+            State::headless(p),
+        );
+    settle(&mut h);
+    assert!(exists(&h, "Record"));
+    click(&mut h, "Compositions");
+    assert!(!has_text(&h, "No recent projects"));
+    let grid = h.get_by_label("Grid").rect();
+    double_click_at(&mut h, egui::pos2(grid.min.x - 60.0, grid.max.y + 30.0));
+    assert_eq!(h.state().file.as_deref(), Some(path.as_path()));
+    assert_eq!(h.state().project.composition.name, "From recents");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn browser_grid_toggle_and_favorite_heart_persist_in_prefs() {
+    let mut h = app();
+    assert!(!h.state().prefs.general.browser_grid);
+    click(&mut h, "Grid");
+    assert!(h.state().prefs.general.browser_grid);
+    click(&mut h, "Grid");
+    assert!(!h.state().prefs.general.browser_grid);
+    // Heart on the first effect row.
+    click(&mut h, "Effects");
+    let grid = h.get_by_label("Grid").rect();
+    // The panel's right edge is the window's, less its margin; heart sits at the cell's right.
+    let at = egui::pos2(1280.0 - 16.0 - 11.0, grid.max.y + 18.0);
+    h.hover_at(at);
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+    settle(&mut h);
+    let favs = h.state().prefs.general.favorites.clone();
+    assert!(
+        favs.len() == 1 && favs[0].starts_with("fx:"),
+        "heart click stored {favs:?}"
+    );
 }

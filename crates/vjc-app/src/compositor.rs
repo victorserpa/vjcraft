@@ -151,6 +151,11 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         discard;
     }
     var s = textureSample(tex, smp, q);
+    // pad = channel mask: bit 0..3 set = R, G, B, A off (off alpha means opaque).
+    if ((u.pad & 1u) != 0u) { s.r = 0.0; }
+    if ((u.pad & 2u) != 0u) { s.g = 0.0; }
+    if ((u.pad & 4u) != 0u) { s.b = 0.0; }
+    if ((u.pad & 8u) != 0u) { s.a = 1.0; }
     s = vec4(mix(s.rgb, vec3(0.0), tblack), s.a * tmix);
     let b = textureLoad(base_tex, vec2<i32>(in.pos.xy), 0);
     let id = u.mode;
@@ -572,6 +577,8 @@ pub struct LayerDraw<'a> {
     /// Clip then layer transform (output px -> picture px), applied when mapping the picture
     /// into the frame, after the effects of the layer.
     pub transform: Affine,
+    /// Channels of the picture that are drawn (an off channel is zeroed, off alpha = opaque).
+    pub channels: vjc_model::Channels,
 }
 
 /// A layer group: `len` consecutive entries of the layer list (bottom to top) from `start`
@@ -625,6 +632,9 @@ pub struct Compositor {
     /// Layers / groups rendered on their own because a slice routes them (only the ones
     /// in use are kept).
     routed: HashMap<SliceSource, (wgpu::Texture, wgpu::TextureView)>,
+    /// Layer / group the preview monitor shows (`None` = no preview render). Set by the
+    /// caller before each render; the result is stored under `SliceSource::Preview`.
+    pub preview: Option<SliceSource>,
     fx: Fx,
     /// Copy of the composition and its uniform / bind group, for the composition transform.
     xf: Option<(wgpu::Texture, wgpu::Buffer, wgpu::BindGroup)>,
@@ -965,6 +975,7 @@ impl Compositor {
             slots: HashMap::new(),
             group: None,
             routed: HashMap::new(),
+            preview: None,
             fx,
             xf: None,
             master_transform: Affine::IDENTITY,
@@ -1421,7 +1432,7 @@ impl Compositor {
                         l.transition.map_or(0.0f32, |t| t.1).to_bits(),
                         l.transition.map_or(0, |t| t.0),
                         u32::from(l.transition.is_some_and(|t| t.2)),
-                        0u32,
+                        l.channels.off_mask(),
                     ],
                     &l.transform,
                     self.size,
@@ -1525,13 +1536,21 @@ impl Compositor {
             );
             self.fade_pass(&mut enc, extent);
         }
-        self.routed.retain(|k, _| routes.contains(k));
-        for r in routes {
+        let preview = self
+            .preview
+            .filter(|p| matches!(p, SliceSource::Layer(_) | SliceSource::Group(_)));
+        self.routed
+            .retain(|k, _| routes.contains(k) || (*k == SliceSource::Preview && preview.is_some()));
+        let jobs = routes
+            .iter()
+            .map(|r| (*r, *r))
+            .chain(preview.map(|p| (SliceSource::Preview, p)));
+        for (key, content) in jobs {
             self.render_route(
                 device,
                 queue,
                 &mut enc,
-                *r,
+                (key, content),
                 (layers_bottom_to_top, groups),
                 (extent, fade > 0.0, &mut group_no),
             );
@@ -1692,7 +1711,7 @@ impl Compositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         enc: &mut wgpu::CommandEncoder,
-        route: SliceSource,
+        (route, content): (SliceSource, SliceSource),
         (layers, groups): (&[LayerDraw], &[GroupDraw]),
         (extent, fade, group_no): (wgpu::Extent3d, bool, &mut usize),
     ) {
@@ -1719,7 +1738,7 @@ impl Compositor {
             occlusion_query_set: None,
             multiview_mask: None,
         }));
-        match route {
+        match content {
             SliceSource::Layer(id) => {
                 if let Some(l) = layers.iter().find(|l| l.id == id) {
                     self.draw_layer(device, queue, enc, l, false, extent);
@@ -1817,6 +1836,7 @@ mod tests {
                     generator: None,
                     transition: None,
                     transform: Affine::IDENTITY,
+                    channels: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(2),
@@ -1828,6 +1848,7 @@ mod tests {
                     generator: None,
                     transition: None,
                     transform: Affine::IDENTITY,
+                    channels: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -1894,6 +1915,7 @@ mod tests {
             generator: None,
             transition: Some((vjc_core::transition::Kind::Dissolve.shader_id(), 0.5, out)),
             transform: Affine::IDENTITY,
+            channels: Default::default(),
         };
         let layers = [
             draw(1, &[0, 0, 0, 255], true),
@@ -1972,6 +1994,7 @@ mod tests {
                 generator: None,
                 transition: None,
                 transform: Affine::IDENTITY,
+                channels: Default::default(),
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
             comp.render(&device, &queue, &layer, &master, 1.0);
@@ -2046,6 +2069,7 @@ mod tests {
             }),
             transition: None,
             transform: Affine::IDENTITY,
+            channels: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2120,6 +2144,7 @@ mod tests {
             }),
             transition: None,
             transform: Affine::IDENTITY,
+            channels: Default::default(),
         }];
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots");
@@ -2235,6 +2260,7 @@ mod tests {
                 generator: None,
                 transition: None,
                 transform: Affine::IDENTITY,
+                channels: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2382,6 +2408,7 @@ mod tests {
                     generator: None,
                     transition: None,
                     transform: Affine::IDENTITY,
+                    channels: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -2399,6 +2426,7 @@ mod tests {
                     generator: None,
                     transition: None,
                     transform: Affine::IDENTITY,
+                    channels: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layer, &[], 1.0);
@@ -2500,6 +2528,7 @@ mod tests {
                 generator: None,
                 transition: None,
                 transform: Affine::IDENTITY,
+                channels: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let col = read_col(&device, &queue, &comp, 4);
@@ -2653,6 +2682,7 @@ mod tests {
                     generator: None,
                     transition: None,
                     transform: Affine::IDENTITY,
+                    channels: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -2669,6 +2699,7 @@ mod tests {
                     generator: None,
                     transition: None,
                     transform: Affine::IDENTITY,
+                    channels: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -2696,6 +2727,7 @@ mod tests {
             generator: None,
             transition: None,
             transform: Affine::IDENTITY,
+            channels: Default::default(),
         }
     }
 
@@ -2884,5 +2916,98 @@ mod tests {
         // Nothing routed: no extra texture is kept.
         show(1.0, &[]);
         assert!(comp.routed_view(SliceSource::Layer(l1)).is_none());
+    }
+
+    /// The preview texture shows the selected layer alone (slice 1, source Preview) while
+    /// slice 0 shows the composition; with no preview set nothing extra is kept and a
+    /// Preview slice falls back to the composition. Skipped when there is no adapter.
+    #[test]
+    fn gpu_preview_texture_shows_selected_layer_only_when_requested() {
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (red, blue) = ([255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+        let l2 = uuid::Uuid::from_u128(2);
+        let layers = [solid(1, &red, 1.0), solid(2, &blue, 0.5)];
+        let mut screen = vjc_core::mapping::new_screen("t", 2, 1);
+        for (i, src) in [SliceSource::Composition, SliceSource::Preview]
+            .iter()
+            .enumerate()
+        {
+            let mut sl = vjc_core::mapping::new_slice(2, 1);
+            let x = i as f32;
+            sl.output_mesh = vec![(x, 0.0), (x + 1.0, 0.0), (x, 1.0), (x + 1.0, 1.0)];
+            sl.source = *src;
+            screen.slices.push(sl);
+        }
+        let mut comp = Compositor::new(&device, 1, 1);
+        let renderer = crate::slice_render::SliceRenderer::new(&device);
+        let (tex, view) = crate::slice_render::make_screen_target(&device, 2, 1);
+        let mut show = |preview: Option<SliceSource>| {
+            comp.preview = preview;
+            comp.render_routed(&device, &queue, (&layers, &[]), (&[], 1.0), &[]);
+            let src = |sl: &vjc_model::Slice| {
+                let v = comp.routed_view(sl.source).unwrap_or(&comp.target_view);
+                (v, comp.size)
+            };
+            renderer.render(&device, &queue, &screen, &src, &view);
+            read_row_of(&device, &queue, &tex, 2)
+        };
+        let near =
+            |got: &[u8], want: [u8; 3]| got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 2);
+        let img = show(Some(SliceSource::Layer(l2)));
+        assert!(
+            near(&img[0..3], [127, 0, 127]),
+            "composition {:?}",
+            &img[0..3]
+        );
+        assert!(near(&img[4..7], [0, 0, 127]), "preview {:?}", &img[4..7]);
+        let img = show(None);
+        assert!(
+            near(&img[4..7], [127, 0, 127]),
+            "falls back {:?}",
+            &img[4..7]
+        );
+        assert!(comp.routed_view(SliceSource::Preview).is_none());
+    }
+
+    /// Channel toggles: a mid-grey-blue layer with G off loses its green; with A off an
+    /// alpha 0.5 picture turns opaque. Skipped when there is no adapter.
+    #[test]
+    fn gpu_clip_channel_toggles_zero_channels_and_force_opaque_alpha() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let px = [200u8, 100, 50, 128];
+        let mut layers = [solid(1, &px, 1.0)];
+        let mut comp = Compositor::new(&device, 1, 1);
+        let mut show = |channels: vjc_model::Channels| {
+            layers[0].channels = channels;
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            let (tex, view) = crate::slice_render::make_screen_target(&device, 1, 1);
+            let mut screen = vjc_core::mapping::new_screen("t", 1, 1);
+            screen.slices.push(vjc_core::mapping::new_slice(1, 1));
+            let renderer = crate::slice_render::SliceRenderer::new(&device);
+            let src = |_: &vjc_model::Slice| (&comp.target_view, comp.size);
+            renderer.render(&device, &queue, &screen, &src, &view);
+            read_row_of(&device, &queue, &tex, 1)
+        };
+        let all = show(vjc_model::Channels::default());
+        let no_g = show(vjc_model::Channels {
+            g: false,
+            ..Default::default()
+        });
+        assert_eq!(no_g[1], 0, "green off");
+        assert!(no_g[0].abs_diff(all[0]) <= 2 && no_g[2].abs_diff(all[2]) <= 2);
+        let no_a = show(vjc_model::Channels {
+            a: false,
+            ..Default::default()
+        });
+        assert!(
+            no_a[0].abs_diff(200) <= 2,
+            "opaque alpha keeps colour {no_a:?}"
+        );
+        assert!(all[0] < 150, "half alpha over black darkens {all:?}");
     }
 }

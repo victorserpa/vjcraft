@@ -1,7 +1,7 @@
 //! Crossfader A/B: pure gain curves and the helpers the compositor and UI share.
 //! Position 0 = all A, 1 = all B.
 
-use vjc_model::{Bus, Crossfader, Param};
+use vjc_model::{Bus, CrossfadeBehaviour, Crossfader, Param};
 
 /// Fade law. `ConstantPower` is the default: cos/sin keeps perceived energy flat at the
 /// middle (both buses at ~0.707), where `Linear` dips (0.5 + 0.5) and `Cut` switches
@@ -79,8 +79,9 @@ pub fn layer_gain(cf: Option<&Crossfader>, bus: Option<&Bus>, position: f64) -> 
     let Some(bus) = bus else {
         return 1.0;
     };
-    let curve = cf.map_or(CrossfadeCurve::default(), |c| {
-        CrossfadeCurve::from_name(&c.curve)
+    let curve = cf.map_or(CrossfadeCurve::default(), |c| match c.behaviour {
+        CrossfadeBehaviour::Cut => CrossfadeCurve::Cut,
+        CrossfadeBehaviour::Fade => CrossfadeCurve::from_name(&c.curve),
     });
     let (a, b) = gains(position, curve);
     match bus {
@@ -89,10 +90,25 @@ pub fn layer_gain(cf: Option<&Crossfader>, bus: Option<&Bus>, position: f64) -> 
     }
 }
 
+/// Blend mode of a layer: the crossfader's own when the layer sits on a bus and the
+/// crossfader sets one, else the layer's.
+pub fn layer_blend(
+    cf: Option<&Crossfader>,
+    bus: Option<&Bus>,
+    own: &vjc_model::BlendMode,
+) -> vjc_model::BlendMode {
+    match (bus, cf.and_then(|c| c.blend.as_ref())) {
+        (Some(_), Some(b)) => b.clone(),
+        _ => own.clone(),
+    }
+}
+
 pub fn new_crossfader() -> Crossfader {
     Crossfader {
         position: Param::number("Position", CENTER, Some((0.0, 1.0))),
         curve: CrossfadeCurve::default().name().to_string(),
+        behaviour: Default::default(),
+        blend: None,
     }
 }
 
@@ -164,5 +180,38 @@ mod first_touch_tests {
         let (a, _) = gains(0.5, CrossfadeCurve::default());
         assert!((none - a).abs() < 1e-12);
         assert_eq!(layer_gain(None, None, 0.5), 1.0);
+    }
+
+    #[test]
+    fn cut_behaviour_overrides_the_curve() {
+        let mut cf = new_crossfader();
+        cf.curve = CrossfadeCurve::Linear.name().to_string();
+        assert!((layer_gain(Some(&cf), Some(&Bus::A), 0.25) - 0.75).abs() < 1e-9);
+        cf.behaviour = CrossfadeBehaviour::Cut;
+        assert_eq!(layer_gain(Some(&cf), Some(&Bus::A), 0.25), 1.0);
+        assert_eq!(layer_gain(Some(&cf), Some(&Bus::B), 0.25), 0.0);
+    }
+
+    #[test]
+    fn crossfader_blend_replaces_the_blend_of_bus_layers_only() {
+        use vjc_model::BlendMode;
+        let mut cf = new_crossfader();
+        assert_eq!(
+            layer_blend(Some(&cf), Some(&Bus::A), &BlendMode::Multiply),
+            BlendMode::Multiply
+        );
+        cf.blend = Some(BlendMode::Add);
+        assert_eq!(
+            layer_blend(Some(&cf), Some(&Bus::B), &BlendMode::Multiply),
+            BlendMode::Add
+        );
+        assert_eq!(
+            layer_blend(Some(&cf), None, &BlendMode::Multiply),
+            BlendMode::Multiply
+        );
+        assert_eq!(
+            layer_blend(None, Some(&Bus::A), &BlendMode::Multiply),
+            BlendMode::Multiply
+        );
     }
 }

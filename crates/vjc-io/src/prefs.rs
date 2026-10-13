@@ -19,6 +19,48 @@ pub struct General {
     pub browser_folder: Option<PathBuf>,
     /// Folder holding the ML model files (`.onnx`); `None` = `<app data dir>/models`.
     pub models_folder: Option<PathBuf>,
+    /// Recently opened or saved `.vjc` projects, newest first (at most `MAX_RECENT`).
+    pub recent_projects: Vec<PathBuf>,
+    /// Browser favourites: `dir:<path>` for folders, `fx:<name>` for effects / generators.
+    pub favorites: Vec<String>,
+    /// Browser shows thumbnails in a grid instead of a list.
+    pub browser_grid: bool,
+}
+
+/// Longest recent-projects list kept.
+pub const MAX_RECENT: usize = 12;
+
+impl General {
+    /// Moves `path` to the front of the recent projects (no duplicates, capped).
+    pub fn push_recent(&mut self, path: &Path) {
+        self.recent_projects.retain(|p| p != path);
+        self.recent_projects.insert(0, path.to_path_buf());
+        self.recent_projects.truncate(MAX_RECENT);
+    }
+
+    pub fn is_favorite(&self, key: &str) -> bool {
+        self.favorites.iter().any(|f| f == key)
+    }
+
+    /// Adds the favourite, or removes it when present. Returns the new state.
+    pub fn toggle_favorite(&mut self, key: &str) -> bool {
+        if self.is_favorite(key) {
+            self.favorites.retain(|f| f != key);
+            false
+        } else {
+            self.favorites.push(key.to_string());
+            true
+        }
+    }
+
+    fn sanitize(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.recent_projects.retain(|p| seen.insert(p.clone()));
+        self.recent_projects.truncate(MAX_RECENT);
+        let mut seen = std::collections::HashSet::new();
+        self.favorites
+            .retain(|f| !f.is_empty() && seen.insert(f.clone()));
+    }
 }
 
 impl Default for General {
@@ -30,6 +72,9 @@ impl Default for General {
             last_project: None,
             browser_folder: None,
             models_folder: None,
+            recent_projects: vec![],
+            favorites: vec![],
+            browser_grid: false,
         }
     }
 }
@@ -391,6 +436,7 @@ impl Default for Prefs {
 impl Prefs {
     /// Clamps values to sane ranges.
     pub fn sanitize(&mut self) {
+        self.general.sanitize();
         self.api.port = self.api.port.clamp(1, 65534);
         self.general.autosave_secs = self.general.autosave_secs.clamp(5, 3600);
         self.video.width = self.video.width.clamp(1, 16384);
@@ -655,5 +701,38 @@ mod tests {
         assert_eq!(p.general.autosave_secs, 5);
         assert_eq!(p.video.width, 1);
         assert_eq!(p.video.fps, 60.0);
+    }
+
+    #[test]
+    fn recent_projects_move_to_front_dedupe_and_cap() {
+        let mut g = General::default();
+        for n in 0..(MAX_RECENT + 3) {
+            g.push_recent(Path::new(&format!("/p/{n}.vjc")));
+        }
+        assert_eq!(g.recent_projects.len(), MAX_RECENT);
+        g.push_recent(Path::new("/p/5.vjc"));
+        assert_eq!(g.recent_projects[0], Path::new("/p/5.vjc"));
+        assert_eq!(
+            g.recent_projects
+                .iter()
+                .filter(|p| *p == Path::new("/p/5.vjc"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn favorites_toggle_roundtrip_through_the_prefs_file() {
+        let mut p = Prefs::default();
+        assert!(p.general.toggle_favorite("dir:/a"));
+        assert!(p.general.toggle_favorite("fx:Blur"));
+        assert!(!p.general.toggle_favorite("dir:/a"));
+        p.general.browser_grid = true;
+        let f = std::env::temp_dir().join(format!("vjc-fav-{}.json", std::process::id()));
+        p.save(&f).unwrap();
+        let (back, _) = Prefs::load(&f);
+        std::fs::remove_file(&f).ok();
+        assert_eq!(back.general.favorites, ["fx:Blur"]);
+        assert!(back.general.browser_grid);
     }
 }

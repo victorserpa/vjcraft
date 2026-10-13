@@ -39,9 +39,82 @@ pub struct Entry {
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tab {
     Files,
+    Compositions,
+    Record,
     Effects,
     Generators,
     Network,
+}
+
+/// What a double click in the browser asks the app to do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Opened {
+    /// Load the media file into the selected cell.
+    File(PathBuf),
+    /// Open the `.vjc` project.
+    Project(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    Dir,
+    Video,
+    Project,
+    Effect,
+}
+
+/// One entry of the Files / Compositions / Record / Effects / Generators lists.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub name: String,
+    pub path: Option<PathBuf>,
+    pub mtime: Option<SystemTime>,
+    pub kind: RowKind,
+    /// Favourite key (`dir:<path>` / `fx:<name>`); `None` = cannot be a favourite.
+    pub fav: Option<String>,
+    pub item: Option<Item>,
+}
+
+pub fn dir_key(p: &Path) -> String {
+    format!("dir:{}", p.display())
+}
+
+pub fn fx_key(name: &str) -> String {
+    format!("fx:{name}")
+}
+
+/// Favourites first, folders before files; otherwise the order is kept (stable).
+pub fn favorites_first(rows: &mut [Row], general: &vjc_io::prefs::General) {
+    rows.sort_by_key(|r| {
+        (
+            r.kind != RowKind::Dir,
+            !r.fav.as_deref().is_some_and(|k| general.is_favorite(k)),
+        )
+    });
+}
+
+/// Columns of the grid view for a panel `width` (always 1 in list view).
+pub fn grid_cols(width: f32, grid: bool) -> usize {
+    if grid {
+        ((width / GRID_CELL_W).floor() as usize).max(1)
+    } else {
+        1
+    }
+}
+
+const GRID_CELL_W: f32 = 84.0;
+const GRID_CELL_H: f32 = 74.0;
+const LIST_ROW_H: f32 = 40.0;
+
+/// Videos in `dir` (the app's recordings), newest first. Missing folder = empty.
+pub fn list_recordings(dir: &Path) -> Vec<Entry> {
+    let mut out: Vec<Entry> = list_dir(dir).into_iter().filter(|e| !e.is_dir).collect();
+    out.sort_by(|a, b| {
+        b.mtime
+            .cmp(&a.mtime)
+            .then_with(|| b.name.to_lowercase().cmp(&a.name.to_lowercase()))
+    });
+    out
 }
 
 /// Result of one discovery pass: sources found and a note per protocol that is unusable.
@@ -310,6 +383,10 @@ pub struct Browser {
     net: NetListing,
     net_rx: Option<Receiver<NetListing>>,
     net_at: Option<std::time::Instant>,
+    /// Recordings made by the app (Record tab), refreshed every few seconds.
+    rec: Vec<Entry>,
+    rec_dir: PathBuf,
+    rec_at: Option<std::time::Instant>,
 }
 
 impl Browser {
@@ -324,6 +401,9 @@ impl Browser {
             net: NetListing::default(),
             net_rx: None,
             net_at: None,
+            rec: vec![],
+            rec_dir: crate::capture::recordings_dir(),
+            rec_at: None,
         }
     }
 
@@ -345,14 +425,29 @@ impl Browser {
         self.dir = dir;
     }
 
-    /// Draws the panel contents; returns a file the user double-clicked.
-    pub fn show(&mut self, ui: &mut egui::Ui, fx: &[(String, Item)]) -> Option<PathBuf> {
+    /// Draws the panel contents; returns what the user double-clicked and whether the
+    /// favourites / view mode in `general` changed (the caller saves the prefs).
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        fx: &[(String, Item)],
+        general: &mut vjc_io::prefs::General,
+    ) -> (Option<Opened>, bool) {
         let ctx = ui.ctx().clone();
         self.thumbs.poll();
-        ui.horizontal(|ui| {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
             crate::help::help(
                 ui.selectable_value(&mut self.tab, Tab::Files, "Files"),
                 "browser-files",
+            );
+            crate::help::help(
+                ui.selectable_value(&mut self.tab, Tab::Compositions, "Compositions"),
+                "browser-compositions",
+            );
+            crate::help::help(
+                ui.selectable_value(&mut self.tab, Tab::Record, "Record"),
+                "browser-record",
             );
             crate::help::help(
                 ui.selectable_value(&mut self.tab, Tab::Effects, "Effects"),
@@ -393,9 +488,38 @@ impl Browser {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs(1));
         }
-        ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search"));
+        if self.tab == Tab::Record {
+            let stale = self
+                .rec_at
+                .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3));
+            if stale {
+                self.rec = list_recordings(&self.rec_dir);
+                self.rec_at = Some(std::time::Instant::now());
+            }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(3));
+        }
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 52.0).clamp(40.0, 200.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .hint_text("Search")
+                    .desired_width(w),
+            );
+            let grid = general.browser_grid;
+            let r = ui
+                .selectable_label(grid, "Grid")
+                .on_hover_text("Grid or list view");
+            if r.clicked() {
+                general.browser_grid = !grid;
+                changed = true;
+            }
+        });
         ui.separator();
         let mut opened = None;
+        let q = self.query.trim().to_lowercase();
+        let matches = |name: &str| q.is_empty() || name.to_lowercase().contains(&q);
+        let mut rows: Vec<Row> = vec![];
         match self.tab {
             Tab::Files => {
                 ui.horizontal(|ui| {
@@ -407,94 +531,145 @@ impl Browser {
                     }
                     ui.label(self.dir.display().to_string());
                 });
-                let mut enter = None;
-                let rows: Vec<Entry> = filter(&self.entries, &self.query, None)
-                    .into_iter()
-                    .cloned()
+                // Favourite folders: one click jumps there.
+                let favs: Vec<PathBuf> = general
+                    .favorites
+                    .iter()
+                    .filter_map(|k| k.strip_prefix("dir:").map(PathBuf::from))
+                    .filter(|p| p.is_dir())
                     .collect();
-                // Only visible rows request thumbnails, so a huge folder
-                // cannot thrash the cache.
-                egui::ScrollArea::vertical().show_rows(ui, 40.0, rows.len(), |ui, range| {
-                    for e in &rows[range] {
-                        let (rect, r) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 40.0),
-                            egui::Sense::click_and_drag(),
-                        );
-                        if r.hovered() {
-                            ui.painter().rect_filled(
-                                rect,
-                                3.0,
-                                ui.visuals().widgets.hovered.bg_fill,
+                if !favs.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for f in &favs {
+                            let name = f.file_name().map_or_else(
+                                || f.display().to_string(),
+                                |n| n.to_string_lossy().into_owned(),
                             );
-                        }
-                        let th = egui::Rect::from_min_size(rect.min, egui::vec2(64.0, 36.0));
-                        let label = if e.is_dir {
-                            format!("[dir] {}", e.name)
-                        } else {
-                            if let Some(id) = self.thumbs.texture(&ctx, &(e.path.clone(), e.mtime))
+                            if ui
+                                .small_button(format!("\u{2665} {name}"))
+                                .on_hover_text(f.display().to_string())
+                                .clicked()
                             {
-                                ui.painter().image(
-                                    id,
-                                    th,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            } else {
-                                ui.painter()
-                                    .rect_filled(th, 2.0, ui.visuals().extreme_bg_color);
-                            }
-                            e.name.clone()
-                        };
-                        ui.painter().text(
-                            egui::pos2(rect.min.x + 70.0, rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            egui::FontId::proportional(13.0),
-                            ui.visuals().text_color(),
-                        );
-                        if e.is_dir {
-                            if r.clicked() {
-                                enter = Some(e.path.clone());
-                            }
-                        } else {
-                            if r.double_clicked() {
-                                opened = Some(e.path.clone());
-                            }
-                            if r.drag_started() {
-                                egui::DragAndDrop::set_payload(&ctx, Item::File(e.path.clone()));
+                                self.go(f.clone());
+                                self.query.clear();
                             }
                         }
+                    });
+                }
+                rows = filter(&self.entries, &self.query, None)
+                    .into_iter()
+                    .map(|e| Row {
+                        name: e.name.clone(),
+                        path: Some(e.path.clone()),
+                        mtime: e.mtime,
+                        kind: if e.is_dir {
+                            RowKind::Dir
+                        } else {
+                            RowKind::Video
+                        },
+                        fav: e.is_dir.then(|| dir_key(&e.path)),
+                        item: (!e.is_dir).then(|| Item::File(e.path.clone())),
+                    })
+                    .collect();
+            }
+            Tab::Compositions => {
+                rows = general
+                    .recent_projects
+                    .iter()
+                    .filter(|p| p.is_file())
+                    .filter_map(|p| {
+                        let name = p.file_stem()?.to_string_lossy().into_owned();
+                        matches(&name).then(|| Row {
+                            name,
+                            path: Some(p.clone()),
+                            mtime: None,
+                            kind: RowKind::Project,
+                            fav: None,
+                            item: None,
+                        })
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    ui.weak("No recent projects. Open or save a .vjc to list it here.");
+                }
+            }
+            Tab::Record => {
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        self.rec_at = None;
                     }
+                    ui.weak(self.rec_dir.display().to_string());
                 });
-                if let Some(d) = enter {
-                    self.go(d);
-                    self.query.clear();
+                rows = self
+                    .rec
+                    .iter()
+                    .filter(|e| matches(&e.name))
+                    .map(|e| Row {
+                        name: e.name.clone(),
+                        path: Some(e.path.clone()),
+                        mtime: e.mtime,
+                        kind: RowKind::Video,
+                        fav: None,
+                        item: Some(Item::File(e.path.clone())),
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    ui.weak("No recordings yet. Use Record in the top bar.");
                 }
             }
             Tab::Effects | Tab::Generators => {
                 let want_gen = self.tab == Tab::Generators;
-                let q = self.query.trim().to_lowercase();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (name, item) in fx {
-                        if matches!(item, Item::Generator(_)) != want_gen
-                            || !(q.is_empty() || name.to_lowercase().contains(&q))
-                        {
-                            continue;
-                        }
-                        let r = ui.add(
-                            egui::Button::new(name)
-                                .min_size(egui::vec2(ui.available_width(), 24.0))
-                                .sense(egui::Sense::click_and_drag()),
-                        );
-                        if r.drag_started() {
+                rows = fx
+                    .iter()
+                    .filter(|(name, item)| {
+                        matches!(item, Item::Generator(_)) == want_gen && matches(name)
+                    })
+                    .map(|(name, item)| Row {
+                        name: name.clone(),
+                        path: None,
+                        mtime: None,
+                        kind: RowKind::Effect,
+                        fav: Some(fx_key(name)),
+                        item: Some(item.clone()),
+                    })
+                    .collect();
+            }
+            Tab::Network => {}
+        }
+        if self.tab != Tab::Network {
+            favorites_first(&mut rows, general);
+            let mut enter = None;
+            for ev in self.draw_rows(ui, &ctx, &rows, general) {
+                match ev {
+                    Ev::Click(i) if rows[i].kind == RowKind::Dir => {
+                        enter = rows[i].path.clone();
+                    }
+                    Ev::Double(i) => match (rows[i].kind, rows[i].path.clone()) {
+                        (RowKind::Video, Some(p)) => opened = Some(Opened::File(p)),
+                        (RowKind::Project, Some(p)) => opened = Some(Opened::Project(p)),
+                        _ => {}
+                    },
+                    Ev::Drag(i) => {
+                        if let Some(item) = &rows[i].item {
                             egui::DragAndDrop::set_payload(&ctx, item.clone());
                         }
                     }
-                });
+                    Ev::Fav(i) => {
+                        if let Some(k) = &rows[i].fav {
+                            general.toggle_favorite(k);
+                            changed = true;
+                        }
+                    }
+                    Ev::Click(_) => {}
+                }
             }
+            if let Some(d) = enter {
+                self.go(d);
+                self.query.clear();
+            }
+        }
+        match self.tab {
+            Tab::Files | Tab::Compositions | Tab::Record | Tab::Effects | Tab::Generators => {}
             Tab::Network => {
                 ui.horizontal(|ui| {
                     if ui.button("Refresh").clicked() {
@@ -558,8 +733,181 @@ impl Browser {
                     });
             }
         }
-        opened
+        (opened, changed)
     }
+
+    /// Draws `rows` as a list or a grid of thumbnails (only visible rows request
+    /// thumbnails). Heart on rows that can be favourites.
+    fn draw_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rows: &[Row],
+        general: &vjc_io::prefs::General,
+    ) -> Vec<Ev> {
+        let grid = general.browser_grid;
+        let cols = grid_cols(ui.available_width(), grid);
+        let cell_w = if grid {
+            ui.available_width() / cols as f32
+        } else {
+            ui.available_width()
+        };
+        let cell_h = if grid { GRID_CELL_H } else { LIST_ROW_H };
+        let mut evs = vec![];
+        egui::ScrollArea::vertical().show_rows(
+            ui,
+            cell_h,
+            rows.len().div_ceil(cols),
+            |ui, range| {
+                for line in range {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (i, row) in rows.iter().enumerate().skip(line * cols).take(cols) {
+                            self.draw_cell(
+                                ui,
+                                ctx,
+                                row,
+                                i,
+                                (cell_w, cell_h),
+                                grid,
+                                general,
+                                &mut evs,
+                            );
+                        }
+                    });
+                }
+            },
+        );
+        evs
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        row: &Row,
+        i: usize,
+        (w, h): (f32, f32),
+        grid: bool,
+        general: &vjc_io::prefs::General,
+        evs: &mut Vec<Ev>,
+    ) {
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
+        r.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, row.name.clone())
+        });
+        if r.hovered() {
+            ui.painter()
+                .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+        let th = if grid {
+            egui::Rect::from_min_size(
+                egui::pos2(rect.center().x - 32.0, rect.min.y + 2.0),
+                egui::vec2(64.0, 36.0),
+            )
+        } else {
+            egui::Rect::from_min_size(rect.min, egui::vec2(64.0, 36.0))
+        };
+        let text = match row.kind {
+            RowKind::Dir => {
+                ui.painter()
+                    .rect_filled(th, 2.0, ui.visuals().widgets.inactive.bg_fill);
+                format!("[dir] {}", row.name)
+            }
+            RowKind::Video => {
+                match self
+                    .thumbs
+                    .texture(ctx, &(row.path.clone().unwrap_or_default(), row.mtime))
+                {
+                    Some(id) => ui.painter().image(
+                        id,
+                        th,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    ),
+                    None => ui
+                        .painter()
+                        .rect_filled(th, 2.0, ui.visuals().extreme_bg_color),
+                };
+                row.name.clone()
+            }
+            RowKind::Project | RowKind::Effect => {
+                if grid || row.kind == RowKind::Project {
+                    ui.painter()
+                        .rect_filled(th, 2.0, ui.visuals().extreme_bg_color);
+                }
+                row.name.clone()
+            }
+        };
+        let (pos, align, width) = if grid {
+            (
+                egui::pos2(rect.center().x, th.max.y + 4.0),
+                egui::Align2::CENTER_TOP,
+                w - 6.0,
+            )
+        } else {
+            (
+                egui::pos2(rect.min.x + 70.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                w - 70.0 - 22.0,
+            )
+        };
+        let galley = ui.painter().layout(
+            text,
+            egui::FontId::proportional(if grid { 11.0 } else { 13.0 }),
+            ui.visuals().text_color(),
+            width.max(10.0),
+        );
+        let top_left = align.anchor_size(pos, galley.size()).min;
+        ui.painter()
+            .with_clip_rect(rect)
+            .galley(top_left, galley, ui.visuals().text_color());
+        if row.fav.is_some() {
+            let on = row.fav.as_deref().is_some_and(|k| general.is_favorite(k));
+            let hr = egui::Rect::from_min_size(
+                egui::pos2(rect.max.x - 20.0, rect.min.y + 2.0),
+                egui::vec2(18.0, 18.0),
+            );
+            let heart = ui
+                .interact(hr, ui.id().with(("heart", i)), egui::Sense::click())
+                .on_hover_text(if on {
+                    "Remove from favourites"
+                } else {
+                    "Add to favourites"
+                });
+            ui.painter().text(
+                hr.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{2665}",
+                egui::FontId::proportional(14.0),
+                if on {
+                    crate::theme::ACCENT
+                } else {
+                    ui.visuals().weak_text_color()
+                },
+            );
+            if heart.clicked() {
+                evs.push(Ev::Fav(i));
+                return;
+            }
+        }
+        if r.double_clicked() {
+            evs.push(Ev::Double(i));
+        } else if r.clicked() {
+            evs.push(Ev::Click(i));
+        }
+        if r.drag_started() {
+            evs.push(Ev::Drag(i));
+        }
+    }
+}
+
+enum Ev {
+    Click(usize),
+    Double(usize),
+    Drag(usize),
+    Fav(usize),
 }
 
 #[cfg(test)]
@@ -677,5 +1025,58 @@ mod tests {
         assert_eq!((c.len(), c.bytes()), (2, 80));
         c.insert(k("a"), frame(10)); // replace updates bytes
         assert_eq!(c.bytes(), 50);
+    }
+
+    fn row(name: &str, kind: RowKind, fav: Option<String>) -> Row {
+        Row {
+            name: name.into(),
+            path: None,
+            mtime: None,
+            kind,
+            fav,
+            item: None,
+        }
+    }
+
+    #[test]
+    fn favorites_sort_first_and_folders_stay_before_files() {
+        let mut g = vjc_io::prefs::General::default();
+        g.toggle_favorite(&fx_key("Zoom"));
+        g.toggle_favorite(&dir_key(Path::new("/b")));
+        let mut rows = vec![
+            row("Blur", RowKind::Effect, Some(fx_key("Blur"))),
+            row("a.mp4", RowKind::Video, None),
+            row("a", RowKind::Dir, Some(dir_key(Path::new("/a")))),
+            row("Zoom", RowKind::Effect, Some(fx_key("Zoom"))),
+            row("b", RowKind::Dir, Some(dir_key(Path::new("/b")))),
+        ];
+        favorites_first(&mut rows, &g);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["b", "a", "Zoom", "Blur", "a.mp4"]);
+    }
+
+    #[test]
+    fn grid_columns_follow_the_width_and_list_is_one_column() {
+        assert_eq!(grid_cols(500.0, false), 1);
+        assert_eq!(grid_cols(10.0, true), 1);
+        assert_eq!(grid_cols(GRID_CELL_W * 3.0 + 1.0, true), 3);
+    }
+
+    #[test]
+    fn recordings_list_newest_first_and_skip_other_files() {
+        let d = std::env::temp_dir().join(format!("vjc-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for (name, age) in [("old.mp4", 0), ("new.mp4", 100), ("mid.mp4", 50)] {
+            let f = std::fs::File::create(d.join(name)).unwrap();
+            f.set_modified(t0 + std::time::Duration::from_secs(age))
+                .unwrap();
+        }
+        std::fs::write(d.join("notes.txt"), b"").unwrap();
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let names: Vec<String> = list_recordings(&d).into_iter().map(|e| e.name).collect();
+        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(names, ["new.mp4", "mid.mp4", "old.mp4"]);
+        assert!(list_recordings(Path::new("/no/such/dir")).is_empty());
     }
 }

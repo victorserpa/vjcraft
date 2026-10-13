@@ -164,6 +164,8 @@ mod tests {
             },
             autopilot: Default::default(),
             crossfader_bus: None,
+            audio: true,
+            video: true,
             group: None,
         }
     }

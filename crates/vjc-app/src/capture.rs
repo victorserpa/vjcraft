@@ -301,13 +301,18 @@ impl Capture {
 
 /// `~/Movies/VJCraft/<UTC timestamp>.mp4` (the platform's video folder when known).
 pub fn default_path() -> PathBuf {
-    let base = directories::UserDirs::new()
-        .and_then(|d| d.video_dir().map(|p| p.to_path_buf()))
-        .unwrap_or_else(std::env::temp_dir);
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    unique_path(&base.join("VJCraft"), &timestamp(secs))
+    unique_path(&recordings_dir(), &timestamp(secs))
+}
+
+/// Folder the app records into (`~/Movies/VJCraft`); the browser's Record tab lists it.
+pub fn recordings_dir() -> PathBuf {
+    directories::UserDirs::new()
+        .and_then(|d| d.video_dir().map(|p| p.to_path_buf()))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("VJCraft")
 }
 
 /// `<dir>/<stem>.mp4`, or `<stem>-2.mp4`, `-3`... when the name is taken (1 s resolution).

@@ -12,6 +12,7 @@ mod link_io;
 mod midi_io;
 mod ml_fx;
 mod ml_gpu;
+mod monitor;
 mod monitors;
 mod netout;
 mod osc_io;
@@ -101,6 +102,12 @@ struct State {
     /// Tab of the bottom parameter panel.
     panel_tab: PanelTab,
     comp_tex: Option<egui::TextureId>,
+    /// egui id of the preview monitor texture (registered while the monitor is visible).
+    prev_tex: Option<egui::TextureId>,
+    /// Fit / pan of the Composition and Preview monitors (runtime only).
+    mon_views: [monitor::MonitorView; 2],
+    /// Set by `monitor_column` when drawn; `compose` renders the preview only then.
+    monitor_seen: bool,
     /// Output recording in progress (runtime only).
     capture: Option<capture::Capture>,
     /// Syphon / NDI publishers of the screens set to those devices (runtime only).
@@ -487,20 +494,23 @@ fn group_header(
 }
 
 fn add_effect_menu(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
-    ui.menu_button("Add effect", |ui| {
-        for (id, _) in vjc_fx::BUILTIN {
-            if ui.button(fx_label(id)).clicked()
-                && let Some(effect) = vjc_fx::new_effect(id)
-            {
-                cmds.push(Command::AddEffect {
-                    target,
-                    effect,
-                    index: usize::MAX,
-                });
-                ui.close();
-            }
+    ui.menu_button("Add effect", |ui| add_effect_list(ui, target, cmds));
+}
+
+/// The bundled effects as menu entries; a click appends the effect to the target's chain.
+fn add_effect_list(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
+    for (id, _) in vjc_fx::BUILTIN {
+        if ui.button(fx_label(id)).clicked()
+            && let Some(effect) = vjc_fx::new_effect(id)
+        {
+            cmds.push(Command::AddEffect {
+                target,
+                effect,
+                index: usize::MAX,
+            });
+            ui.close();
         }
-    });
+    }
 }
 
 type Gens = HashMap<LayerId, (DeckId, u32, f64)>;
@@ -803,6 +813,8 @@ fn new_layer(n: usize) -> Layer {
         },
         autopilot: Default::default(),
         crossfader_bus: None,
+        audio: true,
+        video: true,
         group: None,
     }
 }
@@ -868,6 +880,9 @@ impl State {
             fx_epoch: std::time::Instant::now(),
             panel_tab: PanelTab::Composition,
             comp_tex: None,
+            prev_tex: None,
+            mon_views: Default::default(),
+            monitor_seen: false,
             capture: None,
             netout: Default::default(),
             artnet: Default::default(),
@@ -1311,6 +1326,7 @@ impl State {
                 self.warnings = warnings;
                 self.status = format!("Opened {}", path.display());
                 self.prefs.general.last_project = Some(path.clone());
+                self.prefs.general.push_recent(&path);
                 self.save_prefs();
                 self.file = Some(path);
                 self.dirty = false;
@@ -1363,6 +1379,7 @@ impl State {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
                 self.prefs.general.last_project = Some(path.clone());
+                self.prefs.general.push_recent(&path);
                 self.save_prefs();
                 self.file = Some(path);
                 self.dirty = false;
@@ -2143,6 +2160,8 @@ impl State {
             return;
         };
         let routes = self.active_routes();
+        let want_preview = std::mem::take(&mut self.monitor_seen) || self.preview_routed();
+        let preview_src = self.selected.map(|(l, _)| vjc_model::SliceSource::Layer(l));
         let c = &self.project.composition;
         let (w, h) = (c.width.max(1), c.height.max(1));
         let dials = self.dials();
@@ -2223,6 +2242,10 @@ impl State {
         // Group of each entry of `draws` (an outgoing transition source shares its layer's).
         let mut draw_groups: Vec<Option<vjc_model::GroupId>> = vec![];
         for (l, f) in &frames {
+            // Video toggle off: the layer is not drawn (its clips keep playing).
+            if !l.video {
+                continue;
+            }
             // Clip chain first, then the layer chain.
             let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
             let clip = active_of(players, gens, l.id)
@@ -2293,6 +2316,11 @@ impl State {
                     l.crossfader_bus.as_ref(),
                     cf_pos,
                 )) as f32;
+            let blend = vjc_core::crossfader::layer_blend(
+                c.crossfader.as_ref(),
+                l.crossfader_bus.as_ref(),
+                &l.track.blend,
+            );
             if let Some((o, (kind, prog), of)) = cross {
                 let fx = draw_chain(
                     &mut self.fx,
@@ -2307,12 +2335,13 @@ impl State {
                 draws.push(LayerDraw {
                     id: Uuid::from_u128(l.id.as_u128() ^ OUT_MASK),
                     opacity,
-                    blend: l.track.blend.clone(),
+                    blend: blend.clone(),
                     fit: o.fit,
                     effects: fx,
                     generator: None,
                     transition: Some((kind.shader_id(), prog, true)),
                     transform: layer_xf,
+                    channels: Default::default(),
                     frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
                 });
             }
@@ -2321,11 +2350,12 @@ impl State {
                 id: l.id,
                 transition: cross.map(|(_, (k, p), _)| (k.shader_id(), p, false)),
                 opacity,
-                blend: l.track.blend.clone(),
+                blend,
                 fit: fit_of(l).unwrap_or_default(),
                 effects,
                 generator,
                 transform: xf,
+                channels: clip.map_or_else(Default::default, |k| k.channels),
                 frame: f
                     .as_ref()
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
@@ -2380,6 +2410,7 @@ impl State {
         comp.master_transform = vjc_core::transform::Affine::inverse_of(
             &vjc_core::transform::Resolved::of(&c.master.transform, &actx),
         );
+        comp.preview = if want_preview { preview_src } else { None };
         comp.render_routed(
             &rs.device,
             &rs.queue,
@@ -2387,6 +2418,21 @@ impl State {
             (&master, master_opacity),
             &routes,
         );
+        if want_preview && let Some(v) = comp.routed_view(vjc_model::SliceSource::Preview) {
+            let mut r = rs.renderer.write();
+            match self.prev_tex {
+                Some(id) => r.update_egui_texture_from_wgpu_texture(
+                    &rs.device,
+                    v,
+                    wgpu::FilterMode::Linear,
+                    id,
+                ),
+                None => {
+                    self.prev_tex =
+                        Some(r.register_native_texture(&rs.device, v, wgpu::FilterMode::Linear));
+                }
+            }
+        }
         self.ml.pump(comp, &rs.device, &rs.queue);
         match self.rec_request.take() {
             Some(true) if self.capture.is_none() => {
@@ -2454,6 +2500,18 @@ impl State {
         ids.extend(self.net_wants().iter().map(|w| w.id));
         ids.extend(self.artnet_wants().iter().map(|w| w.id));
         ids
+    }
+
+    /// True when a slice of a rendered screen shows the preview monitor.
+    fn preview_routed(&self) -> bool {
+        let ids = self.output_screen_ids();
+        self.project
+            .output
+            .screens
+            .iter()
+            .filter(|s| ids.contains(&s.id))
+            .flat_map(|s| &s.slices)
+            .any(|sl| sl.source == vjc_model::SliceSource::Preview)
     }
 
     /// Layers and groups that a slice of a rendered screen routes: the only extra renders
@@ -3387,7 +3445,11 @@ impl State {
                             ui.add(egui::Label::new(help_shown).wrap());
                         });
                 }
-                opened = self.browser.show(ui, &fxs)
+                let (o, changed) = self.browser.show(ui, &fxs, &mut self.prefs.general);
+                opened = o;
+                if changed {
+                    self.prefs_dirty = true;
+                }
             });
             self.track_size(
                 |l| &mut l.browser_w,
@@ -3450,11 +3512,15 @@ impl State {
         // Transport bar: under the grid, above the property panels.
         let r = egui::Panel::bottom("transport").show(ui, |ui| self.time_bar(ui));
         self.transport_h = r.response.rect.height();
-        if let Some(path) = opened {
-            match self.selected {
+        match opened {
+            Some(browser::Opened::File(path)) => match self.selected {
                 Some((l, c)) => self.drop_file(l, c, path),
                 None => self.status = "Select a cell to load the file".into(),
+            },
+            Some(browser::Opened::Project(path)) if self.confirm_discard() => {
+                self.load(path);
             }
+            Some(browser::Opened::Project(_)) | None => {}
         }
         if ctx.input(|i| i.pointer.any_released())
             && let Some(item) = egui::DragAndDrop::payload::<browser::Item>(&ctx)
@@ -3729,6 +3795,36 @@ impl State {
                                             solo: !layer.solo,
                                         });
                                     }
+                                    for (txt, tip, on, video) in [
+                                        ("V", "Layer video on/off", layer.video, true),
+                                        ("\u{266A}", "Layer audio on/off", layer.audio, false),
+                                    ] {
+                                        let b = ui.add(egui::Button::new(txt).min_size(sq).fill(
+                                            if on {
+                                                egui::Color32::TRANSPARENT
+                                            } else {
+                                                theme::LAYER_ON
+                                            },
+                                        ));
+                                        if b.on_hover_text(tip).clicked() {
+                                            cmds.push(if video {
+                                                Command::SetLayerVideo {
+                                                    layer: lid,
+                                                    enabled: !on,
+                                                }
+                                            } else {
+                                                Command::SetLayerAudio {
+                                                    layer: lid,
+                                                    enabled: !on,
+                                                }
+                                            });
+                                        }
+                                    }
+                                    ui.menu_button("Fx+", |ui| {
+                                        add_effect_list(ui, EffectTarget::Layer(lid), &mut cmds)
+                                    })
+                                    .response
+                                    .on_hover_text("Add effect");
                                     let bus_row = ui.horizontal(|ui| {
                                         for (txt, bus) in [
                                             ("A", Some(vjc_model::Bus::A)),
@@ -3915,37 +4011,62 @@ impl State {
         }
     }
 
-    /// Left column of the bottom area: Composition monitor over Preview monitor, each
-    /// letterboxed to the composition aspect.
+    /// Left column of the bottom area: Composition monitor over Preview monitor. Each has a
+    /// Fit / Fill / 1:1 dropdown, drag to pan (double click resets) and the composition size.
+    /// The Preview shows the selected layer alone (the composition when none is selected).
     fn monitor_column(&mut self, ui: &mut egui::Ui) {
-        let c = &self.project.composition;
-        let aspect = c.width as f32 / c.height.max(1) as f32;
-        let label_h = ui.text_style_height(&egui::TextStyle::Body);
+        self.monitor_seen = true;
+        let (cw, ch) = (
+            self.project.composition.width,
+            self.project.composition.height,
+        );
+        let head_h = ui.spacing().interact_size.y;
         let gap = ui.spacing().item_spacing.y;
-        let each = ((ui.available_height() - 2.0 * (label_h + gap) - gap) / 2.0).max(0.0);
+        let each = ((ui.available_height() - 2.0 * (head_h + gap) - gap) / 2.0).max(0.0);
         let w = ui.available_width();
-        for (name, note) in [
-            ("Composition monitor", None),
-            ("Preview monitor", Some("Preview = Output")),
-        ] {
-            ui.label(name);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, each), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 0.0, theme::MONITOR_BG);
-            match self.comp_tex {
+        let preview_tex = self.selected.and(self.prev_tex);
+        for (i, name) in ["Composition monitor", "Preview monitor"]
+            .into_iter()
+            .enumerate()
+        {
+            ui.horizontal(|ui| {
+                ui.label(name);
+                egui::ComboBox::from_id_salt(("monfit", i))
+                    .width(54.0)
+                    .selected_text(self.mon_views[i].fit.label())
+                    .show_ui(ui, |ui| {
+                        for f in monitor::MonitorFit::ALL {
+                            ui.selectable_value(&mut self.mon_views[i].fit, f, f.label());
+                        }
+                    });
+                ui.weak(monitor::size_label(cw, ch));
+            });
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(w, each), egui::Sense::click_and_drag());
+            if resp.dragged() {
+                self.mon_views[i].pan += resp.drag_delta();
+            }
+            if resp.double_clicked() {
+                self.mon_views[i].pan = egui::Vec2::ZERO;
+            }
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0.0, theme::MONITOR_BG);
+            let tex = if i == 1 {
+                preview_tex.or(self.comp_tex)
+            } else {
+                self.comp_tex
+            };
+            match tex {
                 Some(id) => {
-                    let mut fit = egui::vec2(w, w / aspect);
-                    if fit.y > each {
-                        fit = egui::vec2(each * aspect, each);
-                    }
-                    ui.painter().image(
+                    painter.image(
                         id,
-                        egui::Rect::from_center_size(rect.center(), fit),
+                        monitor::picture_rect(rect, (cw, ch), self.mon_views[i]),
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
                 }
                 None => {
-                    ui.painter().text(
+                    painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "No signal",
@@ -3954,8 +4075,13 @@ impl State {
                     );
                 }
             }
-            if let Some(note) = note {
-                ui.painter().text(
+            if i == 1 {
+                let note = if preview_tex.is_some() {
+                    "Selected layer"
+                } else {
+                    "Composition (no layer selected)"
+                };
+                painter.text(
                     rect.left_top() + egui::vec2(4.0, 2.0),
                     egui::Align2::LEFT_TOP,
                     note,
@@ -4107,6 +4233,34 @@ impl State {
                         }
                     });
             });
+            let behaviours = [
+                (vjc_model::CrossfadeBehaviour::Fade, "Fade".to_string()),
+                (vjc_model::CrossfadeBehaviour::Cut, "Cut".to_string()),
+            ];
+            let cur = c
+                .crossfader
+                .as_ref()
+                .map(|x| x.behaviour)
+                .unwrap_or_default();
+            if let Some(behaviour) =
+                params::combo(ui, "cfbeh", "Crossfader behaviour", &cur, &behaviours)
+            {
+                cmds.push(Command::SetCrossfaderBehaviour { behaviour });
+            }
+            let mut modes: Vec<(Option<BlendMode>, String)> =
+                vec![(None, "Layer's own".to_string())];
+            modes.extend(
+                vjc_core::blend::COMPOSITION_MODES
+                    .iter()
+                    .map(|(m, n)| (Some(m.clone()), n.to_string())),
+            );
+            let cur = c.crossfader.as_ref().and_then(|x| x.blend.clone());
+            if let Some(blend) = params::combo(ui, "cfblend", "Crossfader blend", &cur, &modes) {
+                cmds.push(Command::SetCrossfaderBlend { blend });
+            }
+        }
+        if params::section(ui, "sec-comp-audio", "Master audio") {
+            self.audio_rows(ui, AudioTarget::Master, &c.master, cmds);
         }
         if params::section(ui, "sec-transform", "Transform") {
             self.transform_rows(ui, EffectTarget::Master, cmds);
@@ -4259,6 +4413,19 @@ impl State {
                 }
                 if ui.toggle_value(&mut bypass, "Bypass").changed() {
                     cmds.push(Command::SetLayerBypass { layer: lid, bypass });
+                }
+                let (mut video, mut audio) = (l.video, l.audio);
+                if ui.toggle_value(&mut video, "Video").changed() {
+                    cmds.push(Command::SetLayerVideo {
+                        layer: lid,
+                        enabled: video,
+                    });
+                }
+                if ui.toggle_value(&mut audio, "Audio").changed() {
+                    cmds.push(Command::SetLayerAudio {
+                        layer: lid,
+                        enabled: audio,
+                    });
                 }
             });
         }
@@ -4729,6 +4896,26 @@ impl State {
                     fit,
                 });
             }
+            ui.horizontal(|ui| {
+                let mut ch = k.channels;
+                let mut changed = false;
+                for (txt, flag) in [
+                    ("R", &mut ch.r),
+                    ("G", &mut ch.g),
+                    ("B", &mut ch.b),
+                    ("A", &mut ch.a),
+                ] {
+                    changed |= ui.toggle_value(flag, txt).changed();
+                }
+                if changed {
+                    cmds.push(Command::SetClipChannels {
+                        deck,
+                        layer,
+                        column,
+                        channels: ch,
+                    });
+                }
+            });
         }
         if params::section(ui, "sec-clip-transform", "Transform") {
             self.transform_rows(
@@ -5697,6 +5884,29 @@ fn is_sequential(mode: vjc_model::PlayMode, dir: Direction, rate: f64) -> bool {
 }
 
 #[cfg(test)]
+mod audio_mix_tests {
+    use super::*;
+
+    #[test]
+    fn audio_mix_mutes_when_layer_audio_is_off_and_applies_master() {
+        let mut p = Project::new("t");
+        let layer = new_layer(1);
+        let id = layer.id;
+        p.composition.layers.push(layer);
+        let clip = vjc_core::clip_from_path("/x/a.mov".into());
+        p.composition.master.volume.set_number(0.5);
+        let (vol, _) = audio_mix(&p, id, &clip);
+        assert!((vol - 0.5).abs() < 1e-6, "master volume scales: {vol}");
+        p.composition.layers[0].audio = false;
+        assert_eq!(audio_mix(&p, id, &clip).0, 0.0);
+        // Video off leaves the audio alone.
+        p.composition.layers[0].audio = true;
+        p.composition.layers[0].video = false;
+        assert!(audio_mix(&p, id, &clip).0 > 0.0);
+    }
+}
+
+#[cfg(test)]
 mod sequential_tests {
     use super::*;
 
@@ -5748,6 +5958,13 @@ fn audio_mix(p: &Project, layer: LayerId, clip: &vjc_model::Clip) -> (f32, f32) 
         .find(|l| l.id == layer)
         .map(|l| &l.track);
     let mut vol = vnum(&clip.track.volume) * vnum(&p.composition.master.volume);
+    if p.composition
+        .layers
+        .iter()
+        .any(|l| l.id == layer && !l.audio)
+    {
+        vol = 0.0;
+    }
     let mut pan = num(&clip.track.pan) + num(&p.composition.master.pan);
     if let Some(t) = lt {
         vol *= vnum(&t.volume);

@@ -24,6 +24,10 @@ fn one() -> f64 {
     1.0
 }
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Composition {
     pub id: Uuid,
@@ -71,6 +75,12 @@ pub struct Layer {
     pub autopilot: Autopilot,
     pub crossfader_bus: Option<Bus>,
     pub group: Option<Uuid>,
+    /// Audio of the layer's clips is heard (off = muted, independent of volume).
+    #[serde(default = "yes")]
+    pub audio: bool,
+    /// The layer's picture is drawn (off = hidden, audio unaffected).
+    #[serde(default = "yes")]
+    pub video: bool,
 }
 
 /// Adjacent layers composed together first, then blended into the stack as one layer.
@@ -130,6 +140,40 @@ pub struct Clip {
     /// How the video is fitted to the composition frame.
     #[serde(default)]
     pub fit: FitMode,
+    /// Colour channels of the picture that are drawn.
+    #[serde(default)]
+    pub channels: Channels,
+}
+
+/// R/G/B/A visibility of a clip's picture. A channel that is off is zeroed (R, G, B) or
+/// ignored (A: the picture becomes opaque).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Channels {
+    pub r: bool,
+    pub g: bool,
+    pub b: bool,
+    pub a: bool,
+}
+
+impl Default for Channels {
+    fn default() -> Self {
+        Channels {
+            r: true,
+            g: true,
+            b: true,
+            a: true,
+        }
+    }
+}
+
+impl Channels {
+    /// Shader mask: bit 0..3 set = that channel (R, G, B, A) is OFF.
+    pub fn off_mask(self) -> u32 {
+        u32::from(!self.r)
+            | u32::from(!self.g) << 1
+            | u32::from(!self.b) << 2
+            | u32::from(!self.a) << 3
+    }
 }
 
 /// Aspect-ratio handling of a clip inside the composition frame.
@@ -497,6 +541,19 @@ pub enum Bus {
 pub struct Crossfader {
     pub position: Param,
     pub curve: String,
+    /// Fade = gains follow the curve; Cut = hard switch at the middle (ignores the curve).
+    #[serde(default)]
+    pub behaviour: CrossfadeBehaviour,
+    /// Blend mode used by the layers on a bus instead of their own; `None` = their own.
+    #[serde(default)]
+    pub blend: Option<BlendMode>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CrossfadeBehaviour {
+    #[default]
+    Fade,
+    Cut,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -675,8 +732,8 @@ pub enum SliceSource {
     Layer(LayerId),
     /// One layer group on its own (its layers, group chain and opacity).
     Group(GroupId),
-    /// The preview monitor. Preview currently equals the output, so this is the
-    /// composition.
+    /// The preview monitor: the selected layer on its own; the composition when nothing
+    /// is selected.
     Preview,
 }
 
@@ -1042,6 +1099,8 @@ mod tests {
             solo,
             bypass,
             crossfader_bus: None,
+            audio: true,
+            video: true,
             transition: Transition {
                 kind: "cut".into(),
                 duration_beats: None,
@@ -1075,6 +1134,8 @@ mod tests {
             },
             autopilot: Default::default(),
             crossfader_bus: None,
+            audio: true,
+            video: true,
             group: None,
         });
         p.composition.decks[0].set_clip(
@@ -1090,6 +1151,7 @@ mod tests {
                 track: Track::new(BlendMode::Normal),
                 fit: FitMode::default(),
                 blend_override: None,
+                channels: Default::default(),
             },
         );
         let json = serde_json::to_string(&p).unwrap();

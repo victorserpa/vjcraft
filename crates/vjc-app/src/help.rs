@@ -128,6 +128,10 @@ pub fn text(key: &str) -> Option<&'static str> {
         }
         "browser-effects" => "Built-in effects. Drag one onto a layer, clip or master chain.",
         "browser-generators" => "Procedural sources. Drag one onto an empty cell to make a clip.",
+        "browser-compositions" => "Recent projects. Double-click one to open it.",
+        "browser-record" => {
+            "Recordings made by the app, newest first. Double-click one to load it into the selected cell."
+        }
         "browser-network" => "Video sources found on the network.",
         // Output setup
         "out-screens" => {
