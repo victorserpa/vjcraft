@@ -6,6 +6,7 @@ pub mod blend;
 pub mod clock;
 pub mod effects;
 pub mod playhead;
+pub mod shortcuts;
 
 pub use effects::EffectTarget;
 use std::path::PathBuf;
@@ -83,7 +84,8 @@ pub enum Command {
         delta: i32,
     },
     /// Triggers the nearest clip of the layer `delta` columns away from `from` (empty cells
-    /// are passed over; at the ends nothing changes and `NoClip` is returned). Runtime only.
+    /// and placeholders are passed over; at the ends nothing changes and `NoClip` is
+    /// returned). Runtime only.
     StepClip {
         deck: DeckId,
         layer: LayerId,
@@ -229,6 +231,14 @@ pub enum Command {
     Resync {
         at: Instant,
     },
+    /// Inserts a shortcut at `index` (clamped).
+    AddShortcut {
+        shortcut: vjc_model::Shortcut,
+        index: usize,
+    },
+    RemoveShortcut {
+        id: Uuid,
+    },
 }
 
 /// What a coalescible command targets.
@@ -326,6 +336,7 @@ pub enum Error {
     NoDeck,
     NoClip,
     NoEffect,
+    NoShortcut,
     /// Clip has no file source to play.
     NotPlayable,
     /// Layer/column still holds clips, or is not the last column.
@@ -342,6 +353,7 @@ impl std::fmt::Display for Error {
             Error::NoDeck => "current deck not found",
             Error::NoClip => "no clip in cell",
             Error::NoEffect => "effect not found",
+            Error::NoShortcut => "shortcut not found",
             Error::NotPlayable => "clip has no playable file source",
             Error::InUse => "layer or column is not empty",
             Error::InvalidValue => "value out of range",
@@ -613,12 +625,16 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             };
             while (0..n).contains(&c) {
                 let col = c as ColumnIdx;
-                if clip_in(p, deck, layer, col).is_some() {
-                    let ev = trigger_event(p, deck, layer, col)?;
-                    return Ok(Applied {
-                        inverse: None,
-                        events: vec![ev],
-                    });
+                // Empty cells and placeholders are passed over.
+                match trigger_event(p, deck, layer, col) {
+                    Ok(ev) => {
+                        return Ok(Applied {
+                            inverse: None,
+                            events: vec![ev],
+                        });
+                    }
+                    Err(Error::NoClip | Error::NotPlayable) => {}
+                    Err(e) => return Err(e),
                 }
                 c += sign;
             }
@@ -972,6 +988,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::MoveEffect { .. }
         | Command::SetEffectBypass { .. }
         | Command::SetEffectParam { .. } => effects::apply(p, cmd),
+        Command::AddShortcut { .. } | Command::RemoveShortcut { .. } => shortcuts::apply(p, cmd),
         Command::SetBpm { bpm } => {
             if !bpm.is_finite() || bpm <= 0.0 {
                 return Err(Error::InvalidValue);
@@ -1103,7 +1120,7 @@ mod tests {
     use super::*;
 
     const A: DeckId = Uuid::from_u128(1);
-    use vjc_model::Transition;
+    use vjc_model::{ShortcutMode, Transition};
 
     fn layer(n: usize) -> Layer {
         Layer {
@@ -2306,5 +2323,228 @@ mod tests {
         assert_eq!(playback_rate(1.0, 1.0, 1.0), 1.0);
         assert_eq!(playback_rate(2.0, 0.5, 2.0), 2.0);
         assert_eq!(playback_rate(1.5, 1.0, 0.0), 0.0);
+    }
+
+    use crate::shortcuts::{self as sc, Ctx};
+
+    fn ctx(sel: Option<u32>, bypass: bool) -> Ctx {
+        Ctx::new(sel, bypass)
+    }
+
+    #[test]
+    fn resolve_every_address() {
+        let (p, l1, l2) = grid();
+        // Layers count from the bottom: layer 1 is the last listed (l2).
+        assert!(matches!(
+            sc::resolve(&p, "/comp/layer/1/clip/3/connect", 1.0),
+            Some(Command::TriggerClip { deck: A, layer, column: 2 }) if layer == l2
+        ));
+        assert!(matches!(
+            sc::resolve(&p, "/comp/layer/2/clip/1/connect", 1.0),
+            Some(Command::TriggerClip { layer, column: 0, .. }) if layer == l1
+        ));
+        assert_eq!(sc::resolve(&p, "/comp/layer/3/clip/1/connect", 1.0), None);
+        assert_eq!(sc::resolve(&p, "/comp/layer/1/clip/0/connect", 1.0), None);
+        assert_eq!(sc::resolve(&p, "/comp/layer/1/clip/1/connect", 0.0), None);
+        assert_eq!(
+            sc::resolve(&p, "/comp/column/2/connect", 1.0),
+            Some(Command::TriggerColumn { deck: A, column: 1 })
+        );
+        assert_eq!(
+            sc::resolve(&p, "/comp/layer/2/opacity", 3.0),
+            Some(Command::SetOpacity {
+                layer: l1,
+                value: 1.0
+            })
+        );
+        assert_eq!(
+            sc::resolve(&p, "/comp/layer/1/clear", 1.0),
+            Some(Command::ClearLayer { layer: l2 })
+        );
+        assert!(matches!(
+            sc::resolve(&p, "/comp/tempo/tap", 1.0),
+            Some(Command::Tap { .. })
+        ));
+        assert_eq!(
+            sc::resolve(&p, "/comp/tempo/bpm", 9999.0),
+            Some(Command::SetBpm {
+                bpm: clock::MAX_BPM
+            })
+        );
+        assert_eq!(
+            sc::resolve(&p, "/comp/master/bypass", 1.0),
+            Some(Command::SetMasterBypass { bypass: true })
+        );
+        assert_eq!(
+            sc::resolve(&p, "/comp/master/opacity", 0.5),
+            Some(Command::SetMasterOpacity { value: 0.5 })
+        );
+        assert_eq!(sc::resolve(&p, "/comp/clear", 1.0), Some(Command::ClearAll));
+        assert_eq!(sc::resolve(&p, "/comp/nope", 1.0), None);
+        let c = ctx(Some(1), false);
+        assert_eq!(
+            sc::resolve_with(&p, &c, "/comp/column/next", 1.0),
+            Some(Command::StepColumn {
+                deck: A,
+                from: Some(1),
+                delta: 1
+            })
+        );
+        assert_eq!(
+            sc::resolve_with(&p, &c, "/comp/column/selected/connect", 1.0),
+            Some(Command::TriggerColumn { deck: A, column: 1 })
+        );
+    }
+
+    #[test]
+    fn activate_honors_modes() {
+        let (mut p, _, _) = grid();
+        let c = ctx(None, false);
+        let mk = |target: &str, mode, range, invert| {
+            let mut s = sc::key_shortcut("Q", target, mode, range);
+            s.invert = invert;
+            s
+        };
+        let op = "/comp/layer/1/opacity";
+        // Absolute: fixed value (range.1, or range.0 inverted).
+        assert_eq!(
+            sc::activate(&p, &c, &mk(op, ShortcutMode::Absolute, (0.0, 0.25), false)),
+            Some(Command::SetOpacity {
+                layer: p.composition.layers[1].id,
+                value: 0.25
+            })
+        );
+        assert!(matches!(
+            sc::activate(&p, &c, &mk(op, ShortcutMode::Absolute, (0.1, 0.25), true)),
+            Some(Command::SetOpacity { value, .. }) if value == 0.1
+        ));
+        // Toggle: opacity starts at 1 -> 0, and bypass flips with the runtime state.
+        assert!(matches!(
+            sc::activate(&p, &c, &mk(op, ShortcutMode::Toggle, (0.0, 1.0), false)),
+            Some(Command::SetOpacity { value, .. }) if value == 0.0
+        ));
+        let by = mk(
+            "/comp/master/bypass",
+            ShortcutMode::Toggle,
+            (0.0, 1.0),
+            false,
+        );
+        assert_eq!(
+            sc::activate(&p, &c, &by),
+            Some(Command::SetMasterBypass { bypass: true })
+        );
+        assert_eq!(
+            sc::activate(&p, &ctx(None, true), &by),
+            Some(Command::SetMasterBypass { bypass: false })
+        );
+        // Relative: increments the current value (clamped), negative when inverted.
+        p.composition.tempo.bpm = 100.0;
+        let bpm = |inv| mk("/comp/tempo/bpm", ShortcutMode::Relative, (0.0, 5.0), inv);
+        assert_eq!(
+            sc::activate(&p, &c, &bpm(false)),
+            Some(Command::SetBpm { bpm: 105.0 })
+        );
+        assert_eq!(
+            sc::activate(&p, &c, &bpm(true)),
+            Some(Command::SetBpm { bpm: 95.0 })
+        );
+        // Trigger fires the address.
+        let t = mk(
+            "/comp/column/1/connect",
+            ShortcutMode::Trigger,
+            (0.0, 1.0),
+            false,
+        );
+        assert_eq!(
+            sc::activate(&p, &c, &t),
+            Some(Command::TriggerColumn { deck: A, column: 0 })
+        );
+    }
+
+    #[test]
+    fn learn_creates_replaces_removes_and_undoes() {
+        let (mut p, _, _) = grid();
+        let mut h = History::new();
+        let now = Instant::now();
+        let run = |p: &mut Project, h: &mut History, cmds: Vec<Command>| {
+            for c in cmds {
+                h.exec(p, c, now).unwrap();
+            }
+        };
+        let t1 = "/comp/column/1/connect";
+        let t2 = "/comp/column/2/connect";
+        let cmds = sc::learn(&p, t1, "A");
+        run(&mut p, &mut h, cmds);
+        assert_eq!(sc::key_for(&p, t1), Some("A"));
+        // Same target, new key: replaces.
+        let cmds = sc::learn(&p, t1, "B");
+        run(&mut p, &mut h, cmds);
+        assert_eq!(p.shortcuts.len(), 1);
+        assert_eq!(sc::key_for(&p, t1), Some("B"));
+        // Same key on another target: the key moves.
+        let cmds = sc::learn(&p, t2, "B");
+        run(&mut p, &mut h, cmds);
+        assert_eq!(p.shortcuts.len(), 1);
+        assert_eq!(sc::key_for(&p, t1), None);
+        assert_eq!(sc::key_for(&p, t2), Some("B"));
+        // Delete removes; unmapped target is a no-op.
+        assert!(sc::unlearn(&p, t1).is_empty());
+        let cmds = sc::unlearn(&p, t2);
+        run(&mut p, &mut h, cmds);
+        assert!(p.shortcuts.is_empty());
+        // Undo brings it back at the same place.
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(sc::key_for(&p, t2), Some("B"));
+        h.redo(&mut p).unwrap().unwrap();
+        assert!(p.shortcuts.is_empty());
+        assert_eq!(
+            apply(&mut p, Command::RemoveShortcut { id: Uuid::new_v4() }),
+            Err(Error::NoShortcut)
+        );
+    }
+
+    #[test]
+    fn default_preset_resolves() {
+        let (p, _, _) = grid();
+        let d = sc::default_shortcuts();
+        let keys: Vec<_> = d.iter().filter_map(|s| sc::key_of(s)).collect();
+        assert_eq!(keys, ["ArrowLeft", "ArrowRight", "Space"]);
+        let c = ctx(Some(1), false);
+        for s in &d {
+            assert!(sc::activate(&p, &c, s).is_some(), "{}", s.target);
+        }
+    }
+
+    #[test]
+    fn step_clip_skips_placeholder() {
+        // Layer 2 (l2) has clips at 0 and a placeholder at 2: stepping from 0 finds nothing.
+        let (mut p, l1, l2) = grid();
+        let step = |p: &mut Project, layer, from| {
+            apply(
+                p,
+                Command::StepClip {
+                    deck: A,
+                    layer,
+                    from,
+                    delta: 1,
+                },
+            )
+        };
+        assert_eq!(step(&mut p, l2, Some(0)), Err(Error::NoClip));
+        // Backwards from the end also passes over the placeholder.
+        let a = apply(
+            &mut p,
+            Command::StepClip {
+                deck: A,
+                layer: l2,
+                from: None,
+                delta: -1,
+            },
+        )
+        .unwrap();
+        assert!(matches!(&a.events[0], Event::ClipStarted { column: 0, .. }));
+        // A playable clip after the gap is still reached.
+        let a = step(&mut p, l1, Some(0)).unwrap();
+        assert!(matches!(&a.events[0], Event::ClipStarted { column: 2, .. }));
     }
 }

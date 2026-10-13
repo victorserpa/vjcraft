@@ -50,8 +50,14 @@ struct State {
     last_pointer: Option<egui::Pos2>,
     /// Cell selected by click; fallback target for drops.
     selected: Option<(LayerId, u32)>,
-    /// Column last triggered by a column command (target of Space and the arrow keys).
+    /// Column last triggered (by column, cell or step); the "selected" column of shortcuts.
     col_sel: Option<u32>,
+    /// Shortcuts > Edit keyboard: clicks pick a target instead of acting.
+    learn: bool,
+    /// Target (address) waiting for a key while learning.
+    learn_target: Option<String>,
+    /// Mappable widgets drawn this frame, for learn clicks and the key overlay.
+    targets: Vec<(egui::Rect, String)>,
     /// Master bypass: black output (runtime only, not saved).
     master_bypass: bool,
     /// Path of the open .vjc, if any.
@@ -354,6 +360,7 @@ impl State {
                 name: format!("{i}"),
             });
         }
+        project.shortcuts = vjc_core::shortcuts::default_shortcuts();
         State {
             project,
             history: History::new(),
@@ -375,6 +382,9 @@ impl State {
             last_pointer: None,
             selected: None,
             col_sel: None,
+            learn: false,
+            learn_target: None,
+            targets: vec![],
             master_bypass: false,
             file: None,
             dirty: false,
@@ -580,12 +590,15 @@ impl State {
         );
         let ncols = self.project.composition.columns.len() as i64;
         let col_after = match &cmd {
-            Command::TriggerColumn { column, .. } => Some(*column),
+            Command::TriggerColumn { column, .. } | Command::TriggerClip { column, .. } => {
+                Some(*column)
+            }
             Command::StepColumn { from, delta, .. } => Some(from.map_or(0, |c| {
                 (i64::from(c) + i64::from(*delta)).clamp(0, (ncols - 1).max(0)) as u32
             })),
             _ => None,
         };
+        let is_step = matches!(cmd, Command::StepClip { .. });
         match self
             .history
             .exec(&mut self.project, cmd, std::time::Instant::now())
@@ -593,6 +606,15 @@ impl State {
             Ok(events) => {
                 if col_after.is_some() {
                     self.col_sel = col_after;
+                }
+                if is_step {
+                    // The step lands on the first playable clip: follow it.
+                    let landed = events.iter().find_map(|e| match e {
+                        Event::ClipStarted { column, .. }
+                        | Event::GeneratorStarted { column, .. } => Some(*column),
+                        _ => None,
+                    });
+                    self.col_sel = landed.or(self.col_sel);
                 }
                 if !runtime {
                     self.dirty = true;
@@ -916,44 +938,127 @@ impl State {
                 cmds.push(Command::SetMasterSpeed { value: sp });
             }
             let mut bypass = self.master_bypass;
-            if ui.toggle_value(&mut bypass, "Bypass").changed() {
+            let by = ui.toggle_value(&mut bypass, "Bypass");
+            self.targets.push((by.rect, "/comp/master/bypass".into()));
+            if by.changed() {
                 cmds.push(Command::SetMasterBypass { bypass });
             }
             if ui.button("Clear All").clicked() {
                 cmds.push(Command::ClearAll);
             }
         });
+        if self.learn {
+            cmds.clear();
+        }
         for c in cmds {
             self.exec(c);
         }
     }
 
-    /// Provisional shortcuts (configurable mapping is issue #15): Left/Right = previous/next
-    /// column, Space = trigger the selected column. Ignored while a text field has focus.
-    fn column_keys(&mut self, ctx: &egui::Context) {
+    /// Key shortcuts from the project, plus the learn flow. Nothing fires while a widget
+    /// has keyboard focus (text field or a focused button), so Space never also presses it.
+    fn shortcut_keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let deck = self.project.composition.current_deck;
-        let (left, right, space) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::Space),
-            )
+        let pressed: Vec<egui::Key> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if !modifiers.command && !modifiers.alt => Some(*key),
+                    _ => None,
+                })
+                .collect()
         });
-        if left || right {
-            let delta = if right { 1 } else { -1 };
-            self.exec(Command::StepColumn {
-                deck,
-                from: self.col_sel,
-                delta,
-            });
-        } else if space {
-            self.exec(Command::TriggerColumn {
-                deck,
-                column: self.col_sel.unwrap_or(0),
-            });
+        if self.learn {
+            for key in pressed {
+                self.learn_key(key);
+            }
+            return;
+        }
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let rt = vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass);
+        for key in pressed {
+            let name = key.name();
+            let cmds: Vec<Command> = self
+                .project
+                .shortcuts
+                .iter()
+                .filter(|s| vjc_core::shortcuts::key_of(s) == Some(name))
+                .filter_map(|s| vjc_core::shortcuts::activate(&self.project, &rt, s))
+                .collect();
+            for c in cmds {
+                self.exec(c);
+            }
+        }
+    }
+
+    /// One key press in learn mode: Esc leaves, Delete unmaps the target, any other key
+    /// maps to it (replacing its old key and taking the key from any other target).
+    fn learn_key(&mut self, key: egui::Key) {
+        use egui::Key;
+        if key == Key::Escape {
+            self.learn = false;
+            self.learn_target = None;
+            self.status = "Keyboard editing off".into();
+            return;
+        }
+        let Some(target) = self.learn_target.clone() else {
+            return;
+        };
+        let cmds = if matches!(key, Key::Delete | Key::Backspace) {
+            self.status = format!("Unmapped {target}");
+            vjc_core::shortcuts::unlearn(&self.project, &target)
+        } else {
+            self.status = format!("{} -> {target}", key.name());
+            vjc_core::shortcuts::learn(&self.project, &target, key.name())
+        };
+        for c in cmds {
+            self.exec(c);
+        }
+    }
+
+    /// Learn mode, end of frame: a click on a mapped widget picks it; the overlay shows
+    /// each target's key. Commands from the clicks are dropped so nothing else happens.
+    fn learn_pass(&mut self, ui: &egui::Ui, cmds: &mut Vec<Command>) {
+        if !self.learn {
+            return;
+        }
+        cmds.clear();
+        let ctx = ui.ctx();
+        if ctx.input(|i| i.pointer.primary_pressed())
+            && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
+            && let Some((_, a)) = self.targets.iter().rev().find(|(r, _)| r.contains(pos))
+        {
+            self.learn_target = Some(a.clone());
+            self.status = format!("{a}: press a key (Delete unmaps, Esc leaves)");
+        }
+        let paint = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("learn_overlay"),
+        ));
+        let v = ui.visuals();
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        for (rect, addr) in &self.targets {
+            let picked = self.learn_target.as_deref() == Some(addr);
+            if picked {
+                paint.rect_stroke(*rect, 3.0, v.selection.stroke, egui::StrokeKind::Outside);
+            }
+            if let Some(k) = vjc_core::shortcuts::key_for(&self.project, addr) {
+                let galley =
+                    paint.layout_no_wrap(k.to_owned(), font.clone(), v.strong_text_color());
+                let r = egui::Rect::from_min_size(rect.min, galley.size() + egui::vec2(6.0, 2.0));
+                paint.rect_filled(r, 3.0, v.selection.bg_fill);
+                paint.galley(r.min + egui::vec2(3.0, 1.0), galley, v.strong_text_color());
+            }
         }
     }
 
@@ -974,7 +1079,9 @@ impl State {
             {
                 cmds.push(Command::SetBpm { bpm });
             }
-            if ui.button("Tap").clicked() {
+            let tap = ui.button("Tap");
+            self.targets.push((tap.rect, "/comp/tempo/tap".into()));
+            if tap.clicked() {
                 cmds.push(Command::Tap { at: now });
             }
             let minus = ui.button("\u{2212}").on_hover_text("Nudge slower (hold)");
@@ -1024,6 +1131,9 @@ impl State {
             }
             ui.toggle_value(&mut self.metronome, "Metronome");
         });
+        if self.learn {
+            cmds.clear();
+        }
         for c in cmds {
             self.exec(c);
         }
@@ -1086,6 +1196,22 @@ impl State {
                     self.redo();
                 }
             });
+            ui.menu_button("Shortcuts", |ui| {
+                if ui
+                    .selectable_label(self.learn, "Edit keyboard")
+                    .clicked()
+                {
+                    ui.close();
+                    self.learn = !self.learn;
+                    self.learn_target = None;
+                    self.status = if self.learn {
+                        "Click a cell, column, opacity, Tap or Bypass, then press a key (Esc leaves)"
+                            .into()
+                    } else {
+                        "Keyboard editing off".into()
+                    };
+                }
+            });
             ui.menu_button("Output", |ui| {
                 if self.monitors.is_empty() {
                     ui.label("No monitors found");
@@ -1109,9 +1235,10 @@ impl State {
                 }
             });
         });
+        self.targets.clear();
         self.time_bar(ui);
         self.master_bar(ui);
-        self.column_keys(&ctx);
+        self.shortcut_keys(&ctx);
 
         // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).
         let redo_key = egui::KeyboardShortcut::new(
@@ -1260,7 +1387,10 @@ impl State {
                     for (ci, n) in names.iter().enumerate() {
                         let b = egui::Button::new(format!("\u{25b6} {n}"))
                             .selected(self.col_sel == Some(ci as u32));
-                        if ui.add(b).clicked() {
+                        let r = ui.add(b);
+                        self.targets
+                            .push((r.rect, vjc_core::shortcuts::column_address(ci as u32)));
+                        if r.clicked() {
                             cmds.push(Command::TriggerColumn {
                                 deck: cur,
                                 column: ci as u32,
@@ -1408,6 +1538,11 @@ impl State {
                                     generator_menu(ui, cur, lid, ci, &mut cmds);
                                 });
                             }
+                            if let Some(a) =
+                                vjc_core::shortcuts::clip_address(&self.project, lid, ci)
+                            {
+                                self.targets.push((r.rect, a));
+                            }
                             cells.push(CellInfo {
                                 rect: r.rect,
                                 layer: lid,
@@ -1448,10 +1583,13 @@ impl State {
                             vjc_model::Value::Number(n) => n as f32,
                             _ => 1.0,
                         };
-                        if ui
-                            .add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2))
-                            .changed()
+                        let op_r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
+                        if let Some(a) =
+                            vjc_core::shortcuts::layer_address(&self.project, lid, "opacity")
                         {
+                            self.targets.push((op_r.rect, a));
+                        }
+                        if op_r.changed() {
                             cmds.push(Command::SetOpacity {
                                 layer: lid,
                                 value: op as f64,
@@ -1533,8 +1671,17 @@ impl State {
         {
             self.drop_file(l, c, path);
         }
+        self.learn_pass(ui, &mut cmds);
         for c in cmds {
             self.exec(c);
+        }
+        // A click leaves keyboard focus on the widget; free it so shortcut keys keep working.
+        if ctx.input(|i| i.pointer.any_released()) && !ctx.egui_wants_keyboard_input() {
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
         }
     }
 
