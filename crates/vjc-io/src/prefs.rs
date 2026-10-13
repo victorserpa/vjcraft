@@ -104,6 +104,27 @@ impl Default for Osc {
     }
 }
 
+/// Remote HTTP/WebSocket API (no authentication: loopback unless the user exposes it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Api {
+    pub enabled: bool,
+    /// REST port; the WebSocket listens on `port + 1`.
+    pub port: u16,
+    /// Bind 0.0.0.0 instead of 127.0.0.1 (anyone on the network can then control VJCraft).
+    pub expose_network: bool,
+}
+
+impl Default for Api {
+    fn default() -> Self {
+        Api {
+            enabled: false,
+            port: 8090,
+            expose_network: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -113,6 +134,7 @@ pub struct Prefs {
     pub control: Control,
     pub audio: Audio,
     pub osc: Osc,
+    pub api: Api,
 }
 
 impl Default for Prefs {
@@ -124,6 +146,7 @@ impl Default for Prefs {
             control: Control::default(),
             audio: Audio::default(),
             osc: Osc::default(),
+            api: Api::default(),
         }
     }
 }
@@ -131,6 +154,7 @@ impl Default for Prefs {
 impl Prefs {
     /// Clamps values to sane ranges.
     pub fn sanitize(&mut self) {
+        self.api.port = self.api.port.clamp(1, 65534);
         self.general.autosave_secs = self.general.autosave_secs.clamp(5, 3600);
         self.video.width = self.video.width.clamp(1, 16384);
         self.video.height = self.video.height.clamp(1, 16384);
@@ -291,6 +315,16 @@ mod tests {
         let (b, w) = Prefs::load(&p);
         assert_eq!(a, b);
         assert!(w.is_none());
+    }
+
+    #[test]
+    fn api_is_off_on_loopback_port_8090_by_default() {
+        let mut p = Prefs::default();
+        assert!(!p.api.enabled && !p.api.expose_network);
+        assert_eq!(p.api.port, 8090);
+        p.api.port = 65535;
+        p.sanitize();
+        assert_eq!(p.api.port, 65534);
     }
 
     #[test]

@@ -18,12 +18,15 @@ rfd = "0.17.2"
 vjc-media = { path = "../vjc-media" }
 bytemuck = { version = "1", features = ["derive"] }
 uuid.workspace = true
+serde_json.workspace = true
 pollster = "1"
 directories = "6"
 vjc-fx = { path = "../vjc-fx" }
 midir = "0.11.1"
 vjc-net = { path = "../vjc-net", default-features = false }
 rusty_link = { version = "0.4.9", optional = true }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tiny_http = { version = "0.12", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"

@@ -1,3 +1,4 @@
+mod api_io;
 mod browser;
 mod capture;
 mod compositor;
@@ -105,6 +106,8 @@ struct State {
     osc_cfg: Option<osc_io::Cfg>,
     osc_prev: HashMap<String, f64>,
     osc_limit: vjc_core::osc::RateLimit,
+    api: api_io::Api,
+    api_cfg: Option<api_io::Cfg>,
     /// Mappable widgets drawn this frame, for learn clicks and the key overlay.
     targets: Vec<(egui::Rect, String)>,
     /// Master bypass: black output (runtime only, not saved).
@@ -174,6 +177,7 @@ enum PrefsTab {
     Video,
     Control,
     Osc,
+    Api,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -773,6 +777,12 @@ impl State {
             osc_cfg: None,
             osc_prev: HashMap::new(),
             osc_limit: Default::default(),
+            api: if live {
+                api_io::Api::spawn()
+            } else {
+                api_io::Api::idle()
+            },
+            api_cfg: None,
             led_prev: HashMap::new(),
             targets: vec![],
             master_bypass: false,
@@ -2184,6 +2194,29 @@ impl State {
         }
     }
 
+    /// Remote API, once per frame: applies the config, then answers the queued requests
+    /// (the server threads wait for the reply, the render loop never waits for them).
+    fn api_pump(&mut self, ctx: &egui::Context) {
+        self.api.set_ctx(ctx);
+        let cfg = api_io::Cfg::from_prefs(&self.prefs.api);
+        if self.api_cfg.as_ref() != Some(&cfg) {
+            self.api.configure(cfg.clone());
+            self.api_cfg = Some(cfg);
+        }
+        for _ in 0..api_io::MAX_PER_FRAME {
+            let Ok(msg) = self.api.rx.try_recv() else {
+                break;
+            };
+            let rt = self.rt_ctx();
+            let active = |l| active_of(&self.players, &self.gens, l);
+            let (cmd, reply) = api_io::answer(&self.project, &rt, &active, msg.req);
+            if let Some(c) = cmd {
+                self.exec(c);
+            }
+            let _ = msg.reply.send(reply);
+        }
+    }
+
     /// Delete in MIDI/OSC learn: unmaps the picked target's MIDI and OSC controls.
     fn unlearn_midi_osc(&mut self) {
         let Some(target) = self.learn_target.clone() else {
@@ -2514,6 +2547,7 @@ impl State {
         self.shortcut_keys(&ctx);
         self.midi_pump();
         self.osc_pump();
+        self.api_pump(&ctx);
 
         // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).
         let redo_key = egui::KeyboardShortcut::new(

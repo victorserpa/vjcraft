@@ -1,7 +1,7 @@
 //! Preferences window (File > Preferences..., Cmd+,). Edits apply live;
 //! the file is written when the window closes.
 
-use crate::{PrefsTab, State};
+use crate::{PrefsTab, State, api_io};
 use eframe::egui;
 use vjc_model::FitMode;
 
@@ -25,6 +25,7 @@ impl State {
                         (PrefsTab::Video, "Video"),
                         (PrefsTab::Control, "Control"),
                         (PrefsTab::Osc, "OSC"),
+                        (PrefsTab::Api, "Remote API"),
                     ] {
                         ui.selectable_value(&mut self.prefs_tab, t, l);
                     }
@@ -132,6 +133,41 @@ impl State {
                             });
                         });
                         ui.weak("Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
+                    }
+                    PrefsTab::Api => {
+                        let a = &mut p.api;
+                        ui.checkbox(&mut a.enabled, "Enable Remote API (HTTP + WebSocket)");
+                        ui.add_enabled_ui(a.enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Port");
+                                ui.add(egui::DragValue::new(&mut a.port).range(1..=65534));
+                                ui.weak(format!("WebSocket: {}", u32::from(a.port) + 1));
+                            });
+                            ui.checkbox(
+                                &mut a.expose_network,
+                                "Expose to the network (default: this computer only)",
+                            );
+                        });
+                        if a.enabled && a.expose_network {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "Warning: no authentication. Anyone on your network can control VJCraft.",
+                            );
+                        }
+                        if a.enabled {
+                            match self.api.status() {
+                                api_io::Status::Listening(addr) => {
+                                    ui.weak(format!("Listening on {addr}"));
+                                }
+                                api_io::Status::Failed(e) => {
+                                    ui.colored_label(ui.visuals().error_fg_color, e);
+                                }
+                                api_io::Status::Off => {
+                                    ui.weak("Starting...");
+                                }
+                            }
+                        }
+                        ui.weak("See docs/api.md. Applies immediately.");
                     }
                 }
                 ui.separator();
