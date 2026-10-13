@@ -8,12 +8,14 @@ pub mod clock;
 pub mod crossfader;
 pub mod effects;
 pub mod groups;
+pub mod ltc;
 pub mod mapping;
 pub mod midi;
 pub mod osc;
 pub mod playback;
 pub mod playhead;
 pub mod shortcuts;
+pub mod timecode;
 pub mod transition;
 
 pub use effects::EffectTarget;
@@ -22,7 +24,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vjc_model::{
     BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId, FitMode,
-    GroupId, Layer, LayerId, Param, PlayMode, Project, Source, Track, Transport, Value,
+    GroupId, Layer, LayerId, Param, PlayMode, Project, Source, Timecode, TimecodeCue, Track,
+    Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -377,6 +380,17 @@ pub enum Command {
         column: ColumnIdx,
         beats: Option<f64>,
     },
+    /// Clip follows the external timecode from `start` (None = off).
+    SetTimecodeStart {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        start: Option<Timecode>,
+    },
+    /// Replaces the whole timecode cue list of the composition.
+    SetTimecodeCues {
+        cues: Vec<TimecodeCue>,
+    },
     SetPlayMode {
         deck: DeckId,
         layer: LayerId,
@@ -477,6 +491,8 @@ enum Target {
     Opacity(LayerId),
     Speed(DeckId, LayerId, ColumnIdx),
     Bpm,
+    TimecodeCues,
+    TimecodeStart(DeckId, LayerId, ColumnIdx),
     MasterOpacity,
     MasterSpeed,
     GroupOpacity(GroupId),
@@ -499,6 +515,14 @@ impl Command {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
             Command::SetBpm { .. } => Some(Target::Bpm),
+            // Dragging a timecode field emits one command per frame.
+            Command::SetTimecodeCues { .. } => Some(Target::TimecodeCues),
+            Command::SetTimecodeStart {
+                deck,
+                layer,
+                column,
+                ..
+            } => Some(Target::TimecodeStart(*deck, *layer, *column)),
             Command::SetScreenSize { screen, .. } => Some(Target::ScreenSize(*screen)),
             Command::SetSliceMesh { slice, .. } => Some(Target::SliceMesh(*slice)),
             Command::SetSliceMask { slice, .. } => Some(Target::SliceMask(*slice)),
@@ -1642,6 +1666,36 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetTimecodeStart {
+            deck,
+            layer,
+            column,
+            start,
+        } => {
+            if start.is_some_and(|t| !timecode::is_valid(&t)) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = std::mem::replace(
+                &mut transport_mut(p, deck, layer, column)?.timecode_start,
+                start,
+            );
+            undoable(
+                Command::SetTimecodeStart {
+                    deck,
+                    layer,
+                    column,
+                    start: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetTimecodeCues { cues } => {
+            if cues.iter().any(|c| !timecode::is_valid(&c.time)) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = std::mem::replace(&mut p.composition.timecode_cues, cues);
+            undoable(Command::SetTimecodeCues { cues: prev }, vec![])
+        }
         Command::SetPlayMode {
             deck,
             layer,
@@ -2554,6 +2608,35 @@ mod tests {
         };
         roundtrip(&mut p, set(Some(4.0)));
         assert_eq!(apply(&mut p, set(Some(0.0))), Err(Error::InvalidValue));
+    }
+
+    #[test]
+    fn timecode_start_and_cues_roundtrip_and_validate() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let tc = Timecode::new(1, 0, 0, 0, vjc_model::TcFps::F25);
+        let set = |start| Command::SetTimecodeStart {
+            deck: A,
+            layer: l,
+            column: 0,
+            start,
+        };
+        roundtrip(&mut p, set(Some(tc)));
+        let bad = Timecode::new(0, 0, 0, 25, vjc_model::TcFps::F25);
+        assert_eq!(apply(&mut p, set(Some(bad))), Err(Error::InvalidValue));
+        let cue = TimecodeCue {
+            time: tc,
+            column: 1,
+            layer: Some(l),
+        };
+        let cues = |c: &TimecodeCue| Command::SetTimecodeCues {
+            cues: vec![c.clone()],
+        };
+        roundtrip(&mut p, cues(&cue));
+        let mut wrong = cue.clone();
+        wrong.time = bad;
+        assert_eq!(apply(&mut p, cues(&wrong)), Err(Error::InvalidValue));
     }
 
     #[test]

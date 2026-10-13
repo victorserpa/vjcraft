@@ -12,8 +12,8 @@ const POLL: Duration = Duration::from_millis(1500);
 const CLIENT: &str = "VJCraft";
 
 pub enum In {
-    /// Raw message from a device (by port name).
-    Msg(String, Vec<u8>),
+    /// Raw message from a device (by port name) and the instant the callback received it.
+    Msg(String, Vec<u8>, Instant),
     /// A device appeared (its LEDs need their state again).
     Connected(String),
 }
@@ -49,6 +49,18 @@ impl Midi {
     }
 }
 
+/// Names of the MIDI input ports now present.
+pub fn input_ports() -> Vec<String> {
+    let Ok(probe) = MidiInput::new(CLIENT) else {
+        return vec![];
+    };
+    probe
+        .ports()
+        .iter()
+        .filter_map(|p| probe.port_name(p).ok())
+        .collect()
+}
+
 fn run(tx: Sender<In>, out_rx: Receiver<(String, [u8; 3])>) {
     let mut inputs: HashMap<String, MidiInputConnection<()>> = HashMap::new();
     let mut outputs: HashMap<String, midir::MidiOutputConnection> = HashMap::new();
@@ -80,6 +92,11 @@ fn run(tx: Sender<In>, out_rx: Receiver<(String, [u8; 3])>) {
     }
 }
 
+/// MIDI callback body: stamps the message on arrival, not when the UI drains it.
+fn on_message(tx: &Sender<In>, device: &str, bytes: &[u8]) {
+    let _ = tx.send(In::Msg(device.to_owned(), bytes.to_vec(), Instant::now()));
+}
+
 /// Opens new input ports; returns the names newly connected.
 fn sync_inputs(
     tx: &Sender<In>,
@@ -107,9 +124,7 @@ fn sync_inputs(
         match input.connect(
             &port,
             "vjcraft-in",
-            move |_, bytes, _| {
-                let _ = sender.send(In::Msg(dev.clone(), bytes.to_vec()));
-            },
+            move |_, bytes, _| on_message(&sender, &dev, bytes),
             (),
         ) {
             Ok(conn) => {
@@ -151,4 +166,26 @@ fn sync_outputs(open: &mut HashMap<String, midir::MidiOutputConnection>) -> Vec<
         }
     }
     fresh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_timestamp_is_taken_in_the_callback() {
+        let (tx, rx) = channel();
+        let before = Instant::now();
+        on_message(&tx, "dev", &[0xF1, 0x00]);
+        let after = Instant::now();
+        std::thread::sleep(Duration::from_millis(30));
+        let Ok(In::Msg(d, b, at)) = rx.try_recv() else {
+            panic!("no message");
+        };
+        assert_eq!((d.as_str(), b), ("dev", vec![0xF1, 0x00]));
+        assert!(
+            at >= before && at <= after,
+            "stamped at receive, not at drain"
+        );
+    }
 }

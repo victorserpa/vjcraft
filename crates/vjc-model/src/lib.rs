@@ -47,6 +47,9 @@ pub struct Composition {
     pub master_speed: f64,
     pub crossfader: Option<Crossfader>,
     pub dashboard: Vec<Param>,
+    /// Timecode cues, fired when the external timecode crosses them.
+    #[serde(default)]
+    pub timecode_cues: Vec<TimecodeCue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,6 +182,69 @@ pub struct Transport {
     pub cue_points: Vec<f64>,
     pub in_point: f64,
     pub out_point: f64,
+    /// When set, the clip follows the external timecode: position = timecode - this start.
+    #[serde(default)]
+    pub timecode_start: Option<Timecode>,
+}
+
+/// Timecode frame rates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TcFps {
+    F24,
+    F25,
+    /// 29.97 fps drop-frame.
+    F2997Df,
+    F30,
+}
+
+impl TcFps {
+    pub const ALL: [TcFps; 4] = [TcFps::F24, TcFps::F25, TcFps::F2997Df, TcFps::F30];
+
+    /// Frame numbers per second on the display (30 for 29.97).
+    pub fn nominal(self) -> u32 {
+        match self {
+            TcFps::F24 => 24,
+            TcFps::F25 => 25,
+            TcFps::F2997Df | TcFps::F30 => 30,
+        }
+    }
+
+    /// Real frames per second.
+    pub fn rate(self) -> f64 {
+        match self {
+            TcFps::F2997Df => 30000.0 / 1001.0,
+            f => f64::from(f.nominal()),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TcFps::F24 => "24",
+            TcFps::F25 => "25",
+            TcFps::F2997Df => "29.97 DF",
+            TcFps::F30 => "30",
+        }
+    }
+}
+
+/// A SMPTE timecode value (hours:minutes:seconds:frames at a frame rate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timecode {
+    pub h: u8,
+    pub m: u8,
+    pub s: u8,
+    pub f: u8,
+    pub fps: TcFps,
+}
+
+/// Fires a column (or one layer's clip of it) when the timecode crosses `time`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimecodeCue {
+    pub time: Timecode,
+    pub column: ColumnIdx,
+    /// None = the whole column, Some = just that layer.
+    #[serde(default)]
+    pub layer: Option<LayerId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +600,7 @@ impl Default for Transport {
             cue_points: vec![],
             in_point: 0.0,
             out_point: 1.0,
+            timecode_start: None,
         }
     }
 }
@@ -568,6 +635,7 @@ impl Project {
                 master_speed: 1.0,
                 crossfader: None,
                 dashboard: vec![],
+                timecode_cues: vec![],
             },
             output: OutputSetup { screens: vec![] },
             shortcuts: vec![],
@@ -606,6 +674,101 @@ impl Composition {
         l.group
             .and_then(|id| self.group(id))
             .map_or(1.0, |g| g.speed)
+    }
+}
+
+impl Timecode {
+    pub fn new(h: u8, m: u8, s: u8, f: u8, fps: TcFps) -> Timecode {
+        Timecode { h, m, s, f, fps }
+    }
+
+    /// Frames in one day at this rate (the wrap point).
+    fn day_frames(fps: TcFps) -> u64 {
+        match fps {
+            // 30 x 86400 minus 2 per minute except every tenth.
+            TcFps::F2997Df => 2_589_408,
+            f => u64::from(f.nominal()) * 86_400,
+        }
+    }
+
+    /// Frames since 00:00:00:00 (drop-frame numbers skipped).
+    pub fn frames(&self) -> u64 {
+        let nom = u64::from(self.fps.nominal());
+        let (h, m, s, f) = (
+            u64::from(self.h),
+            u64::from(self.m),
+            u64::from(self.s),
+            u64::from(self.f),
+        );
+        let n = nom * (3600 * h + 60 * m + s) + f;
+        if self.fps == TcFps::F2997Df {
+            let tm = 60 * h + m;
+            n.saturating_sub(2 * (tm - tm / 10))
+        } else {
+            n
+        }
+    }
+
+    /// Timecode `n` frames after 00:00:00:00, wrapping at 24 h.
+    pub fn from_frames(fps: TcFps, n: u64) -> Timecode {
+        let mut n = n % Self::day_frames(fps);
+        if fps == TcFps::F2997Df {
+            let (d, r) = (n / 17_982, n % 17_982);
+            n += 18 * d + if r < 2 { 0 } else { 2 * ((r - 2) / 1798) };
+        }
+        let nom = u64::from(fps.nominal());
+        Timecode {
+            f: (n % nom) as u8,
+            s: (n / nom % 60) as u8,
+            m: (n / (nom * 60) % 60) as u8,
+            h: (n / (nom * 3600) % 24) as u8,
+            fps,
+        }
+    }
+
+    /// Adds (or subtracts) frames, wrapping at 24 h.
+    pub fn add_frames(&self, delta: i64) -> Timecode {
+        let day = Self::day_frames(self.fps) as i64;
+        let n = (self.frames() as i64 + delta).rem_euclid(day);
+        Timecode::from_frames(self.fps, n as u64)
+    }
+
+    /// Wall-clock seconds since 00:00:00:00.
+    pub fn seconds(&self) -> f64 {
+        self.frames() as f64 / self.fps.rate()
+    }
+
+    /// Nearest frame to `secs` (wraps at 24 h; negative clamps to 0).
+    pub fn from_seconds(fps: TcFps, secs: f64) -> Timecode {
+        let n = if secs.is_finite() {
+            (secs.max(0.0) * fps.rate()).round() as u64
+        } else {
+            0
+        };
+        Timecode::from_frames(fps, n)
+    }
+
+    /// Fields in range; drop-frame skips frames 0 and 1 at minutes not divisible by 10.
+    pub fn is_valid(&self) -> bool {
+        self.h < 24
+            && self.m < 60
+            && self.s < 60
+            && u32::from(self.f) < self.fps.nominal()
+            && !(self.fps == TcFps::F2997Df
+                && self.s == 0
+                && self.f < 2
+                && !self.m.is_multiple_of(10))
+    }
+}
+
+impl std::fmt::Display for Timecode {
+    fn fmt(&self, w: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sep = if self.fps == TcFps::F2997Df { ';' } else { ':' };
+        write!(
+            w,
+            "{:02}:{:02}:{:02}{sep}{:02}",
+            self.h, self.m, self.s, self.f
+        )
     }
 }
 
@@ -690,5 +853,20 @@ mod tests {
         let mut p = Param::number("x", 0.5, Some((0.0, 1.0)));
         p.set_number(3.0);
         assert_eq!(p.value, Value::Number(1.0));
+    }
+
+    #[test]
+    fn old_projects_without_timecode_fields_load() {
+        let mut v = serde_json::to_value(Project::new("x")).unwrap();
+        v["composition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("timecode_cues");
+        let p: Project = serde_json::from_value(v).unwrap();
+        assert!(p.composition.timecode_cues.is_empty());
+        let mut t = serde_json::to_value(Transport::default()).unwrap();
+        t.as_object_mut().unwrap().remove("timecode_start");
+        let t: Transport = serde_json::from_value(t).unwrap();
+        assert_eq!(t.timecode_start, None);
     }
 }

@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use vjc_model::FitMode;
+use vjc_model::{FitMode, TcFps};
 
 pub const PREFS_VERSION: u32 = 1;
 
@@ -125,6 +125,36 @@ impl Default for Api {
     }
 }
 
+/// Where the external timecode comes from.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum TcSource {
+    #[default]
+    Off,
+    /// MIDI Timecode from the named input port.
+    Mtc { port: String },
+    /// LTC audio from an input device (empty name = default) and 0-based channel.
+    Ltc { device: String, channel: u16 },
+}
+
+/// What a timecode-driven clip does when the signal disappears.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnLoss {
+    #[default]
+    Freeze,
+    FreeRun,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Timecode {
+    pub source: TcSource,
+    /// Added to the incoming timecode, in frames of the incoming rate.
+    pub offset_frames: i32,
+    pub on_loss: OnLoss,
+    /// LTC only: fixed frame rate; None detects it.
+    pub ltc_fps: Option<TcFps>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -135,6 +165,7 @@ pub struct Prefs {
     pub audio: Audio,
     pub osc: Osc,
     pub api: Api,
+    pub timecode: Timecode,
 }
 
 impl Default for Prefs {
@@ -147,6 +178,7 @@ impl Default for Prefs {
             audio: Audio::default(),
             osc: Osc::default(),
             api: Api::default(),
+            timecode: Timecode::default(),
         }
     }
 }

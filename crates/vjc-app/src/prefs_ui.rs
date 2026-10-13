@@ -26,6 +26,7 @@ impl State {
                         (PrefsTab::Control, "Control"),
                         (PrefsTab::Osc, "OSC"),
                         (PrefsTab::Api, "Remote API"),
+                        (PrefsTab::Timecode, "Timecode"),
                     ] {
                         ui.selectable_value(&mut self.prefs_tab, t, l);
                     }
@@ -133,6 +134,97 @@ impl State {
                             });
                         });
                         ui.weak("Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
+                    }
+                    PrefsTab::Timecode => {
+                        use vjc_io::prefs::{OnLoss, TcSource};
+                        let (ports, inputs) = self.tc_devices.get_or_insert_with(|| {
+                            (
+                                crate::midi_io::input_ports(),
+                                vjc_media::ltc_in::input_devices(),
+                            )
+                        });
+                        let t = &mut p.timecode;
+                        let kind = match t.source {
+                            TcSource::Off => 0,
+                            TcSource::Mtc { .. } => 1,
+                            TcSource::Ltc { .. } => 2,
+                        };
+                        let mut pick = kind;
+                        ui.horizontal(|ui| {
+                            ui.label("Source");
+                            for (i, l) in ["Off", "MTC (MIDI)", "LTC (audio)"].into_iter().enumerate() {
+                                ui.selectable_value(&mut pick, i, l);
+                            }
+                        });
+                        if pick != kind {
+                            t.source = match pick {
+                                1 => TcSource::Mtc {
+                                    port: ports.first().cloned().unwrap_or_default(),
+                                },
+                                2 => TcSource::Ltc {
+                                    device: String::new(),
+                                    channel: 0,
+                                },
+                                _ => TcSource::Off,
+                            };
+                        }
+                        match &mut t.source {
+                            TcSource::Off => {}
+                            TcSource::Mtc { port } => {
+                                egui::ComboBox::from_label("MIDI port")
+                                    .selected_text(if port.is_empty() { "(none)" } else { port.as_str() })
+                                    .show_ui(ui, |ui| {
+                                        for n in ports.iter() {
+                                            ui.selectable_value(port, n.clone(), n);
+                                        }
+                                    });
+                            }
+                            TcSource::Ltc { device, channel } => {
+                                egui::ComboBox::from_label("Audio input")
+                                    .selected_text(if device.is_empty() { "(default)" } else { device.as_str() })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(device, String::new(), "(default)");
+                                        for n in inputs.iter() {
+                                            ui.selectable_value(device, n.clone(), n);
+                                        }
+                                    });
+                                ui.horizontal(|ui| {
+                                    ui.label("Channel");
+                                    let mut c = u32::from(*channel) + 1;
+                                    if ui.add(egui::DragValue::new(&mut c).range(1..=64)).changed() {
+                                        *channel = (c - 1) as u16;
+                                    }
+                                });
+                                let mut auto = t.ltc_fps.is_none();
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut auto, "Detect frame rate").changed() {
+                                        t.ltc_fps = (!auto).then_some(vjc_model::TcFps::F25);
+                                    }
+                                    if let Some(f) = &mut t.ltc_fps {
+                                        for o in vjc_model::TcFps::ALL {
+                                            ui.selectable_value(f, o, o.label());
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        if ui.button("Refresh devices").clicked() {
+                            self.tc_devices = None;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Offset");
+                            ui.add(
+                                egui::DragValue::new(&mut t.offset_frames)
+                                    .range(-1_000_000..=1_000_000)
+                                    .suffix(" frames"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("On signal loss");
+                            ui.selectable_value(&mut t.on_loss, OnLoss::Freeze, "Freeze");
+                            ui.selectable_value(&mut t.on_loss, OnLoss::FreeRun, "Run free");
+                        });
+                        ui.weak("Clips with Timecode sync (Clip tab) and cues (Composition tab) follow this source.");
                     }
                     PrefsTab::Api => {
                         let a = &mut p.api;

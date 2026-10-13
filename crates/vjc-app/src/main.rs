@@ -12,6 +12,7 @@ mod output_ui;
 mod params;
 mod prefs_ui;
 mod slice_render;
+mod timecode_io;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
@@ -100,6 +101,10 @@ struct State {
     learn_midi: bool,
     /// MIDI devices thread, and the LED state last sent to controllers.
     midi: midi_io::Midi,
+    /// External timecode (MTC / LTC) state.
+    tc: timecode_io::TcRuntime,
+    /// MIDI input ports and audio input devices listed in Preferences > Timecode.
+    tc_devices: Option<(Vec<String>, Vec<String>)>,
     led_prev: HashMap<vjc_core::midi::Led, bool>,
     /// OSC sockets thread, the config last sent to it, and the output state last sent.
     osc: osc_io::Osc,
@@ -178,6 +183,7 @@ enum PrefsTab {
     Control,
     Osc,
     Api,
+    Timecode,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -764,6 +770,8 @@ impl State {
             learn: false,
             learn_target: None,
             learn_midi: false,
+            tc: timecode_io::TcRuntime::new(),
+            tc_devices: None,
             midi: if live {
                 midi_io::Midi::spawn()
             } else {
@@ -1415,6 +1423,16 @@ impl State {
         };
         let mut finished = vec![];
         let mut autopilot = vec![];
+        // External timecode (offset applied): None = no signal or source off.
+        let tc_on = self.prefs.timecode.source != vjc_io::prefs::TcSource::Off;
+        if let Some(err) = self
+            .tc
+            .sync(&self.prefs.timecode, std::time::Instant::now())
+        {
+            self.status = err;
+        }
+        let tc_now = if tc_on { self.tc.current(now) } else { None };
+        let tc_free_run = self.prefs.timecode.on_loss == vjc_io::prefs::OnLoss::FreeRun;
         for o in self.flow.outgoing.values_mut() {
             o.state = o.state.advance(dt);
         }
@@ -1444,9 +1462,29 @@ impl State {
             let rate = vjc_core::playback_rate(tr.speed, sync, speed_of(layer));
             // Play modes: the playhead picks the position, the player serves the frame.
             if let (Some(d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
-                let t = head.tick(dt, tr.play_mode, tr.direction, rate, d);
+                // Timecode clips: position = timecode - start (random access, muted); without
+                // signal they freeze or run free from where they were, per the prefs.
+                let by_tc = tc_on && tr.timecode_start.is_some();
+                let t = match (&tr.timecode_start, tc_now) {
+                    (Some(start), Some(cur)) if tc_on => {
+                        let t = vjc_core::timecode::clip_position(
+                            cur,
+                            start,
+                            tr.play_mode,
+                            tr.direction,
+                            rate,
+                            d,
+                        );
+                        head.seek(t.position);
+                        t
+                    }
+                    (Some(_), None) if tc_on && !tc_free_run => {
+                        head.tick(0.0, tr.play_mode, tr.direction, rate, d)
+                    }
+                    _ => head.tick(dt, tr.play_mode, tr.direction, rate, d),
+                };
                 // Forward playback streams; everything else needs random access.
-                player.set_sequential(is_sequential(tr.play_mode, tr.direction, rate));
+                player.set_sequential(!by_tc && is_sequential(tr.play_mode, tr.direction, rate));
                 let mut position = t.position;
                 if let Some((_, w)) = self.flow.beat_loops.get(layer)
                     && !t.finished
@@ -1458,6 +1496,7 @@ impl State {
                 player.set_position(position);
                 // Audio only at forward 1x; any other speed, direction or pause is muted.
                 let audible = rate.is_finite()
+                    && !by_tc
                     && (rate - 1.0).abs() < 1e-3
                     && is_sequential(tr.play_mode, tr.direction, rate)
                     && tr.direction != Direction::Pause
@@ -1496,8 +1535,37 @@ impl State {
                     _ => 1.0,
                 };
                 let sync = vjc_core::clock::generator_sync_rate(tr.beat_sync, bpm);
-                *t += dt * vjc_core::playback_rate(tr.speed, sync, speed_of(layer)) * dir;
+                let rate = vjc_core::playback_rate(tr.speed, sync, speed_of(layer));
+                match (&tr.timecode_start, tc_now) {
+                    (Some(start), Some(cur)) if tc_on => {
+                        *t = (cur - start.seconds()).max(0.0) * rate * dir;
+                    }
+                    (Some(_), None) if tc_on && !tc_free_run => {}
+                    _ => *t += dt * rate * dir,
+                }
             }
+        }
+        // Timecode cues: each crossing triggers once.
+        match tc_now {
+            Some(cur) => {
+                let cues = self.project.composition.timecode_cues.clone();
+                let deck = self.project.composition.current_deck;
+                for i in self.tc.cues.step(&cues, cur) {
+                    let c = &cues[i];
+                    self.exec(match c.layer {
+                        Some(layer) => Command::TriggerClip {
+                            deck,
+                            layer,
+                            column: c.column,
+                        },
+                        None => Command::TriggerColumn {
+                            deck,
+                            column: c.column,
+                        },
+                    });
+                }
+            }
+            None => self.tc.cues.reset(),
         }
         // Once: clear the layer after the last frame.
         for layer in finished {
@@ -2096,13 +2164,16 @@ impl State {
     fn midi_pump(&mut self) {
         use vjc_core::midi as m;
         while let Ok(ev) = self.midi.rx.try_recv() {
-            let (device, bytes) = match ev {
+            let (device, bytes, at) = match ev {
                 midi_io::In::Connected(d) => {
                     self.led_prev.retain(|(dev, _, _), _| *dev != d);
                     continue;
                 }
-                midi_io::In::Msg(d, b) => (d, b),
+                midi_io::In::Msg(d, b, at) => (d, b, at),
             };
+            if self.tc.feed_midi(&device, &bytes, &self.prefs.timecode, at) {
+                continue;
+            }
             let Some(msg) = m::parse(&bytes) else {
                 continue;
             };
@@ -2377,6 +2448,30 @@ impl State {
             };
             if ui.toggle_value(&mut link, label).changed() {
                 cmds.push(Command::SetLink { enabled: link });
+            }
+            if self.prefs.timecode.source != vjc_io::prefs::TcSource::Off {
+                ui.separator();
+                let cur = self.tc.current(now);
+                let text = match (self.tc.last, cur) {
+                    (Some(l), Some(c)) => vjc_model::Timecode::from_seconds(l.fps, c).to_string(),
+                    (Some(l), None) => l.to_string(),
+                    (None, _) => "--:--:--:--".to_owned(),
+                };
+                let color = if cur.is_some() {
+                    ui.visuals().text_color()
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                ui.label(
+                    egui::RichText::new(format!("TC {text}"))
+                        .monospace()
+                        .color(color),
+                )
+                .on_hover_text(if cur.is_some() {
+                    "External timecode"
+                } else {
+                    "No timecode signal"
+                });
             }
         });
         if self.learn {
@@ -3084,6 +3179,8 @@ impl State {
                 });
         });
         ui.separator();
+        self.cue_list(ui, cmds);
+        ui.separator();
         ui.strong("Dashboard");
         for (i, v) in dials.iter().enumerate() {
             let n = i + 1;
@@ -3101,6 +3198,80 @@ impl State {
         }
         ui.separator();
         self.chain_ui(ui, EffectTarget::Master, cmds);
+    }
+
+    /// Timecode cues: (time, column, layer) rows; edits send the whole list as one command.
+    fn cue_list(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let comp = &self.project.composition;
+        let mut cues = comp.timecode_cues.clone();
+        let mut changed = false;
+        ui.strong("Timecode cues");
+        let mut remove = None;
+        for (i, cue) in cues.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                changed |= timecode_io::tc_editor(ui, ("cue", i), &mut cue.time);
+                ui.label("col");
+                let mut col = cue.column + 1;
+                let max = comp.columns.len().max(1) as u32;
+                if ui
+                    .add(egui::DragValue::new(&mut col).range(1..=max))
+                    .changed()
+                {
+                    cue.column = col - 1;
+                    changed = true;
+                }
+                let name = |l: Option<LayerId>| {
+                    l.and_then(|id| comp.layers.iter().find(|x| x.id == id))
+                        .map_or("All layers".to_owned(), |x| x.name.clone())
+                };
+                egui::ComboBox::from_id_salt(("cuelayer", i))
+                    .selected_text(name(cue.layer))
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(&mut cue.layer, None, "All layers")
+                            .changed();
+                        for l in &comp.layers {
+                            changed |= ui
+                                .selectable_value(&mut cue.layer, Some(l.id), &l.name)
+                                .changed();
+                        }
+                    });
+                if ui
+                    .small_button("\u{2715}")
+                    .on_hover_text("Remove cue")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            cues.remove(i);
+            changed = true;
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Add cue").clicked() {
+                let time = self.tc.last.unwrap_or(vjc_model::Timecode::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    vjc_model::TcFps::F25,
+                ));
+                cues.push(vjc_model::TimecodeCue {
+                    time,
+                    column: 0,
+                    layer: None,
+                });
+                changed = true;
+            }
+            if cues.is_empty() {
+                ui.weak("Fires a column when the timecode crosses its time.");
+            }
+        });
+        if changed {
+            cmds.push(Command::SetTimecodeCues { cues });
+        }
     }
 
     fn layer_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
@@ -3435,6 +3606,55 @@ impl State {
                 column,
                 beats,
             });
+        }
+        ui.separator();
+        ui.strong("Timecode sync");
+        let mut on = t.timecode_start.is_some();
+        let seed =
+            self.tc
+                .last
+                .unwrap_or(vjc_model::Timecode::new(0, 0, 0, 0, vjc_model::TcFps::F25));
+        if ui
+            .checkbox(&mut on, "Follow timecode (position = timecode - start)")
+            .changed()
+        {
+            cmds.push(Command::SetTimecodeStart {
+                deck,
+                layer,
+                column,
+                start: on.then_some(seed),
+            });
+        }
+        if let Some(mut start) = t.timecode_start {
+            ui.horizontal(|ui| {
+                ui.label("Start");
+                if timecode_io::tc_editor(ui, ("tcstart", layer, column), &mut start) {
+                    cmds.push(Command::SetTimecodeStart {
+                        deck,
+                        layer,
+                        column,
+                        start: Some(start),
+                    });
+                }
+                if ui
+                    .add_enabled(
+                        self.tc.last.is_some(),
+                        egui::Button::new("Set from current"),
+                    )
+                    .clicked()
+                    && let Some(cur) = self.tc.last
+                {
+                    cmds.push(Command::SetTimecodeStart {
+                        deck,
+                        layer,
+                        column,
+                        start: Some(cur),
+                    });
+                }
+            });
+            if self.prefs.timecode.source == vjc_io::prefs::TcSource::Off {
+                ui.weak("Choose a timecode source in Preferences > Timecode.");
+            }
         }
         ui.separator();
         let playing = self.active(layer) == Some((deck, column));

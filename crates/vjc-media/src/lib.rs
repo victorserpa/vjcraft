@@ -21,6 +21,7 @@ use std::time::Duration;
 
 pub mod audio;
 pub mod capture;
+pub mod ltc_in;
 
 /// A decoded RGBA8 frame (tightly packed, `width * 4` bytes per row).
 #[derive(Clone)]

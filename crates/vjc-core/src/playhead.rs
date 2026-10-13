@@ -17,6 +17,44 @@ pub struct Tick {
     pub finished: bool,
 }
 
+/// Position for a clip driven by an external clock: `elapsed` seconds since the clip's
+/// start (negative holds the start), at `speed`, over `duration` seconds. Same modes and
+/// directions as `Playhead::tick`, but absolute instead of incremental. Random and Pause
+/// directions follow Forward / hold the start.
+pub fn position_at(
+    elapsed: f64,
+    mode: PlayMode,
+    direction: Direction,
+    speed: f64,
+    duration: f64,
+) -> Tick {
+    let travel =
+        if elapsed.is_finite() && speed.is_finite() && duration.is_finite() && duration > 0.0 {
+            elapsed.max(0.0) * speed.max(0.0) / duration
+        } else {
+            0.0
+        };
+    let backward = direction == Direction::Backward;
+    let x = if direction == Direction::Pause {
+        0.0
+    } else {
+        travel
+    };
+    let u = if backward { 1.0 - x } else { x };
+    let (position, ended) = match mode {
+        PlayMode::Bounce => {
+            let w = u.rem_euclid(2.0);
+            (if w > 1.0 { 2.0 - w } else { w }, false)
+        }
+        PlayMode::Once | PlayMode::OnceHold => (u.clamp(0.0, 1.0), x >= 1.0),
+        _ => (u.rem_euclid(1.0), false),
+    };
+    Tick {
+        position,
+        finished: ended && mode == PlayMode::Once,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Playhead {
     /// Unfolded travel, in clip lengths. Loop keeps it in [0,1), Bounce in [0,2),
@@ -256,5 +294,24 @@ mod tests {
         assert_eq!(t.position, 0.0);
         let t = h.tick(1.0, PlayMode::Loop, Direction::Forward, 1.0, 0.0);
         assert_eq!(t.position, 0.0);
+    }
+
+    #[test]
+    fn position_at_follows_modes() {
+        let at = |e, m, d| position_at(e, m, d, 1.0, 4.0);
+        let (l, f, b) = (PlayMode::Loop, Direction::Forward, Direction::Backward);
+        assert_eq!(at(1.0, l, f).position, 0.25);
+        assert_eq!(at(5.0, l, f).position, 0.25);
+        assert_eq!(at(-3.0, l, f).position, 0.0);
+        assert_eq!(at(1.0, l, b).position, 0.75);
+        assert_eq!(at(5.0, PlayMode::Bounce, f).position, 0.75);
+        assert_eq!(at(6.0, PlayMode::Bounce, f).position, 0.5);
+        let end = at(9.0, PlayMode::Once, f);
+        assert_eq!((end.position, end.finished), (1.0, true));
+        let hold = at(9.0, PlayMode::OnceHold, f);
+        assert_eq!((hold.position, hold.finished), (1.0, false));
+        assert_eq!(at(9.0, PlayMode::Once, b).position, 0.0);
+        assert_eq!(position_at(2.0, l, f, 2.0, 4.0).position, 0.0);
+        assert_eq!(position_at(f64::NAN, l, f, 1.0, 4.0).position, 0.0);
     }
 }
