@@ -12,7 +12,8 @@ use vjc_core::playhead::Playhead;
 use vjc_core::{Command, Event, History};
 use vjc_media::{Frame, Player};
 use vjc_model::{
-    BlendMode, Column, Direction, FitMode, Layer, LayerId, PlayMode, Project, Track, Transition,
+    BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId, PlayMode, Project, Track,
+    Transition,
 };
 
 struct State {
@@ -20,8 +21,11 @@ struct State {
     history: History,
     warnings: Vec<String>,
     status: String,
-    /// Playing clip per layer: (column, player). One clip per layer.
-    players: HashMap<LayerId, (u32, Player)>,
+    /// Playing clip per layer: (deck it was triggered from, column, player). One clip per
+    /// layer. Lookups of the playing clip use this deck, never `current_deck`.
+    players: HashMap<LayerId, (DeckId, u32, Player)>,
+    /// Deck tab being renamed, with its edit buffer.
+    renaming: Option<(DeckId, String)>,
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
     heads: HashMap<LayerId, Playhead>,
     last_head_tick: std::time::Instant,
@@ -123,6 +127,19 @@ fn offer_recovery(s: &mut State) {
     let _ = std::fs::remove_file(r);
 }
 
+/// Empty decks go without asking; a deck with clips needs a yes.
+fn confirm_remove_deck(name: &str, clips: usize) -> bool {
+    clips == 0
+        || rfd::MessageDialog::new()
+            .set_title("Remove deck")
+            .set_description(format!(
+                "Remove deck \"{name}\" and its {clips} clip(s)? Undo brings it back."
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show()
+            == rfd::MessageDialogResult::Yes
+}
+
 fn new_layer(n: usize) -> Layer {
     Layer {
         id: Uuid::new_v4(),
@@ -179,6 +196,7 @@ impl State {
             phase: 0.0,
             nudge_dir: 0,
             metronome: false,
+            renaming: None,
         }
     }
 
@@ -362,6 +380,7 @@ impl State {
                 | Command::Resync { .. }
                 | Command::TriggerClip { .. }
                 | Command::ClearLayer { .. }
+                | Command::SelectDeck { .. }
         );
         match self
             .history
@@ -403,6 +422,7 @@ impl State {
         for e in events {
             match e {
                 Event::ClipStarted {
+                    deck,
                     layer,
                     column,
                     path,
@@ -410,8 +430,8 @@ impl State {
                     if path.exists() {
                         self.players.remove(&layer); // joins the old decode thread
                         self.players
-                            .insert(layer, (column, Player::open_scrub(&path)));
-                        let tr = self.transport(layer, column);
+                            .insert(layer, (deck, column, Player::open_scrub(&path)));
+                        let tr = self.transport(deck, layer, column);
                         let dir = tr.map_or(Direction::Forward, |t| t.direction);
                         let seed = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -431,19 +451,26 @@ impl State {
                 }
                 Event::Nudge { dir, at } => self.clock.nudge(dir, at),
                 Event::Resync { at } => self.clock.resync(at),
-                Event::CellChanged { layer, column } => {
-                    if self.players.get(&layer).map(|(c, _)| *c) == Some(column) {
+                Event::CellChanged {
+                    deck,
+                    layer,
+                    column,
+                } => {
+                    if self.players.get(&layer).map(|(d, c, _)| (*d, *c)) == Some((deck, column)) {
                         self.players.remove(&layer);
                     }
                 }
+                Event::DeckRemoved { deck } => self.players.retain(|_, (d, _, _)| *d != deck),
             }
         }
     }
 
-    fn transport(&self, layer: LayerId, column: u32) -> Option<vjc_model::Transport> {
-        let c = &self.project.composition;
-        let deck = c.decks.iter().find(|d| d.id == c.current_deck)?;
-        Some(deck.clip_at(layer, column)?.transport.clone())
+    fn transport(&self, deck: DeckId, layer: LayerId, column: u32) -> Option<vjc_model::Transport> {
+        Some(
+            vjc_core::clip_in(&self.project, deck, layer, column)?
+                .transport
+                .clone(),
+        )
     }
 
     /// Once per frame: follows the project BPM, advances the clock and every playhead.
@@ -459,17 +486,13 @@ impl State {
         if let Some(b) = t.beat {
             self.beat = b;
         }
-        let c = &self.project.composition;
-        let Some(deck) = c.decks.iter().find(|d| d.id == c.current_deck) else {
-            return;
-        };
         let dt = now
             .saturating_duration_since(self.last_head_tick)
             .as_secs_f64();
         self.last_head_tick = now;
         let mut finished = vec![];
-        for (layer, (col, player)) in &self.players {
-            let Some(clip) = deck.clip_at(*layer, *col) else {
+        for (layer, (deck, col, player)) in &self.players {
+            let Some(clip) = vjc_core::clip_in(&self.project, *deck, *layer, *col) else {
                 continue;
             };
             let tr = &clip.transport;
@@ -493,12 +516,18 @@ impl State {
     }
 
     fn drop_file(&mut self, layer: LayerId, column: u32, path: PathBuf) {
+        let deck = self.project.composition.current_deck;
         self.exec(Command::ImportMedia {
+            deck,
             layer,
             column,
             path,
         });
-        self.exec(Command::TriggerClip { layer, column });
+        self.exec(Command::TriggerClip {
+            deck,
+            layer,
+            column,
+        });
     }
 
     fn compose(&mut self, frame: &eframe::Frame) {
@@ -538,15 +567,17 @@ impl State {
                     if l.bypass {
                         None
                     } else {
-                        self.players.get(&l.id).and_then(|(_, p)| p.latest_frame())
+                        self.players
+                            .get(&l.id)
+                            .and_then(|(_, _, p)| p.latest_frame())
                     },
                 )
             })
             .collect();
-        let deck = c.decks.iter().find(|d| d.id == c.current_deck);
+        // Fit comes from the deck the clip was triggered from, not the visible one.
         let fit_of = |l: &Layer| {
-            let col = self.players.get(&l.id).map(|(c, _)| *c)?;
-            Some(deck?.clip_at(l.id, col)?.fit)
+            let (deck, col, _) = self.players.get(&l.id)?;
+            Some(vjc_core::clip_in(&self.project, *deck, l.id, *col)?.fit)
         };
         let draws: Vec<LayerDraw> = frames
             .iter()
@@ -796,7 +827,7 @@ impl State {
                 }
             });
         }
-        for (_, p) in self.players.values() {
+        for (_, _, p) in self.players.values() {
             if let Some(e) = p.error() {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
@@ -841,6 +872,7 @@ impl State {
         ui.separator();
 
         let mut cmds: Vec<Command> = vec![];
+        self.deck_tabs(ui, &mut cmds);
         let mut cells = vec![];
         let ncols = self.project.composition.columns.len() as u32;
         let cur = self.project.composition.current_deck;
@@ -876,7 +908,9 @@ impl State {
                         ui.label(&comp.layers[li].name);
                         for ci in 0..ncols {
                             let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
-                            let on = self.players.get(&lid).map(|(c, _)| *c) == Some(ci);
+                            // Highlight only when playing from the deck being shown.
+                            let on =
+                                self.players.get(&lid).map(|(d, c, _)| (*d, *c)) == Some((cur, ci));
                             let text = clip
                                 .map(|k| k.name.as_str())
                                 .unwrap_or("(drop / right-click)");
@@ -900,6 +934,7 @@ impl State {
                                         if ui.selectable_label(cur_mode == Some(m), name).clicked()
                                         {
                                             cmds.push(Command::SetPlayMode {
+                                                deck: cur,
                                                 layer: lid,
                                                 column: ci,
                                                 mode: m,
@@ -918,6 +953,7 @@ impl State {
                                     for (d, name) in dirs {
                                         if ui.selectable_label(cur_dir == Some(d), name).clicked() {
                                             cmds.push(Command::SetDirection {
+                                                deck: cur,
                                                 layer: lid,
                                                 column: ci,
                                                 direction: d,
@@ -942,6 +978,7 @@ impl State {
                                         };
                                         if ui.selectable_label(cur_sync == o, label).clicked() {
                                             cmds.push(Command::SetBeatSync {
+                                                deck: cur,
                                                 layer: lid,
                                                 column: ci,
                                                 beats: o,
@@ -954,6 +991,7 @@ impl State {
                                     for m in FitMode::ALL {
                                         if ui.selectable_label(cur_fit == m, m.label()).clicked() {
                                             cmds.push(Command::SetFit {
+                                                deck: cur,
                                                 layer: lid,
                                                 column: ci,
                                                 fit: m,
@@ -989,6 +1027,7 @@ impl State {
                             }
                             if r.clicked() && clip.is_some() {
                                 cmds.push(Command::TriggerClip {
+                                    deck: cur,
                                     layer: lid,
                                     column: ci,
                                 });
@@ -1031,22 +1070,36 @@ impl State {
                                     }
                                 }
                             });
-                        // Speed of the clip playing on this layer.
-                        let active = self.players.get(&lid).map(|(c, _)| *c);
-                        match active.and_then(|c| Some((c, comp.decks[deck_idx?].clip_at(lid, c)?)))
-                        {
-                            Some((c, k)) => {
+                        // Speed of the clip playing on this layer (from its own deck).
+                        let active = self.players.get(&lid).map(|(d, c, _)| (*d, *c));
+                        match active.and_then(|(d, c)| {
+                            Some((d, c, vjc_core::clip_in(&self.project, d, lid, c)?))
+                        }) {
+                            Some((d, c, k)) => {
                                 let mut sp = k.transport.speed as f32;
-                                if ui
-                                    .add(egui::Slider::new(&mut sp, 0.0..=4.0).fixed_decimals(2))
-                                    .changed()
-                                {
-                                    cmds.push(Command::SetSpeed {
-                                        layer: lid,
-                                        column: c,
-                                        speed: sp as f64,
-                                    });
-                                }
+                                // Edit the clip in the deck it plays from.
+                                ui.vertical(|ui| {
+                                    if d != cur {
+                                        let name = comp.decks.iter().find(|x| x.id == d);
+                                        ui.small(format!(
+                                            "from {}",
+                                            name.map_or("?", |x| x.name.as_str())
+                                        ));
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut sp, 0.0..=4.0).fixed_decimals(2),
+                                        )
+                                        .changed()
+                                    {
+                                        cmds.push(Command::SetSpeed {
+                                            deck: d,
+                                            layer: lid,
+                                            column: c,
+                                            speed: sp as f64,
+                                        });
+                                    }
+                                });
                             }
                             None => {
                                 ui.label("-");
@@ -1075,6 +1128,94 @@ impl State {
         for c in cmds {
             self.exec(c);
         }
+    }
+
+    /// Tabs above the grid: click selects, double click renames, "+" adds, menu removes.
+    fn deck_tabs(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let cur = self.project.composition.current_deck;
+        let decks: Vec<(DeckId, String, usize)> = self
+            .project
+            .composition
+            .decks
+            .iter()
+            .map(|d| (d.id, d.name.clone(), d.clips.len()))
+            .collect();
+        let last = decks.len() == 1;
+        ui.horizontal(|ui| {
+            for (i, (id, name, nclips)) in decks.iter().enumerate() {
+                if let Some((rid, buf)) = self.renaming.as_mut().filter(|(r, _)| r == id) {
+                    let rid = *rid;
+                    let e = ui.add(egui::TextEdit::singleline(buf).desired_width(90.0));
+                    e.request_focus();
+                    if e.lost_focus() {
+                        let ok = ui.input(|i| !i.key_pressed(egui::Key::Escape));
+                        if ok && !buf.trim().is_empty() && buf != name {
+                            cmds.push(Command::RenameDeck {
+                                deck: rid,
+                                name: buf.trim().to_string(),
+                            });
+                        }
+                        self.renaming = None;
+                    }
+                    continue;
+                }
+                let r = ui.selectable_label(*id == cur, name);
+                if r.double_clicked() {
+                    self.renaming = Some((*id, name.clone()));
+                } else if r.clicked() && *id != cur {
+                    cmds.push(Command::SelectDeck { deck: *id });
+                }
+                r.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        self.renaming = Some((*id, name.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(i > 0, egui::Button::new("Move left"))
+                        .clicked()
+                    {
+                        cmds.push(Command::MoveDeck {
+                            deck: *id,
+                            index: i - 1,
+                        });
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(i + 1 < decks.len(), egui::Button::new("Move right"))
+                        .clicked()
+                    {
+                        cmds.push(Command::MoveDeck {
+                            deck: *id,
+                            index: i + 1,
+                        });
+                        ui.close();
+                    }
+                    if ui.add_enabled(!last, egui::Button::new("Remove")).clicked() {
+                        ui.close();
+                        if confirm_remove_deck(name, *nclips) {
+                            cmds.push(Command::RemoveDeck {
+                                deck: *id,
+                                select: None,
+                            });
+                        }
+                    }
+                });
+            }
+            if ui.button("+").on_hover_text("Add deck").clicked() {
+                let deck = Deck {
+                    id: Uuid::new_v4(),
+                    name: format!("Deck {}", decks.len() + 1),
+                    clips: vec![],
+                };
+                let id = deck.id;
+                cmds.push(Command::AddDeck {
+                    deck,
+                    index: decks.len(),
+                    select: None,
+                });
+                cmds.push(Command::SelectDeck { deck: id });
+            }
+        });
     }
 
     /// Re-reads the monitor list about once a second; closes the output if its monitor vanished.

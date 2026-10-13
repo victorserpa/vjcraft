@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vjc_model::{
-    BlendMode, Clip, Column, ColumnIdx, Direction, FitMode, Layer, LayerId, PlayMode, Project,
-    Source, Track, Transport, Value,
+    BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, FitMode, Layer, LayerId, PlayMode,
+    Project, Source, Track, Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -20,22 +20,26 @@ pub const COALESCE_WINDOW: Duration = Duration::from_millis(500);
 pub enum Command {
     /// Creates a clip from a media file and puts it in the cell.
     ImportMedia {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         path: PathBuf,
     },
     /// Puts a ready-made clip in the cell (replacing any).
     SetClip {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         clip: Clip,
     },
     ClearCell {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
     },
     /// Plays the cell's clip on its layer. Runtime only: not undoable.
     TriggerClip {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
     },
@@ -52,6 +56,7 @@ pub enum Command {
         blend: BlendMode,
     },
     SetFit {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         fit: FitMode,
@@ -75,24 +80,54 @@ pub enum Command {
     SetBpm {
         bpm: f64,
     },
+    /// Inserts a deck at `index`. Does not change the current deck unless `select` is set.
+    AddDeck {
+        deck: Deck,
+        index: usize,
+        /// Selection to restore after inserting (set by the undo of a `RemoveDeck`).
+        select: Option<DeckId>,
+    },
+    /// Removes a deck (never the last one). Clips go with it; undo restores them.
+    RemoveDeck {
+        deck: DeckId,
+        /// Selection to restore after removing (set by the undo of an `AddDeck`).
+        select: Option<DeckId>,
+    },
+    RenameDeck {
+        deck: DeckId,
+        name: String,
+    },
+    /// Moves the deck to `index` in the tab order.
+    MoveDeck {
+        deck: DeckId,
+        index: usize,
+    },
+    /// Switches the grid shown. Runtime only: not undoable, playing clips keep playing.
+    SelectDeck {
+        deck: DeckId,
+    },
     /// Stretches the clip to `beats` beats (None = off). The app derives the player rate.
     SetBeatSync {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         beats: Option<f64>,
     },
     SetPlayMode {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         mode: PlayMode,
     },
     SetDirection {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         direction: Direction,
     },
     /// Clip speed multiplier, 0..=4 (coalesces: slider drags are one undo step).
     SetSpeed {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         speed: f64,
@@ -115,7 +150,7 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     Opacity(LayerId),
-    Speed(LayerId, ColumnIdx),
+    Speed(DeckId, LayerId, ColumnIdx),
     Bpm,
 }
 
@@ -124,7 +159,12 @@ impl Command {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
             Command::SetBpm { .. } => Some(Target::Bpm),
-            Command::SetSpeed { layer, column, .. } => Some(Target::Speed(*layer, *column)),
+            Command::SetSpeed {
+                deck,
+                layer,
+                column,
+                ..
+            } => Some(Target::Speed(*deck, *layer, *column)),
             _ => None,
         }
     }
@@ -134,6 +174,7 @@ impl Command {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     ClipStarted {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
         path: PathBuf,
@@ -143,8 +184,13 @@ pub enum Event {
     },
     /// The clip in this cell was replaced or removed.
     CellChanged {
+        deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
+    },
+    /// A deck left the project: clips playing from it must stop.
+    DeckRemoved {
+        deck: DeckId,
     },
     Tap {
         at: Instant,
@@ -202,12 +248,29 @@ fn undoable(inverse: Command, events: Vec<Event>) -> Result<Applied, Error> {
     })
 }
 
-fn deck_mut(p: &mut Project) -> Result<&mut vjc_model::Deck, Error> {
-    let c = &mut p.composition;
-    let cur = c.current_deck;
-    c.decks
+fn deck_mut(p: &mut Project, id: DeckId) -> Result<&mut vjc_model::Deck, Error> {
+    p.composition
+        .decks
         .iter_mut()
-        .find(|d| d.id == cur)
+        .find(|d| d.id == id)
+        .ok_or(Error::NoDeck)
+}
+
+/// The clip at (layer, column) of a specific deck. Playing clips are looked up with the
+/// deck they were triggered from, never with `current_deck`.
+pub fn clip_in(p: &Project, deck: DeckId, layer: LayerId, column: ColumnIdx) -> Option<&Clip> {
+    p.composition
+        .decks
+        .iter()
+        .find(|d| d.id == deck)?
+        .clip_at(layer, column)
+}
+
+fn deck_idx(p: &Project, id: DeckId) -> Result<usize, Error> {
+    p.composition
+        .decks
+        .iter()
+        .position(|d| d.id == id)
         .ok_or(Error::NoDeck)
 }
 
@@ -230,11 +293,12 @@ fn check_cell(p: &Project, layer: LayerId, column: ColumnIdx) -> Result<(), Erro
 
 fn transport_mut(
     p: &mut Project,
+    deck: DeckId,
     layer: LayerId,
     column: ColumnIdx,
 ) -> Result<&mut Transport, Error> {
     check_cell(p, layer, column)?;
-    deck_mut(p)?
+    deck_mut(p, deck)?
         .clips
         .iter_mut()
         .find(|k| k.layer == layer && k.column == column)
@@ -267,63 +331,93 @@ pub fn clip_from_path(path: PathBuf) -> Clip {
 
 fn set_clip(
     p: &mut Project,
+    deck: DeckId,
     layer: LayerId,
     column: ColumnIdx,
     clip: Clip,
 ) -> Result<Applied, Error> {
     check_cell(p, layer, column)?;
-    let deck = deck_mut(p)?;
+    let deck = deck_mut(p, deck)?;
+    let deck_id = deck.id;
     let prev = deck.clip_at(layer, column).cloned();
     deck.set_clip(layer, column, clip);
     let inverse = match prev {
         Some(clip) => Command::SetClip {
+            deck: deck_id,
             layer,
             column,
             clip,
         },
-        None => Command::ClearCell { layer, column },
+        None => Command::ClearCell {
+            deck: deck_id,
+            layer,
+            column,
+        },
     };
-    undoable(inverse, vec![Event::CellChanged { layer, column }])
+    undoable(
+        inverse,
+        vec![Event::CellChanged {
+            deck: deck_id,
+            layer,
+            column,
+        }],
+    )
 }
 
 /// Applies a command to the project. Pure: no I/O, no UI, no players.
 pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
     match cmd {
         Command::ImportMedia {
+            deck,
             layer,
             column,
             path,
-        } => set_clip(p, layer, column, clip_from_path(path)),
+        } => set_clip(p, deck, layer, column, clip_from_path(path)),
         Command::SetClip {
+            deck,
             layer,
             column,
             clip,
-        } => set_clip(p, layer, column, clip),
-        Command::ClearCell { layer, column } => {
+        } => set_clip(p, deck, layer, column, clip),
+        Command::ClearCell {
+            deck,
+            layer,
+            column,
+        } => {
             check_cell(p, layer, column)?;
-            let deck = deck_mut(p)?;
+            let deck = deck_mut(p, deck)?;
+            let deck_id = deck.id;
             let clip = deck.clip_at(layer, column).cloned().ok_or(Error::NoClip)?;
             deck.clips
                 .retain(|c| !(c.layer == layer && c.column == column));
             undoable(
                 Command::SetClip {
+                    deck: deck_id,
                     layer,
                     column,
                     clip,
                 },
-                vec![Event::CellChanged { layer, column }],
+                vec![Event::CellChanged {
+                    deck: deck_id,
+                    layer,
+                    column,
+                }],
             )
         }
-        Command::TriggerClip { layer, column } => {
+        Command::TriggerClip {
+            deck,
+            layer,
+            column,
+        } => {
             check_cell(p, layer, column)?;
-            let clip = deck_mut(p)?
-                .clip_at(layer, column)
-                .cloned()
-                .ok_or(Error::NoClip)?;
+            let deck = deck_mut(p, deck)?;
+            let deck_id = deck.id;
+            let clip = deck.clip_at(layer, column).cloned().ok_or(Error::NoClip)?;
             match clip.source {
                 Source::File { path } => Ok(Applied {
                     inverse: None,
                     events: vec![Event::ClipStarted {
+                        deck: deck_id,
                         layer,
                         column,
                         path,
@@ -351,9 +445,14 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.layers[i].track.blend, blend);
             undoable(Command::SetBlend { layer, blend: prev }, vec![])
         }
-        Command::SetFit { layer, column, fit } => {
+        Command::SetFit {
+            deck,
+            layer,
+            column,
+            fit,
+        } => {
             check_cell(p, layer, column)?;
-            let k = deck_mut(p)?
+            let k = deck_mut(p, deck)?
                 .clips
                 .iter_mut()
                 .find(|k| k.layer == layer && k.column == column)
@@ -361,6 +460,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut k.clip.fit, fit);
             undoable(
                 Command::SetFit {
+                    deck,
                     layer,
                     column,
                     fit: prev,
@@ -417,6 +517,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             undoable(Command::AddColumn { column: removed }, vec![])
         }
         Command::SetBeatSync {
+            deck,
             layer,
             column,
             beats,
@@ -425,7 +526,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             if beats.is_some_and(|b| !b.is_finite() || b <= 0.0) {
                 return Err(Error::InvalidValue);
             }
-            let k = deck_mut(p)?
+            let k = deck_mut(p, deck)?
                 .clips
                 .iter_mut()
                 .find(|k| k.layer == layer && k.column == column)
@@ -433,6 +534,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut k.clip.transport.beat_sync, beats);
             undoable(
                 Command::SetBeatSync {
+                    deck,
                     layer,
                     column,
                     beats: prev,
@@ -441,13 +543,16 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             )
         }
         Command::SetPlayMode {
+            deck,
             layer,
             column,
             mode,
         } => {
-            let prev = std::mem::replace(&mut transport_mut(p, layer, column)?.play_mode, mode);
+            let prev =
+                std::mem::replace(&mut transport_mut(p, deck, layer, column)?.play_mode, mode);
             undoable(
                 Command::SetPlayMode {
+                    deck,
                     layer,
                     column,
                     mode: prev,
@@ -456,14 +561,16 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             )
         }
         Command::SetDirection {
+            deck,
             layer,
             column,
             direction,
         } => {
-            let t = transport_mut(p, layer, column)?;
+            let t = transport_mut(p, deck, layer, column)?;
             let prev = std::mem::replace(&mut t.direction, direction);
             undoable(
                 Command::SetDirection {
+                    deck,
                     layer,
                     column,
                     direction: prev,
@@ -472,6 +579,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             )
         }
         Command::SetSpeed {
+            deck,
             layer,
             column,
             speed,
@@ -479,9 +587,10 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             if !speed.is_finite() || !(0.0..=4.0).contains(&speed) {
                 return Err(Error::InvalidValue);
             }
-            let prev = std::mem::replace(&mut transport_mut(p, layer, column)?.speed, speed);
+            let prev = std::mem::replace(&mut transport_mut(p, deck, layer, column)?.speed, speed);
             undoable(
                 Command::SetSpeed {
+                    deck,
                     layer,
                     column,
                     speed: prev,
@@ -501,6 +610,78 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             inverse: None,
             events: vec![Event::Resync { at }],
         }),
+        Command::AddDeck {
+            deck,
+            index,
+            select,
+        } => {
+            let id = deck.id;
+            // Validate before mutating so an error leaves the project unchanged.
+            if let Some(s) = select
+                && s != id
+            {
+                deck_idx(p, s)?;
+            }
+            let ds = &mut p.composition.decks;
+            ds.insert(index.min(ds.len()), deck);
+            let prev = p.composition.current_deck;
+            if let Some(s) = select {
+                p.composition.current_deck = s;
+            }
+            undoable(
+                Command::RemoveDeck {
+                    deck: id,
+                    select: Some(prev),
+                },
+                vec![],
+            )
+        }
+        Command::RemoveDeck { deck, select } => {
+            let i = deck_idx(p, deck)?;
+            if p.composition.decks.len() == 1 {
+                return Err(Error::InUse);
+            }
+            let removed = p.composition.decks.remove(i);
+            let c = &mut p.composition;
+            let was_current = c.current_deck == deck;
+            if was_current {
+                c.current_deck = c.decks[i.min(c.decks.len() - 1)].id;
+            }
+            if let Some(s) = select
+                && c.decks.iter().any(|d| d.id == s)
+            {
+                c.current_deck = s;
+            }
+            undoable(
+                Command::AddDeck {
+                    deck: removed,
+                    index: i,
+                    select: was_current.then_some(deck),
+                },
+                vec![Event::DeckRemoved { deck }],
+            )
+        }
+        Command::RenameDeck { deck, name } => {
+            let i = deck_idx(p, deck)?;
+            let prev = std::mem::replace(&mut p.composition.decks[i].name, name);
+            undoable(Command::RenameDeck { deck, name: prev }, vec![])
+        }
+        Command::MoveDeck { deck, index } => {
+            let i = deck_idx(p, deck)?;
+            let ds = &mut p.composition.decks;
+            let d = ds.remove(i);
+            let to = index.min(ds.len());
+            ds.insert(to, d);
+            undoable(Command::MoveDeck { deck, index: i }, vec![])
+        }
+        Command::SelectDeck { deck } => {
+            deck_idx(p, deck)?;
+            p.composition.current_deck = deck;
+            Ok(Applied {
+                inverse: None,
+                events: vec![],
+            })
+        }
         Command::SetBpm { bpm } => {
             if !bpm.is_finite() || bpm <= 0.0 {
                 return Err(Error::InvalidValue);
@@ -554,10 +735,12 @@ impl History {
         // Resolve the clip id now so redo recreates the very same clip.
         let cmd = match cmd {
             Command::ImportMedia {
+                deck,
                 layer,
                 column,
                 path,
             } => Command::SetClip {
+                deck,
                 layer,
                 column,
                 clip: clip_from_path(path),
@@ -628,6 +811,8 @@ mod tests {
     }
 
     use super::*;
+
+    const A: DeckId = Uuid::from_u128(1);
     use vjc_model::Transition;
 
     fn layer(n: usize) -> Layer {
@@ -649,6 +834,8 @@ mod tests {
 
     fn setup() -> (Project, LayerId) {
         let mut p = Project::new("t");
+        p.composition.decks[0].id = A;
+        p.composition.current_deck = A;
         let l = layer(1);
         let id = l.id;
         p.composition.layers.push(l);
@@ -663,6 +850,7 @@ mod tests {
         h.exec(
             p,
             Command::ImportMedia {
+                deck: A,
                 layer: l,
                 column: 0,
                 path: "/x/a.mov".into(),
@@ -701,6 +889,7 @@ mod tests {
         h.exec(
             &mut p,
             Command::ImportMedia {
+                deck: A,
                 layer: l,
                 column: 0,
                 path: "/x/a.mov".into(),
@@ -720,6 +909,7 @@ mod tests {
         roundtrip(
             &mut p,
             Command::ImportMedia {
+                deck: A,
                 layer: l,
                 column: 0,
                 path: "/x/a.mov".into(),
@@ -731,6 +921,7 @@ mod tests {
         roundtrip(
             &mut p,
             Command::ClearCell {
+                deck: A,
                 layer: l,
                 column: 0,
             },
@@ -745,6 +936,7 @@ mod tests {
         roundtrip(
             &mut p,
             Command::SetClip {
+                deck: A,
                 layer: l,
                 column: 0,
                 clip: clip_from_path("/x/b.mov".into()),
@@ -762,6 +954,7 @@ mod tests {
             .exec(
                 &mut p,
                 Command::TriggerClip {
+                    deck: A,
                     layer: l,
                     column: 0,
                 },
@@ -771,6 +964,7 @@ mod tests {
         assert_eq!(
             ev,
             vec![Event::ClipStarted {
+                deck: p.composition.current_deck,
                 layer: l,
                 column: 0,
                 path: "/x/a.mov".into()
@@ -787,6 +981,7 @@ mod tests {
             apply(
                 &mut p,
                 Command::TriggerClip {
+                    deck: A,
                     layer: l,
                     column: 0
                 }
@@ -805,6 +1000,7 @@ mod tests {
         apply(
             &mut p,
             Command::SetClip {
+                deck: A,
                 layer: l,
                 column: 0,
                 clip: c,
@@ -815,6 +1011,7 @@ mod tests {
             apply(
                 &mut p,
                 Command::TriggerClip {
+                    deck: A,
                     layer: l,
                     column: 0
                 }
@@ -845,6 +1042,7 @@ mod tests {
         roundtrip(
             &mut p,
             Command::SetFit {
+                deck: A,
                 layer: l,
                 column: 0,
                 fit: FitMode::Fill,
@@ -861,6 +1059,7 @@ mod tests {
             roundtrip(
                 &mut p,
                 Command::SetPlayMode {
+                    deck: A,
                     layer: l,
                     column: 0,
                     mode,
@@ -871,6 +1070,7 @@ mod tests {
             roundtrip(
                 &mut p,
                 Command::SetDirection {
+                    deck: A,
                     layer: l,
                     column: 0,
                     direction,
@@ -878,6 +1078,7 @@ mod tests {
             );
         }
         let missing = Command::SetDirection {
+            deck: A,
             layer: l,
             column: 1,
             direction: Direction::Pause,
@@ -892,6 +1093,7 @@ mod tests {
         let t = Instant::now();
         import(&mut p, &mut h, l, t);
         let set = |speed| Command::SetSpeed {
+            deck: A,
             layer: l,
             column: 0,
             speed,
@@ -923,6 +1125,7 @@ mod tests {
         let mut h = History::new();
         import(&mut p, &mut h, l, Instant::now());
         let set = |beats| Command::SetBeatSync {
+            deck: A,
             layer: l,
             column: 0,
             beats,
@@ -1025,6 +1228,7 @@ mod tests {
             apply(
                 &mut p,
                 Command::ClearCell {
+                    deck: A,
                     layer: l,
                     column: 9
                 }
@@ -1035,6 +1239,7 @@ mod tests {
             apply(
                 &mut p,
                 Command::ClearCell {
+                    deck: A,
                     layer: l,
                     column: 0
                 }
@@ -1111,5 +1316,284 @@ mod tests {
         h.exec(&mut p, op(0.2), t0 + Duration::from_secs(5))
             .unwrap();
         assert!(!h.can_redo());
+    }
+
+    fn new_deck(name: &str) -> Deck {
+        Deck {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            clips: vec![],
+        }
+    }
+
+    #[test]
+    fn deck_commands_undo_redo() {
+        let (mut p, _) = setup();
+        let first = p.composition.decks[0].id;
+        roundtrip(
+            &mut p,
+            Command::AddDeck {
+                deck: new_deck("B"),
+                index: 1,
+                select: None,
+            },
+        );
+        let mut h = History::new();
+        h.exec(
+            &mut p,
+            Command::AddDeck {
+                deck: new_deck("B"),
+                index: 1,
+                select: None,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let b = p.composition.decks[1].id;
+        roundtrip(
+            &mut p,
+            Command::RenameDeck {
+                deck: b,
+                name: "Intro".into(),
+            },
+        );
+        roundtrip(&mut p, Command::MoveDeck { deck: b, index: 0 });
+        roundtrip(
+            &mut p,
+            Command::RemoveDeck {
+                deck: b,
+                select: None,
+            },
+        );
+        assert_ne!(first, b);
+    }
+
+    #[test]
+    fn remove_deck_keeps_clips_on_undo_and_never_last() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let a = p.composition.decks[0].id;
+        assert_eq!(
+            apply(
+                &mut p,
+                Command::RemoveDeck {
+                    deck: a,
+                    select: None
+                }
+            )
+            .unwrap_err(),
+            Error::InUse
+        );
+        h.exec(
+            &mut p,
+            Command::AddDeck {
+                deck: new_deck("B"),
+                index: 1,
+                select: None,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let ev = h
+            .exec(
+                &mut p,
+                Command::RemoveDeck {
+                    deck: a,
+                    select: None,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(ev, vec![Event::DeckRemoved { deck: a }]);
+        assert_ne!(p.composition.current_deck, a);
+        h.undo(&mut p).unwrap().unwrap();
+        assert!(clip_in(&p, a, l, 0).is_some());
+    }
+
+    #[test]
+    fn select_deck_is_runtime_and_playing_lookup_ignores_it() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let a = p.composition.current_deck;
+        h.exec(
+            &mut p,
+            Command::AddDeck {
+                deck: new_deck("B"),
+                index: 1,
+                select: None,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let b = p.composition.decks[1].id;
+        h.exec(&mut p, Command::SelectDeck { deck: b }, Instant::now())
+            .unwrap();
+        assert_eq!(p.composition.current_deck, b);
+        // Playing clip is still found in deck A; the current deck has no clip there.
+        assert_eq!(clip_in(&p, a, l, 0).unwrap().name, "a");
+        assert!(clip_in(&p, b, l, 0).is_none());
+        // Undo goes to AddDeck, not to a deck switch.
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.decks.len(), 1);
+        assert_eq!(
+            apply(&mut p, Command::SelectDeck { deck: b }).unwrap_err(),
+            Error::NoDeck
+        );
+    }
+
+    #[test]
+    fn undo_redo_target_origin_deck_not_current() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let now = Instant::now();
+        let a = p.composition.current_deck;
+        import(&mut p, &mut h, l, now);
+        h.exec(
+            &mut p,
+            Command::AddDeck {
+                deck: new_deck("B"),
+                index: 1,
+                select: None,
+            },
+            now,
+        )
+        .unwrap();
+        let b = p.composition.decks[1].id;
+        h.exec(&mut p, Command::SelectDeck { deck: b }, now)
+            .unwrap();
+        h.exec(
+            &mut p,
+            Command::ImportMedia {
+                deck: A,
+                layer: l,
+                column: 0,
+                path: "/x/b.mov".into(),
+            },
+            now,
+        )
+        .unwrap();
+        h.exec(&mut p, Command::SelectDeck { deck: a }, now)
+            .unwrap();
+        h.exec(
+            &mut p,
+            Command::SetFit {
+                deck: A,
+                layer: l,
+                column: 0,
+                fit: FitMode::Fill,
+            },
+            now,
+        )
+        .unwrap();
+        let a_fit = clip_in(&p, a, l, 0).unwrap().fit;
+        let a_before = FitMode::default();
+        assert_ne!(a_fit, a_before);
+        h.exec(&mut p, Command::SelectDeck { deck: b }, now)
+            .unwrap();
+        let b_before = p.composition.decks[1].clone();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(clip_in(&p, a, l, 0).unwrap().fit, a_before);
+        assert_eq!(p.composition.decks[1], b_before);
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(clip_in(&p, a, l, 0).unwrap().fit, a_fit);
+        assert_eq!(p.composition.decks[1], b_before);
+    }
+
+    #[test]
+    fn speed_coalescing_is_per_deck() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let now = Instant::now();
+        import(&mut p, &mut h, l, now);
+        let b = new_deck("B");
+        let bid = b.id;
+        h.exec(
+            &mut p,
+            Command::AddDeck {
+                deck: b,
+                index: 1,
+                select: None,
+            },
+            now,
+        )
+        .unwrap();
+        for deck in [A, bid] {
+            if deck == bid {
+                h.exec(
+                    &mut p,
+                    Command::SetClip {
+                        deck,
+                        layer: l,
+                        column: 0,
+                        clip: clip_from_path("/x/b.mov".into()),
+                    },
+                    now,
+                )
+                .unwrap();
+            }
+            h.exec(
+                &mut p,
+                Command::SetSpeed {
+                    deck,
+                    layer: l,
+                    column: 0,
+                    speed: 2.0,
+                },
+                now,
+            )
+            .unwrap();
+        }
+        // Two decks, two steps: undoing the last only touches deck B.
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(clip_in(&p, bid, l, 0).unwrap().transport.speed, 1.0);
+        assert_eq!(clip_in(&p, A, l, 0).unwrap().transport.speed, 2.0);
+    }
+
+    #[test]
+    fn undo_deck_ops_restore_selection() {
+        let (mut p, _) = setup();
+        let mut h = History::new();
+        let now = Instant::now();
+        let b = new_deck("B");
+        let bid = b.id;
+        h.exec(
+            &mut p,
+            Command::AddDeck {
+                deck: b,
+                index: 1,
+                select: None,
+            },
+            now,
+        )
+        .unwrap();
+        h.exec(&mut p, Command::SelectDeck { deck: bid }, now)
+            .unwrap();
+        // Undo AddDeck while B is selected: back to A.
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.current_deck, A);
+        h.redo(&mut p).unwrap().unwrap();
+        h.exec(&mut p, Command::SelectDeck { deck: bid }, now)
+            .unwrap();
+        // Remove the current deck, undo: it is selected again.
+        h.exec(
+            &mut p,
+            Command::RemoveDeck {
+                deck: bid,
+                select: None,
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(p.composition.current_deck, A);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.current_deck, bid);
+        // Removing a non-current deck leaves selection alone on undo.
+        h.redo(&mut p).unwrap().unwrap();
+        h.exec(&mut p, Command::SelectDeck { deck: A }, now)
+            .unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.current_deck, bid);
     }
 }
