@@ -89,6 +89,8 @@ struct Warns {
     kinds: BTreeMap<String, (usize, BTreeSet<String>)>,
     /// Effect nodes import_chain looked at (imported or warned about), by identity.
     chain_effects: BTreeSet<usize>,
+    /// Animation source nodes that became an `Animation`, by identity.
+    mapped_anim: BTreeSet<usize>,
 }
 
 impl Warns {
@@ -178,7 +180,6 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
         return Err(AvcError::NotAComposition);
     }
     let mut warnings = Warns::default();
-    collect_unsupported(&root, &mut warnings);
     let mut effects_imported = 0;
 
     let info = root.child("CompositionInfo");
@@ -337,6 +338,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     for _ in 0..stray {
         warnings.add("effect outside layer/clip/master chains not imported", "");
     }
+    collect_unsupported(&root, &mut warnings);
     Ok(Import {
         project,
         warnings: warnings.lines(),
@@ -363,7 +365,7 @@ fn range_param<'a>(params: &'a Node, name: &str) -> Option<&'a Node> {
 /// Opacity of a layer/clip/master track. Lives in the track's own `Params`, or in the
 /// `Params` of the Blend mixer's RenderPass. Never searched deeper: effects (dry/wet) and
 /// sources carry their own unrelated "Opacity" params.
-fn track_opacity(vt: &Node) -> Option<f64> {
+fn track_opacity(vt: &Node) -> Option<&Node> {
     let direct = vt.child("Params").and_then(|p| range_param(p, "Opacity"));
     let mixer = || {
         vt.kids("ChoosableMixer")
@@ -372,14 +374,16 @@ fn track_opacity(vt: &Node) -> Option<f64> {
             .and_then(|r| r.child("Params"))
             .and_then(|p| range_param(p, "Opacity"))
     };
-    direct.or_else(mixer).and_then(|p| p.num("value"))
+    direct.or_else(mixer).filter(|p| p.num("value").is_some())
 }
 
-fn set_opacity(t: &mut Track, v: f64, w: &mut Warns) {
+fn set_opacity(t: &mut Track, node: &Node, w: &mut Warns) {
+    let v = node.num("value").unwrap_or(1.0);
     if !(0.0..=1.0).contains(&v) {
         w.add("opacity out of range, clamped", &format!("{v}"));
     }
     t.opacity.set_number(v);
+    t.opacity.animation = param_animation(node, w);
 }
 
 fn norm(s: &str) -> String {
@@ -480,6 +484,7 @@ fn map_param(fx: &mut Effect, effect: &str, sp: &Node, w: &mut Warns) {
     };
     if fits {
         t.set_number(v);
+        t.animation = param_animation(sp, w);
     } else {
         w.add("effect param range differs (default used)", &detail);
     }
@@ -702,18 +707,73 @@ fn generator_params(p: &Node) -> Vec<Param> {
     out
 }
 
+/// Animation of a ParamRange: envelope (BehaviourDouble) wins, then dashboard link, then
+/// timeline. Sources that were turned into an `Animation` are recorded so they do not warn.
+fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
+    let beats_of = |n: &Node| {
+        n.child("Beats_d")
+            .and_then(|b| b.num("numManualBeats"))
+            .filter(|b| *b > 0.0)
+    };
+    if let Some(env) = sp.find(&|n| n.tag == "ModifierEnvelope", &[]) {
+        let mut points: Vec<(f64, f64)> = env
+            .find(&|n| n.tag == "points", &[])
+            .map(|p| {
+                p.kids("point")
+                    .filter_map(|pt| Some((pt.num("x")?, pt.num("y")?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !points.is_empty() {
+            points.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let beats = sp.children.iter().find_map(beats_of).unwrap_or(4.0);
+            w.mapped_anim.insert(node_id(env));
+            return Some(Animation::Envelope { points, beats });
+        }
+    }
+    if let Some(d) = sp.child("PhaseSourceDashboardLink")
+        && let Some(id) = d.num("linkId")
+        && id >= 1.0
+    {
+        w.mapped_anim.insert(node_id(d));
+        return Some(Animation::Dashboard {
+            dial: id as u32 - 1,
+        });
+    }
+    if let Some(t) = sp.child("PhaseSourceTimeline") {
+        let ms = t.num("defaultMillisecondsDuration").filter(|m| *m > 0.0);
+        let anim = match (ms, beats_of(t)) {
+            (Some(ms), _) => Animation::Timeline {
+                duration_secs: ms / 1000.0,
+                curve: Curve::Linear,
+            },
+            (None, Some(beats)) => Animation::Beats {
+                beats,
+                curve: Curve::Linear,
+            },
+            _ => return None,
+        };
+        w.mapped_anim.insert(node_id(t));
+        return Some(anim);
+    }
+    None
+}
+
 fn collect_unsupported(root: &Node, w: &mut Warns) {
+    let mapped = w.mapped_anim.clone();
     root.walk(&mut |n| {
         let key = match n.tag.as_str() {
             "Notes" => Some("Notes ignored"),
             "AnimationSettings" => Some("parameter animation settings ignored"),
             "CrossFader" => Some("crossfader and layer A/B buses ignored"),
             "EmbeddedThumbnail" => Some("embedded thumbnails ignored"),
-            "ModifierEnvelope" => Some("envelopes ignored"),
+            "ModifierEnvelope" if !mapped.contains(&node_id(n)) => {
+                Some("envelopes not imported (param not mapped)")
+            }
             "WireRenderPass" => Some("output wiring ignored"),
-            "AudioFileSource" => Some("audio sources ignored"),
-            "PhaseSourceTimeline" | "PhaseSourceDashboardLink" => {
-                Some("param animation/dashboard links ignored")
+            "AudioFileSource" => Some("audio sources ignored (clips have no audio slot)"),
+            "PhaseSourceTimeline" | "PhaseSourceDashboardLink" if !mapped.contains(&node_id(n)) => {
+                Some("param animation/dashboard links not imported (param not mapped)")
             }
             _ => None,
         };
@@ -725,6 +785,79 @@ fn collect_unsupported(root: &Node, w: &mut Warns) {
 
 #[cfg(test)]
 mod tests {
+    fn anim_of(param: &str) -> (Import, Option<Animation>) {
+        let xml = format!(
+            r#"<Composition name="x" numColumns="1"><Layer layerIndex="0"/><Deck><Clip layerIndex="0" columnIndex="0"><VideoTrack><Params name="Params"><ParamRange name="Opacity" value="0.5">{param}</ParamRange></Params><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/a.mov"/></VideoSource></PrimarySource></VideoTrack></Clip></Deck></Composition>"#
+        );
+        let i = super::import_str(&xml).unwrap();
+        let a = i.project.composition.decks[0].clips[0]
+            .clip
+            .track
+            .opacity
+            .animation
+            .clone();
+        (i, a)
+    }
+
+    #[test]
+    fn envelope_maps() {
+        let (i, a) = anim_of(
+            r#"<BehaviourDouble><Modifier><ModifierEnvelope><points><point x="1" y="0" curve="0"/><point x="0" y="1" curve="0"/></points></ModifierEnvelope></Modifier></BehaviourDouble>"#,
+        );
+        assert_eq!(
+            a,
+            Some(Animation::Envelope {
+                points: vec![(0.0, 1.0), (1.0, 0.0)],
+                beats: 4.0
+            })
+        );
+        assert!(i.warning_counts.keys().all(|k| !k.contains("envelope")));
+    }
+
+    #[test]
+    fn dashboard_link_maps() {
+        let (i, a) = anim_of(r#"<PhaseSourceDashboardLink linkId="3" linkName="Link 3"/>"#);
+        assert_eq!(a, Some(Animation::Dashboard { dial: 2 }));
+        assert!(i.warning_counts.keys().all(|k| !k.contains("dashboard")));
+    }
+
+    #[test]
+    fn timeline_and_beats_map() {
+        let (_, a) = anim_of(r#"<PhaseSourceTimeline defaultMillisecondsDuration="2500"/>"#);
+        assert_eq!(
+            a,
+            Some(Animation::Timeline {
+                duration_secs: 2.5,
+                curve: Curve::Linear
+            })
+        );
+        let (_, a) = anim_of(
+            r#"<PhaseSourceTimeline><Beats_d mode="0" numManualBeats="8"/></PhaseSourceTimeline>"#,
+        );
+        assert_eq!(
+            a,
+            Some(Animation::Beats {
+                beats: 8.0,
+                curve: Curve::Linear
+            })
+        );
+    }
+
+    #[test]
+    fn unmapped_animation_still_warns() {
+        let xml = r#"<Composition name="x" numColumns="1"><Params name="Params"><ParamRange name="Foo" value="1"><PhaseSourceDashboardLink linkId="1"/></ParamRange></Params><AudioFileSource FileName="/a.wav"/></Composition>"#;
+        let i = super::import_str(xml).unwrap();
+        assert_eq!(
+            i.warning_counts
+                .get("param animation/dashboard links not imported (param not mapped)"),
+            Some(&1)
+        );
+        assert!(
+            i.warning_counts
+                .contains_key("audio sources ignored (clips have no audio slot)")
+        );
+    }
+
     #[test]
     fn effect_outside_chain_warns() {
         let xml = r#"<Composition name="x" numColumns="1"><Layer layerIndex="0"/><Deck><Clip layerIndex="0" columnIndex="0"><VideoTrack><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/a.mov"/><RenderPass baseType="Effect" type="Blur"/></VideoSource></PrimarySource></VideoTrack></Clip></Deck></Composition>"#;
