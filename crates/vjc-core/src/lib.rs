@@ -114,6 +114,33 @@ pub enum Command {
         layer: LayerId,
         blend: BlendMode,
     },
+    SetCompositionName {
+        name: String,
+    },
+    /// Composition frame size in pixels (1..=16384) and frame rate (> 0).
+    SetCompositionSize {
+        width: u32,
+        height: u32,
+        fps: f32,
+    },
+    RenameLayer {
+        layer: LayerId,
+        name: String,
+    },
+    SetLayerSolo {
+        layer: LayerId,
+        solo: bool,
+    },
+    SetLayerBypass {
+        layer: LayerId,
+        bypass: bool,
+    },
+    RenameClip {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        name: String,
+    },
     SetFit {
         deck: DeckId,
         layer: LayerId,
@@ -746,6 +773,68 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.layers[i].track.blend, blend);
             undoable(Command::SetBlend { layer, blend: prev }, vec![])
         }
+        Command::SetCompositionName { name } => {
+            let prev = std::mem::replace(&mut p.composition.name, name);
+            undoable(Command::SetCompositionName { name: prev }, vec![])
+        }
+        Command::SetCompositionSize { width, height, fps } => {
+            let ok = (1..=16384).contains(&width) && (1..=16384).contains(&height);
+            if !ok || !fps.is_finite() || fps <= 0.0 {
+                return Err(Error::InvalidValue);
+            }
+            let c = &mut p.composition;
+            let inverse = Command::SetCompositionSize {
+                width: c.width,
+                height: c.height,
+                fps: c.fps,
+            };
+            (c.width, c.height, c.fps) = (width, height, fps);
+            undoable(inverse, vec![])
+        }
+        Command::RenameLayer { layer, name } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].name, name);
+            undoable(Command::RenameLayer { layer, name: prev }, vec![])
+        }
+        Command::SetLayerSolo { layer, solo } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].solo, solo);
+            undoable(Command::SetLayerSolo { layer, solo: prev }, vec![])
+        }
+        Command::SetLayerBypass { layer, bypass } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].bypass, bypass);
+            undoable(
+                Command::SetLayerBypass {
+                    layer,
+                    bypass: prev,
+                },
+                vec![],
+            )
+        }
+        Command::RenameClip {
+            deck,
+            layer,
+            column,
+            name,
+        } => {
+            check_cell(p, layer, column)?;
+            let k = deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .ok_or(Error::NoClip)?;
+            let prev = std::mem::replace(&mut k.clip.name, name);
+            undoable(
+                Command::RenameClip {
+                    deck,
+                    layer,
+                    column,
+                    name: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetFit {
             deck,
             layer,
@@ -1109,6 +1198,85 @@ impl History {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panel_commands_undo_redo() {
+        let (mut p, l) = setup();
+        let mut h = History::default();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let cmds = [
+            Command::SetCompositionName {
+                name: "Show".into(),
+            },
+            Command::SetCompositionSize {
+                width: 1280,
+                height: 720,
+                fps: 25.0,
+            },
+            Command::RenameLayer {
+                layer: l,
+                name: "Bg".into(),
+            },
+            Command::SetLayerSolo {
+                layer: l,
+                solo: true,
+            },
+            Command::SetLayerBypass {
+                layer: l,
+                bypass: true,
+            },
+            Command::RenameClip {
+                deck: A,
+                layer: l,
+                column: 0,
+                name: "Intro".into(),
+            },
+        ];
+        let before = p.clone();
+        for c in cmds {
+            h.exec(&mut p, c, t).unwrap();
+        }
+        let after = p.clone();
+        assert_eq!(
+            (after.composition.width, after.composition.fps),
+            (1280, 25.0)
+        );
+        assert_eq!(clip(&after, l).unwrap().name, "Intro");
+        for _ in 0..6 {
+            h.undo(&mut p).unwrap().unwrap();
+        }
+        assert_eq!(p, before);
+        for _ in 0..6 {
+            h.redo(&mut p).unwrap().unwrap();
+        }
+        assert_eq!(p, after);
+    }
+
+    #[test]
+    fn composition_size_rejects_invalid_and_clip_needs_clip() {
+        let (mut p, l) = setup();
+        for (w, h, f) in [
+            (0, 10, 30.0),
+            (10, 20000, 30.0),
+            (10, 10, 0.0),
+            (10, 10, f32::NAN),
+        ] {
+            let c = Command::SetCompositionSize {
+                width: w,
+                height: h,
+                fps: f,
+            };
+            assert_eq!(apply(&mut p, c).unwrap_err(), Error::InvalidValue);
+        }
+        let c = Command::RenameClip {
+            deck: A,
+            layer: l,
+            column: 0,
+            name: "x".into(),
+        };
+        assert_eq!(apply(&mut p, c).unwrap_err(), Error::NoClip);
+    }
+
     #[test]
     fn bpm_rejects_invalid() {
         let mut p = vjc_model::Project::new("t");

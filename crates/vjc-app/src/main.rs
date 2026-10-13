@@ -2,6 +2,7 @@ mod browser;
 mod compositor;
 mod fx;
 mod monitors;
+mod params;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
@@ -16,7 +17,7 @@ use vjc_core::{Command, Event, History};
 use vjc_media::{Frame, Player};
 use vjc_model::{
     BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId, PlayMode, Project, Track,
-    Transition,
+    Transition, Value,
 };
 
 struct State {
@@ -39,8 +40,8 @@ struct State {
     comp: Option<Compositor>,
     fx: fx::FxLib,
     fx_epoch: std::time::Instant,
-    /// Whose effect chain the effects panel shows.
-    fx_scope: FxScope,
+    /// Tab of the bottom parameter panel.
+    panel_tab: PanelTab,
     comp_tex: Option<egui::TextureId>,
     /// Display id of the monitor the output window is on, while open.
     output: Option<u32>,
@@ -81,10 +82,10 @@ struct State {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum FxScope {
-    Clip,
+enum PanelTab {
+    Composition,
     Layer,
-    Master,
+    Clip,
 }
 
 /// Active effects of a chain with this frame's uniforms. Effects still compiling or that
@@ -187,13 +188,17 @@ fn generator_menu(
     });
 }
 
+fn labeled<T: Copy>(v: &[(T, &str)]) -> Vec<(T, String)> {
+    v.iter().map(|(a, n)| (*a, n.to_string())).collect()
+}
+
 /// Edits one effect param; returns the new value when the user changed it.
 fn param_widget(
     ui: &mut egui::Ui,
-    name: &str,
+    p: &vjc_model::Param,
     kind: &vjc_fx::InputKind,
-    value: &vjc_model::Value,
 ) -> Option<vjc_model::Value> {
+    let (name, value) = (p.name.as_str(), &p.value);
     use vjc_fx::InputKind as K;
     use vjc_model::Value as V;
     let mut out = None;
@@ -202,10 +207,11 @@ fn param_widget(
         ui.label(name);
         match (kind, value) {
             (K::Float { min, max, .. }, V::Number(n)) => {
-                let mut x = *n;
-                if ui.add(egui::Slider::new(&mut x, *min..=*max)).changed() {
-                    out = Some(V::Number(x));
-                }
+                let d = match p.default {
+                    V::Number(d) => d,
+                    _ => *min,
+                };
+                out = params::param_slider(ui, name, "", *n, d, (*min, *max)).map(V::Number);
             }
             (K::Bool { .. }, V::Bool(b)) => {
                 let mut x = *b;
@@ -401,7 +407,7 @@ impl State {
             comp: None,
             fx: fx::FxLib::new(),
             fx_epoch: std::time::Instant::now(),
-            fx_scope: FxScope::Layer,
+            panel_tab: PanelTab::Composition,
             comp_tex: None,
             output: None,
             monitors: monitors::list(),
@@ -1001,28 +1007,11 @@ impl State {
         comp.render(&rs.device, &rs.queue, &draws, &master, master_opacity);
     }
 
-    /// Master row: opacity, speed, bypass, Clear All.
+    /// Master row: bypass, Clear All (opacity and speed live in the Composition tab).
     fn master_bar(&mut self, ui: &mut egui::Ui) {
         let mut cmds = vec![];
         let bar = ui.horizontal(|ui| {
             ui.label("Master");
-            let mut op = match self.project.composition.master.opacity.value {
-                vjc_model::Value::Number(n) => n,
-                _ => 1.0,
-            };
-            if ui
-                .add(egui::Slider::new(&mut op, 0.0..=1.0).text("Opacity"))
-                .changed()
-            {
-                cmds.push(Command::SetMasterOpacity { value: op });
-            }
-            let mut sp = self.project.composition.master_speed;
-            if ui
-                .add(egui::Slider::new(&mut sp, 0.0..=4.0).text("Speed"))
-                .changed()
-            {
-                cmds.push(Command::SetMasterSpeed { value: sp });
-            }
             let mut bypass = self.master_bypass;
             let by = ui.toggle_value(&mut bypass, "Bypass");
             self.targets.push((by.rect, "/comp/master/bypass".into()));
@@ -1327,6 +1316,14 @@ impl State {
         egui::Panel::right("browser")
             .default_size(260.0)
             .show(ui, |ui| opened = self.browser.show(ui, &fxs));
+        let mut pcmds = vec![];
+        egui::Panel::bottom("params")
+            .default_size(220.0)
+            .resizable(true)
+            .show(ui, |ui| self.params_panel(ui, &mut pcmds));
+        for c in pcmds {
+            self.exec(c);
+        }
         if let Some(path) = opened {
             match self.selected {
                 Some((l, c)) => self.drop_file(l, c, path),
@@ -1504,7 +1501,6 @@ impl State {
                     }
                     ui.label("Opacity");
                     ui.label("Blend");
-                    ui.label("Speed");
                     ui.label("");
                     ui.end_row();
                     for li in 0..comp.layers.len() {
@@ -1545,88 +1541,8 @@ impl State {
                                 .selected(on)
                                 .min_size(egui::vec2(90.0, 24.0));
                             let r = ui.add(btn);
-                            if let Some(cur_fit) = clip.map(|k| k.fit) {
-                                let cur_sync = clip.and_then(|k| k.transport.beat_sync);
-                                let cur_mode = clip.map(|k| k.transport.play_mode);
-                                let cur_dir = clip.map(|k| k.transport.direction);
+                            if clip.is_some() {
                                 r.context_menu(|ui| {
-                                    ui.label("Play mode");
-                                    let modes = [
-                                        (PlayMode::Loop, "Loop"),
-                                        (PlayMode::Bounce, "Bounce"),
-                                        (PlayMode::Once, "Once"),
-                                        (PlayMode::OnceHold, "Once, hold last frame"),
-                                    ];
-                                    for (m, name) in modes {
-                                        if ui.selectable_label(cur_mode == Some(m), name).clicked()
-                                        {
-                                            cmds.push(Command::SetPlayMode {
-                                                deck: cur,
-                                                layer: lid,
-                                                column: ci,
-                                                mode: m,
-                                            });
-                                            ui.close();
-                                        }
-                                    }
-                                    ui.separator();
-                                    ui.label("Direction");
-                                    let dirs = [
-                                        (Direction::Forward, "Forward"),
-                                        (Direction::Backward, "Backward"),
-                                        (Direction::Pause, "Pause"),
-                                        (Direction::Random, "Random"),
-                                    ];
-                                    for (d, name) in dirs {
-                                        if ui.selectable_label(cur_dir == Some(d), name).clicked() {
-                                            cmds.push(Command::SetDirection {
-                                                deck: cur,
-                                                layer: lid,
-                                                column: ci,
-                                                direction: d,
-                                            });
-                                            ui.close();
-                                        }
-                                    }
-                                    ui.separator();
-                                    ui.label("Sync to BPM");
-                                    let opts = [
-                                        None,
-                                        Some(1.0),
-                                        Some(2.0),
-                                        Some(4.0),
-                                        Some(8.0),
-                                        Some(16.0),
-                                    ];
-                                    for o in opts {
-                                        let label = match o {
-                                            None => "off".to_string(),
-                                            Some(n) => format!("{n} beats"),
-                                        };
-                                        if ui.selectable_label(cur_sync == o, label).clicked() {
-                                            cmds.push(Command::SetBeatSync {
-                                                deck: cur,
-                                                layer: lid,
-                                                column: ci,
-                                                beats: o,
-                                            });
-                                            ui.close();
-                                        }
-                                    }
-                                    ui.separator();
-                                    ui.label("Aspect ratio");
-                                    for m in FitMode::ALL {
-                                        if ui.selectable_label(cur_fit == m, m.label()).clicked() {
-                                            cmds.push(Command::SetFit {
-                                                deck: cur,
-                                                layer: lid,
-                                                column: ci,
-                                                fit: m,
-                                            });
-                                            ui.close();
-                                        }
-                                    }
-                                    ui.separator();
                                     let t = EffectTarget::Clip {
                                         deck: cur,
                                         layer: lid,
@@ -1721,41 +1637,6 @@ impl State {
                                     }
                                 }
                             });
-                        // Speed of the clip playing on this layer (from its own deck).
-                        let active = active_of(&self.players, &self.gens, lid);
-                        match active.and_then(|(d, c)| {
-                            Some((d, c, vjc_core::clip_in(&self.project, d, lid, c)?))
-                        }) {
-                            Some((d, c, k)) => {
-                                let mut sp = k.transport.speed as f32;
-                                // Edit the clip in the deck it plays from.
-                                ui.vertical(|ui| {
-                                    if d != cur {
-                                        let name = comp.decks.iter().find(|x| x.id == d);
-                                        ui.small(format!(
-                                            "from {}",
-                                            name.map_or("?", |x| x.name.as_str())
-                                        ));
-                                    }
-                                    if ui
-                                        .add(
-                                            egui::Slider::new(&mut sp, 0.0..=4.0).fixed_decimals(2),
-                                        )
-                                        .changed()
-                                    {
-                                        cmds.push(Command::SetSpeed {
-                                            deck: d,
-                                            layer: lid,
-                                            column: c,
-                                            speed: sp as f64,
-                                        });
-                                    }
-                                });
-                            }
-                            None => {
-                                ui.label("-");
-                            }
-                        }
                         if ui.button("Clear").clicked() {
                             cmds.push(Command::ClearLayer { layer: lid });
                         }
@@ -1764,7 +1645,6 @@ impl State {
                 });
             });
         self.cells = cells;
-        self.effects_panel(ui, &mut cmds);
         if let Some((l, c)) = pick
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(
@@ -1791,62 +1671,228 @@ impl State {
         }
     }
 
-    /// Chain of the selected layer, its playing clip or the master, with per-effect controls.
-    fn effects_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-        ui.separator();
+    /// Bottom panel: Composition / Layer / Clip parameters of the selection.
+    fn params_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         ui.horizontal(|ui| {
-            ui.strong("Effects");
-            ui.selectable_value(&mut self.fx_scope, FxScope::Clip, "Clip");
-            ui.selectable_value(&mut self.fx_scope, FxScope::Layer, "Layer");
-            ui.selectable_value(&mut self.fx_scope, FxScope::Master, "Master");
+            ui.selectable_value(&mut self.panel_tab, PanelTab::Composition, "Composition");
+            ui.selectable_value(&mut self.panel_tab, PanelTab::Layer, "Layer");
+            ui.selectable_value(&mut self.panel_tab, PanelTab::Clip, "Clip");
         });
-        let sel = self.selected.map(|s| s.0);
-        let target = match self.fx_scope {
-            FxScope::Master => Some(EffectTarget::Master),
-            FxScope::Layer => sel.map(EffectTarget::Layer),
-            FxScope::Clip => sel.and_then(|l| {
-                let (deck, column) = self.active(l)?;
-                Some(EffectTarget::Clip {
-                    deck,
-                    layer: l,
-                    column,
-                })
-            }),
-        };
-        let Some(target) = target else {
-            ui.label("Select a layer (click its name); Clip needs a playing clip.");
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| match self.panel_tab {
+            PanelTab::Composition => self.composition_tab(ui, cmds),
+            PanelTab::Layer => self.layer_tab(ui, cmds),
+            PanelTab::Clip => self.clip_tab(ui, cmds),
+        });
+    }
+
+    fn composition_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let c = &self.project.composition;
+        if let Some(name) = params::text_field(ui, "cname", "Name", &c.name) {
+            cmds.push(Command::SetCompositionName { name });
+        }
+        let (mut w, mut h, mut fps) = (c.width, c.height, c.fps);
+        let mut size_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Size");
+            // speed 0: typed only, so a drag does not resize the output every frame.
+            size_changed |= ui
+                .add(egui::DragValue::new(&mut w).speed(0.0).range(1..=16384))
+                .changed();
+            ui.label("x");
+            size_changed |= ui
+                .add(egui::DragValue::new(&mut h).speed(0.0).range(1..=16384))
+                .changed();
+            ui.label("fps");
+            size_changed |= ui
+                .add(egui::DragValue::new(&mut fps).speed(0.0).range(1.0..=240.0))
+                .changed();
+        });
+        if size_changed {
+            cmds.push(Command::SetCompositionSize {
+                width: w,
+                height: h,
+                fps,
+            });
+        }
+        let op = &c.master.opacity;
+        if let (Value::Number(n), Value::Number(d)) = (&op.value, &op.default)
+            && let Some(value) = params::param_slider(ui, "mop", "Opacity", *n, *d, (0.0, 1.0))
+        {
+            cmds.push(Command::SetMasterOpacity { value });
+        }
+        if let Some(value) =
+            params::param_slider(ui, "msp", "Speed", c.master_speed, 1.0, (0.0, 4.0))
+        {
+            cmds.push(Command::SetMasterSpeed { value });
+        }
+        ui.separator();
+        self.chain_ui(ui, EffectTarget::Master, cmds);
+    }
+
+    fn layer_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let Some(lid) = self.selected.map(|s| s.0) else {
+            ui.label("Select a layer (click its name or a cell).");
             return;
         };
-        ui.menu_button("Add effect", |ui| add_effect_menu(ui, target, cmds));
-        if let EffectTarget::Clip {
-            deck,
-            layer,
-            column,
-        } = target
-            && let Some(vjc_model::Source::Generator { kind, params }) =
-                vjc_core::clip_in(&self.project, deck, layer, column).map(|k| k.source.clone())
+        let Some(l) = self.project.composition.layers.iter().find(|l| l.id == lid) else {
+            return;
+        };
+        if let Some(name) = params::text_field(ui, ("lname", lid), "Name", &l.name) {
+            cmds.push(Command::RenameLayer { layer: lid, name });
+        }
+        let op = &l.track.opacity;
+        if let (Value::Number(n), Value::Number(d)) = (&op.value, &op.default)
+            && let Some(value) =
+                params::param_slider(ui, ("lop", lid), "Opacity", *n, *d, (0.0, 1.0))
         {
-            ui.strong(format!("Generator: {}", fx_label(&kind)));
-            let inputs = self.fx.isf(&kind).map(|f| f.inputs.clone());
-            if inputs.is_none() {
-                ui.colored_label(egui::Color32::LIGHT_RED, "unknown generator (not rendered)");
+            cmds.push(Command::SetOpacity { layer: lid, value });
+        }
+        let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
+            .iter()
+            .map(|(m, n)| (m.clone(), n.to_string()))
+            .collect();
+        if let Some(blend) = params::combo(ui, ("lbl", lid), "Blend", &l.track.blend, &modes) {
+            cmds.push(Command::SetBlend { layer: lid, blend });
+        }
+        let (mut solo, mut bypass) = (l.solo, l.bypass);
+        ui.horizontal(|ui| {
+            if ui.toggle_value(&mut solo, "Solo").changed() {
+                cmds.push(Command::SetLayerSolo { layer: lid, solo });
             }
-            for (pi, p) in params.iter().enumerate() {
-                let Some(ik) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
-                    continue;
-                };
-                if let Some(value) = param_widget(ui, &p.name, ik, &p.value) {
-                    cmds.push(Command::SetGeneratorParam {
-                        deck,
-                        layer,
-                        column,
-                        param: pi,
-                        value,
-                    });
+            if ui.toggle_value(&mut bypass, "Bypass").changed() {
+                cmds.push(Command::SetLayerBypass { layer: lid, bypass });
+            }
+        });
+        ui.separator();
+        self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
+    }
+
+    fn clip_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let deck = self.project.composition.current_deck;
+        let sel = self.selected;
+        let Some((layer, column, k)) =
+            sel.and_then(|(l, c)| Some((l, c, vjc_core::clip_in(&self.project, deck, l, c)?)))
+        else {
+            ui.label("Select a cell with a clip.");
+            return;
+        };
+        let k = k.clone();
+        let t = &k.transport;
+        if let Some(name) = params::text_field(ui, ("kname", layer, column), "Name", &k.name) {
+            cmds.push(Command::RenameClip {
+                deck,
+                layer,
+                column,
+                name,
+            });
+        }
+        match &k.source {
+            vjc_model::Source::File { path } => {
+                ui.label(format!("Source: file {}", path.display()));
+            }
+            vjc_model::Source::Generator { kind, params } => {
+                ui.strong(format!("Source: generator {}", fx_label(kind)));
+                let inputs = self.fx.isf(kind).map(|f| f.inputs.clone());
+                if inputs.is_none() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "unknown generator (not rendered)");
+                }
+                for (pi, p) in params.iter().enumerate() {
+                    let Some(ik) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
+                        continue;
+                    };
+                    if let Some(value) = ui.push_id(pi, |ui| param_widget(ui, p, ik)).inner {
+                        cmds.push(Command::SetGeneratorParam {
+                            deck,
+                            layer,
+                            column,
+                            param: pi,
+                            value,
+                        });
+                    }
                 }
             }
-            ui.separator();
+            _ => {
+                ui.label("Source: not supported yet");
+            }
         }
+        ui.separator();
+        let modes = labeled(&[
+            (PlayMode::Loop, "Loop"),
+            (PlayMode::Bounce, "Bounce"),
+            (PlayMode::Once, "Once"),
+            (PlayMode::OnceHold, "Once, hold last frame"),
+        ]);
+        if let Some(mode) = params::combo(ui, "pm", "Play mode", &t.play_mode, &modes) {
+            cmds.push(Command::SetPlayMode {
+                deck,
+                layer,
+                column,
+                mode,
+            });
+        }
+        let dirs = labeled(&[
+            (Direction::Forward, "Forward"),
+            (Direction::Backward, "Backward"),
+            (Direction::Pause, "Pause"),
+            (Direction::Random, "Random"),
+        ]);
+        if let Some(direction) = params::combo(ui, "dir", "Direction", &t.direction, &dirs) {
+            cmds.push(Command::SetDirection {
+                deck,
+                layer,
+                column,
+                direction,
+            });
+        }
+        if let Some(speed) = params::param_slider(ui, "spd", "Speed", t.speed, 1.0, (0.0, 4.0)) {
+            cmds.push(Command::SetSpeed {
+                deck,
+                layer,
+                column,
+                speed,
+            });
+        }
+        let syncs: Vec<(Option<f64>, String)> =
+            [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0), Some(16.0)]
+                .into_iter()
+                .map(|b| (b, b.map_or("off".into(), |n| format!("{n} beats"))))
+                .collect();
+        if let Some(beats) = params::combo(ui, "sync", "Beat sync", &t.beat_sync, &syncs) {
+            cmds.push(Command::SetBeatSync {
+                deck,
+                layer,
+                column,
+                beats,
+            });
+        }
+        let fits: Vec<(FitMode, String)> = FitMode::ALL
+            .iter()
+            .map(|m| (*m, m.label().to_string()))
+            .collect();
+        if let Some(fit) = params::combo(ui, "fit", "Fit", &k.fit, &fits) {
+            cmds.push(Command::SetFit {
+                deck,
+                layer,
+                column,
+                fit,
+            });
+        }
+        ui.separator();
+        self.chain_ui(
+            ui,
+            EffectTarget::Clip {
+                deck,
+                layer,
+                column,
+            },
+            cmds,
+        );
+    }
+
+    /// Effect chain of a target with per-effect controls.
+    fn chain_ui(&mut self, ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
+        ui.menu_button("Add effect", |ui| add_effect_menu(ui, target, cmds));
         let chain = vjc_core::effects::chain(&self.project, target)
             .unwrap_or_default()
             .to_vec();
@@ -1898,7 +1944,8 @@ impl State {
                 let Some(kind) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
                     continue;
                 };
-                if let Some(value) = param_widget(ui, &p.name, kind, &p.value) {
+                // Scope ids per effect so equal param names do not share edit state.
+                if let Some(value) = ui.push_id((e.id, pi), |ui| param_widget(ui, p, kind)).inner {
                     cmds.push(Command::SetEffectParam {
                         target,
                         effect: e.id,
