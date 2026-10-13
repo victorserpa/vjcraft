@@ -302,7 +302,12 @@ fn blend_of(vt: &Node) -> BlendMode {
     else {
         return BlendMode::Normal;
     };
-    match rp.attr("type").unwrap_or("") {
+    blend_from_name(rp.attr("type").unwrap_or(""))
+}
+
+/// Mixer type name as written in .avc files.
+fn blend_from_name(name: &str) -> BlendMode {
+    match name {
         "Add" => BlendMode::Add,
         "Burn" => BlendMode::Burn,
         "Darken" => BlendMode::Darken,
@@ -336,6 +341,7 @@ fn blend_of(vt: &Node) -> BlendMode {
         "PiP" => BlendMode::PictureInPicture,
         "RGB" => BlendMode::Rgb,
         "B&W" => BlendMode::BlackWhite,
+        // In .avc files "Alpha" is the default alpha-over mixer, i.e. our Normal.
         "Alpha" | "Normal" => BlendMode::Normal,
         _ => BlendMode::Unknown,
     }
@@ -461,6 +467,14 @@ fn collect_unsupported(root: &Node, w: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn avc_alpha_imports_as_normal() {
+        assert_eq!(
+            super::blend_from_name("Alpha"),
+            vjc_model::BlendMode::Normal
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

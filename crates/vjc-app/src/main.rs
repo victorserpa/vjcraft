@@ -1050,22 +1050,22 @@ impl State {
                                 value: op as f64,
                             });
                         }
-                        let label = if layer.track.blend == BlendMode::Add {
-                            "Add"
-                        } else {
-                            "Normal"
-                        };
+                        let label = vjc_core::blend::COMPOSITION_MODES
+                            .iter()
+                            .find(|(m, _)| *m == layer.track.blend)
+                            .map_or("Normal", |(_, n)| *n);
                         egui::ComboBox::from_id_salt(("blend", lid))
                             .selected_text(label)
-                            .width(70.0)
+                            .width(90.0)
                             .show_ui(ui, |ui| {
-                                for (b, name) in
-                                    [(BlendMode::Normal, "Normal"), (BlendMode::Add, "Add")]
-                                {
-                                    if ui.selectable_label(layer.track.blend == b, name).clicked() {
+                                for (b, name) in vjc_core::blend::COMPOSITION_MODES {
+                                    if ui
+                                        .selectable_label(layer.track.blend == *b, *name)
+                                        .clicked()
+                                    {
                                         cmds.push(Command::SetBlend {
                                             layer: lid,
-                                            blend: b,
+                                            blend: b.clone(),
                                         });
                                     }
                                 }

@@ -2,6 +2,7 @@
 //! function `apply`. `History` keeps inverses for undo/redo. No UI, no players: the app
 //! reacts to the returned `Event`s. See replica/architecture.md section 3.
 
+pub mod blend;
 pub mod clock;
 pub mod playhead;
 

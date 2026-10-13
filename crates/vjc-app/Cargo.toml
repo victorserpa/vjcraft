@@ -21,3 +21,6 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"
+
+[dev-dependencies]
+pollster = "1"
