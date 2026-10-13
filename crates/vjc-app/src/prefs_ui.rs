@@ -69,6 +69,28 @@ impl State {
                             }
                         });
                         ui.weak("Empty = project folder, else ~/Movies. Applies on next launch.");
+                        ui.horizontal(|ui| {
+                            ui.label("ML models folder");
+                            let mut t = p
+                                .general
+                                .models_folder
+                                .as_ref()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default();
+                            if ui.text_edit_singleline(&mut t).changed() {
+                                p.general.models_folder =
+                                    (!t.trim().is_empty()).then(|| t.trim().into());
+                            }
+                            if ui.button("Choose...").clicked()
+                                && let Some(d) = rfd::FileDialog::new().pick_folder()
+                            {
+                                p.general.models_folder = Some(d);
+                            }
+                        });
+                        ui.weak(
+                            "Where Depth and Remove Background look for their .onnx files \
+                             (empty = the app data folder, models/). See docs/ml.md.",
+                        );
                     }
                     PrefsTab::Audio => {
                         // TODO(#19): list output devices with cpal (not a dependency yet).

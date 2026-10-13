@@ -8,6 +8,8 @@ mod fx;
 mod help;
 mod link_io;
 mod midi_io;
+mod ml_fx;
+mod ml_gpu;
 mod monitors;
 mod netout;
 mod osc_io;
@@ -70,6 +72,7 @@ struct State {
     flow: Flow,
     comp: Option<Compositor>,
     fx: fx::FxLib,
+    ml: ml_fx::MlHub,
     fx_epoch: std::time::Instant,
     /// Tab of the bottom parameter panel.
     panel_tab: PanelTab,
@@ -213,6 +216,8 @@ enum PanelTab {
 /// failed are skipped.
 fn draw_chain(
     lib: &mut fx::FxLib,
+    ml: &mut ml_fx::MlHub,
+    src_tag: Option<u64>,
     chain: &[vjc_model::Effect],
     time: f32,
     size: (u32, u32),
@@ -224,11 +229,26 @@ fn draw_chain(
         if lib.status(&e.kind) != Some(&fx::Status::Ready) {
             continue;
         }
+        // Fully dry: the effect never runs, so no worker and no model load for it.
+        if e.dry_wet.is_nan() || e.dry_wet <= 0.0 {
+            continue;
+        }
+        // ML effects wait for their model: missing or failed ones are skipped.
+        let ml_draw = if ml_fx::model_of(&e.kind).is_some() {
+            // No tag = a source that cannot own a model (outgoing transition): skipped.
+            match src_tag.and_then(|t| ml.draw(&e.kind, e.id, t)) {
+                Some(d) => Some(d),
+                None => continue,
+            }
+        } else {
+            None
+        };
         if let Some(isf) = lib.isf(&e.kind) {
             out.push(EffectDraw {
                 kind: e.kind.clone(),
                 uniforms: isf.pack(&vjc_core::anim::resolve(&e.params, ctx), time, size),
                 dry_wet: e.dry_wet,
+                ml: ml_draw,
             });
         }
     }
@@ -763,6 +783,7 @@ impl State {
             last_head_tick: std::time::Instant::now(),
             comp: None,
             fx: fx::FxLib::new(),
+            ml: ml_fx::MlHub::new(),
             fx_epoch: std::time::Instant::now(),
             panel_tab: PanelTab::Composition,
             comp_tex: None,
@@ -1979,6 +2000,10 @@ impl State {
             self.fx.set_status(&done.kind, st);
         }
         let time = self.fx_epoch.elapsed().as_secs_f32();
+        self.ml.set_dir(ml_fx::models_dir(
+            self.prefs.general.models_folder.as_ref(),
+            project_dirs().map(|d| d.data_dir().to_path_buf()),
+        ));
         let cf_pos = c
             .crossfader
             .as_ref()
@@ -2008,14 +2033,31 @@ impl State {
                             (w, h),
                         ),
                         dry_wet: 1.0,
+                        ml: None,
                     })
                 }
                 _ => None,
             };
-            let mut effects =
-                draw_chain(&mut self.fx, clip_fx.unwrap_or_default(), time, size, &actx);
+            // Identifies the clip feeding this layer: ML effects reset their state when it changes.
+            let src_tag = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                active_of(players, gens, l.id).hash(&mut h);
+                h.finish()
+            };
+            let mut effects = draw_chain(
+                &mut self.fx,
+                &mut self.ml,
+                Some(src_tag),
+                clip_fx.unwrap_or_default(),
+                time,
+                size,
+                &actx,
+            );
             effects.extend(draw_chain(
                 &mut self.fx,
+                &mut self.ml,
+                Some(src_tag),
                 &l.track.effects,
                 time,
                 size,
@@ -2036,6 +2078,8 @@ impl State {
             if let Some((o, (kind, prog), of)) = cross {
                 let fx = draw_chain(
                     &mut self.fx,
+                    &mut self.ml,
+                    None,
                     &l.track.effects,
                     time,
                     (of.width, of.height),
@@ -2067,7 +2111,15 @@ impl State {
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
             });
         }
-        let master = draw_chain(&mut self.fx, &c.master.effects, time, (w, h), &actx);
+        let master = draw_chain(
+            &mut self.fx,
+            &mut self.ml,
+            Some(0),
+            &c.master.effects,
+            time,
+            (w, h),
+            &actx,
+        );
         let master_opacity = if self.master_bypass {
             0.0
         } else {
@@ -2091,7 +2143,15 @@ impl State {
                     len,
                     opacity: vjc_core::anim::effective_number(&g.track.opacity, &actx) as f32,
                     blend: g.track.blend.clone(),
-                    effects: draw_chain(&mut self.fx, &g.track.effects, time, (w, h), &actx),
+                    effects: draw_chain(
+                        &mut self.fx,
+                        &mut self.ml,
+                        Some(0),
+                        &g.track.effects,
+                        time,
+                        (w, h),
+                        &actx,
+                    ),
                 });
             }
             i += len;
@@ -2104,6 +2164,7 @@ impl State {
             &master,
             master_opacity,
         );
+        self.ml.pump(comp, &rs.device, &rs.queue);
         match self.rec_request.take() {
             Some(true) if self.capture.is_none() => {
                 let size = comp.size;
@@ -4116,7 +4177,7 @@ impl State {
             let actx = self.anim_ctx(&dials);
             let failure = match self.fx.status(&e.kind) {
                 Some(fx::Status::Failed(why)) => Some(why.clone()),
-                _ => None,
+                _ => self.ml.problem(&e.kind, e.id),
             };
             ui.horizontal(|ui| {
                 let mut on = !e.bypass;

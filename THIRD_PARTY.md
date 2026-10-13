@@ -22,3 +22,13 @@
 
 - Used by the optional Remote API (`crates/vjc-app/src/api_io.rs`): `tiny_http` 0.12 serves REST, `tungstenite` 0.30 (feature `handshake` only, no TLS) serves WebSocket. Both are off the network unless the user enables the API in Preferences.
 - Licenses: tiny_http Apache-2.0 / MIT, tungstenite Apache-2.0 / MIT; both compatible with GPL-3.0-only. Sources: https://github.com/tiny-http/tiny-http, https://github.com/snapview/tungstenite-rs.
+
+## tract (ML inference, `crates/vjc-ml`)
+
+- ONNX inference for the Depth and Remove Background effects, pinned to `tract-onnx` 0.23.8. License: Apache-2.0 / MIT, compatible with GPL-3.0-only. Source: https://github.com/sonos/tract.
+
+## ML models (not distributed)
+
+- The effects load `.onnx` files from a user folder; VJCraft neither bundles nor downloads them (`*.onnx` is git-ignored). How to get them: `docs/ml.md`.
+- MiDaS v2.1 small (`model-small.onnx`), Depth effect. License: MIT. Source: https://github.com/isl-org/MiDaS.
+- Robust Video Matting, MobileNetV3 fp32 (`rvm_mobilenetv3_fp32.onnx`), Remove Background effect. License: GPL-3.0, same as this project. Source: https://github.com/PeterL1n/RobustVideoMatting.

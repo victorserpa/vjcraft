@@ -39,6 +39,11 @@ pub const BUILTIN: &[(&str, &str)] = &[
         include_str!("../../../assets/effects/vignette.fs"),
     ),
     ("blur", include_str!("../../../assets/effects/blur.fs")),
+    ("depth", include_str!("../../../assets/effects/depth.fs")),
+    (
+        "remove_bg",
+        include_str!("../../../assets/effects/remove_bg.fs"),
+    ),
     (
         "brightness_contrast",
         include_str!("../../../assets/effects/brightness_contrast.fs"),
@@ -472,6 +477,7 @@ pub fn glsl_source(isf: &Isf) -> String {
          layout(std140, set = 0, binding = 0) uniform ISFU { vec4 p[16]; } isf_u;\n\
          layout(set = 0, binding = 1) uniform texture2D inputImage;\n\
          layout(set = 0, binding = 2) uniform sampler isf_smp;\n\
+         layout(set = 0, binding = 3) uniform texture2D vjc_mask;\n\
          #define gl_FragColor isf_FragColor\n\
          #define TIME isf_u.p[0].x\n\
          #define RENDERSIZE isf_u.p[0].yz\n\
@@ -503,7 +509,7 @@ impl Isf {
 }
 
 /// Translates ISF to a WGSL fragment module (entry point `main`; bindings: 0 uniform
-/// block, 1 input texture, 2 sampler; `@location(0)` input is the ISF y-up uv).
+/// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects); `@location(0)` input is the ISF y-up uv).
 pub fn translate(isf: &Isf) -> Result<String, FxError> {
     use naga::{back::wgsl, front::glsl, valid};
     let src = glsl_source(isf);
@@ -592,7 +598,7 @@ mod tests {
 
     #[test]
     fn all_builtin_effects_translate() {
-        assert_eq!(BUILTIN.len(), 10);
+        assert_eq!(BUILTIN.len(), 12);
         for (id, src) in BUILTIN {
             let (isf, wgsl) = compile(src).unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(wgsl.contains("fn main"), "{id}");

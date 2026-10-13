@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use vjc_core::blend::shader_id;
 use vjc_model::{BlendMode, FitMode, LayerId};
 
+use crate::ml_gpu::MlStore;
+pub use crate::ml_gpu::{MlDraw, MlFrame};
+
 /// Fraction of the destination frame (x, y) covered by a `src` video for the given mode.
 pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) {
     let (sw, sh, dw, dh) = (
@@ -197,6 +200,9 @@ pub struct EffectDraw {
     pub uniforms: vjc_fx::Uniforms,
     /// 1 = effect only, 0 = input only (effect skipped), between = mix(in, out, dry_wet).
     pub dry_wet: f32,
+    /// Set for ML effects: the effect reads a mask produced by an ML worker and is skipped
+    /// until the first one arrives.
+    pub ml: Option<MlDraw>,
 }
 
 /// What an effect with this dry/wet costs.
@@ -229,7 +235,9 @@ struct U { t: vec4<f32> };
 @group(0) @binding(3) var samp: sampler;
 @fragment
 fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    return mix(textureSample(dry, samp, uv), textureSample(wet, samp, uv), u.t.x);
+    // `uv` is ISF-style (y up); textures are stored top row first.
+    let p = vec2(uv.x, 1.0 - uv.y);
+    return mix(textureSample(dry, samp, p), textureSample(wet, samp, p), u.t.x);
 }
 "#;
 
@@ -249,6 +257,7 @@ struct Fx {
     mix_pipe: wgpu::RenderPipeline,
     mix_bufs: Vec<wgpu::Buffer>,
     mix_next: usize,
+    ml: MlStore,
 }
 
 fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
@@ -278,7 +287,7 @@ fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
 /// One fullscreen fragment pass of an effect or generator shader: `src` is bound as
 /// `inputImage`, the result replaces `dst`.
 #[allow(clippy::too_many_arguments)]
-fn draw_pass(
+pub(crate) fn draw_pass(
     device: &wgpu::Device,
     enc: &mut wgpu::CommandEncoder,
     bgl: &wgpu::BindGroupLayout,
@@ -287,6 +296,7 @@ fn draw_pass(
     buf: &wgpu::Buffer,
     src: &wgpu::TextureView,
     dst: &wgpu::TextureView,
+    mask: &wgpu::TextureView,
 ) {
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("fx_bg"),
@@ -303,6 +313,10 @@ fn draw_pass(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(mask),
             },
         ],
     });
@@ -374,7 +388,7 @@ impl Fx {
         let buf = &self.bufs[self.next];
         self.next += 1;
         queue.write_buffer(buf, 0, bytemuck::cast_slice(&g.uniforms));
-        draw_pass(device, enc, bgl, sampler, pipe, buf, blank, dst);
+        draw_pass(device, enc, bgl, sampler, pipe, buf, blank, dst, blank);
     }
 
     /// Runs `effects` in order, ping-ponging between two scratch textures of `size`.
@@ -402,6 +416,20 @@ impl Fx {
             let Some(pipe) = self.pipes.get(&e.kind) else {
                 continue;
             };
+            let in_view = match cur {
+                None => input,
+                Some(i) => match self.scratch.get(&size) {
+                    Some(sc) => &sc[i].1,
+                    None => input,
+                },
+            };
+            let mask = match &e.ml {
+                None => None,
+                Some(m) => match self.ml.prepare(device, enc, bgl, sampler, in_view, m) {
+                    Some(v) => Some(v),
+                    None => continue,
+                },
+            };
             if !self.used.contains(&size) {
                 self.used.push(size);
             }
@@ -426,7 +454,17 @@ impl Fx {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
-            draw_pass(device, enc, bgl, sampler, pipe, buf, src, &scratch[out].1);
+            draw_pass(
+                device,
+                enc,
+                bgl,
+                sampler,
+                pipe,
+                buf,
+                src,
+                &scratch[out].1,
+                mask.unwrap_or(src),
+            );
             if let MixPlan::Blend(t) = plan {
                 if self.mix_bufs.len() <= self.mix_next {
                     self.mix_bufs
@@ -542,6 +580,8 @@ struct Slot {
 pub struct Compositor {
     pipe: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
+    /// Layout of effect passes (`bgl` plus the ML mask).
+    fx_bgl: wgpu::BindGroupLayout,
     base_bgl: wgpu::BindGroupLayout,
     base: wgpu::Texture,
     base_bind: wgpu::BindGroup,
@@ -650,6 +690,34 @@ impl Compositor {
                 },
             ],
         });
+        // Effect passes: the layer bindings plus the ML mask texture.
+        let fx_bgl = {
+            let mut e: Vec<wgpu::BindGroupLayoutEntry> = vec![];
+            for binding in 0..4u32 {
+                e.push(wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: match binding {
+                        0 => wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        2 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        _ => wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                    },
+                    count: None,
+                });
+            }
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fx_bgl"),
+                entries: &e,
+            })
+        };
         let base_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compositor_base_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -824,13 +892,16 @@ impl Compositor {
             multiview_mask: None,
             cache: None,
         });
+        let fx_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fx_pl"),
+            bind_group_layouts: &[Some(&fx_bgl)],
+            immediate_size: 0,
+        });
+        let ml = MlStore::new(device, &fx_vs, &fx_layout);
         let fx = Fx {
             vs: fx_vs,
-            layout: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("fx_pl"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            }),
+            layout: fx_layout,
+            ml,
             pipes: HashMap::new(),
             bufs: vec![],
             next: 0,
@@ -846,6 +917,7 @@ impl Compositor {
         Compositor {
             pipe,
             bgl,
+            fx_bgl,
             base_bgl,
             base,
             base_bind,
@@ -940,7 +1012,7 @@ impl Compositor {
                 device,
                 queue,
                 enc,
-                &self.bgl,
+                &self.fx_bgl,
                 &self.sampler,
                 &self.blank,
                 &slot.view,
@@ -951,7 +1023,7 @@ impl Compositor {
             device,
             queue,
             enc,
-            &self.bgl,
+            &self.fx_bgl,
             &self.sampler,
             &slot.view,
             slot.size,
@@ -1074,7 +1146,7 @@ impl Compositor {
             device,
             queue,
             enc,
-            &self.bgl,
+            &self.fx_bgl,
             &self.sampler,
             &gb.view,
             size,
@@ -1340,7 +1412,7 @@ impl Compositor {
             device,
             queue,
             &mut enc,
-            &self.bgl,
+            &self.fx_bgl,
             &self.sampler,
             &self.target_view,
             self.size,
@@ -1407,6 +1479,24 @@ impl Compositor {
         let used = std::mem::take(&mut self.fx.used);
         self.fx.scratch.retain(|k, _| used.contains(k));
         queue.submit(Some(enc.finish()));
+        self.fx.ml.dispatch(device, queue);
+    }
+
+    /// Reduced frames of ML effects whose readback finished (never waits).
+    pub fn ml_poll(&mut self, device: &wgpu::Device) -> Vec<MlFrame> {
+        self.fx.ml.poll(device)
+    }
+
+    /// Installs the newest mask of an ML effect instance (one byte per pixel, top row first).
+    pub fn ml_set_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: u128,
+        size: (u32, u32),
+        data: &[u8],
+    ) {
+        self.fx.ml.set_mask(device, queue, key, size, data);
     }
 }
 
@@ -1601,6 +1691,7 @@ mod tests {
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet: 1.0,
+            ml: None,
         };
         let src = [51u8, 102, 204, 255];
         for on_master in [false, true] {
@@ -1683,6 +1774,7 @@ mod tests {
                 kind: "solid_color".into(),
                 uniforms: isf.pack(&params, 0.0, (1, 1)),
                 dry_wet: 1.0,
+                ml: None,
             }),
             transition: None,
         }];
@@ -1754,6 +1846,7 @@ mod tests {
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet,
+            ml: None,
         };
         let src = [255u8, 255, 255, 255];
         // (chain, expected red)
@@ -1861,6 +1954,249 @@ mod tests {
         [got[0], got[1], got[2], got[3]]
     }
 
+    fn read_row(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor, w: u32) -> Vec<u8> {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got = buf.slice(..).get_mapped_range().expect("map")[..w as usize * 4].to_vec();
+        buf.unmap();
+        got
+    }
+
+    /// A pixel with mask 0 is transparent after "Remove Background"; before the first
+    /// mask arrives the effect is skipped. Skipped when there is no adapter.
+    #[test]
+    fn gpu_ml_mask_makes_pixels_transparent() {
+        let Some((device, queue)) = gpu() else { return };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("remove_bg").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 2, 1);
+        comp.add_effect(&device, "remove_bg", &wgsl).unwrap();
+        let ml = MlDraw {
+            key: 7,
+            tag: 0,
+            size: (2, 1),
+        };
+        let red = [255u8, 0, 0, 255].repeat(2);
+        let green = [0u8, 255, 0, 255].repeat(2);
+        let draw = |comp: &mut Compositor| {
+            let layer = [
+                LayerDraw {
+                    id: uuid::Uuid::from_u128(2),
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    fit: FitMode::Stretch,
+                    effects: vec![],
+                    frame: Some((2, 1, &green, 1)),
+                    generator: None,
+                    transition: None,
+                },
+                LayerDraw {
+                    id: uuid::Uuid::from_u128(1),
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    fit: FitMode::Stretch,
+                    effects: vec![EffectDraw {
+                        kind: "remove_bg".into(),
+                        // Default params: Transparent mode, threshold 0.5.
+                        uniforms: isf.pack(&isf.default_params(), 0.0, (2, 1)),
+                        dry_wet: 1.0,
+                        ml: Some(ml.clone()),
+                    }],
+                    frame: Some((2, 1, &red, 1)),
+                    generator: None,
+                    transition: None,
+                },
+            ];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            read_row(&device, &queue, comp, 2)
+        };
+        // No mask yet: effect skipped, the image shows as is.
+        assert_eq!(draw(&mut comp), [255, 0, 0, 255, 255, 0, 0, 255]);
+        // The readback of the reduced frame is requested and completes without waiting.
+        let mut frames = vec![];
+        for _ in 0..100 {
+            frames.extend(comp.ml_poll(&device));
+            if !frames.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].key, frames[0].size), (7, (2, 1)));
+        assert_eq!(
+            frames[0].rgba, red,
+            "reduced frame keeps orientation and colour"
+        );
+        comp.ml_set_mask(&device, &queue, 7, (2, 1), &[0, 255]);
+        let got = draw(&mut comp);
+        // Mask 0: the layer below shows through. Mask 255: the pixel is kept.
+        assert_eq!(
+            &got[..4],
+            [0, 255, 0, 255],
+            "mask 0 must be transparent: {got:?}"
+        );
+        assert_eq!(
+            &got[4..],
+            [255, 0, 0, 255],
+            "mask 255 keeps the pixel: {got:?}"
+        );
+    }
+
+    /// Red channel of each row of a 1-pixel-wide target, top row first.
+    fn read_col(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor, h: u32) -> Vec<u8> {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = buf.slice(..).get_mapped_range().expect("map");
+        let out = (0..h as usize).map(|r| data[r * 256]).collect();
+        drop(data);
+        buf.unmap();
+        out
+    }
+
+    /// Image whose top is black and bottom white keeps its orientation through the dry/wet
+    /// mix (dry/wet 0.25 is not symmetric, so a flipped mix pass shows). Skipped without adapter.
+    #[test]
+    fn gpu_dry_wet_keeps_vertical_orientation() {
+        let Some((device, queue)) = gpu() else { return };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("invert").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 4);
+        comp.add_effect(&device, "invert", &wgsl).unwrap();
+        let img: Vec<u8> = (0..4u8)
+            .flat_map(|r| [r * 85, r * 85, r * 85, 255])
+            .collect();
+        for (dry_wet, first, last) in [(1.0, 255u8, 0u8), (0.25, 64, 191)] {
+            let layer = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![EffectDraw {
+                    kind: "invert".into(),
+                    uniforms: isf.pack(&isf.default_params(), 0.0, (1, 4)),
+                    dry_wet,
+                    ml: None,
+                }],
+                frame: Some((1, 4, &img, 1)),
+                generator: None,
+                transition: None,
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            let col = read_col(&device, &queue, &comp, 4);
+            assert!(
+                col[0].abs_diff(first) <= 3 && col[3].abs_diff(last) <= 3,
+                "dry_wet {dry_wet}: rows {col:?}, want {first} .. {last}"
+            );
+        }
+    }
+
+    /// A mask with the top half 0 and the bottom half 255 clears the top half. Skipped
+    /// without adapter.
+    #[test]
+    fn gpu_ml_mask_keeps_vertical_orientation() {
+        let Some((device, queue)) = gpu() else { return };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("remove_bg").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 4);
+        comp.add_effect(&device, "remove_bg", &wgsl).unwrap();
+        let ml = MlDraw {
+            key: 8,
+            tag: 0,
+            size: (1, 4),
+        };
+        let red = [255u8, 0, 0, 255].repeat(4);
+        let green = [0u8, 255, 0, 255].repeat(4);
+        let draw = |comp: &mut Compositor| {
+            let layers = [
+                LayerDraw {
+                    id: uuid::Uuid::from_u128(2),
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    fit: FitMode::Stretch,
+                    effects: vec![],
+                    frame: Some((1, 4, &green, 1)),
+                    generator: None,
+                    transition: None,
+                },
+                LayerDraw {
+                    id: uuid::Uuid::from_u128(1),
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    fit: FitMode::Stretch,
+                    effects: vec![EffectDraw {
+                        kind: "remove_bg".into(),
+                        uniforms: isf.pack(&isf.default_params(), 0.0, (1, 4)),
+                        dry_wet: 1.0,
+                        ml: Some(ml.clone()),
+                    }],
+                    frame: Some((1, 4, &red, 1)),
+                    generator: None,
+                    transition: None,
+                },
+            ];
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            read_col(&device, &queue, comp, 4)
+        };
+        draw(&mut comp); // registers the instance
+        comp.ml_set_mask(&device, &queue, 8, (1, 4), &[0, 0, 255, 255]);
+        let col = draw(&mut comp);
+        // Red channel: green layer shows (0) where the mask is 0, red (255) where kept.
+        assert_eq!(
+            col,
+            [0, 0, 255, 255],
+            "top half must be transparent: {col:?}"
+        );
+    }
+
     fn solid<'a>(n: u128, px: &'a [u8; 4], opacity: f32) -> LayerDraw<'a> {
         LayerDraw {
             id: uuid::Uuid::from_u128(n),
@@ -1940,6 +2276,7 @@ mod tests {
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet: 1.0,
+            ml: None,
         };
         let (below, src) = ([255u8, 0, 0, 255], [51u8, 102, 204, 255]);
         let layers = [solid(1, &below, 1.0), solid(2, &src, 1.0)];

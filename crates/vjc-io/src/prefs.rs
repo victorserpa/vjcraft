@@ -17,6 +17,8 @@ pub struct General {
     pub last_project: Option<PathBuf>,
     /// Browser start folder; `None` = project folder, else ~/Movies.
     pub browser_folder: Option<PathBuf>,
+    /// Folder holding the ML model files (`.onnx`); `None` = `<app data dir>/models`.
+    pub models_folder: Option<PathBuf>,
 }
 
 impl Default for General {
@@ -27,6 +29,7 @@ impl Default for General {
             open_last_project: false,
             last_project: None,
             browser_folder: None,
+            models_folder: None,
         }
     }
 }

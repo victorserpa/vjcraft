@@ -14,7 +14,7 @@ use vjc_media::record::{Recorder, Summary};
 pub(crate) const MAX_INFLIGHT: usize = 3;
 
 pub(crate) const PENDING: u8 = 0;
-const OK: u8 = 1;
+pub(crate) const OK: u8 = 1;
 const ERR: u8 = 2;
 
 /// Shared result of one buffer map: pending, ok or error.
