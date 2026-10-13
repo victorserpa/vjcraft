@@ -540,9 +540,42 @@ impl Project {
     }
 }
 
+impl Composition {
+    /// True when the layer is not rendered: bypassed, or another layer is soloed.
+    pub fn layer_off(&self, l: &Layer) -> bool {
+        l.bypass || (!l.solo && self.layers.iter().any(|o| o.solo))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solo_turns_other_layers_off() {
+        let mut p = Project::new("t");
+        let mk = |solo, bypass| Layer {
+            id: Uuid::new_v4(),
+            name: "L".into(),
+            track: Track::new(BlendMode::Normal),
+            solo,
+            bypass,
+            crossfader_bus: None,
+            transition: Transition {
+                kind: "cut".into(),
+                duration_beats: None,
+                duration_secs: 0.0,
+            },
+            autopilot: Default::default(),
+            group: None,
+        };
+        p.composition.layers = vec![mk(false, false), mk(false, false)];
+        let c = &p.composition;
+        assert!(!c.layer_off(&c.layers[0]) && !c.layer_off(&c.layers[1]));
+        p.composition.layers[1].solo = true;
+        let c = &p.composition;
+        assert!(c.layer_off(&c.layers[0]) && !c.layer_off(&c.layers[1]));
+    }
 
     #[test]
     fn project_json_roundtrip() {

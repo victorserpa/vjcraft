@@ -180,13 +180,83 @@ impl Prefs {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
-        let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        // Keep fields this build does not know (file written by a newer version).
+        let mut new = serde_json::to_value(self).map_err(std::io::Error::other)?;
+        if let Some(old) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        {
+            let known = serde_json::to_value(Prefs::default()).map_err(std::io::Error::other)?;
+            merge_unknown(&mut new, &old, &known);
+            if let Some(v) = old.get("version").and_then(|v| v.as_u64())
+                && v > u64::from(PREFS_VERSION)
+            {
+                new["version"] = v.into();
+            }
+        }
+        let json = serde_json::to_vec_pretty(&new).map_err(std::io::Error::other)?;
         crate::write_atomic(path, &json)
+    }
+}
+
+/// Copies keys of `old` that the current struct does not know (`known` is a
+/// fully populated serialization), recursing into objects. Keys the struct knows
+/// but omitted from `new` (removed / None) stay removed.
+fn merge_unknown(new: &mut serde_json::Value, old: &serde_json::Value, known: &serde_json::Value) {
+    if let (Some(n), Some(o)) = (new.as_object_mut(), old.as_object()) {
+        for (k, v) in o {
+            match (n.get_mut(k), known.get(k)) {
+                (Some(nv), Some(kv)) => merge_unknown(nv, v, kv),
+                (None, Some(_)) => {}
+                (_, None) => {
+                    n.insert(k.clone(), v.clone());
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn save_keeps_unknown_fields_of_newer_file() {
+        let d = std::env::temp_dir().join(format!("vjc-prefs-new-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("prefs.json");
+        std::fs::write(
+            &f,
+            r#"{"version":7,"future":{"a":1},"video":{"fps":30.0,"hdr":true}}"#,
+        )
+        .unwrap();
+        let (p, _) = super::Prefs::load(&f);
+        p.save(&f).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert_eq!(v["future"]["a"], 1);
+        assert_eq!(v["video"]["hdr"], true);
+        assert_eq!(v["video"]["fps"], 30.0);
+        assert_eq!(v["version"], 7);
+    }
+
+    #[test]
+    fn save_does_not_resurrect_cleared_known_fields() {
+        let d = std::env::temp_dir().join(format!("vjc-prefs-clr-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("prefs.json");
+        let mut p = super::Prefs::default();
+        p.general.last_project = Some("/tmp/x.vjc".into());
+        p.save(&f).unwrap();
+        p.general.last_project = None;
+        p.save(&f).unwrap();
+        p.save(&f).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert!(v["general"]["last_project"].is_null());
+        std::fs::write(&f, r#"{"general":{"last_project":"/a","newer":5}}"#).unwrap();
+        p.save(&f).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        assert!(v["general"]["last_project"].is_null());
+        assert_eq!(v["general"]["newer"], 5);
+    }
+
     #[test]
     fn corrupt_file_is_backed_up() {
         let d = std::env::temp_dir().join(format!("vjc-prefs-bak-{}", std::process::id()));

@@ -262,18 +262,30 @@ pub fn text_field(
     let mut out = None;
     ui.horizontal(|ui| {
         ui.label(label);
+        // A buffer left from an edit that never lost focus (tab switched away) is stale:
+        // it only counts if the field was drawn in the previous frame too, so a focus
+        // loss this frame (Tab, click outside) still sees the typed text.
+        let eid = id.with("edit");
+        let frame = ui.ctx().cumulative_frame_nr();
         let mut buf: String = ui
-            .data(|d| d.get_temp(id))
-            .unwrap_or_else(|| current.into());
-        let e = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(160.0));
+            .data(|d| d.get_temp::<(String, u64)>(id))
+            .filter(|(_, f)| frame <= f + 1)
+            .map_or_else(|| current.into(), |(b, _)| b);
+        let e = ui.add(
+            egui::TextEdit::singleline(&mut buf)
+                .id(eid)
+                .desired_width(160.0),
+        );
         if e.lost_focus() {
-            ui.data_mut(|d| d.remove_temp::<String>(id));
+            ui.data_mut(|d| d.remove_temp::<(String, u64)>(id));
             let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
             if !esc && !buf.trim().is_empty() && buf.trim() != current {
                 out = Some(buf.trim().to_string());
             }
         } else if e.has_focus() {
-            ui.data_mut(|d| d.insert_temp(id, buf));
+            ui.data_mut(|d| d.insert_temp(id, (buf, frame)));
+        } else {
+            ui.data_mut(|d| d.remove_temp::<(String, u64)>(id));
         }
     });
     out

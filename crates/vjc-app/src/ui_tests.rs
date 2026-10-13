@@ -607,3 +607,94 @@ fn small_window_no_panic_no_overlap() {
         }
     }
 }
+
+#[test]
+fn drop_with_default_fit_is_one_undo_step() {
+    let mut p = prefs();
+    p.video.fit = FitMode::Fill;
+    let mut st = State::headless(p);
+    let deck = st.project.composition.current_deck;
+    let layer = st.project.composition.layers[0].id;
+    st.drop_file(layer, 0, PathBuf::from("/nonexistent/a.mp4"));
+    let fit = |s: &State| {
+        s.project
+            .composition
+            .decks
+            .iter()
+            .find(|d| d.id == deck)
+            .and_then(|d| d.clip_at(layer, 0))
+            .map(|c| c.fit)
+    };
+    assert_eq!(fit(&st), Some(FitMode::Fill));
+    st.undo();
+    assert_eq!(fit(&st), None);
+}
+
+#[test]
+fn save_as_records_last_project() {
+    let mut st = State::headless(prefs());
+    let f = tmp_vjc("lastproj");
+    assert!(st.save_to(f.clone()));
+    assert_eq!(st.prefs.general.last_project, Some(f));
+}
+
+#[test]
+fn name_field_applies_typed_text_on_tab() {
+    let mut h = app();
+    click(&mut h, "Layer");
+    h.query_all_by_value("Layer 2").next().unwrap().click();
+    settle(&mut h);
+    let lid = h.state().selected.unwrap().0;
+    let field = h
+        .query_all_by_role(egui::accesskit::Role::TextInput)
+        .filter(|n| n.value().as_deref() == Some("Layer 2"))
+        .max_by(|a, b| a.rect().min.y.total_cmp(&b.rect().min.y))
+        .expect("name field");
+    field.click();
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    h.event(egui::Event::Text("Renamed".into()));
+    h.step();
+    h.key_press(egui::Key::Tab);
+    settle(&mut h);
+    assert_eq!(layer_name(&h, lid), "Renamed", "Tab");
+    // Same via click outside the field (focus is surrendered before the widget runs).
+    let field = h
+        .query_all_by_role(egui::accesskit::Role::TextInput)
+        .filter(|n| n.value().as_deref() == Some("Renamed"))
+        .max_by(|a, b| a.rect().min.y.total_cmp(&b.rect().min.y))
+        .expect("name field");
+    field.click();
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    h.event(egui::Event::Text("Clicked".into()));
+    h.step();
+    let away = h.get_by_label("Add layer").rect().center();
+    h.hover_at(away);
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: away,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    settle(&mut h);
+    assert_eq!(layer_name(&h, lid), "Clicked", "click outside");
+}
+
+fn layer_name(h: &Harness<'_, State>, lid: LayerId) -> String {
+    h.state()
+        .project
+        .composition
+        .layers
+        .iter()
+        .find(|l| l.id == lid)
+        .unwrap()
+        .name
+        .clone()
+}

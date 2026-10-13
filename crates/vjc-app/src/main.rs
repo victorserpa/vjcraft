@@ -803,6 +803,8 @@ impl State {
         match vjc_io::save(&self.project, &path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
+                self.prefs.general.last_project = Some(path.clone());
+                self.save_prefs();
                 self.file = Some(path);
                 self.dirty = false;
                 if let Some(r) = self.recovery_path() {
@@ -1419,20 +1421,15 @@ impl State {
 
     fn drop_file(&mut self, layer: LayerId, column: u32, path: PathBuf) {
         let deck = self.project.composition.current_deck;
-        self.exec(Command::ImportMedia {
+        // One undo step: the default fit is set on the clip before it is placed.
+        let mut clip = vjc_core::clip_from_path(path);
+        clip.fit = self.prefs.video.fit;
+        self.exec(Command::SetClip {
             deck,
             layer,
             column,
-            path,
+            clip,
         });
-        if self.prefs.video.fit != FitMode::default() {
-            self.exec(Command::SetFit {
-                deck,
-                layer,
-                column,
-                fit: self.prefs.video.fit,
-            });
-        }
         self.exec(Command::TriggerClip {
             deck,
             layer,
@@ -1494,7 +1491,7 @@ impl State {
             .map(|l| {
                 (
                     l,
-                    if l.bypass {
+                    if c.layer_off(l) {
                         None
                     } else {
                         self.players
@@ -1543,7 +1540,7 @@ impl State {
             let clip_fx = clip.map(|k| k.track.effects.as_slice());
             let generator = match (clip.map(|k| &k.source), gens.get(&l.id)) {
                 (Some(vjc_model::Source::Generator { kind, params }), Some((_, _, t)))
-                    if !l.bypass =>
+                    if !c.layer_off(l) =>
                 {
                     self.fx.request(kind);
                     let ready = self.fx.status(kind) == Some(&fx::Status::Ready);
@@ -1572,7 +1569,7 @@ impl State {
                 .flow
                 .outgoing
                 .get(&l.id)
-                .filter(|_| !l.bypass)
+                .filter(|_| !c.layer_off(l))
                 .and_then(|o| Some((o, o.state.current()?, out_frames.get(&l.id)?)));
             let opacity = (vjc_core::anim::effective_number(&l.track.opacity, &actx)
                 * vjc_core::crossfader::layer_gain(
@@ -3534,6 +3531,9 @@ impl eframe::App for State {
 
     /// Closing the app mid-recording still writes the mp4 trailer (bounded wait).
     fn on_exit(&mut self) {
+        if self.prefs_dirty {
+            self.save_prefs();
+        }
         if let Some(cap) = self.capture.take() {
             let _ = cap.shutdown();
         }

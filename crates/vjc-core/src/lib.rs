@@ -1745,6 +1745,15 @@ impl History {
             },
             c => c,
         };
+        // Empty names are rejected for user edits only: undo/redo go through
+        // `apply` because a name that was already empty must be restorable.
+        if let Command::RenameLayer { name, .. }
+        | Command::RenameClip { name, .. }
+        | Command::RenameDeck { name, .. } = &cmd
+            && name.trim().is_empty()
+        {
+            return Err(Error::InvalidValue);
+        }
         let target = cmd.target();
         let Applied { inverse, events } = apply(p, cmd.clone())?;
         let Some(undo) = inverse else {
@@ -2038,6 +2047,54 @@ mod tests {
         assert_eq!(*p, before);
         h.redo(p).unwrap().unwrap();
         assert_eq!(*p, after);
+    }
+
+    #[test]
+    fn empty_names_rejected() {
+        let mut p = Project::new("t");
+        let mut h = History::new();
+        let d = p.composition.decks[0].id;
+        let r = h.exec(
+            &mut p,
+            Command::RenameDeck {
+                deck: d,
+                name: "  ".into(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(r, Err(Error::InvalidValue));
+        assert_eq!(p.composition.decks[0].name, "Deck");
+    }
+
+    #[test]
+    fn empty_clip_name_undo_redo_roundtrip() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        h.exec(
+            &mut p,
+            Command::ImportMedia {
+                deck: A,
+                layer: l,
+                column: 0,
+                path: "/".into(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(clip(&p, l).unwrap().name, "");
+        let rename = |name: &str| Command::RenameClip {
+            deck: A,
+            layer: l,
+            column: 0,
+            name: name.into(),
+        };
+        let t = Instant::now() + std::time::Duration::from_secs(10);
+        h.exec(&mut p, rename("a"), t).unwrap();
+        assert!(h.undo(&mut p).unwrap().is_ok());
+        assert_eq!(clip(&p, l).unwrap().name, "");
+        assert!(h.redo(&mut p).unwrap().is_ok());
+        assert_eq!(clip(&p, l).unwrap().name, "a");
+        assert!(h.exec(&mut p, rename(" "), t).is_err());
     }
 
     #[test]
