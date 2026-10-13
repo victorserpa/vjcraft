@@ -2,6 +2,8 @@
 //! function `apply`. `History` keeps inverses for undo/redo. No UI, no players: the app
 //! reacts to the returned `Event`s. See replica/architecture.md section 3.
 
+pub mod clock;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -72,6 +74,24 @@ pub enum Command {
     SetBpm {
         bpm: f64,
     },
+    /// Stretches the clip to `beats` beats (None = off). The app derives the player rate.
+    SetBeatSync {
+        layer: LayerId,
+        column: ColumnIdx,
+        beats: Option<f64>,
+    },
+    /// Clock input (not undoable, not in history): the app forwards these to its `Clock`.
+    Tap {
+        at: Instant,
+    },
+    /// -1, 0, +1: temporary slower/normal/faster.
+    Nudge {
+        dir: i8,
+        at: Instant,
+    },
+    Resync {
+        at: Instant,
+    },
 }
 
 /// What a coalescible command targets.
@@ -106,6 +126,16 @@ pub enum Event {
     CellChanged {
         layer: LayerId,
         column: ColumnIdx,
+    },
+    Tap {
+        at: Instant,
+    },
+    Nudge {
+        dir: i8,
+        at: Instant,
+    },
+    Resync {
+        at: Instant,
     },
 }
 
@@ -353,6 +383,42 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let removed = p.composition.columns.remove(i);
             undoable(Command::AddColumn { column: removed }, vec![])
         }
+        Command::SetBeatSync {
+            layer,
+            column,
+            beats,
+        } => {
+            check_cell(p, layer, column)?;
+            if beats.is_some_and(|b| !b.is_finite() || b <= 0.0) {
+                return Err(Error::InvalidValue);
+            }
+            let k = deck_mut(p)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .ok_or(Error::NoClip)?;
+            let prev = std::mem::replace(&mut k.clip.transport.beat_sync, beats);
+            undoable(
+                Command::SetBeatSync {
+                    layer,
+                    column,
+                    beats: prev,
+                },
+                vec![],
+            )
+        }
+        Command::Tap { at } => Ok(Applied {
+            inverse: None,
+            events: vec![Event::Tap { at }],
+        }),
+        Command::Nudge { dir, at } => Ok(Applied {
+            inverse: None,
+            events: vec![Event::Nudge { dir, at }],
+        }),
+        Command::Resync { at } => Ok(Applied {
+            inverse: None,
+            events: vec![Event::Resync { at }],
+        }),
         Command::SetBpm { bpm } => {
             if !bpm.is_finite() || bpm <= 0.0 {
                 return Err(Error::InvalidValue);
@@ -702,6 +768,32 @@ mod tests {
                 fit: FitMode::Fill,
             },
         );
+    }
+
+    #[test]
+    fn beat_sync_roundtrip_and_validation() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let set = |beats| Command::SetBeatSync {
+            layer: l,
+            column: 0,
+            beats,
+        };
+        roundtrip(&mut p, set(Some(4.0)));
+        assert_eq!(apply(&mut p, set(Some(0.0))), Err(Error::InvalidValue));
+    }
+
+    #[test]
+    fn clock_inputs_are_events_not_history() {
+        let (mut p, _) = setup();
+        let mut h = History::new();
+        let at = Instant::now();
+        let ev = h.exec(&mut p, Command::Tap { at }, at).unwrap();
+        assert_eq!(ev, vec![Event::Tap { at }]);
+        h.exec(&mut p, Command::Resync { at }, at).unwrap();
+        h.exec(&mut p, Command::Nudge { dir: 1, at }, at).unwrap();
+        assert!(!h.can_undo());
     }
 
     #[test]

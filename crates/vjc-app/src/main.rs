@@ -7,6 +7,7 @@ use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
+use vjc_core::clock::{Clock, beat_sync_rate};
 use vjc_core::{Command, Event, History};
 use vjc_media::{Frame, Player};
 use vjc_model::{BlendMode, Column, FitMode, Layer, LayerId, Project, Track, Transition};
@@ -34,6 +35,14 @@ struct State {
     dirty: bool,
     last_autosave: std::time::Instant,
     title: String,
+    /// Master clock (runtime only; BPM lives in the project, phase here).
+    clock: Clock,
+    /// Latest beat index and phase from `clock.tick`, for the indicator.
+    beat: i64,
+    phase: f64,
+    nudge_dir: i8,
+    /// Visual only for now. TODO(#9): click sound (see build-log).
+    metronome: bool,
 }
 
 /// Grid cell geometry for hit-testing.
@@ -157,6 +166,11 @@ impl State {
             dirty: false,
             last_autosave: std::time::Instant::now(),
             title: String::new(),
+            clock: Clock::new(120.0, std::time::Instant::now()),
+            beat: 0,
+            phase: 0.0,
+            nudge_dir: 0,
+            metronome: false,
         }
     }
 
@@ -332,12 +346,23 @@ impl State {
 
     /// Sends a command through the bus and reacts to the resulting events.
     fn exec(&mut self, cmd: Command) {
+        // Clock inputs and triggers do not change the saved project.
+        let runtime = matches!(
+            cmd,
+            Command::Tap { .. }
+                | Command::Nudge { .. }
+                | Command::Resync { .. }
+                | Command::TriggerClip { .. }
+                | Command::ClearLayer { .. }
+        );
         match self
             .history
             .exec(&mut self.project, cmd, std::time::Instant::now())
         {
             Ok(events) => {
-                self.dirty = true;
+                if !runtime {
+                    self.dirty = true;
+                }
                 self.handle(events);
             }
             Err(e) => self.status = format!("Command failed: {e}"),
@@ -384,12 +409,49 @@ impl State {
                 Event::LayerCleared { layer } => {
                     self.players.remove(&layer);
                 }
+                Event::Tap { at } => {
+                    if let Some(bpm) = self.clock.tap(at) {
+                        self.exec(Command::SetBpm { bpm });
+                    }
+                }
+                Event::Nudge { dir, at } => self.clock.nudge(dir, at),
+                Event::Resync { at } => self.clock.resync(at),
                 Event::CellChanged { layer, column } => {
                     if self.players.get(&layer).map(|(c, _)| *c) == Some(column) {
                         self.players.remove(&layer);
                     }
                 }
             }
+        }
+    }
+
+    /// Once per frame: follows the project BPM, advances the clock and sets the player
+    /// rate of every beat-synced clip (clip length = n beats; else just `speed`).
+    fn tick_clock(&mut self) {
+        let now = std::time::Instant::now();
+        let bpm = self.project.composition.tempo.bpm;
+        if self.clock.bpm() != bpm.clamp(vjc_core::clock::MIN_BPM, vjc_core::clock::MAX_BPM) {
+            self.clock.set_bpm(bpm, now);
+        }
+        let t = self.clock.tick(now);
+        self.phase = t.phase;
+        if let Some(b) = t.beat {
+            self.beat = b;
+        }
+        let c = &self.project.composition;
+        let Some(deck) = c.decks.iter().find(|d| d.id == c.current_deck) else {
+            return;
+        };
+        for (layer, (col, player)) in &self.players {
+            let Some(clip) = deck.clip_at(*layer, *col) else {
+                continue;
+            };
+            let tr = &clip.transport;
+            let sync = match (tr.beat_sync, player.duration()) {
+                (Some(n), Some(d)) => beat_sync_rate(d, n, bpm),
+                _ => 1.0,
+            };
+            player.set_rate(tr.speed * sync);
         }
     }
 
@@ -465,6 +527,78 @@ impl State {
             })
             .collect();
         comp.render(&rs.device, &rs.queue, &draws);
+    }
+
+    /// Tempo row: BPM, tap, nudge (hold), resync, half/double, beat lights, metronome.
+    fn time_bar(&mut self, ui: &mut egui::Ui) {
+        let now = std::time::Instant::now();
+        let mut cmds = vec![];
+        ui.horizontal(|ui| {
+            ui.label("BPM");
+            let mut bpm = self.project.composition.tempo.bpm;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut bpm)
+                        .range(20.0..=300.0)
+                        .speed(0.1),
+                )
+                .changed()
+            {
+                cmds.push(Command::SetBpm { bpm });
+            }
+            if ui.button("Tap").clicked() {
+                cmds.push(Command::Tap { at: now });
+            }
+            let minus = ui.button("\u{2212}").on_hover_text("Nudge slower (hold)");
+            let plus = ui.button("+").on_hover_text("Nudge faster (hold)");
+            let dir = if minus.is_pointer_button_down_on() {
+                -1
+            } else if plus.is_pointer_button_down_on() {
+                1
+            } else {
+                0
+            };
+            if dir != self.nudge_dir {
+                self.nudge_dir = dir;
+                cmds.push(Command::Nudge { dir, at: now });
+            }
+            if ui.button("Resync").clicked() {
+                cmds.push(Command::Resync { at: now });
+            }
+            let bpm = self.project.composition.tempo.bpm;
+            if ui.button("\u{00f7}2").clicked() {
+                cmds.push(Command::SetBpm {
+                    bpm: (bpm / 2.0).max(vjc_core::clock::MIN_BPM),
+                });
+            }
+            if ui.button("\u{00d7}2").clicked() {
+                cmds.push(Command::SetBpm {
+                    bpm: (bpm * 2.0).min(vjc_core::clock::MAX_BPM),
+                });
+            }
+            // 4 lights: the current beat of the bar glows, fading with the phase.
+            let on = self.beat.rem_euclid(4) as usize;
+            let fade = (1.0 - self.phase.fract()).clamp(0.0, 1.0) as f32;
+            for i in 0..4 {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                let col = if i == on {
+                    let base = if i == 0 {
+                        egui::Color32::YELLOW
+                    } else {
+                        egui::Color32::LIGHT_BLUE
+                    };
+                    base.gamma_multiply(0.35 + 0.65 * fade)
+                } else {
+                    ui.visuals().widgets.inactive.bg_fill
+                };
+                ui.painter().circle_filled(rect.center(), 6.0, col);
+            }
+            ui.toggle_value(&mut self.metronome, "Metronome");
+        });
+        for c in cmds {
+            self.exec(c);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -546,21 +680,8 @@ impl State {
                     self.output = None;
                 }
             });
-            ui.separator();
-            ui.label("BPM");
-            let mut bpm = self.project.composition.tempo.bpm;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut bpm)
-                        .range(20.0..=300.0)
-                        .speed(0.1),
-                )
-                .changed()
-            {
-                self.exec(Command::SetBpm { bpm });
-            }
-            // TODO: BPM is fixed for M0; no clock/sync yet.
         });
+        self.time_bar(ui);
 
         // Undo/redo shortcuts (Shift variant first: it also matches plain Cmd+Z).
         let redo_key = egui::KeyboardShortcut::new(
@@ -726,7 +847,32 @@ impl State {
                                 .min_size(egui::vec2(90.0, 24.0));
                             let r = ui.add(btn);
                             if let Some(cur_fit) = clip.map(|k| k.fit) {
+                                let cur_sync = clip.and_then(|k| k.transport.beat_sync);
                                 r.context_menu(|ui| {
+                                    ui.label("Sync to BPM");
+                                    let opts = [
+                                        None,
+                                        Some(1.0),
+                                        Some(2.0),
+                                        Some(4.0),
+                                        Some(8.0),
+                                        Some(16.0),
+                                    ];
+                                    for o in opts {
+                                        let label = match o {
+                                            None => "off".to_string(),
+                                            Some(n) => format!("{n} beats"),
+                                        };
+                                        if ui.selectable_label(cur_sync == o, label).clicked() {
+                                            cmds.push(Command::SetBeatSync {
+                                                layer: lid,
+                                                column: ci,
+                                                beats: o,
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
                                     ui.label("Aspect ratio");
                                     for m in FitMode::ALL {
                                         if ui.selectable_label(cur_fit == m, m.label()).clicked() {
@@ -897,6 +1043,7 @@ impl State {
 impl eframe::App for State {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_monitors();
+        self.tick_clock();
         self.compose(frame);
         State::ui(self, ui);
         let ctx = ui.ctx().clone();

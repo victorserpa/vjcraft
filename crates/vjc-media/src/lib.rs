@@ -4,7 +4,7 @@
 
 use ffmpeg_next as ff;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -23,6 +23,26 @@ struct Shared {
     latest: Mutex<Option<Frame>>,
     stop: AtomicBool,
     error: Mutex<Option<String>>,
+    /// Playback rate (f64 bits), 1.0 = file speed. Set by `Player::set_rate`.
+    rate: AtomicU64,
+    /// File duration in seconds (f64 bits); 0 = unknown.
+    duration: AtomicU64,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            latest: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            error: Mutex::new(None),
+            rate: AtomicU64::new(1.0f64.to_bits()),
+            duration: AtomicU64::new(0),
+        }
+    }
+
+    fn rate(&self) -> f64 {
+        f64::from_bits(self.rate.load(Ordering::Relaxed))
+    }
 }
 
 pub struct Player {
@@ -35,11 +55,7 @@ impl Player {
     /// Starts decoding `path` in a background thread. Open errors are reported via `error()`.
     pub fn open(path: impl AsRef<Path>) -> Player {
         let path = path.as_ref().to_path_buf();
-        let shared = Arc::new(Shared {
-            latest: Mutex::new(None),
-            stop: AtomicBool::new(false),
-            error: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new());
         let (s, p) = (shared.clone(), path.clone());
         let thread = std::thread::Builder::new()
             .name("vjc-decode".into())
@@ -69,6 +85,22 @@ impl Player {
 
     pub fn error(&self) -> Option<String> {
         self.shared.error.lock().unwrap().clone()
+    }
+
+    /// Sets the playback rate (1.0 = file speed), clamped to 0.05..=20. Applies from the
+    /// next frame without a time jump. Design choice: the decode thread paces itself by
+    /// this rate, so the clock stays outside the player (simplest; no seek per tick).
+    pub fn set_rate(&self, rate: f64) {
+        let r = if rate.is_finite() { rate } else { 1.0 };
+        self.shared
+            .rate
+            .store(r.clamp(0.05, 20.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Duration of the file in seconds, once known (None for images/unknown).
+    pub fn duration(&self) -> Option<f64> {
+        let d = f64::from_bits(self.shared.duration.load(Ordering::Relaxed));
+        (d > 0.0).then_some(d)
     }
 
     pub fn stop(&mut self) {
@@ -129,7 +161,7 @@ impl Pool {
 /// Decodes the file; with `looping` restarts at EOF. Also used by tests with `looping=false`
 /// through `decode_n`.
 fn run(path: &Path, shared: &Shared, looping: bool) -> Result<(), ff::Error> {
-    decode_loop(path, looping, &mut |frame, due| {
+    decode_loop(path, looping, shared, &mut |frame, due| {
         // Pace: wait until the frame's presentation time.
         loop {
             if shared.stop.load(Ordering::Relaxed) {
@@ -149,10 +181,16 @@ fn run(path: &Path, shared: &Shared, looping: bool) -> Result<(), ff::Error> {
 fn decode_loop(
     path: &Path,
     looping: bool,
+    shared: &Shared,
     sink: &mut dyn FnMut(Frame, Instant) -> bool,
 ) -> Result<(), ff::Error> {
     ff::init()?;
     let mut ictx = ff::format::input(&path)?;
+    let dur = ictx.duration();
+    if dur > 0 {
+        let secs = dur as f64 / f64::from(ff::ffi::AV_TIME_BASE);
+        shared.duration.store(secs.to_bits(), Ordering::Relaxed);
+    }
     let (stream_idx, tb, avg_fps, params) = {
         let st = ictx
             .streams()
@@ -177,6 +215,10 @@ fn decode_loop(
     let mut seq = 0u64;
     let mut base = Instant::now();
     let mut first_pts: Option<f64> = None;
+    // Pacing anchor: media time `anchor_t` plays at wall time `base`, at `cur_rate`.
+    let mut cur_rate = shared.rate();
+    let mut anchor_t: Option<f64> = None;
+    let mut last_t = f64::NAN;
     let mut count = 0u64;
     let mut emitted_this_pass = 0u64;
 
@@ -209,7 +251,18 @@ fn decode_loop(
                     .map(|p| p as f64 * tb)
                     .unwrap_or(count as f64 / avg_fps);
                 let first = *first_pts.get_or_insert(t);
-                let due = base + Duration::from_secs_f64((t - first).max(0.0));
+                let rate = shared.rate();
+                let at = *anchor_t.get_or_insert(first);
+                if rate != cur_rate {
+                    // Re-anchor at the previous frame so the rate change has no jump.
+                    let (advance, anchor) = rerate(last_t, at, cur_rate);
+                    base += advance;
+                    anchor_t = Some(anchor);
+                    cur_rate = rate;
+                }
+                last_t = t;
+                let due = base
+                    + Duration::from_secs_f64((t - anchor_t.unwrap_or(first)).max(0.0) / cur_rate);
                 count += 1;
                 emitted_this_pass += 1;
                 seq += 1;
@@ -248,15 +301,30 @@ fn decode_loop(
         decoder.flush();
         base = Instant::now();
         first_pts = None;
+        anchor_t = None;
+        // No previous frame in the new pass.
+        last_t = f64::NAN;
         count = 0;
         emitted_this_pass = 0;
     }
 }
 
+/// Wall-time advance and new anchor when the rate changes. `last_t` is the
+/// previous frame's pts in this pass, or NaN when there is none yet.
+fn rerate(last_t: f64, anchor: f64, cur_rate: f64) -> (Duration, f64) {
+    if last_t.is_nan() {
+        return (Duration::ZERO, anchor);
+    }
+    (
+        Duration::from_secs_f64((last_t - anchor).max(0.0) / cur_rate),
+        last_t,
+    )
+}
+
 /// Decodes up to `n` frames as fast as possible (no pacing, no loop). For tests/benchmarks.
 pub fn decode_n(path: &Path, n: usize) -> Result<Vec<Frame>, ff::Error> {
     let mut out = vec![];
-    decode_loop(path, false, &mut |f, _| {
+    decode_loop(path, false, &Shared::new(), &mut |f, _| {
         out.push(Frame {
             data: Arc::new((*f.data).clone()),
             ..f
@@ -268,6 +336,17 @@ pub fn decode_n(path: &Path, n: usize) -> Result<Vec<Frame>, ff::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rerate_at_pass_start_does_not_jump() {
+        // Previous pass ended at 9.5 s; new pass starts with no previous frame.
+        let (adv, anchor) = super::rerate(f64::NAN, 0.0, 1.0);
+        assert_eq!(adv, std::time::Duration::ZERO);
+        assert_eq!(anchor, 0.0);
+        let (adv, anchor) = super::rerate(2.0, 1.0, 0.5);
+        assert_eq!(adv, std::time::Duration::from_secs(2));
+        assert_eq!(anchor, 2.0);
+    }
+
     use super::*;
 
     const SAMPLE: &str = "/Applications/Resolume Arena/media/AV/Beat 001.mov";
@@ -337,5 +416,18 @@ mod tests {
             eprintln!("{name}: ok {}x{}", frames[0].width, frames[0].height);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_rate_is_clamped_and_sanitized() {
+        let pl = Player::open("/nonexistent/x.mov");
+        assert_eq!(pl.shared.rate(), 1.0);
+        pl.set_rate(2.0);
+        assert_eq!(pl.shared.rate(), 2.0);
+        pl.set_rate(1000.0);
+        assert_eq!(pl.shared.rate(), 20.0);
+        pl.set_rate(f64::NAN);
+        assert_eq!(pl.shared.rate(), 1.0);
+        assert_eq!(pl.duration(), None);
     }
 }
