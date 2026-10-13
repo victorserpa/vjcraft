@@ -60,6 +60,17 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
         ["comp", "master", "opacity"] => Some(number(&p.composition.master.opacity.value)),
         ["comp", "master", "bypass"] => Some(f64::from(u8::from(ctx.master_bypass))),
         ["comp", "tempo", "bpm"] => Some(p.composition.tempo.bpm),
+        ["comp", "dashboard", n] => {
+            let i = number_of(n)?
+                .checked_sub(1)
+                .filter(|i| *i < super::anim::DIALS)?;
+            Some(
+                p.composition
+                    .dashboard
+                    .get(i)
+                    .map_or(0.0, |d| number(&d.value)),
+            )
+        }
         _ => None,
     }
 }
@@ -115,6 +126,15 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
         ["comp", "master", "opacity"] => Some(Command::SetMasterOpacity {
             value: value.clamp(0.0, 1.0),
         }),
+        ["comp", "dashboard", n] => {
+            let dial = number_of(n)?
+                .checked_sub(1)
+                .filter(|i| *i < super::anim::DIALS)?;
+            Some(Command::SetDashboardDial {
+                dial: dial as u32,
+                value: value.clamp(0.0, 1.0),
+            })
+        }
         ["comp", "clear"] => fire.then_some(Command::ClearAll),
         _ => None,
     }

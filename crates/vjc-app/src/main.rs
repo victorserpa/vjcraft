@@ -145,6 +145,7 @@ fn draw_chain(
     chain: &[vjc_model::Effect],
     time: f32,
     size: (u32, u32),
+    ctx: &vjc_core::anim::AnimCtx,
 ) -> Vec<EffectDraw> {
     let mut out = vec![];
     for e in chain.iter().filter(|e| !e.bypass) {
@@ -155,7 +156,7 @@ fn draw_chain(
         if let Some(isf) = lib.isf(&e.kind) {
             out.push(EffectDraw {
                 kind: e.kind.clone(),
-                uniforms: isf.pack(&e.params, time, size),
+                uniforms: isf.pack(&vjc_core::anim::resolve(&e.params, ctx), time, size),
             });
         }
     }
@@ -242,11 +243,20 @@ fn labeled<T: Copy>(v: &[(T, &str)]) -> Vec<(T, String)> {
     v.iter().map(|(a, n)| (*a, n.to_string())).collect()
 }
 
+fn number_of(v: &vjc_model::Value) -> f64 {
+    match v {
+        vjc_model::Value::Number(n) => *n,
+        _ => 0.0,
+    }
+}
+
 /// Edits one effect param; returns the new value when the user changed it.
 fn param_widget(
     ui: &mut egui::Ui,
     p: &vjc_model::Param,
     kind: &vjc_fx::InputKind,
+    ctx: &vjc_core::anim::AnimCtx,
+    anim_out: &mut Option<Option<vjc_model::Animation>>,
 ) -> Option<vjc_model::Value> {
     let (name, value) = (p.name.as_str(), &p.value);
     use vjc_fx::InputKind as K;
@@ -261,7 +271,12 @@ fn param_widget(
                     V::Number(d) => d,
                     _ => *min,
                 };
-                out = params::param_slider(ui, name, "", *n, d, (*min, *max)).map(V::Number);
+                let shown = vjc_core::anim::effective_number(p, ctx);
+                let (v, a) =
+                    params::param_slider_anim(ui, name, "", shown, d, (*min, *max), &p.animation);
+                out = v.map(V::Number);
+                *anim_out = a;
+                let _ = n;
             }
             (K::Bool { .. }, V::Bool(b)) => {
                 let mut x = *b;
@@ -1175,12 +1190,32 @@ impl State {
         });
     }
 
+    /// Dashboard dial values 0..1 (missing dials read 0).
+    fn dials(&self) -> Vec<f64> {
+        let d = &self.project.composition.dashboard;
+        (0..vjc_core::anim::DIALS)
+            .map(|i| d.get(i).map_or(0.0, |p| number_of(&p.value)))
+            .collect()
+    }
+
+    /// Animation inputs of this frame. TODO(#24): no FFT bands until audio input exists.
+    fn anim_ctx<'a>(&self, dials: &'a [f64]) -> vjc_core::anim::AnimCtx<'a> {
+        vjc_core::anim::AnimCtx {
+            beat_phase: self.clock.phase(std::time::Instant::now()),
+            time_secs: self.fx_epoch.elapsed().as_secs_f64(),
+            fft_bands: &[],
+            dashboard: dials,
+        }
+    }
+
     fn compose(&mut self, frame: &eframe::Frame) {
         let Some(rs) = frame.wgpu_render_state() else {
             return;
         };
         let c = &self.project.composition;
         let (w, h) = (c.width.max(1), c.height.max(1));
+        let dials = self.dials();
+        let actx = self.anim_ctx(&dials);
         if self.comp.is_none() {
             let comp = Compositor::new(&rs.device, w, h);
             self.comp_tex = Some(rs.renderer.write().register_native_texture(
@@ -1258,25 +1293,39 @@ impl State {
                     let ready = self.fx.status(kind) == Some(&fx::Status::Ready);
                     self.fx.isf(kind).filter(|_| ready).map(|isf| EffectDraw {
                         kind: kind.clone(),
-                        uniforms: isf.pack(params, *t as f32, (w, h)),
+                        uniforms: isf.pack(
+                            &vjc_core::anim::resolve(params, &actx),
+                            *t as f32,
+                            (w, h),
+                        ),
                     })
                 }
                 _ => None,
             };
-            let mut effects = draw_chain(&mut self.fx, clip_fx.unwrap_or_default(), time, size);
-            effects.extend(draw_chain(&mut self.fx, &l.track.effects, time, size));
+            let mut effects =
+                draw_chain(&mut self.fx, clip_fx.unwrap_or_default(), time, size, &actx);
+            effects.extend(draw_chain(
+                &mut self.fx,
+                &l.track.effects,
+                time,
+                size,
+                &actx,
+            ));
             let cross = self
                 .flow
                 .outgoing
                 .get(&l.id)
                 .filter(|_| !l.bypass)
                 .and_then(|o| Some((o, o.state.current()?, out_frames.get(&l.id)?)));
-            let opacity = match l.track.opacity.value {
-                vjc_model::Value::Number(n) => n as f32,
-                _ => 1.0,
-            };
+            let opacity = vjc_core::anim::effective_number(&l.track.opacity, &actx) as f32;
             if let Some((o, (kind, prog), of)) = cross {
-                let fx = draw_chain(&mut self.fx, &l.track.effects, time, (of.width, of.height));
+                let fx = draw_chain(
+                    &mut self.fx,
+                    &l.track.effects,
+                    time,
+                    (of.width, of.height),
+                    &actx,
+                );
                 draws.push(LayerDraw {
                     id: Uuid::from_u128(l.id.as_u128() ^ OUT_MASK),
                     opacity,
@@ -1301,14 +1350,11 @@ impl State {
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
             });
         }
-        let master = draw_chain(&mut self.fx, &c.master.effects, time, (w, h));
+        let master = draw_chain(&mut self.fx, &c.master.effects, time, (w, h), &actx);
         let master_opacity = if self.master_bypass {
             0.0
         } else {
-            match c.master.opacity.value {
-                vjc_model::Value::Number(n) => n as f32,
-                _ => 1.0,
-            }
+            vjc_core::anim::effective_number(&c.master.opacity, &actx) as f32
         };
         comp.render(&rs.device, &rs.queue, &draws, &master, master_opacity);
     }
@@ -2122,6 +2168,8 @@ impl State {
     }
 
     fn composition_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let dials = self.dials();
+        let actx = self.anim_ctx(&dials);
         let c = &self.project.composition;
         if let Some(name) = params::text_field(ui, "cname", "Name", &c.name) {
             cmds.push(Command::SetCompositionName { name });
@@ -2151,10 +2199,26 @@ impl State {
             });
         }
         let op = &c.master.opacity;
-        if let (Value::Number(n), Value::Number(d)) = (&op.value, &op.default)
-            && let Some(value) = params::param_slider(ui, "mop", "Opacity", *n, *d, (0.0, 1.0))
-        {
-            cmds.push(Command::SetMasterOpacity { value });
+        if let Value::Number(d) = &op.default {
+            let shown = vjc_core::anim::effective_number(op, &actx);
+            let (v, a) = params::param_slider_anim(
+                ui,
+                "mop",
+                "Opacity",
+                shown,
+                *d,
+                (0.0, 1.0),
+                &op.animation,
+            );
+            if let Some(value) = v {
+                cmds.push(Command::SetMasterOpacity { value });
+            }
+            if let Some(animation) = a {
+                cmds.push(Command::SetAnimation {
+                    target: vjc_core::AnimTarget::MasterOpacity,
+                    animation,
+                });
+            }
         }
         if let Some(value) =
             params::param_slider(ui, "msp", "Speed", c.master_speed, 1.0, (0.0, 4.0))
@@ -2162,10 +2226,28 @@ impl State {
             cmds.push(Command::SetMasterSpeed { value });
         }
         ui.separator();
+        ui.strong("Dashboard");
+        for (i, v) in dials.iter().enumerate() {
+            let n = i + 1;
+            let r = ui.horizontal(|ui| {
+                params::param_slider(ui, ("dial", i), &format!("Dial {n}"), *v, 0.0, (0.0, 1.0))
+            });
+            if let Some(value) = r.inner {
+                cmds.push(Command::SetDashboardDial {
+                    dial: i as u32,
+                    value,
+                });
+            }
+            self.targets
+                .push((r.response.rect, format!("/comp/dashboard/{n}")));
+        }
+        ui.separator();
         self.chain_ui(ui, EffectTarget::Master, cmds);
     }
 
     fn layer_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let dials = self.dials();
+        let actx = self.anim_ctx(&dials);
         let Some(lid) = self.selected.map(|s| s.0) else {
             ui.label("Select a layer (click its name or a cell).");
             return;
@@ -2177,11 +2259,26 @@ impl State {
             cmds.push(Command::RenameLayer { layer: lid, name });
         }
         let op = &l.track.opacity;
-        if let (Value::Number(n), Value::Number(d)) = (&op.value, &op.default)
-            && let Some(value) =
-                params::param_slider(ui, ("lop", lid), "Opacity", *n, *d, (0.0, 1.0))
-        {
-            cmds.push(Command::SetOpacity { layer: lid, value });
+        if let Value::Number(d) = &op.default {
+            let shown = vjc_core::anim::effective_number(op, &actx);
+            let (v, a) = params::param_slider_anim(
+                ui,
+                ("lop", lid),
+                "Opacity",
+                shown,
+                *d,
+                (0.0, 1.0),
+                &op.animation,
+            );
+            if let Some(value) = v {
+                cmds.push(Command::SetOpacity { layer: lid, value });
+            }
+            if let Some(animation) = a {
+                cmds.push(Command::SetAnimation {
+                    target: vjc_core::AnimTarget::LayerOpacity(lid),
+                    animation,
+                });
+            }
         }
         let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
             .iter()
@@ -2304,6 +2401,8 @@ impl State {
             return;
         };
         let k = k.clone();
+        let dials = self.dials();
+        let actx = self.anim_ctx(&dials);
         let t = &k.transport;
         if let Some(name) = params::text_field(ui, ("kname", layer, column), "Name", &k.name) {
             cmds.push(Command::RenameClip {
@@ -2327,7 +2426,22 @@ impl State {
                     let Some(ik) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
                         continue;
                     };
-                    if let Some(value) = ui.push_id(pi, |ui| param_widget(ui, p, ik)).inner {
+                    let mut an = None;
+                    let r = ui
+                        .push_id(pi, |ui| param_widget(ui, p, ik, &actx, &mut an))
+                        .inner;
+                    if let Some(animation) = an {
+                        cmds.push(Command::SetAnimation {
+                            target: vjc_core::AnimTarget::Generator {
+                                deck,
+                                layer,
+                                column,
+                                param: pi,
+                            },
+                            animation,
+                        });
+                    }
+                    if let Some(value) = r {
                         cmds.push(Command::SetGeneratorParam {
                             deck,
                             layer,
@@ -2506,6 +2620,8 @@ impl State {
         let n = chain.len();
         for (i, e) in chain.iter().enumerate() {
             let inputs = self.fx.isf(&e.kind).map(|f| f.inputs.clone());
+            let dials = self.dials();
+            let actx = self.anim_ctx(&dials);
             let failure = match self.fx.status(&e.kind) {
                 Some(fx::Status::Failed(why)) => Some(why.clone()),
                 _ => None,
@@ -2552,7 +2668,21 @@ impl State {
                     continue;
                 };
                 // Scope ids per effect so equal param names do not share edit state.
-                if let Some(value) = ui.push_id((e.id, pi), |ui| param_widget(ui, p, kind)).inner {
+                let mut an = None;
+                let r = ui
+                    .push_id((e.id, pi), |ui| param_widget(ui, p, kind, &actx, &mut an))
+                    .inner;
+                if let Some(animation) = an {
+                    cmds.push(Command::SetAnimation {
+                        target: vjc_core::AnimTarget::Effect {
+                            target,
+                            effect: e.id,
+                            param: pi,
+                        },
+                        animation,
+                    });
+                }
+                if let Some(value) = r {
                     cmds.push(Command::SetEffectParam {
                         target,
                         effect: e.id,

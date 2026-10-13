@@ -2,6 +2,7 @@
 //! function `apply`. `History` keeps inverses for undo/redo. No UI, no players: the app
 //! reacts to the returned `Event`s. See replica/architecture.md section 3.
 
+pub mod anim;
 pub mod blend;
 pub mod clock;
 pub mod effects;
@@ -141,6 +142,16 @@ pub enum Command {
     },
     SetOpacity {
         layer: LayerId,
+        value: f64,
+    },
+    /// Sets or clears the animation of a numeric param (undoable, coalesces per target).
+    SetAnimation {
+        target: AnimTarget,
+        animation: Option<vjc_model::Animation>,
+    },
+    /// Dashboard dial `dial` (0..8), value 0..=1 (coalesces).
+    SetDashboardDial {
+        dial: u32,
         value: f64,
     },
     SetBlend {
@@ -301,6 +312,24 @@ pub enum Command {
     },
 }
 
+/// A param that can be animated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimTarget {
+    LayerOpacity(LayerId),
+    MasterOpacity,
+    Effect {
+        target: EffectTarget,
+        effect: EffectId,
+        param: usize,
+    },
+    Generator {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        param: usize,
+    },
+}
+
 /// What a coalescible command targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -311,6 +340,8 @@ enum Target {
     MasterSpeed,
     EffectParam(EffectId, usize),
     GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
+    Dial(u32),
+    Anim(AnimTarget),
 }
 
 impl Command {
@@ -318,6 +349,9 @@ impl Command {
         match self {
             Command::SetOpacity { layer, .. } => Some(Target::Opacity(*layer)),
             Command::SetBpm { .. } => Some(Target::Bpm),
+            Command::SetDashboardDial { dial, .. } => Some(Target::Dial(*dial)),
+            // Dragging an animation field emits one command per frame.
+            Command::SetAnimation { target, .. } => Some(Target::Anim(*target)),
             Command::SetMasterOpacity { .. } => Some(Target::MasterOpacity),
             Command::SetMasterSpeed { .. } => Some(Target::MasterSpeed),
             Command::SetEffectParam { effect, param, .. } => {
@@ -435,6 +469,46 @@ impl std::error::Error for Error {}
 pub struct Applied {
     pub inverse: Option<Command>,
     pub events: Vec<Event>,
+}
+
+fn anim_param_mut(p: &mut Project, t: AnimTarget) -> Result<&mut Param, Error> {
+    match t {
+        AnimTarget::MasterOpacity => Ok(&mut p.composition.master.opacity),
+        AnimTarget::LayerOpacity(l) => {
+            let i = layer_idx(p, l)?;
+            Ok(&mut p.composition.layers[i].track.opacity)
+        }
+        AnimTarget::Effect {
+            target,
+            effect,
+            param,
+        } => effects::track_mut(p, target)?
+            .effects
+            .iter_mut()
+            .find(|e| e.id == effect)
+            .ok_or(Error::NoEffect)?
+            .params
+            .get_mut(param)
+            .ok_or(Error::InvalidValue),
+        AnimTarget::Generator {
+            deck,
+            layer,
+            column,
+            param,
+        } => {
+            check_cell(p, layer, column)?;
+            let clip = deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .map(|k| &mut k.clip)
+                .ok_or(Error::NoClip)?;
+            let Source::Generator { params, .. } = &mut clip.source else {
+                return Err(Error::NotPlayable);
+            };
+            params.get_mut(param).ok_or(Error::InvalidValue)
+        }
+    }
 }
 
 fn undoable(inverse: Command, events: Vec<Event>) -> Result<Applied, Error> {
@@ -1207,6 +1281,34 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 inverse: None,
                 events: vec![],
             })
+        }
+        Command::SetAnimation { target, animation } => {
+            let prm = anim_param_mut(p, target)?;
+            if !matches!(prm.value, Value::Number(_)) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = std::mem::replace(&mut prm.animation, animation);
+            undoable(
+                Command::SetAnimation {
+                    target,
+                    animation: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetDashboardDial { dial, value } => {
+            if dial as usize >= anim::DIALS || !value.is_finite() {
+                return Err(Error::InvalidValue);
+            }
+            let d = &mut p.composition.dashboard;
+            while d.len() < anim::DIALS {
+                let n = d.len() + 1;
+                d.push(Param::number(&format!("Dial {n}"), 0.0, Some((0.0, 1.0))));
+            }
+            let prm = &mut d[dial as usize];
+            let prev = number(&prm.value);
+            prm.set_number(value);
+            undoable(Command::SetDashboardDial { dial, value: prev }, vec![])
         }
         Command::AddEffect { .. }
         | Command::RemoveEffect { .. }
@@ -2648,6 +2750,85 @@ mod tests {
         assert_eq!(clip(&mut p, Some(2), 1), Err(Error::NoClip));
         assert_eq!(clip(&mut p, Some(0), -1), Err(Error::NoClip));
         assert_eq!(col(clip(&mut p, None, 1).unwrap()), 0);
+    }
+
+    #[test]
+    fn set_animation_undo_redo() {
+        let (mut p, l, _) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        let target = AnimTarget::LayerOpacity(l);
+        let a = vjc_model::Animation::Dashboard { dial: 2 };
+        let get = |p: &Project| p.composition.layers[0].track.opacity.animation.clone();
+        h.exec(
+            &mut p,
+            Command::SetAnimation {
+                target,
+                animation: Some(a.clone()),
+            },
+            t,
+        )
+        .unwrap();
+        assert_eq!(get(&p), Some(a.clone()));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(get(&p), None);
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(get(&p), Some(a));
+        let bad = Command::SetAnimation {
+            target: AnimTarget::Effect {
+                target: EffectTarget::Master,
+                effect: Uuid::new_v4(),
+                param: 0,
+            },
+            animation: None,
+        };
+        assert_eq!(apply(&mut p, bad).unwrap_err(), Error::NoEffect);
+    }
+
+    #[test]
+    fn set_animation_drag_is_one_undo_step() {
+        let (mut p, l, _) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        let target = AnimTarget::LayerOpacity(l);
+        for (i, d) in [1u32, 2, 3].into_iter().enumerate() {
+            h.exec(
+                &mut p,
+                Command::SetAnimation {
+                    target,
+                    animation: Some(vjc_model::Animation::Dashboard { dial: d }),
+                },
+                t + Duration::from_millis(16 * i as u64),
+            )
+            .unwrap();
+        }
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.layers[0].track.opacity.animation, None);
+    }
+
+    #[test]
+    fn dashboard_dial_by_address_undoes() {
+        let (mut p, _, _) = grid();
+        let cmd = shortcuts::resolve(&p, "/comp/dashboard/3", 0.75).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetDashboardDial {
+                dial: 2,
+                value: 0.75
+            }
+        );
+        let mut h = History::new();
+        h.exec(&mut p, cmd, Instant::now()).unwrap();
+        assert_eq!(p.composition.dashboard.len(), anim::DIALS);
+        let ctx = shortcuts::Ctx::new(None, false);
+        assert_eq!(
+            shortcuts::current(&p, &ctx, "/comp/dashboard/3"),
+            Some(0.75)
+        );
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(shortcuts::current(&p, &ctx, "/comp/dashboard/3"), Some(0.0));
+        assert!(shortcuts::resolve(&p, "/comp/dashboard/9", 1.0).is_none());
+        assert!(shortcuts::resolve(&p, "/comp/dashboard/0", 1.0).is_none());
     }
 
     #[test]

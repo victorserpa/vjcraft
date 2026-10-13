@@ -1,7 +1,7 @@
 //! Reusable parameter widget (slider + typed value + reset) and its pure helpers.
 
 use eframe::egui;
-use vjc_model::Value;
+use vjc_model::{Animation, Curve, Value};
 
 /// "0.5", "1", "-2.25": at most 3 decimals, no trailing zeros.
 pub fn format_value(v: f64) -> String {
@@ -31,14 +31,177 @@ pub fn reset_to(current: &Value, default: &Value) -> Option<Value> {
 /// button. Returns the new value when the user changed it; always inside `range`.
 pub fn param_slider(
     ui: &mut egui::Ui,
-    id: impl std::hash::Hash + std::fmt::Debug + std::fmt::Debug,
+    id: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     value: f64,
     default: f64,
     range: (f64, f64),
 ) -> Option<f64> {
+    slider_inner(ui, id, label, value, default, range, None).0
+}
+
+/// Like `param_slider` plus the "~" animation button. `value` is the effective (animated)
+/// value to display. Returns (new base value, new animation when the user picked one).
+pub fn param_slider_anim(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    value: f64,
+    default: f64,
+    range: (f64, f64),
+    anim: &Option<Animation>,
+) -> (Option<f64>, Option<Option<Animation>>) {
+    slider_inner(ui, id, label, value, default, range, Some(anim))
+}
+
+/// Short name of the animation kind, "Off" for none.
+pub fn anim_kind(a: &Option<Animation>) -> &'static str {
+    match a {
+        None => "Off",
+        Some(Animation::Timeline { .. }) => "Timeline",
+        Some(Animation::Beats { .. }) => "Beats",
+        Some(Animation::Audio { .. }) => "Audio",
+        Some(Animation::Envelope { .. }) => "Envelope",
+        Some(Animation::Dashboard { .. }) => "Dashboard",
+    }
+}
+
+/// A fresh animation of the named kind with usable defaults.
+pub fn default_animation(kind: &str) -> Option<Animation> {
+    match kind {
+        "Timeline" => Some(Animation::Timeline {
+            duration_secs: 4.0,
+            curve: Curve::Sine,
+        }),
+        "Beats" => Some(Animation::Beats {
+            beats: 4.0,
+            curve: Curve::Sine,
+        }),
+        "Envelope" => Some(Animation::Envelope {
+            points: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
+            beats: 4.0,
+        }),
+        "Dashboard" => Some(Animation::Dashboard { dial: 0 }),
+        _ => None,
+    }
+}
+
+fn curve_combo(ui: &mut egui::Ui, id: egui::Id, curve: &mut Curve) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(format!("{curve:?}"))
+        .show_ui(ui, |ui| {
+            for c in [
+                Curve::Linear,
+                Curve::Sine,
+                Curve::Saw,
+                Curve::Square,
+                Curve::Random,
+            ] {
+                let n = format!("{c:?}");
+                ui.selectable_value(curve, c, n);
+            }
+        });
+}
+
+/// Popup body: kind selector and the fields of the current kind. Returns the edited animation.
+fn anim_menu(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    cur: &Option<Animation>,
+) -> Option<Option<Animation>> {
+    let mut a = cur.clone();
+    let mut changed = false;
+    for k in ["Off", "Timeline", "Beats", "Envelope", "Dashboard"] {
+        if ui.selectable_label(anim_kind(cur) == k, k).clicked() && anim_kind(cur) != k {
+            a = default_animation(k);
+            changed = true;
+        }
+    }
+    ui.separator();
+    match &mut a {
+        Some(Animation::Timeline {
+            duration_secs,
+            curve,
+        }) => {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(duration_secs)
+                        .range(0.1..=600.0)
+                        .suffix(" s"),
+                )
+                .changed();
+            let before = curve.clone();
+            curve_combo(ui, id.with("c"), curve);
+            changed |= *curve != before;
+        }
+        Some(Animation::Beats { beats, curve }) => {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(beats)
+                        .range(0.25..=64.0)
+                        .suffix(" beats"),
+                )
+                .changed();
+            let before = curve.clone();
+            curve_combo(ui, id.with("c"), curve);
+            changed |= *curve != before;
+        }
+        Some(Animation::Envelope { points, beats }) => {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(beats)
+                        .range(0.25..=64.0)
+                        .suffix(" beats"),
+                )
+                .changed();
+            let mut remove = None;
+            for (i, (x, y)) in points.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.01))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.01))
+                        .changed();
+                    if ui.small_button("x").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                points.remove(i);
+                changed = true;
+            }
+            if ui.small_button("+ point").clicked() {
+                points.push((1.0, 0.5));
+                changed = true;
+            }
+        }
+        Some(Animation::Dashboard { dial }) => {
+            let mut n = *dial + 1;
+            changed |= ui
+                .add(egui::DragValue::new(&mut n).range(1..=8).prefix("Dial "))
+                .changed();
+            *dial = n - 1;
+        }
+        // TODO(#24): audio needs cpal + rustfft; the variant is evaluated but fed no bands.
+        Some(Animation::Audio { .. }) | None => {}
+    }
+    changed.then_some(a)
+}
+
+fn slider_inner(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    value: f64,
+    default: f64,
+    range: (f64, f64),
+    anim: Option<&Option<Animation>>,
+) -> (Option<f64>, Option<Option<Animation>>) {
     let id = ui.id().with(id);
     let mut out = None;
+    let mut anim_out = None;
     ui.horizontal(|ui| {
         ui.label(label);
         let mut x = value;
@@ -75,8 +238,16 @@ pub fn param_slider(
         {
             out = Some(default.clamp(range.0, range.1));
         }
+        if let Some(cur) = anim {
+            let b = ui.menu_button(if cur.is_some() { "\u{223f}" } else { "~" }, |ui| {
+                anim_menu(ui, id, cur)
+            });
+            if let Some(Some(a)) = b.inner {
+                anim_out = Some(a);
+            }
+        }
     });
-    out
+    (out, anim_out)
 }
 
 /// Single-line text field that commits on Enter or focus loss (never an empty name).
@@ -158,6 +329,15 @@ mod tests {
         for bad in ["", "abc", "NaN", "inf"] {
             assert_eq!(parse_value(bad, r), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn anim_kinds_round_trip() {
+        assert_eq!(anim_kind(&None), "Off");
+        for k in ["Timeline", "Beats", "Envelope", "Dashboard"] {
+            assert_eq!(anim_kind(&default_animation(k)), k);
+        }
+        assert_eq!(default_animation("Off"), None);
     }
 
     #[test]
