@@ -3,10 +3,23 @@
 
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
-use vjc_model::{BlendMode, LayerId};
+use vjc_model::{BlendMode, FitMode, LayerId};
+
+/// Fraction of the destination frame (x, y) covered by a `src` video for the given mode.
+pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) {
+    let (sw, sh, dw, dh) = (src.0.max(1) as f32, src.1.max(1) as f32, dst.0.max(1) as f32, dst.1.max(1) as f32);
+    let (rw, rh) = (dw / sw, dh / sh);
+    let k = match mode {
+        FitMode::Stretch => return (1.0, 1.0),
+        FitMode::Fit => rw.min(rh),
+        FitMode::Fill => rw.max(rh),
+    };
+    (sw * k / dw, sh * k / dh)
+}
 
 const SHADER: &str = r#"
-struct U { opacity: f32, _p0: f32, _p1: f32, _p2: f32 };
+// scale = fraction of the composition frame covered by the video (1,1 = whole frame).
+struct U { opacity: f32, _p0: f32, scale: vec2<f32> };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var smp: sampler;
@@ -25,7 +38,12 @@ fn vs(@builtin(vertex_index) i: u32) -> VO {
 // Straight-alpha output; the blend state does src*a + dst*(1-a) (Normal) or src*a + dst (Add).
 @fragment
 fn fs(in: VO) -> @location(0) vec4<f32> {
-    let c = textureSample(tex, smp, in.uv);
+    // Map frame uv to video uv; outside the video is letterbox (left empty: the black clear shows).
+    let q = (in.uv - vec2(0.5)) / u.scale + vec2(0.5);
+    if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) {
+        discard;
+    }
+    let c = textureSample(tex, smp, q);
     return vec4(c.rgb, c.a * u.opacity);
 }
 "#;
@@ -36,6 +54,7 @@ pub struct LayerDraw<'a> {
     pub id: LayerId,
     pub opacity: f32,
     pub blend: BlendMode,
+    pub fit: FitMode,
     /// `(width, height, rgba, seq)`; `None` = nothing playing (layer skipped).
     pub frame: Option<(u32, u32, &'a [u8], u64)>,
 }
@@ -204,7 +223,8 @@ impl Compositor {
                 );
                 slot.seq = seq;
             }
-            queue.write_buffer(&slot.uniform, 0, bytemuck::bytes_of(&[l.opacity, 0.0f32, 0.0, 0.0]));
+            let (sx, sy) = fit_scale((w, h), self.size, l.fit);
+            queue.write_buffer(&slot.uniform, 0, bytemuck::bytes_of(&[l.opacity, 0.0f32, sx, sy]));
         }
 
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("compose") });
@@ -231,5 +251,25 @@ impl Compositor {
             }
         }
         queue.submit(Some(enc.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn near(a: (f32, f32), b: (f32, f32)) -> bool {
+        (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5
+    }
+
+    #[test]
+    fn fit_fill_stretch() {
+        // 4:3 video in a 16:9 frame.
+        let (src, dst) = ((400, 300), (1920, 1080));
+        assert!(near(fit_scale(src, dst, FitMode::Fit), (0.75, 1.0)));
+        assert!(near(fit_scale(src, dst, FitMode::Fill), (1.0, 4.0 / 3.0)));
+        assert!(near(fit_scale(src, dst, FitMode::Stretch), (1.0, 1.0)));
+        // Same aspect: all modes cover the frame.
+        assert!(near(fit_scale((1920, 1080), dst, FitMode::Fit), (1.0, 1.0)));
     }
 }

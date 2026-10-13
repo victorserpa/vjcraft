@@ -81,6 +81,32 @@ pub struct Clip {
     pub track: Track,
     /// Overrides the layer blend when set.
     pub blend_override: Option<BlendMode>,
+    /// How the video is fitted to the composition frame.
+    #[serde(default)]
+    pub fit: FitMode,
+}
+
+/// Aspect-ratio handling of a clip inside the composition frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FitMode {
+    /// Whole video visible, aspect kept; bars are transparent (lower layers show through).
+    #[default]
+    Fit,
+    /// Frame fully covered, aspect kept, overflow cropped.
+    Fill,
+    /// Frame fully covered, aspect ignored.
+    Stretch,
+}
+
+impl FitMode {
+    pub const ALL: [FitMode; 3] = [FitMode::Fit, FitMode::Fill, FitMode::Stretch];
+    pub fn label(self) -> &'static str {
+        match self {
+            FitMode::Fit => "Fit",
+            FitMode::Fill => "Fill",
+            FitMode::Stretch => "Stretch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -372,6 +398,7 @@ mod tests {
                 source: Source::File { path: "a.mov".into() },
                 transport: Transport::default(),
                 track: Track::new(BlendMode::Normal),
+                fit: FitMode::default(),
                 blend_override: None,
             },
         );

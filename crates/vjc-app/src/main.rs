@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 use vjc_media::{Frame, Player};
-use vjc_model::{BlendMode, Clip, Column, Layer, LayerId, Project, Source, Track, Transition, Transport};
+use vjc_model::{BlendMode, Clip, FitMode, Column, Layer, LayerId, Project, Source, Track, Transition, Transport};
 
 struct State {
     project: Project,
@@ -147,6 +147,7 @@ impl State {
             transport: Transport::default(),
             track: Track::new(BlendMode::Normal),
             blend_override: None,
+            fit: FitMode::default(),
         };
         let c = &mut self.project.composition;
         let cur = c.current_deck;
@@ -178,6 +179,11 @@ impl State {
             .rev()
             .map(|l| (l, if l.bypass { None } else { self.players.get(&l.id).and_then(|(_, p)| p.latest_frame()) }))
             .collect();
+        let deck = c.decks.iter().find(|d| d.id == c.current_deck);
+        let fit_of = |l: &Layer| {
+            let col = self.players.get(&l.id).map(|(c, _)| *c)?;
+            Some(deck?.clip_at(l.id, col)?.fit)
+        };
         let draws: Vec<LayerDraw> = frames
             .iter()
             .map(|(l, f)| LayerDraw {
@@ -187,6 +193,7 @@ impl State {
                     _ => 1.0,
                 },
                 blend: l.track.blend.clone(),
+                fit: fit_of(l).unwrap_or_default(),
                 frame: f.as_ref().map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
             })
             .collect();
@@ -282,6 +289,7 @@ impl State {
 
         let mut trigger: Option<(LayerId, u32)> = None;
         let mut clear: Option<LayerId> = None;
+        let mut set_fit: Option<(LayerId, u32, FitMode)> = None;
         let mut cells = vec![];
         let ncols = self.project.composition.columns.len() as u32;
         let cur = self.project.composition.current_deck;
@@ -307,6 +315,17 @@ impl State {
                         let text = clip.map(|k| k.name.as_str()).unwrap_or("(drop / right-click)");
                         let btn = egui::Button::new(text).selected(on).min_size(egui::vec2(90.0, 24.0));
                         let r = ui.add(btn);
+                        if let Some(cur_fit) = clip.map(|k| k.fit) {
+                            r.context_menu(|ui| {
+                                ui.label("Aspect ratio");
+                                for m in FitMode::ALL {
+                                    if ui.selectable_label(cur_fit == m, m.label()).clicked() {
+                                        set_fit = Some((lid, ci, m));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
                         cells.push(CellInfo { rect: r.rect, layer: lid, col: ci, empty: clip.is_none() });
                         if drag_target == Some((lid, ci)) {
                             ui.painter().rect_stroke(r.rect, 3.0, egui::Stroke::new(2.5, egui::Color32::YELLOW), egui::StrokeKind::Outside);
@@ -344,6 +363,11 @@ impl State {
             });
         });
         self.cells = cells;
+        if let (Some((l, c, m)), Some(d)) = (set_fit, deck_idx) {
+            if let Some(k) = self.project.composition.decks[d].clips.iter_mut().find(|k| k.layer == l && k.column == c) {
+                k.clip.fit = m;
+            }
+        }
         if let Some((l, c)) = pick {
             if let Some(path) = rfd::FileDialog::new().add_filter("Video / image", &["mov", "mp4", "m4v", "mkv", "avi", "webm", "png", "jpg", "jpeg", "webp"]).pick_file() {
                 self.drop_file(l, c, path);

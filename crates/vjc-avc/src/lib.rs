@@ -326,7 +326,7 @@ fn import_clip(c: &Node) -> Option<Clip> {
             }
         }
     }
-    Some(Clip { id: Uuid::new_v4(), name, source, transport, track, blend_override: None })
+    Some(Clip { id: Uuid::new_v4(), name, source, transport, track, blend_override: None, fit: Default::default() })
 }
 
 fn generator_params(p: &Node) -> Vec<Param> {
