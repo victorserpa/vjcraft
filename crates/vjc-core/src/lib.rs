@@ -116,6 +116,11 @@ pub enum Command {
         from: Option<ColumnIdx>,
         delta: i32,
     },
+    /// Points several file clips at new media paths in one step (relink, collect). Cells
+    /// that hold no file clip fail the whole command, so the project never half-changes.
+    SetMediaPaths {
+        changes: Vec<(DeckId, LayerId, ColumnIdx, PathBuf)>,
+    },
     /// Layer transition between clips (kind = a `BlendMode` name, see `transition::Kind`).
     SetLayerTransition {
         layer: LayerId,
@@ -1418,6 +1423,36 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 },
                 vec![],
             )
+        }
+        Command::SetMediaPaths { changes } => {
+            // Validate first so a bad entry leaves the project untouched.
+            for (deck, layer, column, _) in &changes {
+                let d = p
+                    .composition
+                    .decks
+                    .iter()
+                    .find(|d| d.id == *deck)
+                    .ok_or(Error::NoDeck)?;
+                match d.clip_at(*layer, *column).map(|c| &c.source) {
+                    Some(vjc_model::Source::File { .. }) => {}
+                    _ => return Err(Error::NoClip),
+                }
+            }
+            let mut prev = Vec::with_capacity(changes.len());
+            for (deck, layer, column, path) in changes {
+                if let Some(d) = p.composition.decks.iter_mut().find(|d| d.id == deck)
+                    && let Some(c) = d
+                        .clips
+                        .iter_mut()
+                        .find(|c| c.layer == layer && c.column == column)
+                    && let vjc_model::Source::File { path: old } = &mut c.clip.source
+                {
+                    prev.push((deck, layer, column, std::mem::replace(old, path)));
+                }
+            }
+            // Undo in reverse so a cell listed twice ends on its first old path.
+            prev.reverse();
+            undoable(Command::SetMediaPaths { changes: prev }, vec![])
         }
         Command::SetLayerAutopilot { layer, autopilot } => {
             let i = layer_idx(p, layer)?;
@@ -2926,6 +2961,44 @@ impl History {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn set_media_paths_is_one_undo_step_and_all_or_nothing() {
+        let (mut p, l) = setup();
+        let mut h = History::default();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let src = |p: &Project| match &clip_in(p, A, l, 0).unwrap().source {
+            vjc_model::Source::File { path } => path.clone(),
+            _ => panic!("not a file"),
+        };
+        let old = src(&p);
+        let new = PathBuf::from("/media/new.mp4");
+        h.exec(
+            &mut p,
+            Command::SetMediaPaths {
+                changes: vec![(A, l, 0, new.clone())],
+            },
+            t,
+        )
+        .unwrap();
+        assert_eq!(src(&p), new);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(src(&p), old);
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(src(&p), new);
+        // Negative control: an empty cell in the batch rejects it and changes nothing.
+        let before = p.clone();
+        let r = h.exec(
+            &mut p,
+            Command::SetMediaPaths {
+                changes: vec![(A, l, 0, old.clone()), (A, l, 9, old)],
+            },
+            t,
+        );
+        assert!(r.is_err());
+        assert_eq!(p, before);
+    }
+
+    #[test]
     fn transition_autopilot_cues_undo_and_jump_is_runtime() {
         let (mut p, l) = setup();
         let mut h = History::default();
@@ -2946,6 +3019,7 @@ mod tests {
                 autopilot: vjc_model::Autopilot {
                     mode: vjc_model::AutopilotMode::Random,
                     every_loops: 3,
+                    ..Default::default()
                 },
             },
             Command::AddCue {

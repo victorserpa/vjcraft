@@ -61,6 +61,25 @@ pub fn progress(elapsed: f64, duration: f64) -> f32 {
     (elapsed / duration).clamp(0.0, 1.0) as f32
 }
 
+/// Opacity of the outgoing and the incoming clip at crossing `progress` (0..=1), as the
+/// compositor shader applies it (keep in sync with the `tkind` branches in compositor.rs).
+/// `None` for the spatial kinds (push, wipe), where the picture moves instead of fading.
+/// Dissolve keeps the old clip fully visible underneath while the new one fades in.
+pub fn weights(kind: Kind, progress: f32) -> Option<(f32, f32)> {
+    let p = progress.clamp(0.0, 1.0);
+    match kind {
+        Kind::Cut => Some((0.0, 1.0)),
+        Kind::Dissolve => Some((1.0, p)),
+        Kind::ToBlack => Some(if p < 0.5 {
+            (1.0 - 2.0 * p, 0.0)
+        } else {
+            (0.0, 2.0 * p - 1.0)
+        }),
+        Kind::ZoomIn => Some((1.0 - p, p)),
+        Kind::PushLeft | Kind::PushRight | Kind::WipeEllipse => None,
+    }
+}
+
 /// Per-layer state: idle, or crossing from the old clip to the new one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum State {
@@ -158,6 +177,33 @@ mod tests {
         assert_eq!(s.current(), Some((Kind::Dissolve, 0.5)));
         assert_eq!(s.advance(0.6), State::Idle);
         assert_eq!(State::Idle.advance(1.0), State::Idle);
+    }
+
+    #[test]
+    fn weights_follow_the_crossing_over_time() {
+        // 2 s dissolve sampled every 0.5 s: the new clip rises 0, .25, .5, .75, then the
+        // crossing ends (idle = only the new clip).
+        let mut s = State::start(&tr("Dissolve", None, 2.0), 120.0);
+        let mut seen = vec![];
+        while let Some((k, p)) = s.current() {
+            seen.push(weights(k, p).unwrap());
+            s = s.advance(0.5);
+        }
+        assert_eq!(seen, vec![(1.0, 0.0), (1.0, 0.25), (1.0, 0.5), (1.0, 0.75)]);
+        // To black dips to nothing in the middle, both sides fully off.
+        assert_eq!(weights(Kind::ToBlack, 0.5), Some((0.0, 0.0)));
+        assert_eq!(weights(Kind::ToBlack, 0.25), Some((0.5, 0.0)));
+        assert_eq!(weights(Kind::ToBlack, 1.0), Some((0.0, 1.0)));
+        // Zoom cross-fades: the two always sum to 1.
+        for i in 0..=10 {
+            let (o, n) = weights(Kind::ZoomIn, i as f32 / 10.0).unwrap();
+            assert!((o + n - 1.0).abs() < 1e-6);
+        }
+        // Negative controls: a cut shows only the new clip at once; progress is clamped;
+        // spatial kinds have no scalar weights.
+        assert_eq!(weights(Kind::Cut, 0.0), Some((0.0, 1.0)));
+        assert_eq!(weights(Kind::Dissolve, 7.0), Some((1.0, 1.0)));
+        assert_eq!(weights(Kind::PushLeft, 0.5), None);
     }
 
     #[test]

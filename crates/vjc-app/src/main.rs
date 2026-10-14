@@ -52,8 +52,9 @@ use vjc_media::audio::AudioEngine;
 use vjc_media::{Frame, Player};
 use vjc_model::Screen;
 use vjc_model::{
-    Autopilot, AutopilotMode, BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId,
-    OutputDevice, PlayMode, Project, Track, TransformField, Transition, TriggerMode, Value,
+    Autopilot, AutopilotMode, AutopilotUnit, BlendMode, Column, Deck, DeckId, Direction, FitMode,
+    Layer, LayerId, OutputDevice, PlayMode, Project, Track, TransformField, Transition,
+    TriggerMode, Value,
 };
 
 /// Seconds a duration -/+ click moves the region length.
@@ -192,6 +193,7 @@ struct State {
     learn_midi: bool,
     /// MIDI devices thread, and the LED state last sent to controllers.
     midi: midi_io::Midi,
+    collect_job: Option<CollectJob>,
     /// External timecode (MTC / LTC) state.
     tc: timecode_io::TcRuntime,
     /// MIDI input ports and audio input devices listed in Preferences > Timecode.
@@ -381,6 +383,30 @@ struct Flow {
     regions: HashMap<LayerId, (f64, f64)>,
     /// Autopilot on generators: (last bar seen, bars completed) per layer.
     gen_bars: HashMap<LayerId, (i64, u32)>,
+    /// Time each layer's clip has run, for the beat/second autopilot units.
+    auto_time: HashMap<LayerId, vjc_core::playback::TimedClock>,
+}
+
+/// Message from the collect-media worker.
+enum CollectMsg {
+    Progress(usize, usize),
+    Done(vjc_io::media::Collect),
+}
+
+/// A running Collect media: the worker's channel, a cancel flag and the paths the cells
+/// held when it started.
+struct CollectJob {
+    rx: std::sync::mpsc::Receiver<CollectMsg>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    before: HashMap<(DeckId, LayerId, u32), PathBuf>,
+}
+
+impl Drop for CollectJob {
+    /// Closing the app or dropping the job stops the worker between files.
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Outgoing draws use this id mask so they get their own compositor slot.
@@ -1133,6 +1159,7 @@ impl State {
             tc: timecode_io::TcRuntime::new(),
             tc_devices: None,
             midi_ports: None,
+            collect_job: None,
             midi: if live {
                 midi_io::Midi::spawn()
             } else {
@@ -1650,6 +1677,162 @@ impl State {
         }
     }
 
+    /// File > Relink missing media: asks for a folder, then applies `relink_from`.
+    fn relink_media(&mut self) {
+        if vjc_io::media::missing(&self.project).is_empty() {
+            self.status = "No missing media".into();
+            return;
+        }
+        let Some(root) = rfd::FileDialog::new()
+            .set_title("Folder to search for missing media")
+            .pick_folder()
+        else {
+            return;
+        };
+        self.relink_from(&root);
+    }
+
+    /// Relinks every missing file found by name under `root` in one undoable command and
+    /// reports what stayed unmatched.
+    fn relink_from(&mut self, root: &std::path::Path) {
+        let plan = vjc_io::media::plan_relink(&self.project, root, &Default::default());
+        let found = plan.changes.len();
+        if found > 0 {
+            self.exec(Command::SetMediaPaths {
+                changes: plan.changes,
+            });
+        }
+        let amb = plan.ambiguous.len();
+        self.status = if plan.unmatched.is_empty() && amb == 0 {
+            format!("Relinked {found} clip(s)")
+        } else if plan.unmatched.is_empty() {
+            format!(
+                "Relinked {found} clip(s); {amb} file(s) skipped: several candidates share the name"
+            )
+        } else {
+            let names: Vec<String> = plan
+                .unmatched
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into())
+                })
+                .collect();
+            let more = if amb > 0 {
+                format!("; {amb} skipped as ambiguous")
+            } else {
+                String::new()
+            };
+            format!(
+                "Relinked {found} clip(s); not found: {}{more}",
+                names.join(", ")
+            )
+        };
+    }
+
+    /// File > Collect media: copies every referenced file into `<project dir>/media`.
+    fn collect_media(&mut self) {
+        let Some(dir) = self
+            .file
+            .as_ref()
+            .and_then(|f| f.parent())
+            .map(|d| d.to_path_buf())
+        else {
+            self.status = "Save the project first, then collect its media".into();
+            return;
+        };
+        self.collect_into(&dir);
+    }
+
+    /// Starts collecting on a worker thread so a big video never freezes the UI; progress
+    /// shows in the status bar and `collect_pump` applies the result as one undoable command.
+    fn collect_into(&mut self, dir: &std::path::Path) {
+        if self.collect_job.is_some() {
+            self.status = "Collect media is already running".into();
+            return;
+        }
+        let snapshot = self.project.clone();
+        let before: HashMap<(DeckId, LayerId, u32), PathBuf> = snapshot
+            .composition
+            .decks
+            .iter()
+            .flat_map(|d| {
+                d.clips.iter().filter_map(move |c| match &c.clip.source {
+                    vjc_model::Source::File { path } => {
+                        Some(((d.id, c.layer, c.column), path.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        let dir = dir.to_path_buf();
+        self.status = "Collecting media...".into();
+        std::thread::spawn(move || {
+            let progress = tx.clone();
+            let r = vjc_io::media::collect_with(&snapshot, &dir, &flag, &move |i, t| {
+                let _ = progress.send(CollectMsg::Progress(i, t));
+                wake::now();
+            });
+            let _ = tx.send(CollectMsg::Done(r));
+            wake::now();
+        });
+        self.collect_job = Some(CollectJob { rx, cancel, before });
+    }
+
+    /// Drains the collect worker's messages (once per frame, never blocking).
+    fn collect_pump(&mut self) {
+        let Some(job) = &self.collect_job else { return };
+        let mut done = None;
+        let mut lost = false;
+        loop {
+            match job.rx.try_recv() {
+                Ok(CollectMsg::Progress(i, t)) => {
+                    self.status = format!("Collecting media: {i}/{t}");
+                }
+                Ok(CollectMsg::Done(r)) => done = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    lost = done.is_none();
+                    break;
+                }
+            }
+        }
+        if lost {
+            // The worker died without reporting: drop the job so a new collect can start.
+            self.collect_job = None;
+            self.status = "Collect media stopped unexpectedly; paths were not changed".into();
+            return;
+        }
+        let Some(r) = done else { return };
+        let job = self.collect_job.take().expect("job present");
+        let (copied, skipped, failed) = (r.copied, r.skipped, r.failed.len());
+        // Cells edited while copying keep what the user did: only those still holding the
+        // path that was collected are rewritten.
+        let changes: Vec<_> = r
+            .changes
+            .into_iter()
+            .filter(|(d, l, c, _)| {
+                let now =
+                    vjc_core::clip_in(&self.project, *d, *l, *c).and_then(|k| match &k.source {
+                        vjc_model::Source::File { path } => Some(path),
+                        _ => None,
+                    });
+                now.is_some() && now == job.before.get(&(*d, *l, *c))
+            })
+            .collect();
+        if !changes.is_empty() {
+            self.exec(Command::SetMediaPaths { changes });
+        }
+        self.status = if r.cancelled {
+            format!("Collect media cancelled: {copied} copied")
+        } else {
+            format!("Collected media: {copied} copied, {skipped} already there, {failed} failed")
+        };
+    }
+
     /// Saves to the current file or asks for one. Returns true when saved.
     fn save(&mut self) -> bool {
         match self.file.clone() {
@@ -1938,6 +2121,7 @@ impl State {
                         self.remember_pos(layer);
                         self.gens.remove(&layer);
                         self.flow.loops.remove(&layer);
+                        self.flow.auto_time.remove(&layer);
                         self.flow.beat_loops.remove(&layer);
                         self.cross_from_old(layer);
                         let mut player = self
@@ -1979,6 +2163,7 @@ impl State {
                 } => {
                     self.gens.remove(&layer);
                     self.flow.loops.remove(&layer);
+                    self.flow.auto_time.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
                     self.cross_from_old(layer);
                     self.flow.regions.remove(&layer);
@@ -1996,6 +2181,7 @@ impl State {
                 } => {
                     self.gens.remove(&layer);
                     self.flow.loops.remove(&layer);
+                    self.flow.auto_time.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
                     self.cross_from_old(layer);
                     self.flow.regions.remove(&layer);
@@ -2017,6 +2203,7 @@ impl State {
                     self.players.remove(&layer);
                     self.flow.outgoing.remove(&layer);
                     self.flow.loops.remove(&layer);
+                    self.flow.auto_time.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
                     self.flow.gen_bars.remove(&layer);
                     self.flow.regions.remove(&layer);
@@ -2047,6 +2234,7 @@ impl State {
                     self.flow.pos.remove(&layer);
                     self.flow.gen_bars.remove(&layer);
                     self.flow.loops.remove(&layer);
+                    self.flow.auto_time.remove(&layer);
                     self.players.remove(&layer);
                     self.gens.remove(&layer);
                 }
@@ -2573,6 +2761,7 @@ impl State {
                         .iter()
                         .find(|l| l.id == *layer)
                     && l.autopilot.mode != vjc_model::AutopilotMode::Off
+                    && l.autopilot.unit == vjc_model::AutopilotUnit::Loops
                 {
                     let c = self.flow.loops.entry(*layer).or_default();
                     if c.observe(t.position, tr.direction)
@@ -2593,6 +2782,7 @@ impl State {
                 .iter()
                 .find(|l| l.id == *layer)
                 .filter(|l| l.autopilot.mode != vjc_model::AutopilotMode::Off)
+                .filter(|l| l.autopilot.unit == vjc_model::AutopilotUnit::Loops)
             else {
                 continue;
             };
@@ -2601,6 +2791,46 @@ impl State {
             if vjc_core::playback::loops_reached(st.1, l.autopilot.every_loops) {
                 autopilot.push(*layer);
                 self.flow.gen_bars.remove(layer);
+            }
+        }
+        // Autopilot by beats or seconds: counts from the moment the clip started.
+        let running: Vec<(LayerId, DeckId, u32)> = self
+            .players
+            .iter()
+            .map(|(l, v)| (*l, v.0, v.1))
+            .chain(self.gens.iter().map(|(l, v)| (*l, v.0, v.1)))
+            .collect();
+        let live: Vec<LayerId> = running.iter().map(|r| r.0).collect();
+        self.flow.auto_time.retain(|k, _| live.contains(k));
+        for (layer, deck, col) in running {
+            let Some(ap) = self
+                .project
+                .composition
+                .layers
+                .iter()
+                .find(|l| l.id == layer)
+                .map(|l| l.autopilot.clone())
+                .filter(|a| {
+                    a.mode != vjc_model::AutopilotMode::Off
+                        && a.unit != vjc_model::AutopilotUnit::Loops
+                })
+            else {
+                self.flow.auto_time.remove(&layer);
+                continue;
+            };
+            // A paused clip does not run the clock.
+            let playing = vjc_core::clip_in(&self.project, deck, layer, col)
+                .is_some_and(|k| k.transport.direction != Direction::Pause);
+            let e = self
+                .flow
+                .auto_time
+                .entry(layer)
+                .or_insert_with(|| vjc_core::playback::TimedClock::new(&ap));
+            if e.tick(&ap, playing, dt, bpm) {
+                self.flow.auto_time.remove(&layer);
+                if !autopilot.contains(&layer) {
+                    autopilot.push(layer);
+                }
             }
         }
         // Generator TIME runs on the app clock, scaled by the clip transport.
@@ -3502,6 +3732,12 @@ impl State {
                 midi_io::In::Msg(d, ..) if !self.prefs.midi.input_enabled(&d) => continue,
                 midi_io::In::Connected(d) => {
                     self.led_prev.retain(|(dev, _, _), _| *dev != d);
+                    self.status = format!("MIDI device connected: {d}");
+                    continue;
+                }
+                midi_io::In::Disconnected(d, dir) => {
+                    self.status =
+                        format!("MIDI {} disconnected: {d} (waiting for it)", dir.label());
                     continue;
                 }
                 midi_io::In::Msg(d, b, at) => (d, b, at),
@@ -4030,6 +4266,15 @@ impl State {
                     self.save_as();
                 }
                 ui.separator();
+                if ui.button("Relink missing media...").clicked() {
+                    ui.close();
+                    self.relink_media();
+                }
+                if ui.button("Collect media...").clicked() {
+                    ui.close();
+                    self.collect_media();
+                }
+                ui.separator();
                 if ui.button("Import .avc...").clicked() {
                     ui.close();
                     self.import();
@@ -4361,6 +4606,7 @@ impl State {
         self.targets.clear();
         self.shortcut_keys(&ctx);
         self.layout_keys(&ctx);
+        self.collect_pump();
         self.midi_pump();
         self.osc_pump();
         self.dmx_pump();
@@ -5889,28 +6135,62 @@ impl State {
                 (AutopilotMode::Off, "Off"),
                 (AutopilotMode::Next, "Next"),
                 (AutopilotMode::Random, "Random"),
+                (AutopilotMode::Previous, "Previous"),
+                (AutopilotMode::FirstLast, "First / last"),
             ]);
+            let units = labeled(&[
+                (AutopilotUnit::Loops, "Loops"),
+                (AutopilotUnit::Beats, "Beats"),
+                (AutopilotUnit::Seconds, "Seconds"),
+            ]);
+            if let Some(unit) =
+                params::combo(ui, ("lapu", lid), "Autopilot after", &ap.unit, &units)
+            {
+                cmds.push(Command::SetLayerAutopilot {
+                    layer: lid,
+                    autopilot: Autopilot { unit, ..ap.clone() },
+                });
+            }
             if let Some(mode) = params::combo(ui, ("lap", lid), "Autopilot", &ap.mode, &modes) {
                 cmds.push(Command::SetLayerAutopilot {
                     layer: lid,
                     autopilot: Autopilot { mode, ..ap.clone() },
                 });
             }
-            if let Some(n) = params::param_slider(
-                ui,
-                ("lapn", lid),
-                "Autopilot every N loops",
-                f64::from(ap.every_loops),
-                1.0,
-                (1.0, 16.0),
-            ) {
-                cmds.push(Command::SetLayerAutopilot {
-                    layer: lid,
-                    autopilot: Autopilot {
-                        every_loops: n.round() as u32,
-                        ..ap
-                    },
-                });
+            if ap.unit == AutopilotUnit::Loops {
+                if let Some(n) = params::param_slider(
+                    ui,
+                    ("lapn", lid),
+                    "Autopilot every N loops",
+                    f64::from(ap.every_loops),
+                    1.0,
+                    (1.0, 16.0),
+                ) {
+                    cmds.push(Command::SetLayerAutopilot {
+                        layer: lid,
+                        autopilot: Autopilot {
+                            every_loops: n.round() as u32,
+                            ..ap
+                        },
+                    });
+                }
+            } else {
+                let (label, range) = if ap.unit == AutopilotUnit::Beats {
+                    ("Autopilot every N beats", (1.0, 64.0))
+                } else {
+                    ("Autopilot every N seconds", (1.0, 120.0))
+                };
+                if let Some(n) =
+                    params::param_slider(ui, ("lapt", lid), label, ap.every, 8.0, range)
+                {
+                    cmds.push(Command::SetLayerAutopilot {
+                        layer: lid,
+                        autopilot: Autopilot {
+                            every: n.round().max(1.0),
+                            ..ap
+                        },
+                    });
+                }
             }
         }
         if params::section(ui, "sec-layer-audio", "Audio") {

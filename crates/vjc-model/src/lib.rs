@@ -566,12 +566,35 @@ pub struct Transition {
     pub duration_secs: f64,
 }
 
-/// What a layer plays when its clip ends (Once) or after `every_loops` loops.
+/// What a layer plays when its clip ends (Once) or after `every_loops` loops, or after
+/// `every` beats / seconds when `unit` says so.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Autopilot {
     pub mode: AutopilotMode,
     /// Loop-based modes: switch after this many completed loops (min 1).
     pub every_loops: u32,
+    /// What `every_loops` / `every` count.
+    #[serde(default)]
+    pub unit: AutopilotUnit,
+    /// Beats or seconds between switches when `unit` is not `Loops`.
+    #[serde(default = "default_every")]
+    pub every: f64,
+}
+
+fn default_every() -> f64 {
+    8.0
+}
+
+/// When autopilot switches clip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutopilotUnit {
+    /// After `every_loops` completed loops (and when a Once clip ends).
+    #[default]
+    Loops,
+    /// After `every` beats of the app clock since the clip started.
+    Beats,
+    /// After `every` seconds since the clip started.
+    Seconds,
 }
 
 impl Default for Autopilot {
@@ -579,6 +602,8 @@ impl Default for Autopilot {
         Autopilot {
             mode: AutopilotMode::Off,
             every_loops: 1,
+            unit: AutopilotUnit::Loops,
+            every: default_every(),
         }
     }
 }
@@ -588,6 +613,10 @@ pub enum AutopilotMode {
     Off,
     Next,
     Random,
+    /// The playable clip before the current one (wraps).
+    Previous,
+    /// Alternates between the first and the last playable clip.
+    FirstLast,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1257,6 +1286,21 @@ impl std::fmt::Display for Timecode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autopilot_from_an_older_file_defaults_to_loops_and_new_fields_roundtrip() {
+        let old: Autopilot = serde_json::from_str(r#"{"mode":"Next","every_loops":3}"#).unwrap();
+        assert_eq!(old.unit, AutopilotUnit::Loops);
+        assert_eq!(old.every_loops, 3);
+        let new = Autopilot {
+            mode: AutopilotMode::FirstLast,
+            every_loops: 1,
+            unit: AutopilotUnit::Beats,
+            every: 16.0,
+        };
+        let back: Autopilot = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back, new);
+    }
+
     #[test]
     fn column_name_roundtrips_and_defaults_when_absent() {
         let c = Column {

@@ -4211,3 +4211,80 @@ fn whole_gig_through_the_ui() {
     assert_eq!(playing_count(&h), 0);
     assert!(h.state().players.is_empty() && h.state().gens.is_empty());
 }
+
+// #225: File > Relink missing media and Collect media are one undo step each.
+#[test]
+fn relink_and_collect_media_are_undoable_commands() {
+    let root = std::env::temp_dir().join(format!("vjc-ui-relink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("found/deep")).unwrap();
+    std::fs::write(root.join("found/deep/a.mp4"), b"data").unwrap();
+    let gone = root.join("old/a.mp4");
+    let mut h = app();
+    click(&mut h, "Add layer");
+    let lid = h.state().project.composition.layers[0].id;
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut().exec(Command::ImportMedia {
+        deck,
+        layer: lid,
+        column: 0,
+        path: gone.clone(),
+    });
+    let path_of = |h: &egui_kittest::Harness<'_, State>| match &vjc_core::clip_in(
+        &h.state().project,
+        deck,
+        lid,
+        0,
+    )
+    .unwrap()
+    .source
+    {
+        vjc_model::Source::File { path } => path.clone(),
+        _ => panic!("not a file"),
+    };
+    // Negative control: a folder without the file relinks nothing.
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+    h.state_mut().relink_from(&root.join("empty"));
+    assert_eq!(path_of(&h), gone);
+    assert!(h.state().status.contains("not found: a.mp4"));
+    h.state_mut().relink_from(&root.join("found"));
+    assert_eq!(path_of(&h), root.join("found/deep/a.mp4"));
+    h.state_mut().undo();
+    assert_eq!(path_of(&h), gone, "one undo restores the old path");
+    h.state_mut().relink_from(&root.join("found"));
+
+    // Collect copies next to the project and rewrites the path; undo restores it.
+    let proj = root.join("show");
+    h.state_mut().collect_into(&proj);
+    // Runs on a worker: the path is untouched until the completion message is pumped.
+    assert!(h.state().collect_job.is_some());
+    assert_eq!(path_of(&h), root.join("found/deep/a.mp4"));
+    let t0 = std::time::Instant::now();
+    while h.state().collect_job.is_some() {
+        h.state_mut().collect_pump();
+        assert!(t0.elapsed().as_secs() < 20, "collect never finished");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(h.state().status.starts_with("Collected media: 1 copied"));
+    assert_eq!(path_of(&h), proj.join("media/a.mp4"));
+    assert_eq!(std::fs::read(proj.join("media/a.mp4")).unwrap(), b"data");
+    h.state_mut().undo();
+    assert_eq!(path_of(&h), root.join("found/deep/a.mp4"));
+}
+
+#[test]
+fn collect_job_is_dropped_when_the_worker_dies() {
+    let mut s = State::headless(prefs());
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx); // the worker panicked before sending Done
+    s.collect_job = Some(CollectJob {
+        rx,
+        cancel: Default::default(),
+        before: Default::default(),
+    });
+    s.collect_pump();
+    assert!(
+        s.collect_job.is_none(),
+        "a dead worker must not block new collects"
+    );
+}

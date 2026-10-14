@@ -2,6 +2,7 @@
 //! media paths, missing-media warnings, migration and atomic writes.
 
 pub mod effect_presets;
+pub mod media;
 pub mod output_presets;
 pub mod prefs;
 

@@ -14,6 +14,19 @@ pub fn next_clip(mode: AutopilotMode, current: u32, playable: &[bool], rand: u64
             .map(|k| (current as usize + k) % n)
             .find(|&i| ok(i))
             .map(|i| i as u32),
+        AutopilotMode::Previous => (1..=n)
+            .map(|k| (current as usize + n * k - k) % n)
+            .find(|&i| ok(i))
+            .map(|i| i as u32),
+        AutopilotMode::FirstLast => {
+            let first = (0..n).find(|&i| ok(i))?;
+            let last = (0..n).rev().find(|&i| ok(i))?;
+            Some(if current as usize == first {
+                last
+            } else {
+                first
+            } as u32)
+        }
         AutopilotMode::Random => {
             let others: Vec<usize> = (0..n).filter(|&i| ok(i) && i != current as usize).collect();
             if others.is_empty() {
@@ -22,6 +35,68 @@ pub fn next_clip(mode: AutopilotMode, current: u32, playable: &[bool], rand: u64
                 Some(others[(rand % others.len() as u64) as usize] as u32)
             }
         }
+    }
+}
+
+/// Time a clip has been running, for the beat/second autopilot units.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Elapsed {
+    pub secs: f64,
+    pub beats: f64,
+}
+
+impl Elapsed {
+    /// Adds `dt` seconds at `bpm` (a bad bpm adds no beats).
+    pub fn advance(&mut self, dt: f64, bpm: f64) {
+        let dt = dt.max(0.0);
+        self.secs += dt;
+        if bpm.is_finite() && bpm > 0.0 {
+            self.beats += dt * bpm / 60.0;
+        }
+    }
+}
+
+/// Elapsed time of a layer's timed autopilot plus the setting it was counted under, so a
+/// change of unit or interval restarts the count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedClock {
+    unit: vjc_model::AutopilotUnit,
+    every: f64,
+    pub elapsed: Elapsed,
+}
+
+impl TimedClock {
+    pub fn new(ap: &vjc_model::Autopilot) -> Self {
+        Self {
+            unit: ap.unit,
+            every: ap.every,
+            elapsed: Elapsed::default(),
+        }
+    }
+
+    /// Advances by `dt` only while the clip `running` (not paused or stopped); resets when
+    /// the unit or interval differ from the ones counted so far. Returns true when due.
+    pub fn tick(&mut self, ap: &vjc_model::Autopilot, running: bool, dt: f64, bpm: f64) -> bool {
+        if self.unit != ap.unit || self.every != ap.every {
+            *self = Self::new(ap);
+        }
+        if running {
+            self.elapsed.advance(dt, bpm);
+        }
+        timed_due(ap, &self.elapsed)
+    }
+}
+
+/// True when the timed autopilot (`Beats` / `Seconds`) is due. `Loops` is never due here.
+pub fn timed_due(ap: &vjc_model::Autopilot, e: &Elapsed) -> bool {
+    use vjc_model::AutopilotUnit;
+    if ap.mode == AutopilotMode::Off || !(ap.every.is_finite() && ap.every > 0.0) {
+        return false;
+    }
+    match ap.unit {
+        AutopilotUnit::Loops => false,
+        AutopilotUnit::Beats => e.beats >= ap.every,
+        AutopilotUnit::Seconds => e.secs >= ap.every,
     }
 }
 
@@ -400,6 +475,91 @@ mod tests {
         assert_eq!(next_clip(AutopilotMode::Off, 0, &p, 0), None);
         assert_eq!(next_clip(AutopilotMode::Next, 0, &[true], 0), Some(0));
         assert_eq!(next_clip(AutopilotMode::Next, 0, &[false], 0), None);
+    }
+
+    #[test]
+    fn previous_wraps_backwards_and_skips_empty() {
+        let p = [true, false, true, false];
+        assert_eq!(next_clip(AutopilotMode::Previous, 2, &p, 0), Some(0));
+        assert_eq!(next_clip(AutopilotMode::Previous, 0, &p, 0), Some(2));
+        assert_eq!(next_clip(AutopilotMode::Previous, 3, &p, 0), Some(2));
+        assert_eq!(next_clip(AutopilotMode::Previous, 0, &[], 0), None);
+        // Negative control: Previous is not Next.
+        let three = [true; 3];
+        assert_eq!(next_clip(AutopilotMode::Previous, 1, &three, 0), Some(0));
+        assert_eq!(next_clip(AutopilotMode::Next, 1, &three, 0), Some(2));
+    }
+
+    #[test]
+    fn first_last_alternates_between_the_ends_of_the_playable_clips() {
+        let p = [false, true, true, true, false];
+        assert_eq!(next_clip(AutopilotMode::FirstLast, 1, &p, 0), Some(3));
+        assert_eq!(next_clip(AutopilotMode::FirstLast, 3, &p, 0), Some(1));
+        assert_eq!(next_clip(AutopilotMode::FirstLast, 2, &p, 0), Some(1));
+        assert_eq!(next_clip(AutopilotMode::FirstLast, 0, &[false], 0), None);
+        assert_eq!(next_clip(AutopilotMode::FirstLast, 0, &[true], 0), Some(0));
+    }
+
+    #[test]
+    fn timed_autopilot_is_due_by_seconds_or_beats_only_for_its_unit() {
+        use vjc_model::{Autopilot, AutopilotUnit};
+        let ap = |unit, every| Autopilot {
+            mode: AutopilotMode::Next,
+            every_loops: 1,
+            unit,
+            every,
+        };
+        let mut e = Elapsed::default();
+        // 120 bpm: 0.5 s per beat. 3.9 s = 7.8 beats.
+        e.advance(3.9, 120.0);
+        assert!(!timed_due(&ap(AutopilotUnit::Seconds, 4.0), &e));
+        assert!(!timed_due(&ap(AutopilotUnit::Beats, 8.0), &e));
+        e.advance(0.1, 120.0);
+        assert!(timed_due(&ap(AutopilotUnit::Seconds, 4.0), &e));
+        assert!(timed_due(&ap(AutopilotUnit::Beats, 8.0), &e));
+        // Negative controls: loops unit, Off mode, a bad interval and a bad bpm never fire.
+        assert!(!timed_due(&ap(AutopilotUnit::Loops, 1.0), &e));
+        let off = Autopilot {
+            mode: AutopilotMode::Off,
+            ..ap(AutopilotUnit::Seconds, 1.0)
+        };
+        assert!(!timed_due(&off, &e));
+        assert!(!timed_due(&ap(AutopilotUnit::Seconds, 0.0), &e));
+        assert!(!timed_due(&ap(AutopilotUnit::Seconds, f64::NAN), &e));
+        let mut z = Elapsed::default();
+        z.advance(100.0, 0.0);
+        assert!(!timed_due(&ap(AutopilotUnit::Beats, 1.0), &z));
+    }
+
+    #[test]
+    fn timed_clock_pauses_and_resets_on_change() {
+        use vjc_model::{Autopilot, AutopilotUnit};
+        let ap = Autopilot {
+            mode: AutopilotMode::Next,
+            unit: AutopilotUnit::Seconds,
+            every: 4.0,
+            ..Autopilot::default()
+        };
+        let mut c = TimedClock::new(&ap);
+        assert!(!c.tick(&ap, true, 3.0, 120.0));
+        // Paused for a long while: no progress, so it is not due.
+        assert!(!c.tick(&ap, false, 100.0, 120.0));
+        assert_eq!(c.elapsed.secs, 3.0);
+        assert!(c.tick(&ap, true, 1.0, 120.0));
+        // Changing the interval restarts the count.
+        let ap2 = Autopilot {
+            every: 5.0,
+            ..ap.clone()
+        };
+        assert!(!c.tick(&ap2, true, 1.0, 120.0));
+        assert_eq!(c.elapsed.secs, 1.0);
+        let ap3 = Autopilot {
+            unit: AutopilotUnit::Beats,
+            every: 5.0,
+            ..ap2
+        };
+        c.tick(&ap3, true, 0.5, 120.0);
+        assert_eq!(c.elapsed.secs, 0.5);
     }
 
     #[test]
