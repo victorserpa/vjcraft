@@ -15,6 +15,7 @@ pub mod midi;
 pub mod osc;
 pub mod playback;
 pub mod playhead;
+pub mod rehearsal;
 pub mod shortcuts;
 pub mod slice_geom;
 pub mod timecode;

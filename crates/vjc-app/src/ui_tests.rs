@@ -3722,3 +3722,70 @@ fn remove_layer_from_header_menu_needs_no_confirmation_when_stopped() {
     assert!(!exists(&h, "Remove layer?"));
     assert_eq!(h.state().project.composition.layers.len(), n - 1);
 }
+
+fn one_monitor() -> monitors::MonitorInfo {
+    monitors::MonitorInfo {
+        id: 7,
+        name: "main".into(),
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60.0,
+        x: 0,
+        y: 0,
+    }
+}
+
+// Rehearsal: the scratch LED screen must not dirty the project nor reach the recovery file.
+#[test]
+fn rehearsal_setup_is_not_autosaved_nor_dirty() {
+    let mut p = prefs();
+    p.general.autosave = true;
+    p.general.autosave_secs = 30;
+    let old = std::time::Instant::now() - std::time::Duration::from_secs(31);
+    let file = tmp_vjc("rehearsal-recovery.vjc");
+    let _ = std::fs::remove_file(&file);
+
+    // Negative control: the same state outside rehearsal does autosave.
+    let mut ctl = State::headless(p.clone());
+    ctl.dirty = true;
+    ctl.last_autosave = old;
+    ctl.autosave_to(Some(file.clone()));
+    assert!(file.exists(), "control writes");
+    let _ = std::fs::remove_file(&file);
+
+    let mut st = State::headless(p);
+    st.monitors = vec![one_monitor()];
+    st.rehearse_setup();
+    assert!(!st.project.output.screens.is_empty(), "screen added");
+    assert!(!st.dirty, "setup does not dirty the project");
+    st.dirty = true; // even if something later dirties it
+    st.last_autosave = old;
+    st.autosave_to(Some(file.clone()));
+    assert!(!file.exists(), "no autosave in rehearsal");
+    st.persist = true;
+    assert!(
+        st.recovery_path().is_none(),
+        "no recovery path in rehearsal"
+    );
+    st.rehearsal = false;
+    assert!(st.recovery_path().is_some(), "control: path exists outside");
+}
+
+#[test]
+fn data_dir_env_override_wins() {
+    let o = std::ffi::OsString::from("/tmp/vjc-x");
+    assert_eq!(data_dir_from(Some(o)), Some(PathBuf::from("/tmp/vjc-x")));
+    // Negative control: unset or empty falls back to the per-user dir.
+    assert_eq!(data_dir_from(Some("".into())), data_dir_from(None));
+    assert_ne!(data_dir_from(None), Some(PathBuf::from("/tmp/vjc-x")));
+}
+
+#[test]
+fn choosing_fullscreen_resets_rehearsal_windowed_output() {
+    let mut st = State::headless(prefs());
+    st.monitors = vec![one_monitor()];
+    st.rehearse_setup();
+    assert!(st.output_windowed);
+    st.choose_fullscreen(7);
+    assert!(!st.output_windowed);
+}

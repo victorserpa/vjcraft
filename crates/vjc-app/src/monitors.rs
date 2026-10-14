@@ -88,6 +88,31 @@ pub fn output_lost(monitors: &[MonitorInfo], id: u32) -> bool {
     !monitors.is_empty() && find(monitors, id).is_none()
 }
 
+/// How an output window is created: fullscreen on the screen's monitor, or a floating
+/// preview window (no monitor binding, always on top so the main window never occludes it).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub fullscreen: bool,
+    pub always_on_top: bool,
+    pub monitor: Option<usize>,
+}
+
+pub fn output_placement(windowed: bool, monitor_idx: usize) -> Placement {
+    if windowed {
+        Placement {
+            fullscreen: false,
+            always_on_top: true,
+            monitor: None,
+        }
+    } else {
+        Placement {
+            fullscreen: true,
+            always_on_top: false,
+            monitor: Some(monitor_idx),
+        }
+    }
+}
+
 /// Display id at winit index `idx`; None when the list changed and the index is stale.
 pub fn id_at(monitors: &[MonitorInfo], idx: usize) -> Option<u32> {
     monitors.get(idx).map(|m| m.id)
@@ -242,5 +267,24 @@ mod tests {
         assert_eq!(find(&[m(9)], 9), Some(0));
         assert_eq!(find(&[m(7)], 9), None);
         assert_eq!(m(1).label(), "X (1920x1080)");
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn windowed_floats_without_monitor() {
+        let p = output_placement(true, 1);
+        assert!(!p.fullscreen && p.always_on_top && p.monitor.is_none());
+    }
+
+    #[test]
+    fn fullscreen_binds_monitor_not_on_top() {
+        // negative control: the normal path must keep its monitor and not float
+        let p = output_placement(false, 1);
+        assert!(p.fullscreen && !p.always_on_top);
+        assert_eq!(p.monitor, Some(1));
     }
 }

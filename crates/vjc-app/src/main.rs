@@ -225,6 +225,10 @@ struct State {
     sel_mask_pt: Option<usize>,
     /// Screens whose output window the user closed (runtime only).
     closed_screens: std::collections::HashSet<Uuid>,
+    /// Dev rehearsal (VJC_REHEARSE): output windows open windowed, not fullscreen.
+    output_windowed: bool,
+    /// Rehearsal session: its scratch screen is never autosaved or recovered.
+    rehearsal: bool,
     /// Screens showing the test card on their output (runtime only).
     test_cards: std::collections::HashSet<Uuid>,
     /// FPS overlay on every output.
@@ -872,14 +876,31 @@ fn project_dirs() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("", "", "VJCraft")
 }
 
-/// Per-user data dir (macOS: ~/Library/Application Support/VJCraft) + recovery.vjc
+/// `VJC_DATA_DIR` (dev/testing) replaces the per-user data and config dir.
+fn data_dir_from(over: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match over.filter(|o| !o.is_empty()) {
+        Some(o) => Some(PathBuf::from(o)),
+        None => Some(project_dirs()?.data_dir().to_path_buf()),
+    }
+}
+
+/// Per-user data dir (macOS: ~/Library/Application Support/VJCraft), or `VJC_DATA_DIR`.
+fn data_dir() -> Option<PathBuf> {
+    data_dir_from(std::env::var_os("VJC_DATA_DIR"))
+}
+
+/// Per-user data dir + recovery.vjc
 fn recovery_path() -> Option<PathBuf> {
-    Some(project_dirs()?.data_dir().join("recovery.vjc"))
+    Some(data_dir()?.join("recovery.vjc"))
 }
 
 /// Per-user config dir (macOS: ~/Library/Application Support/VJCraft) + prefs.json
 fn prefs_path() -> Option<PathBuf> {
-    Some(project_dirs()?.config_dir().join("prefs.json"))
+    let dir = match std::env::var_os("VJC_DATA_DIR").filter(|o| !o.is_empty()) {
+        Some(o) => PathBuf::from(o),
+        None => project_dirs()?.config_dir().to_path_buf(),
+    };
+    Some(dir.join("prefs.json"))
 }
 
 /// Removes the recovery file (Don't Save, saved, discarded). Missing file is fine.
@@ -999,7 +1020,9 @@ impl State {
 
     /// Recovery file, only for the live app.
     fn recovery_path(&self) -> Option<PathBuf> {
-        self.persist.then(recovery_path).flatten()
+        (self.persist && !self.rehearsal)
+            .then(recovery_path)
+            .flatten()
     }
 
     fn build(prefs: Prefs, live: bool) -> Self {
@@ -1104,7 +1127,7 @@ impl State {
             sel_pt_out: None,
             snap: false,
             presets_dir: live
-                .then(|| project_dirs().map(|d| d.data_dir().join("output-presets")))
+                .then(|| data_dir().map(|d| d.join("output-presets")))
                 .flatten(),
             preset_names: None,
             preset_sel: None,
@@ -1115,6 +1138,8 @@ impl State {
             edit_mask: false,
             sel_mask_pt: None,
             closed_screens: Default::default(),
+            output_windowed: false,
+            rehearsal: false,
             test_cards: Default::default(),
             show_fps: false,
             identify_at: None,
@@ -1638,7 +1663,11 @@ impl State {
     /// `autosave` with an explicit recovery file (`None` = nowhere to write).
     fn autosave_to(&mut self, path: Option<PathBuf>) {
         let every = std::time::Duration::from_secs(self.prefs.general.autosave_secs.into());
-        if !self.prefs.general.autosave || !self.dirty || self.last_autosave.elapsed() < every {
+        if self.rehearsal
+            || !self.prefs.general.autosave
+            || !self.dirty
+            || self.last_autosave.elapsed() < every
+        {
             return;
         }
         self.last_autosave = std::time::Instant::now();
@@ -2778,7 +2807,7 @@ impl State {
         let time = self.fx_epoch.elapsed().as_secs_f32();
         self.ml.set_dir(ml_fx::models_dir(
             self.prefs.general.models_folder.as_ref(),
-            project_dirs().map(|d| d.data_dir().to_path_buf()),
+            data_dir(),
         ));
         let cf_pos = c
             .crossfader
@@ -3972,17 +4001,7 @@ impl State {
                         .clicked()
                     {
                         ui.close();
-                        if let Some(first) = self.project.output.screens.first().map(|s| s.id) {
-                            self.closed_screens.remove(&first);
-                            self.exec(Command::SetScreenDevice {
-                                screen: first,
-                                device: OutputDevice::Monitor {
-                                    name: m.id.to_string(),
-                                },
-                            });
-                        } else {
-                            self.output = Some(m.id);
-                        }
+                        self.choose_fullscreen(m.id);
                     }
                 }
                 if ui.button("Setup...").clicked() {
@@ -6819,6 +6838,52 @@ impl State {
         }
     }
 
+    /// Dev aid (VJC_REHEARSE=1): a 1920x1080 LED-wall screen with three slices (left,
+    /// middle, right) on the main display, windowed, with the test card on.
+    fn rehearse_setup(&mut self) {
+        let screen =
+            vjc_core::rehearsal::screen(self.project.composition.layers.last().map(|l| l.id));
+        let id = screen.id;
+        let Some(mon) = self
+            .monitors
+            .iter()
+            .find(|m| m.name.contains("main"))
+            .or(self.monitors.first())
+            .map(|m| m.id)
+        else {
+            self.status = "Rehearsal: no monitor found".into();
+            return;
+        };
+        self.output_windowed = true;
+        self.rehearsal = true;
+        self.test_cards.insert(id);
+        self.exec(Command::AddScreen { screen, index: 0 });
+        self.exec(Command::SetScreenDevice {
+            screen: id,
+            device: OutputDevice::Monitor {
+                name: mon.to_string(),
+            },
+        });
+        // The scratch screen is not the user's edit.
+        self.dirty = false;
+    }
+
+    /// Output > Fullscreen on a monitor (also leaves the rehearsal windowed mode).
+    fn choose_fullscreen(&mut self, monitor: u32) {
+        self.output_windowed = false;
+        if let Some(first) = self.project.output.screens.first().map(|s| s.id) {
+            self.closed_screens.remove(&first);
+            self.exec(Command::SetScreenDevice {
+                screen: first,
+                device: OutputDevice::Monitor {
+                    name: monitor.to_string(),
+                },
+            });
+        } else {
+            self.output = Some(monitor);
+        }
+    }
+
     /// One fullscreen window per open output: the legacy single output (no screens in the
     /// project) shows the whole composition; each monitor screen shows its sliced texture,
     /// or the whole composition when it has no slices.
@@ -6857,11 +6922,18 @@ impl State {
             let Some(mid) = monitors::id_at(&self.monitors, mon) else {
                 continue;
             };
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title("VJCraft Output")
-                .with_fullscreen(true)
-                .with_decorations(false);
-            builder.monitor = Some(mon);
+            let mut builder = egui::ViewportBuilder::default().with_title("VJCraft Output");
+            let place = monitors::output_placement(self.output_windowed, mon);
+            builder = if place.fullscreen {
+                builder.with_fullscreen(true).with_decorations(false)
+            } else {
+                builder.with_inner_size([960.0, 540.0])
+            };
+            if place.always_on_top {
+                // A window behind the main one is occluded and macOS stops presenting it.
+                builder = builder.with_always_on_top();
+            }
+            builder.monitor = place.monitor;
             let mut close = false;
             let mut leave_learn = false;
             // Esc leaves learn mode first; it must not also close the output.
@@ -7046,6 +7118,9 @@ fn main() -> eframe::Result {
                 for (l, path) in ids.into_iter().zip(autoplay_paths(&p)) {
                     s.drop_file(l, 0, path);
                 }
+            }
+            if std::env::var_os("VJC_REHEARSE").is_some() {
+                s.rehearse_setup();
             }
             // Debug aid: VJC_NETOUT=syphon|ndi publishes the composition on a new screen;
             // VJC_NETIN=<server name> plays that Syphon server on the top layer, column 1.
