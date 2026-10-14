@@ -42,6 +42,9 @@ pub fn new_slice(w: u32, h: u32) -> Slice {
         soft_edge: None,
         source: Default::default(),
         color: Default::default(),
+        mask_invert: false,
+        is_key: false,
+        black_bg: false,
     }
 }
 
@@ -73,6 +76,7 @@ pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
         pixel_perfect: false,
         enabled: true,
         color: Default::default(),
+        delay_ms: 0,
     }
 }
 
@@ -300,6 +304,54 @@ pub const MAX_MASK_POINTS: usize = 32;
 pub const MAX_SOFT_WIDTH: f32 = 0.5;
 pub const GAMMA_RANGE: (f32, f32) = (0.1, 5.0);
 
+/// Shape presets for a slice mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskShape {
+    Rectangle,
+    Ellipse,
+    Triangle,
+    Diamond,
+}
+
+impl MaskShape {
+    pub const ALL: [MaskShape; 4] = [
+        MaskShape::Rectangle,
+        MaskShape::Ellipse,
+        MaskShape::Triangle,
+        MaskShape::Diamond,
+    ];
+}
+
+/// Points of a preset shape inscribed in `bbox` = (x0, y0, x1, y1), normalized screen
+/// coordinates (clamped to 0..=1). Always a valid mask (`mask_valid`).
+pub fn mask_preset(shape: MaskShape, bbox: (f32, f32, f32, f32)) -> Vec<Pt> {
+    let (x0, y0) = (bbox.0.clamp(0.0, 1.0), bbox.1.clamp(0.0, 1.0));
+    let (x1, y1) = (bbox.2.clamp(x0, 1.0), bbox.3.clamp(y0, 1.0));
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (rx, ry) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+    match shape {
+        MaskShape::Rectangle => vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+        MaskShape::Ellipse => (0..24)
+            .map(|i| {
+                let a = i as f32 / 24.0 * std::f32::consts::TAU;
+                (cx + rx * a.cos(), cy + ry * a.sin())
+            })
+            .collect(),
+        MaskShape::Triangle => vec![(cx, y0), (x1, y1), (x0, y1)],
+        MaskShape::Diamond => vec![(cx, y0), (x1, cy), (cx, y1), (x0, cy)],
+    }
+}
+
+/// Delay in whole frames for `delay_ms` at `fps` (0 ms or an unusable fps = 0).
+pub fn delay_frames(delay_ms: u32, fps: f32) -> usize {
+    if delay_ms == 0 || !fps.is_finite() || fps <= 0.0 {
+        return 0;
+    }
+    (delay_ms.min(MAX_DELAY_MS) as f32 * fps / 1000.0).round() as usize
+}
+
+pub const MAX_DELAY_MS: u32 = 100;
+
 /// Mask polygon in normalized screen coordinates: 3..=32 finite points.
 pub fn mask_valid(m: &[Pt]) -> bool {
     (3..=MAX_MASK_POINTS).contains(&m.len()) && m.iter().all(|p| p.0.is_finite() && p.1.is_finite())
@@ -447,6 +499,20 @@ pub fn edge_ramp(e: &vjc_model::SoftEdge, s: f32, t: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mask_presets_are_valid_and_delay_frames_round() {
+        for s in super::MaskShape::ALL {
+            assert!(super::mask_valid(&super::mask_preset(
+                s,
+                (0.1, 0.2, 0.9, 0.8)
+            )));
+        }
+        assert_eq!(super::delay_frames(0, 60.0), 0);
+        assert_eq!(super::delay_frames(100, 60.0), 6);
+        assert_eq!(super::delay_frames(500, 60.0), 6, "clamped to 100 ms");
+        assert_eq!(super::delay_frames(50, 0.0), 0);
+    }
+
     use super::*;
 
     #[test]

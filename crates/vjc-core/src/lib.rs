@@ -358,6 +358,24 @@ pub enum Command {
         slice: Uuid,
         mask: Option<Vec<(f32, f32)>>,
     },
+    /// Invert the slice mask (show only outside it). Coalesces.
+    SetSliceMaskInvert {
+        screen: Uuid,
+        slice: Uuid,
+        invert: bool,
+    },
+    /// Is Key and Black BG of a slice.
+    SetSliceKey {
+        screen: Uuid,
+        slice: Uuid,
+        is_key: bool,
+        black_bg: bool,
+    },
+    /// Screen output delay in ms (clamped to 0..=100). Coalesces.
+    SetScreenDelay {
+        screen: Uuid,
+        delay_ms: u32,
+    },
     /// Soft edge (widths clamped to 0..=0.5, gamma to 0.1..=5); `None` clears it. Coalesces.
     SetSliceSoftEdge {
         screen: Uuid,
@@ -794,6 +812,9 @@ enum Target {
     /// different points are separate steps.
     SliceMask(Uuid, usize, usize),
     SliceSoftEdge(Uuid),
+    SliceMaskInvert(Uuid),
+    SliceKey(Uuid),
+    ScreenDelay(Uuid),
     SliceColor(Uuid),
     ScreenEnabled(Uuid),
     ScreenColor(Uuid),
@@ -836,6 +857,9 @@ impl Command {
                 0,
             )),
             Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),
+            Command::SetSliceMaskInvert { slice, .. } => Some(Target::SliceMaskInvert(*slice)),
+            Command::SetSliceKey { slice, .. } => Some(Target::SliceKey(*slice)),
+            Command::SetScreenDelay { screen, .. } => Some(Target::ScreenDelay(*screen)),
             Command::SetSliceColor { slice, .. } => Some(Target::SliceColor(*slice)),
             Command::SetScreenEnabled { screen, .. } => Some(Target::ScreenEnabled(*screen)),
             Command::SetScreenColor { screen, .. } => Some(Target::ScreenColor(*screen)),
@@ -2434,6 +2458,54 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     screen,
                     slice,
                     mask: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceMaskInvert {
+            screen,
+            slice,
+            invert,
+        } => {
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.mask_invert, invert);
+            undoable(
+                Command::SetSliceMaskInvert {
+                    screen,
+                    slice,
+                    invert: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceKey {
+            screen,
+            slice,
+            is_key,
+            black_bg,
+        } => {
+            let s = slice_mut(p, screen, slice)?;
+            let (pk, pb) = (
+                std::mem::replace(&mut s.is_key, is_key),
+                std::mem::replace(&mut s.black_bg, black_bg),
+            );
+            undoable(
+                Command::SetSliceKey {
+                    screen,
+                    slice,
+                    is_key: pk,
+                    black_bg: pb,
+                },
+                vec![],
+            )
+        }
+        Command::SetScreenDelay { screen, delay_ms } => {
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.delay_ms, delay_ms.min(mapping::MAX_DELAY_MS));
+            undoable(
+                Command::SetScreenDelay {
+                    screen,
+                    delay_ms: prev,
                 },
                 vec![],
             )
@@ -6961,6 +7033,51 @@ mod tests {
             h.exec(&mut p, c, now).unwrap();
         }
         h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn slice_key_invert_and_screen_delay_undo() {
+        let (mut p, sid, lid) = one_screen_slice();
+        let before = p.clone();
+        let mut h = History::new();
+        let now = Instant::now();
+        h.exec(
+            &mut p,
+            Command::SetSliceKey {
+                screen: sid,
+                slice: lid,
+                is_key: true,
+                black_bg: true,
+            },
+            now,
+        )
+        .unwrap();
+        h.exec(
+            &mut p,
+            Command::SetSliceMaskInvert {
+                screen: sid,
+                slice: lid,
+                invert: true,
+            },
+            now,
+        )
+        .unwrap();
+        h.exec(
+            &mut p,
+            Command::SetScreenDelay {
+                screen: sid,
+                delay_ms: 500,
+            },
+            now,
+        )
+        .unwrap();
+        let s = &p.output.screens[0];
+        assert_eq!(s.delay_ms, 100, "clamped");
+        assert!(s.slices[0].is_key && s.slices[0].black_bg && s.slices[0].mask_invert);
+        for _ in 0..3 {
+            h.undo(&mut p).unwrap().unwrap();
+        }
         assert_eq!(p, before);
     }
 

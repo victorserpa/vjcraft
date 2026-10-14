@@ -982,6 +982,9 @@ pub struct Screen {
     /// Opacity, brightness, contrast and RGB of the whole screen, applied after the slices.
     #[serde(default)]
     pub color: ScreenColor,
+    /// Output delay in milliseconds (0..=100), to line screens up. 0 = no queue.
+    #[serde(default)]
+    pub delay_ms: u32,
 }
 
 fn default_true() -> bool {
@@ -1168,6 +1171,15 @@ pub struct Slice {
     /// Per-slice brightness and white balance, to match panels of different batches.
     #[serde(default)]
     pub color: SliceColor,
+    /// Mask inverted: the slice shows only outside the mask polygon.
+    #[serde(default)]
+    pub mask_invert: bool,
+    /// Is Key: the colour is replaced by the alpha (white = content, black = transparent).
+    #[serde(default)]
+    pub is_key: bool,
+    /// Black BG: a black backdrop under the slice (transparent areas turn black).
+    #[serde(default)]
+    pub black_bg: bool,
 }
 
 /// Multipliers applied to the slice's RGB after the soft edge: 1.0 = unchanged.

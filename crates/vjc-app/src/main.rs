@@ -90,6 +90,9 @@ struct ScreenRt {
     id: egui::TextureId,
     /// Registered with nearest filtering (pixel-perfect screen).
     nearest: bool,
+    /// Scratch target the slices draw into while the screen has a delay.
+    live: Option<(wgpu::Texture, wgpu::TextureView)>,
+    ring: slice_render::DelayRing,
 }
 
 struct State {
@@ -4302,25 +4305,45 @@ impl State {
                         size,
                         id: tid,
                         nearest: scr.pixel_perfect,
+                        live: None,
+                        ring: Default::default(),
                     },
                 ) {
                     rs.renderer.write().free_texture(&old.id);
                 }
             }
-            let t = &self.screen_rt[&id];
+            // Delay: the slices draw into a scratch target and a frame queue feeds the
+            // presented texture. A disabled screen skips the queue (black at once).
+            let frames = if scr.enabled {
+                vjc_core::mapping::delay_frames(scr.delay_ms, self.project.composition.fps)
+            } else {
+                0
+            };
+            let t = self.screen_rt.get_mut(&id).expect("just created");
+            if frames == 0 {
+                t.live = None;
+                t.ring.clear();
+            } else if t.live.is_none() {
+                t.live = Some(slice_render::make_screen_target(&rs.device, size.0, size.1));
+            }
+            let target_view = t.live.as_ref().map_or(&t.view, |l| &l.1);
             // Each slice samples its own source; a routed layer / group has its own texture.
             let source = |sl: &vjc_model::Slice| {
                 let view = comp.routed_view(sl.source).unwrap_or(&comp.target_view);
                 (view, comp.size)
             };
-            r.render(&rs.device, &rs.queue, scr, &source, &t.view);
+            r.render(&rs.device, &rs.queue, scr, &source, target_view);
             // The test card goes into the screen target itself, so Art-Net, Syphon and NDI
             // see it too. Black-out and a disabled screen stay black.
             if self.test_cards.contains(&id) && !self.blackouts.contains(&id) && scr.enabled {
                 let px = output_overlay::rasterize(&output_overlay::test_card(scr), size.0, size.1);
                 self.stamper
                     .get_or_insert_with(|| slice_render::Stamper::new(&rs.device))
-                    .stamp(&rs.device, &rs.queue, &t.view, size, &px);
+                    .stamp(&rs.device, &rs.queue, target_view, size, &px);
+            }
+            if let Some((live, _)) = &t.live {
+                t.ring
+                    .push(&rs.device, &rs.queue, live, &t.tex, size, frames);
             }
         }
         // Publish: the screen's own target when it has slices, else the composition.

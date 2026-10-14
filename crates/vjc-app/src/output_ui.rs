@@ -469,6 +469,16 @@ impl State {
                 });
             }
         });
+        widgets::section(ui, "Delay", |ui| {
+            let mut d = c.delay_ms as f32;
+            let max = mapping::MAX_DELAY_MS as f32;
+            if widgets::slider(ui, &mut d, 0.0..=max, "Delay (ms)").changed() {
+                cmds.push(Command::SetScreenDelay {
+                    screen: c.id,
+                    delay_ms: d.round() as u32,
+                });
+            }
+        });
         self.artnet_setup(ui, c, cmds);
     }
 
@@ -896,6 +906,7 @@ impl State {
             });
             self.mask_and_edge_row(ui, scr, sl, cmds);
             self.color_row(ui, scr, sl, cmds);
+            self.key_row(ui, scr, sl, cmds);
             self.slice_inspector(ui, scr, sl, cmds);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -972,6 +983,41 @@ impl State {
                     }
                 }
             });
+            ui.horizontal(|ui| {
+                let mut inv = sl.mask_invert;
+                if ui.checkbox(&mut inv, "Invert mask").changed() {
+                    cmds.push(Command::SetSliceMaskInvert {
+                        screen: scr.id,
+                        slice: sl.id,
+                        invert: inv,
+                    });
+                }
+                ui.label("Shape");
+                let (w, h) = (scr.width.max(1) as f32, scr.height.max(1) as f32);
+                let xs = sl.output_mesh.iter().map(|p| p.0 / w);
+                let ys = sl.output_mesh.iter().map(|p| p.1 / h);
+                let fold = |it: &mut dyn Iterator<Item = f32>| {
+                    it.fold((f32::MAX, f32::MIN), |a, v| (a.0.min(v), a.1.max(v)))
+                };
+                let (x0, x1) = fold(&mut xs.clone());
+                let (y0, y1) = fold(&mut ys.clone());
+                let bbox = if x0 < x1 && y0 < y1 {
+                    (x0, y0, x1, y1)
+                } else {
+                    (0.0, 0.0, 1.0, 1.0)
+                };
+                for (shape, name) in [
+                    (mapping::MaskShape::Rectangle, "Rectangle"),
+                    (mapping::MaskShape::Ellipse, "Ellipse"),
+                    (mapping::MaskShape::Triangle, "Triangle"),
+                    (mapping::MaskShape::Diamond, "Diamond"),
+                ] {
+                    if widgets::btn(ui, name, Kind::Secondary).clicked() {
+                        self.sel_mask_pt = None;
+                        cmds.push(set_mask(Some(mapping::mask_preset(shape, bbox))));
+                    }
+                }
+            });
         });
         widgets::section(ui, "Soft edge", |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1003,6 +1049,31 @@ impl State {
                         screen: scr.id,
                         slice: sl.id,
                         soft_edge: Some(n),
+                    });
+                }
+            });
+        });
+    }
+
+    /// Is Key and Black BG toggles of a slice.
+    fn key_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        scr: &Screen,
+        sl: &vjc_model::Slice,
+        cmds: &mut Vec<Command>,
+    ) {
+        widgets::section(ui, "Alpha", |ui| {
+            ui.horizontal(|ui| {
+                let (mut key, mut bg) = (sl.is_key, sl.black_bg);
+                let a = ui.checkbox(&mut key, "Is Key").changed();
+                let b = ui.checkbox(&mut bg, "Black BG").changed();
+                if a || b {
+                    cmds.push(Command::SetSliceKey {
+                        screen: scr.id,
+                        slice: sl.id,
+                        is_key: key,
+                        black_bg: bg,
                     });
                 }
             });

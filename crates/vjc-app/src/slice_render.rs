@@ -20,7 +20,8 @@ struct U {
     edge: vec4<f32>,            // left, right, top, bottom
     misc: vec4<f32>,            // gamma, mask point count, screen w, screen h
     gain: vec4<f32>,            // slice rgb multiplier
-    con: vec4<f32>,             // slice contrast, screen contrast, screen opacity, 0
+    con: vec4<f32>,             // slice contrast, screen contrast, screen opacity, flags
+                                // flags bit 0 invert mask, bit 1 is key, bit 2 black bg
     sgain: vec4<f32>,           // screen rgb multiplier
     pts: array<vec4<f32>, 16>,  // two mask points per entry
 };
@@ -62,13 +63,21 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
             }
             j = i;
         }
-        if (!inside) {
+        if (inside == ((u32(u.con.w) & 1u) != 0u)) {
             discard;
         }
     }
     let lin = ramp(in.st.x, u.edge.x) * ramp(1.0 - in.st.x, u.edge.y)
         * ramp(in.st.y, u.edge.z) * ramp(1.0 - in.st.y, u.edge.w);
-    let c = textureSample(src, smp, in.uv);
+    var c = textureSample(src, smp, in.uv);
+    let flags = u32(u.con.w);
+    if ((flags & 2u) != 0u) {
+        // Is Key: alpha as a grey level, opaque.
+        c = vec4(vec3(c.a), 1.0);
+    } else if ((flags & 4u) != 0u) {
+        // Black BG: composite over black, opaque.
+        c = vec4(c.rgb * c.a, 1.0);
+    }
     // Slice colour first, then the screen colour on top (the screen's final stage). The soft
     // edge fades last, so contrast below 1 never lifts a blended edge off black.
     let s1 = contrast(c.rgb, u.con.x) * u.gain.rgb;
@@ -105,6 +114,7 @@ fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
     u[14] = screen.color.opacity;
     u[16..19].copy_from_slice(&mapping::slice_gain(&screen.color.color));
     u[19] = 1.0;
+    u[15] = (s.mask_invert as u32 | (s.is_key as u32) << 1 | (s.black_bg as u32) << 2) as f32;
     u
 }
 
@@ -474,6 +484,55 @@ impl Stamper {
     }
 }
 
+/// Frame queue of one screen: `push` stores the live frame and writes into `out` the frame
+/// from `n` pushes ago. `n == 0` is a plain copy (the app skips the ring then and renders
+/// straight into `out`). Until `n` frames are stored, `out` is left as it was.
+#[derive(Default)]
+pub struct DelayRing {
+    frames: std::collections::VecDeque<wgpu::Texture>,
+    n: usize,
+    size: (u32, u32),
+}
+
+impl DelayRing {
+    pub fn push(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        live: &wgpu::Texture,
+        out: &wgpu::Texture,
+        size: (u32, u32),
+        n: usize,
+    ) {
+        if self.n != n || self.size != size {
+            self.frames.clear();
+            self.n = n;
+            self.size = size;
+        }
+        let ext = wgpu::Extent3d {
+            width: size.0.max(1),
+            height: size.1.max(1),
+            depth_or_array_layers: 1,
+        };
+        let mut enc = device.create_command_encoder(&Default::default());
+        let slot = if self.frames.len() >= n.max(1) {
+            let oldest = self.frames.pop_front().expect("non-empty");
+            enc.copy_texture_to_texture(oldest.as_image_copy(), out.as_image_copy(), ext);
+            oldest
+        } else {
+            make_screen_target(device, size.0, size.1).0
+        };
+        enc.copy_texture_to_texture(live.as_image_copy(), slot.as_image_copy(), ext);
+        self.frames.push_back(slot);
+        queue.submit(Some(enc.finish()));
+    }
+
+    /// Drops the stored frames (screen off or delay back to 0).
+    pub fn clear(&mut self) {
+        self.frames.clear();
+    }
+}
+
 /// Render target for a screen.
 pub fn make_screen_target(
     device: &wgpu::Device,
@@ -758,5 +817,173 @@ mod tests {
         assert!((r(0) - 64).abs() <= 2, "{}", r(0));
         assert!((r(1) - 191).abs() <= 2, "{}", r(1));
         assert_eq!((r(2), r(7)), (255, 255));
+    }
+
+    fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// Reads the single pixel of a 1x1 screen texture.
+    fn read1(device: &wgpu::Device, queue: &wgpu::Queue, t: &wgpu::Texture) -> [u8; 4] {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            t.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let d = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        [d[0], d[1], d[2], d[3]]
+    }
+
+    /// Writes frame `v` (grey) into `live`, runs `app_frame` like the app and returns the
+    /// presented pixel: the plain path (n == 0) draws straight into `out`.
+    fn feed(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ring: &mut DelayRing,
+        live: &wgpu::Texture,
+        out: &wgpu::Texture,
+        v: u8,
+        n: usize,
+    ) -> [u8; 4] {
+        let one = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let layout = wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        };
+        let target = if n == 0 { out } else { live };
+        queue.write_texture(target.as_image_copy(), &[v, v, v, 255], layout, one);
+        if n > 0 {
+            ring.push(device, queue, live, out, (1, 1), n);
+        }
+        read1(device, queue, out)
+    }
+
+    /// Delay 0 presents the current frame (as before); delay N presents the frame from N
+    /// pushes ago and black until the queue fills (negative control: N=0 never lags).
+    #[test]
+    fn gpu_delay_zero_is_identity_and_n_lags_n_frames() {
+        let Some((device, queue)) = gpu() else {
+            eprintln!("gpu_delay: SKIPPED (no adapter)");
+            return;
+        };
+        let (live, _) = make_screen_target(&device, 1, 1);
+        let (out0, _) = make_screen_target(&device, 1, 1);
+        let mut ring = DelayRing::default();
+        for v in [10u8, 20, 30] {
+            let got = feed(&device, &queue, &mut ring, &live, &out0, v, 0);
+            assert_eq!(got, [v, v, v, 255], "delay 0 = current frame");
+        }
+        let (out, _) = make_screen_target(&device, 1, 1);
+        let mut ring = DelayRing::default();
+        let seen: Vec<u8> = (1..=6u8)
+            .map(|v| feed(&device, &queue, &mut ring, &live, &out, v * 10, 3)[0])
+            .collect();
+        // Frames 1..3 fill the queue (output untouched: black); frame 4 shows frame 1.
+        assert_eq!(seen, vec![0, 0, 0, 10, 20, 30]);
+    }
+
+    /// Black-out blackens what the delayed texture holds, right on the frame it is asked,
+    /// without waiting for the queue.
+    #[test]
+    fn gpu_blackout_ignores_delay() {
+        let Some((device, queue)) = gpu() else {
+            eprintln!("gpu_blackout_ignores_delay: SKIPPED (no adapter)");
+            return;
+        };
+        let (live, _) = make_screen_target(&device, 1, 1);
+        let (out, _) = make_screen_target(&device, 1, 1);
+        let mut ring = DelayRing::default();
+        let mut last = [0; 4];
+        for v in [50u8, 60, 70, 80] {
+            last = feed(&device, &queue, &mut ring, &live, &out, v, 2);
+        }
+        assert_eq!(last[0], 60, "delayed content is on the output");
+        crate::capture::blacken(&mut last);
+        assert_eq!(&last[..3], &[0, 0, 0], "black-out is immediate");
+    }
+
+    /// Is Key paints the alpha as white / black; off keeps the colour (negative control).
+    #[test]
+    fn gpu_is_key_white_where_content_black_where_transparent() {
+        let mut screen = one_slice_screen();
+        screen.slices[0].is_key = true;
+        let (Some(solid), Some(clear)) = (
+            render_rgba(&screen, [200, 100, 50, 255]),
+            render_rgba(&screen, [200, 100, 50, 0]),
+        ) else {
+            eprintln!("gpu_is_key: SKIPPED (no adapter)");
+            return;
+        };
+        assert_eq!(px(&solid, 1, 0, 0), [255, 255, 255, 255]);
+        assert_eq!(px(&clear, 1, 0, 0), [0, 0, 0, 255]);
+        screen.slices[0].is_key = false;
+        let off = render_rgba(&screen, [200, 100, 50, 255]).unwrap();
+        assert_eq!(px(&off, 1, 0, 0), [200, 100, 50, 255]);
+    }
+
+    /// Black BG turns transparent areas black and opaque; opaque content is unchanged.
+    #[test]
+    fn gpu_black_bg_under_transparent_content() {
+        let mut screen = one_slice_screen();
+        let Some(plain) = render_rgba(&screen, [200, 100, 50, 0]) else {
+            eprintln!("gpu_black_bg: SKIPPED (no adapter)");
+            return;
+        };
+        assert_eq!(px(&plain, 1, 0, 0), [200, 100, 50, 0], "off: untouched");
+        screen.slices[0].black_bg = true;
+        let clear = render_rgba(&screen, [200, 100, 50, 0]).unwrap();
+        assert_eq!(px(&clear, 1, 0, 0), [0, 0, 0, 255]);
+        let solid = render_rgba(&screen, [200, 100, 50, 255]).unwrap();
+        assert_eq!(px(&solid, 1, 0, 0), [200, 100, 50, 255]);
+    }
+
+    /// An inverted mask shows only outside the polygon; not inverted is the opposite.
+    #[test]
+    fn gpu_inverted_mask_inverts() {
+        let mut screen = mapping::new_screen("t", 4, 4);
+        let mut sl = mapping::new_slice(4, 4);
+        sl.mask = Some(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]);
+        screen.slices.push(sl);
+        let Some(normal) = render_rgba(&screen, [255, 255, 255, 255]) else {
+            eprintln!("gpu_inverted_mask: SKIPPED (no adapter)");
+            return;
+        };
+        screen.slices[0].mask_invert = true;
+        let inv = render_rgba(&screen, [255, 255, 255, 255]).unwrap();
+        assert_eq!(px(&normal, 4, 0, 0)[0], 255);
+        assert_eq!(px(&inv, 4, 0, 0)[0], 0, "inside is cut");
+        assert_eq!(px(&normal, 4, 3, 3)[0], 0);
+        assert_eq!(px(&inv, 4, 3, 3)[0], 255, "outside is shown");
     }
 }
