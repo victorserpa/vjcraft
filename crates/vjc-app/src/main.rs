@@ -1248,6 +1248,71 @@ fn confirm_remove_deck(name: &str, clips: usize) -> bool {
             == rfd::MessageDialogResult::Yes
 }
 
+/// Layer operations shared by the Layer menu and the layer header's context menu:
+/// duplicate, insert above / below, clear clips, content lock, fader start, mask mode.
+fn layer_ops_menu(
+    ui: &mut egui::Ui,
+    project: &Project,
+    lid: LayerId,
+    deck: DeckId,
+    cmds: &mut Vec<Command>,
+) {
+    let c = &project.composition;
+    let Some(i) = c.layers.iter().position(|l| l.id == lid) else {
+        return;
+    };
+    let layer = &c.layers[i];
+    if ui.button("Duplicate layer").clicked() {
+        cmds.extend(vjc_core::duplicate_layer_command(project, lid));
+        ui.close();
+    }
+    for (label, at) in [("Insert layer above", i), ("Insert layer below", i + 1)] {
+        if ui.button(label).clicked() {
+            let mut layer = new_layer(c.layers.len() + 1);
+            layer.group = vjc_core::insert_group_at(project, at);
+            cmds.push(Command::AddLayer { layer, index: at });
+            ui.close();
+        }
+    }
+    if ui
+        .add_enabled(!layer.lock_content, egui::Button::new("Clear clips"))
+        .on_disabled_hover_text("The layer content is locked")
+        .clicked()
+    {
+        cmds.push(Command::ClearLayerClips { deck, layer: lid });
+        ui.close();
+    }
+    let mut lock = layer.lock_content;
+    if ui.checkbox(&mut lock, "Lock content").changed() {
+        cmds.push(Command::SetLayerLock {
+            layer: lid,
+            locked: lock,
+        });
+    }
+    let mut fader = layer.fader_start;
+    if ui
+        .checkbox(&mut fader, "Fader start")
+        .on_hover_text("Raising the opacity from 0 restarts the playing clip")
+        .changed()
+    {
+        cmds.push(Command::SetLayerFaderStart {
+            layer: lid,
+            enabled: fader,
+        });
+    }
+    ui.menu_button("Mask mode", |ui| {
+        for mode in vjc_model::MaskMode::ALL {
+            if ui
+                .selectable_label(layer.mask_mode == mode, mode.label())
+                .clicked()
+            {
+                cmds.push(Command::SetLayerMaskMode { layer: lid, mode });
+                ui.close();
+            }
+        }
+    });
+}
+
 fn new_layer(n: usize) -> Layer {
     Layer {
         id: Uuid::new_v4(),
@@ -1263,6 +1328,9 @@ fn new_layer(n: usize) -> Layer {
         autopilot: Default::default(),
         crossfader_bus: None,
         ignore_column_trigger: false,
+        lock_content: false,
+        fader_start: false,
+        mask_mode: Default::default(),
         audio: true,
         video: true,
         trigger_mode: vjc_model::TriggerMode::Restart,
@@ -2572,6 +2640,17 @@ impl State {
                     self.players.remove(&layer);
                     self.gens.remove(&layer);
                 }
+                Event::FaderStart { layer } => {
+                    // The playing clip restarts from the start of its region, in place.
+                    if self.active(layer).is_some() {
+                        self.flow.beat_loops.remove(&layer);
+                        let (start, _) = self.region_of(layer);
+                        if let Some(c) = self.flow.loops.get_mut(&layer) {
+                            c.rebase(0.0);
+                        }
+                        self.seek(layer, start);
+                    }
+                }
                 Event::Skipped { layer, column } => {
                     let name = self
                         .project
@@ -3738,6 +3817,7 @@ impl State {
                     transition: Some((kind.shader_id(), prog, true)),
                     transform: layer_xf,
                     channels: channels_of(o.clip.as_ref()),
+                    mask: l.mask_mode,
                     frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
                 });
             }
@@ -3752,6 +3832,7 @@ impl State {
                 generator,
                 transform: xf,
                 channels: channels_of(clip),
+                mask: l.mask_mode,
                 frame: f
                     .as_ref()
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
@@ -3822,6 +3903,7 @@ impl State {
                         &vjc_core::transform::Resolved::of(&k.track.transform, &pctx),
                     ),
                     channels: k.channels,
+                    mask: Default::default(),
                     frame,
                 });
             }
@@ -4875,6 +4957,15 @@ impl State {
                     ui.close();
                     self.request_remove_layer(l);
                 }
+                if let Some(l) = sel {
+                    ui.separator();
+                    let deck = self.project.composition.current_deck;
+                    let mut cmds = vec![];
+                    layer_ops_menu(ui, &self.project, l, deck, &mut cmds);
+                    for c in cmds {
+                        self.exec(c);
+                    }
+                }
             })
             .response
             // The panel tab is also called "Layer".
@@ -5656,9 +5747,28 @@ impl State {
                                 let name_rect = at(
                                     theme::lh::X0,
                                     theme::lh::NAME_Y,
-                                    theme::lh::NAME_W,
+                                    theme::lh::NAME_W - if layer.lock_content { 14.0 } else { 0.0 },
                                     theme::lh::BUS_H,
                                 );
+                                if layer.lock_content {
+                                    let lock = egui::Rect::from_min_size(
+                                        name_rect.right_top(),
+                                        egui::vec2(14.0, theme::lh::BUS_H),
+                                    );
+                                    ui.painter().text(
+                                        lock.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        icons::i::LOCK,
+                                        theme::icon_font(theme::FS_XS),
+                                        theme::TEXT,
+                                    );
+                                    let r = ui.interact(
+                                        lock,
+                                        ui.id().with(("lock", lid)),
+                                        egui::Sense::hover(),
+                                    );
+                                    icons::name(r, "Content locked", None);
+                                }
                                 let name = ui
                                     .scope_builder(
                                         egui::UiBuilder::new().max_rect(name_rect).layout(
@@ -5698,6 +5808,8 @@ impl State {
                                         remove_layer_req = Some(lid);
                                         ui.close();
                                     }
+                                    ui.separator();
+                                    layer_ops_menu(ui, &self.project, lid, cur, &mut cmds);
                                     ui.separator();
                                     let from = active_of(&self.players, &self.gens, lid)
                                         .filter(|(d, _)| *d == cur)

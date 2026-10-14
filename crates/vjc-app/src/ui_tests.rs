@@ -4780,3 +4780,129 @@ fn multi_drop_keeps_loose_files_of_any_format_and_skips_hidden_in_folders() {
         "AppleDouble sidecar skipped"
     );
 }
+
+// Layer menu: Duplicate layer copies the clip with new ids, above the original; undo removes it.
+#[test]
+fn duplicate_layer_from_the_menu_copies_clips_and_undoes() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let n = h.state().project.composition.layers.len();
+    let before = h.state().project.clone();
+    open_layer_menu(&mut h);
+    click_menu(&mut h, "Duplicate layer");
+    let c = &h.state().project.composition;
+    assert_eq!(c.layers.len(), n + 1);
+    let i = c.layers.iter().position(|l| l.id == lid).unwrap();
+    let copy = c.layers[i - 1].id;
+    assert_ne!(clip_id_at(&h, copy, 1), None);
+    assert_ne!(clip_id_at(&h, copy, 1), clip_id_at(&h, lid, 1));
+    // The copy is not started: what is on air does not change.
+    assert_eq!(h.state().gens.len(), 1);
+    h.state_mut().undo();
+    assert_eq!(h.state().project, before);
+}
+
+// Insert above / below puts the new layer next to the selected one (not at the top).
+#[test]
+fn insert_layer_above_and_below_the_selected_one() {
+    let mut h = app();
+    let lid = h.state().project.composition.layers[1].id;
+    h.state_mut().selected = Some((lid, 0));
+    settle(&mut h);
+    let ids = |h: &Harness<State>| -> Vec<LayerId> {
+        h.state()
+            .project
+            .composition
+            .layers
+            .iter()
+            .map(|l| l.id)
+            .collect()
+    };
+    let old = ids(&h);
+    open_layer_menu(&mut h);
+    click_menu(&mut h, "Insert layer above");
+    let now = ids(&h);
+    assert_eq!(now.len(), old.len() + 1);
+    assert_eq!(
+        now[2], lid,
+        "new layer took the selected one's slot, pushing it down"
+    );
+    open_layer_menu(&mut h);
+    click_menu(&mut h, "Insert layer below");
+    let now = ids(&h);
+    assert_eq!(now[2], lid);
+    assert_eq!(now.len(), old.len() + 2);
+    assert!(!old.contains(&now[3]), "a new layer sits right below");
+}
+
+// Lock content: shows a padlock, ignores trigger; selecting does not touch what is on air.
+#[test]
+fn locked_layer_shows_padlock_and_ignores_trigger_and_selection_keeps_air() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    assert!(
+        !exists(&h, "Content locked"),
+        "control: no padlock when unlocked"
+    );
+    h.state_mut().exec(Command::SetLayerLock {
+        layer: lid,
+        locked: true,
+    });
+    settle(&mut h);
+    assert!(exists(&h, "Content locked"));
+    // Eject and a new trigger are ignored: the generator keeps playing.
+    assert!(!h.state_mut().exec_ok(Command::ClearLayer { layer: lid }));
+    assert!(!h.state_mut().exec_ok(Command::TriggerClip {
+        deck,
+        layer: lid,
+        column: 1
+    }));
+    h.state_mut().exec(Command::ClearAll);
+    settle(&mut h);
+    assert!(h.state().gens.contains_key(&lid));
+    // Selecting another layer and back leaves the air untouched.
+    let other = h
+        .state()
+        .project
+        .composition
+        .layers
+        .iter()
+        .find(|l| l.id != lid)
+        .unwrap()
+        .id;
+    h.state_mut().selected = Some((other, 0));
+    settle(&mut h);
+    h.state_mut().selected = Some((lid, 1));
+    settle(&mut h);
+    assert!(h.state().gens.contains_key(&lid));
+    // Control: unlocked, the eject works.
+    h.state_mut().exec(Command::SetLayerLock {
+        layer: lid,
+        locked: false,
+    });
+    assert!(h.state_mut().exec_ok(Command::ClearLayer { layer: lid }));
+    settle(&mut h);
+    assert!(!h.state().gens.contains_key(&lid));
+}
+
+// Fader start: raising the opacity from 0 restarts the playing generator in place.
+#[test]
+fn fader_start_does_not_reopen_the_clip() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    h.state_mut().exec(Command::SetLayerFaderStart {
+        layer: lid,
+        enabled: true,
+    });
+    h.state_mut().exec(Command::SetOpacity {
+        layer: lid,
+        value: 0.0,
+    });
+    h.state_mut().exec(Command::SetOpacity {
+        layer: lid,
+        value: 0.8,
+    });
+    settle(&mut h);
+    assert!(h.state().gens.contains_key(&lid), "still on air");
+}

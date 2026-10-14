@@ -194,6 +194,9 @@ mod tests {
             video: true,
             trigger_mode: vjc_model::TriggerMode::Restart,
             ignore_column_trigger: false,
+            lock_content: false,
+            fader_start: false,
+            mask_mode: Default::default(),
             group: None,
         }
     }

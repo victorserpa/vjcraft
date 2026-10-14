@@ -53,6 +53,9 @@ struct U { opacity: f32, mode: u32, scale: vec2<f32>, prog: f32, tkind: u32, out
 @group(0) @binding(2) var smp: sampler;
 // Copy of the composition below this layer.
 @group(1) @binding(0) var base_tex: texture_2d<f32>;
+// Mask picture (a mask layer drawn on black) for the layers it masks. A 1x1 texture means
+// "no mask": the source alpha is left alone.
+@group(1) @binding(1) var mask_tex: texture_2d<f32>;
 
 struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
@@ -169,6 +172,10 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     if ((u.pad & 4u) != 0u) { s.b = 0.0; }
     if ((u.pad & 8u) != 0u) { s.a = 1.0; }
     s = vec4(mix(s.rgb, vec3(0.0), tblack), s.a * tmix);
+    let md = textureDimensions(mask_tex);
+    if (md.x > 1u) {
+        s.a = s.a * luma(textureLoad(mask_tex, vec2<i32>(in.pos.xy), 0).rgb);
+    }
     let b = textureLoad(base_tex, vec2<i32>(in.pos.xy), 0);
     let id = u.mode;
     var a = clamp(s.a * u.opacity, 0.0, 1.0);
@@ -654,6 +661,74 @@ pub struct LayerDraw<'a> {
     pub transform: Affine,
     /// Channels of the picture that are drawn (an off channel is zeroed, off alpha = opaque).
     pub channels: vjc_model::Channels,
+    /// What this layer masks. A layer with a mask mode is not drawn: its luminance (drawn on
+    /// black with its own fit, effects and opacity) multiplies the layer(s) below it.
+    pub mask: vjc_model::MaskMode,
+}
+
+/// Where `draw_layer` puts its pass.
+#[derive(Clone, Copy, PartialEq)]
+enum Dest {
+    Composition,
+    Group,
+    /// The mask buffer (a mask layer drawn on black).
+    Mask,
+}
+
+/// Which mask layer (index in the bottom-to-top list) multiplies each layer, and which
+/// layers are mask sources (not drawn). A source without a picture masks nothing. The
+/// nearest mask above wins; "One below" also covers the outgoing half of a transition.
+fn mask_plan(layers: &[LayerDraw]) -> (Vec<Option<usize>>, Vec<bool>) {
+    use vjc_model::MaskMode;
+    let n = layers.len();
+    let is_src: Vec<bool> = layers
+        .iter()
+        .map(|l| l.mask != MaskMode::Off && (l.frame.is_some() || l.generator.is_some()))
+        .collect();
+    let outgoing = |j: usize| layers[j].transition.is_some_and(|t| t.2);
+    let mut plan = vec![None; n];
+    // Top down, so the nearest mask above a layer wins. The outgoing half of a transition
+    // is the same layer as the incoming half above it: it is never a mask picture itself
+    // and never "the layer below".
+    for m in (0..n).rev() {
+        if !is_src[m] || outgoing(m) {
+            continue;
+        }
+        match layers[m].mask {
+            MaskMode::Off => {}
+            MaskMode::AllBelow => {
+                for j in (0..m).filter(|j| !is_src[*j]) {
+                    plan[j] = Some(m);
+                }
+            }
+            MaskMode::OneBelow => {
+                let mut j = m;
+                if j > 0 && outgoing(j - 1) {
+                    j -= 1;
+                }
+                let Some(mut j) = j.checked_sub(1) else {
+                    continue;
+                };
+                if !is_src[j] {
+                    plan[j] = Some(m);
+                    while j > 0 && outgoing(j - 1) {
+                        j -= 1;
+                        plan[j] = Some(m);
+                    }
+                }
+            }
+        }
+    }
+    (plan, is_src)
+}
+
+/// Mask data of one frame, for `draw_layer` calls that may need a mask picture.
+struct MaskCtx<'a> {
+    layers: &'a [LayerDraw<'a>],
+    plan: &'a [Option<usize>],
+    is_src: &'a [bool],
+    /// Index of the first layer of the run being drawn.
+    base: usize,
 }
 
 /// A layer group: `len` consecutive entries of the layer list (bottom to top) from `start`
@@ -675,6 +750,7 @@ struct GroupBuf {
     view: wgpu::TextureView,
     base: wgpu::Texture,
     base_bind: wgpu::BindGroup,
+    base_bind_masked: wgpu::BindGroup,
     size: (u32, u32),
     /// One uniform per group drawn in a frame (writes land before the submit).
     uniforms: Vec<wgpu::Buffer>,
@@ -697,6 +773,14 @@ pub struct Compositor {
     base_bgl: wgpu::BindGroupLayout,
     base: wgpu::Texture,
     base_bind: wgpu::BindGroup,
+    /// Like `base_bind`, but the shader also multiplies the layer by the mask picture.
+    base_bind_masked: wgpu::BindGroup,
+    /// Mask layer drawn on black (composition size), and the 1x1 "no mask" texture.
+    mask: (wgpu::Texture, wgpu::TextureView),
+    white: (wgpu::Texture, wgpu::TextureView),
+    white_ready: bool,
+    /// Index (in the frame's layer list) of the mask layer now held in `mask`.
+    mask_cur: Option<usize>,
     sampler: wgpu::Sampler,
     /// 1x1 texture bound as the (unused) input image of generators.
     blank: wgpu::TextureView,
@@ -749,7 +833,8 @@ fn make_base(
     layout: &wgpu::BindGroupLayout,
     w: u32,
     h: u32,
-) -> (wgpu::Texture, wgpu::BindGroup) {
+    (white, mask): (&wgpu::TextureView, &wgpu::TextureView),
+) -> (wgpu::Texture, wgpu::BindGroup, wgpu::BindGroup) {
     let t = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("composition_base"),
         size: wgpu::Extent3d {
@@ -765,15 +850,24 @@ fn make_base(
         view_formats: &[],
     });
     let v = t.create_view(&Default::default());
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("composition_base_bg"),
-        layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::TextureView(&v),
-        }],
-    });
-    (t, bind)
+    let make = |m: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composition_base_bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&v),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(m),
+                },
+            ],
+        })
+    };
+    // Plain (1x1 white = no mask) and masked (the mask layer's picture).
+    (t, make(white), make(mask))
 }
 
 /// Bind group layout of every effect / generator pass (also used by the browser thumbnails).
@@ -846,8 +940,8 @@ impl Compositor {
         let fx_bgl = fx_bind_layout(device);
         let base_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compositor_base_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
+            entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -855,7 +949,7 @@ impl Compositor {
                     multisampled: false,
                 },
                 count: None,
-            }],
+            }),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("compositor_pl"),
@@ -1040,7 +1134,11 @@ impl Compositor {
             persist_scope: 0,
         };
         let (target, target_view) = make_target(device, w, h);
-        let (base, base_bind) = make_base(device, &base_bgl, w, h);
+        let white = make_target(device, 1, 1);
+        // At least 2x2: a 1x1 mask texture means "no mask" to the shader.
+        let mask = make_target(device, w.max(2), h.max(2));
+        let (base, base_bind, base_bind_masked) =
+            make_base(device, &base_bgl, w, h, (&white.1, &mask.1));
         Compositor {
             pipe,
             bgl,
@@ -1048,6 +1146,11 @@ impl Compositor {
             base_bgl,
             base,
             base_bind,
+            base_bind_masked,
+            mask,
+            white,
+            white_ready: false,
+            mask_cur: None,
             sampler,
             blank,
             fade: (fade_tex, fade_buf, fade_bind),
@@ -1069,7 +1172,7 @@ impl Compositor {
     /// Estimated bytes of live textures (thumbnails are the caller's).
     pub fn vram(&self) -> crate::vram::Usage {
         use crate::vram::gpu_bytes as b;
-        let mut fixed = b(&self.base) + b(&self.target) + b(&self.fade.0);
+        let mut fixed = b(&self.base) + b(&self.target) + b(&self.fade.0) + b(&self.mask.0);
         fixed += self.xf.as_ref().map_or(0, |x| b(&x.0));
         fixed += self.group.as_ref().map_or(0, |g| b(&g.tex) + b(&g.base));
         fixed += self.routed.values().map(|r| b(&r.0)).sum::<u64>();
@@ -1099,7 +1202,14 @@ impl Compositor {
             return false;
         }
         (self.target, self.target_view) = make_target(device, w.max(1), h.max(1));
-        (self.base, self.base_bind) = make_base(device, &self.base_bgl, w.max(1), h.max(1));
+        self.mask = make_target(device, w.max(2), h.max(2));
+        (self.base, self.base_bind, self.base_bind_masked) = make_base(
+            device,
+            &self.base_bgl,
+            w.max(1),
+            h.max(1),
+            (&self.white.1, &self.mask.1),
+        );
         self.size = (w, h);
         true
     }
@@ -1160,7 +1270,7 @@ impl Compositor {
         queue: &wgpu::Queue,
         enc: &mut wgpu::CommandEncoder,
         l: &LayerDraw,
-        to_group: bool,
+        (dest, masked): (Dest, bool),
         extent: wgpu::Extent3d,
     ) {
         let Some(slot) = self.slots.get(&l.id) else {
@@ -1188,9 +1298,28 @@ impl Compositor {
             slot.size,
             &l.effects,
         );
-        let (dst_tex, dst_view, base_tex, base_bind) = match &self.group {
-            Some(g) if to_group => (&g.tex, &g.view, &g.base, &g.base_bind),
-            _ => (&self.target, &self.target_view, &self.base, &self.base_bind),
+        let (dst_tex, dst_view, base_tex, base_bind) = match (&self.group, dest) {
+            (Some(g), Dest::Group) => (
+                &g.tex,
+                &g.view,
+                &g.base,
+                if masked {
+                    &g.base_bind_masked
+                } else {
+                    &g.base_bind
+                },
+            ),
+            (_, Dest::Mask) => (&self.mask.0, &self.mask.1, &self.base, &self.base_bind),
+            _ => (
+                &self.target,
+                &self.target_view,
+                &self.base,
+                if masked {
+                    &self.base_bind_masked
+                } else {
+                    &self.base_bind
+                },
+            ),
         };
         let fx_bind;
         let bind = match out {
@@ -1242,6 +1371,67 @@ impl Compositor {
         pass.draw(0..3, 0..1);
     }
 
+    /// Draws the mask layer `m` on black into the mask buffer (once per frame and layer).
+    fn render_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        layers: &[LayerDraw],
+        m: usize,
+        extent: wgpu::Extent3d,
+    ) {
+        if self.mask_cur == Some(m) {
+            return;
+        }
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mask_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.mask.1,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        }));
+        self.draw_layer(device, queue, enc, &layers[m], (Dest::Mask, false), extent);
+        self.mask_cur = Some(m);
+    }
+
+    /// Draws `layers[i]` into the composition or the group buffer, masked when the plan
+    /// says so. Mask sources are not drawn.
+    fn draw_planned(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        mc: &MaskCtx,
+        (i, dest): (usize, Dest),
+        extent: wgpu::Extent3d,
+    ) {
+        if mc.is_src[i] {
+            return;
+        }
+        let masked = mc.plan[i];
+        if let Some(m) = masked {
+            self.render_mask(device, queue, enc, mc.layers, m, extent);
+        }
+        self.draw_layer(
+            device,
+            queue,
+            enc,
+            &mc.layers[i],
+            (dest, masked.is_some()),
+            extent,
+        );
+    }
+
     /// Composes `run` into the group buffer (transparent start), applies the group chain and
     /// blends the result into the composition. False when nothing in the group is drawn.
     #[allow(clippy::too_many_arguments)]
@@ -1250,7 +1440,7 @@ impl Compositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         enc: &mut wgpu::CommandEncoder,
-        run: &[LayerDraw],
+        (run, mc): (&[LayerDraw], Option<&MaskCtx>),
         g: &GroupDraw,
         n: usize,
         extent: wgpu::Extent3d,
@@ -1261,12 +1451,19 @@ impl Compositor {
         let size = (self.size.0.max(1), self.size.1.max(1));
         if self.group.as_ref().is_none_or(|b| b.size != size) {
             let (tex, view) = make_target(device, size.0, size.1);
-            let (base, base_bind) = make_base(device, &self.base_bgl, size.0, size.1);
+            let (base, base_bind, base_bind_masked) = make_base(
+                device,
+                &self.base_bgl,
+                size.0,
+                size.1,
+                (&self.white.1, &self.mask.1),
+            );
             self.group = Some(GroupBuf {
                 tex,
                 view,
                 base,
                 base_bind,
+                base_bind_masked,
                 size,
                 uniforms: vec![],
             });
@@ -1297,8 +1494,13 @@ impl Compositor {
             occlusion_query_set: None,
             multiview_mask: None,
         }));
-        for l in run {
-            self.draw_layer(device, queue, enc, l, true, extent);
+        for (k, l) in run.iter().enumerate() {
+            match mc {
+                Some(mc) => {
+                    self.draw_planned(device, queue, enc, mc, (mc.base + k, Dest::Group), extent)
+                }
+                None => self.draw_layer(device, queue, enc, l, (Dest::Group, false), extent),
+            }
         }
         let gb = self.group.as_ref().unwrap();
         let out = self.fx.run(
@@ -1578,6 +1780,27 @@ impl Compositor {
             height: self.size.1.max(1),
             depth_or_array_layers: 1,
         };
+        let (plan, is_src) = mask_plan(layers_bottom_to_top);
+        self.mask_cur = None;
+        if !self.white_ready {
+            drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("white_init"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.white.1,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            }));
+            self.white_ready = true;
+        }
         let mut i = 0;
         let mut group_no = 0;
         while i < layers_bottom_to_top.len() {
@@ -1586,19 +1809,32 @@ impl Compositor {
                 .find(|g| g.start == i && g.len > 0 && i + g.len <= layers_bottom_to_top.len());
             if let Some(g) = group {
                 let run = &layers_bottom_to_top[i..i + g.len];
-                if self.compose_group(device, queue, &mut enc, run, g, group_no, extent) {
+                let mc = MaskCtx {
+                    layers: layers_bottom_to_top,
+                    plan: &plan,
+                    is_src: &is_src,
+                    base: i,
+                };
+                if self.compose_group(
+                    device,
+                    queue,
+                    &mut enc,
+                    (run, Some(&mc)),
+                    g,
+                    group_no,
+                    extent,
+                ) {
                     group_no += 1;
                 }
                 i += g.len;
             } else {
-                self.draw_layer(
-                    device,
-                    queue,
-                    &mut enc,
-                    &layers_bottom_to_top[i],
-                    false,
-                    extent,
-                );
+                let mc = MaskCtx {
+                    layers: layers_bottom_to_top,
+                    plan: &plan,
+                    is_src: &is_src,
+                    base: i,
+                };
+                self.draw_planned(device, queue, &mut enc, &mc, (i, Dest::Composition), extent);
                 i += 1;
             }
         }
@@ -1855,7 +2091,7 @@ impl Compositor {
         match content {
             SliceSource::Layer(id) => {
                 if let Some(l) = layers.iter().find(|l| l.id == id) {
-                    self.draw_layer(device, queue, enc, l, false, extent);
+                    self.draw_layer(device, queue, enc, l, (Dest::Composition, false), extent);
                 }
             }
             SliceSource::Group(id) => {
@@ -1864,7 +2100,7 @@ impl Compositor {
                     .find(|g| g.id == Some(id) && g.len > 0 && g.start + g.len <= layers.len());
                 if let Some(g) = found {
                     let run = &layers[g.start..g.start + g.len];
-                    if self.compose_group(device, queue, enc, run, g, *group_no, extent) {
+                    if self.compose_group(device, queue, enc, (run, None), g, *group_no, extent) {
                         *group_no += 1;
                     }
                 }
@@ -1966,6 +2202,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(2),
@@ -1978,6 +2215,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -2045,6 +2283,7 @@ mod tests {
             transition: Some((vjc_core::transition::Kind::Dissolve.shader_id(), 0.5, out)),
             transform: Affine::IDENTITY,
             channels: Default::default(),
+            mask: Default::default(),
         };
         let layers = [
             draw(1, &[0, 0, 0, 255], true),
@@ -2112,6 +2351,7 @@ mod tests {
             transition: Some((kind.shader_id(), progress, out)),
             transform: Affine::IDENTITY,
             channels: Default::default(),
+            mask: Default::default(),
         };
         let layers = [draw(1, old, true), draw(2, new, false)];
         let mut comp = Compositor::new(&device, w, h);
@@ -2194,6 +2434,7 @@ mod tests {
             transition: None,
             transform: Affine::IDENTITY,
             channels: Default::default(),
+            mask: Default::default(),
         };
         comp.render(&device, &queue, &[layer], &[], 1.0);
         let busy = comp.vram();
@@ -2314,6 +2555,7 @@ mod tests {
                 transition: None,
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
+                mask: Default::default(),
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
             comp.render(&device, &queue, &layer, &master, 1.0);
@@ -2390,6 +2632,7 @@ mod tests {
             transition: None,
             transform: Affine::IDENTITY,
             channels: Default::default(),
+            mask: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2466,6 +2709,7 @@ mod tests {
             transition: None,
             transform: Affine::IDENTITY,
             channels: Default::default(),
+            mask: Default::default(),
         }];
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots");
@@ -2642,6 +2886,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 }];
                 comp.render(&device, &queue, &layer, &[], 1.0);
                 let data = read_target(&device, &queue, &comp);
@@ -2715,6 +2960,7 @@ mod tests {
                 transition: None,
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
+                mask: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2808,6 +3054,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 }];
                 comp.render(&device, &queue, &layer, &[], 1.0);
                 last = read_px(&device, &queue, &comp);
@@ -2860,6 +3107,7 @@ mod tests {
                 transition: None,
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
+                mask: Default::default(),
             }];
             comp.render_routed(&device, &queue, (&layer, &[]), (&[], 1.0), &routes);
             main_px = read_px(&device, &queue, &comp);
@@ -2971,6 +3219,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -2990,6 +3239,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layer, &[], 1.0);
@@ -3093,6 +3343,7 @@ mod tests {
                 transition: None,
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
+                mask: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let col = read_col(&device, &queue, &comp, 4);
@@ -3247,6 +3498,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -3265,6 +3517,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -3293,6 +3546,7 @@ mod tests {
             transition: None,
             transform: Affine::IDENTITY,
             channels: Default::default(),
+            mask: Default::default(),
         }
     }
 
@@ -3347,6 +3601,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Mask mode: the mask layer's luminance multiplies the layer right below it, or all of
+    /// the layers below; the mask layer itself is not drawn. Negative controls: mode Off
+    /// leaves the picture alone, a black mask hides it, and a layer above the mask is
+    /// untouched. Skipped when there is no adapter.
+    #[test]
+    fn gpu_mask_mode_one_below_and_all_below() {
+        use vjc_model::MaskMode;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (red, green) = ([255u8, 0, 0, 255], [0u8, 255, 0, 255]);
+        let (white, grey, black) = ([255u8; 4], [128u8, 128, 128, 255], [0u8, 0, 0, 255]);
+        // A fresh compositor per case: layer textures are cached by (id, seq).
+        let run = |layers: Vec<LayerDraw>| {
+            let mut comp = Compositor::new(&device, 1, 1);
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            read_px(&device, &queue, &comp)
+        };
+        let masked = |n, px, mode| LayerDraw {
+            mask: mode,
+            ..solid(n, px, 1.0)
+        };
+        // Control: Off draws the layer (it covers the red one below).
+        let got = run(vec![solid(1, &red, 1.0), masked(2, &white, MaskMode::Off)]);
+        assert_eq!(&got[..3], &[255, 255, 255], "{got:?}");
+        // White mask: the red layer shows in full; the mask layer is not drawn.
+        let got = run(vec![
+            solid(1, &red, 1.0),
+            masked(2, &white, MaskMode::OneBelow),
+        ]);
+        assert_eq!(&got[..3], &[255, 0, 0], "{got:?}");
+        // Grey mask: about half.
+        let got = run(vec![
+            solid(1, &red, 1.0),
+            masked(2, &grey, MaskMode::OneBelow),
+        ]);
+        assert!(got[0].abs_diff(128) <= 3 && got[1] == 0, "{got:?}");
+        // Black mask hides the layer below.
+        let got = run(vec![
+            solid(1, &red, 1.0),
+            masked(2, &black, MaskMode::OneBelow),
+        ]);
+        assert_eq!(&got[..3], &[0, 0, 0], "{got:?}");
+        // One below masks only the layer right below: red (bottom) stays, green is hidden.
+        let got = run(vec![
+            solid(1, &red, 1.0),
+            solid(2, &green, 1.0),
+            masked(3, &black, MaskMode::OneBelow),
+        ]);
+        assert_eq!(&got[..3], &[255, 0, 0], "{got:?}");
+        // All below hides both.
+        let got = run(vec![
+            solid(1, &red, 1.0),
+            solid(2, &green, 1.0),
+            masked(3, &black, MaskMode::AllBelow),
+        ]);
+        assert_eq!(&got[..3], &[0, 0, 0], "{got:?}");
+        // A layer above the mask is not masked.
+        let got = run(vec![
+            solid(1, &red, 1.0),
+            masked(2, &black, MaskMode::AllBelow),
+            solid(3, &green, 1.0),
+        ]);
+        assert_eq!(&got[..3], &[0, 255, 0], "{got:?}");
+        // Masking does not leak into the next frame without a mask.
+        let got = run(vec![solid(1, &red, 1.0)]);
+        assert_eq!(&got[..3], &[255, 0, 0], "{got:?}");
+    }
+
+    /// A mask layer with nothing playing masks nothing.
+    #[test]
+    fn mask_plan_ignores_empty_mask_layer_and_covers_outgoing_half() {
+        use vjc_model::MaskMode;
+        let empty = LayerDraw {
+            mask: MaskMode::AllBelow,
+            frame: None,
+            ..solid(9, &[0; 4], 1.0)
+        };
+        let (plan, src) = mask_plan(&[solid(1, &[1; 4], 1.0), empty]);
+        assert_eq!(plan, vec![None, None]);
+        assert_eq!(src, vec![false, false]);
+        let out = LayerDraw {
+            transition: Some((1, 0.5, true)),
+            ..solid(2, &[1; 4], 1.0)
+        };
+        let m = LayerDraw {
+            mask: MaskMode::OneBelow,
+            ..solid(4, &[1; 4], 1.0)
+        };
+        let (plan, src) = mask_plan(&[solid(1, &[1; 4], 1.0), out, solid(3, &[1; 4], 1.0), m]);
+        assert_eq!(plan, vec![None, Some(3), Some(3), None]);
+        assert_eq!(src, vec![false, false, false, true]);
+    }
+
+    /// A mask layer in a transition: both halves are sources (neither is drawn), the
+    /// incoming half is the mask, and "one below" is the real layer below.
+    #[test]
+    fn mask_plan_transitioning_mask_layer_and_nearest_all_below() {
+        use vjc_model::MaskMode;
+        let out = |n| LayerDraw {
+            transition: Some((1, 0.5, true)),
+            mask: MaskMode::OneBelow,
+            ..solid(n, &[1; 4], 1.0)
+        };
+        let inc = LayerDraw {
+            mask: MaskMode::OneBelow,
+            transition: Some((1, 0.5, false)),
+            ..solid(4, &[1; 4], 1.0)
+        };
+        let (plan, src) = mask_plan(&[solid(1, &[1; 4], 1.0), solid(2, &[1; 4], 1.0), out(3), inc]);
+        assert_eq!(plan, vec![None, Some(3), None, None]);
+        assert_eq!(src, vec![false, false, true, true]);
+        // Control: the plain layer two below is left alone.
+        assert_eq!(plan[0], None);
+        // Two all-below masks: the nearest above wins.
+        let all = |n| LayerDraw {
+            mask: MaskMode::AllBelow,
+            ..solid(n, &[1; 4], 1.0)
+        };
+        let (plan, _) = mask_plan(&[
+            solid(1, &[1; 4], 1.0),
+            all(2),
+            solid(3, &[1; 4], 1.0),
+            all(4),
+        ]);
+        assert_eq!(plan, vec![Some(1), None, Some(3), None]);
     }
 
     /// The group chain runs over the composed group, not over the layers below it.
@@ -3664,6 +4046,7 @@ mod tests {
                     transition: None,
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
+                    mask: Default::default(),
                 })
                 .collect();
             let t = std::time::Instant::now();

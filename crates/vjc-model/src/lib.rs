@@ -102,6 +102,37 @@ pub struct Layer {
     /// A column trigger skips this layer (its playing clip is left alone).
     #[serde(default)]
     pub ignore_column_trigger: bool,
+    /// Content lock: trigger, eject, drop and clear are ignored on this layer.
+    #[serde(default)]
+    pub lock_content: bool,
+    /// Raising the opacity from 0 restarts the playing clip from its start.
+    #[serde(default)]
+    pub fader_start: bool,
+    /// Uses this layer's luminance as a mask for the layers below.
+    #[serde(default)]
+    pub mask_mode: MaskMode,
+}
+
+/// What a layer masks: its luminance multiplies the layer(s) below it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaskMode {
+    #[default]
+    Off,
+    /// Masks only the layer right below.
+    OneBelow,
+    /// Masks everything below.
+    AllBelow,
+}
+
+impl MaskMode {
+    pub const ALL: [MaskMode; 3] = [MaskMode::Off, MaskMode::OneBelow, MaskMode::AllBelow];
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskMode::Off => "Off",
+            MaskMode::OneBelow => "One below",
+            MaskMode::AllBelow => "All below",
+        }
+    }
 }
 
 fn restart() -> TriggerMode {
@@ -1635,6 +1666,9 @@ mod tests {
             video: true,
             trigger_mode: TriggerMode::Restart,
             ignore_column_trigger: false,
+            lock_content: false,
+            fader_start: false,
+            mask_mode: Default::default(),
             transition: Transition {
                 kind: "cut".into(),
                 duration_beats: None,
@@ -1689,6 +1723,9 @@ mod tests {
             video: true,
             trigger_mode: TriggerMode::Restart,
             ignore_column_trigger: false,
+            lock_content: false,
+            fader_start: false,
+            mask_mode: Default::default(),
             group: None,
         });
         p.composition.decks[0].set_clip(
@@ -1796,6 +1833,9 @@ mod tests {
             video: true,
             trigger_mode: TriggerMode::Restart,
             ignore_column_trigger: false,
+            lock_content: false,
+            fader_start: false,
+            mask_mode: Default::default(),
             transition: Transition {
                 kind: "cut".into(),
                 duration_beats: None,
@@ -1941,6 +1981,22 @@ mod tests {
             TriggerStyle::Composition.resolve(old.composition.trigger_style),
             TriggerStyle::Normal
         );
+    }
+
+    #[test]
+    fn layer_lock_fader_mask_default_when_absent_and_roundtrip() {
+        let mut l = fixture().layers.remove(0);
+        l.lock_content = true;
+        l.fader_start = true;
+        l.mask_mode = MaskMode::AllBelow;
+        let v = serde_json::to_value(&l).unwrap();
+        assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap(), l);
+        let mut old = v;
+        for k in ["lock_content", "fader_start", "mask_mode"] {
+            old.as_object_mut().unwrap().remove(k);
+        }
+        let o: Layer = serde_json::from_value(old).unwrap();
+        assert!(!o.lock_content && !o.fader_start && o.mask_mode == MaskMode::Off);
     }
 
     #[test]

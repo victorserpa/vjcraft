@@ -92,6 +92,23 @@ pub enum Command {
     ClearLayer {
         layer: LayerId,
     },
+    /// Empties every cell of the layer in the deck; the layer stays. Refused on a locked layer.
+    ClearLayerClips {
+        deck: DeckId,
+        layer: LayerId,
+    },
+    SetLayerLock {
+        layer: LayerId,
+        locked: bool,
+    },
+    SetLayerFaderStart {
+        layer: LayerId,
+        enabled: bool,
+    },
+    SetLayerMaskMode {
+        layer: LayerId,
+        mode: vjc_model::MaskMode,
+    },
     /// Triggers every clip of the column in each layer. Layers with no clip in the column
     /// are cleared (the column replaces the whole stage, like Resolume). Placeholder or
     /// otherwise unplayable clips are skipped (`Event::Skipped`), the rest still plays.
@@ -881,6 +898,10 @@ pub enum Event {
     LayerCleared {
         layer: LayerId,
     },
+    /// The layer's fader went from 0 up and it has fader start: restart its playing clip.
+    FaderStart {
+        layer: LayerId,
+    },
     /// Jump the playing clip (if it is this cell) to a normalised position.
     Seek {
         deck: DeckId,
@@ -949,6 +970,8 @@ pub enum Error {
     InvalidValue,
     /// Another screen already outputs to that monitor.
     MonitorInUse,
+    /// The layer's content is locked.
+    Locked,
 }
 
 impl std::fmt::Display for Error {
@@ -967,6 +990,7 @@ impl std::fmt::Display for Error {
             Error::NotPlayable => "clip has no playable file source",
             Error::InUse => "layer or column is not empty",
             Error::InvalidValue => "value out of range",
+            Error::Locked => "layer content is locked",
             Error::MonitorInUse => "that monitor already shows another screen",
         })
     }
@@ -1410,7 +1434,7 @@ fn trigger_column(p: &Project, deck: DeckId, column: ColumnIdx) -> Result<Applie
         .composition
         .layers
         .iter()
-        .filter(|l| !l.ignore_column_trigger)
+        .filter(|l| !l.ignore_column_trigger && !l.lock_content)
     {
         match trigger_event(p, deck, l.id, column) {
             Ok(e) => events.push(e),
@@ -1435,6 +1459,7 @@ pub fn playback_rate(clip_speed: f64, sync: f64, master_speed: f64) -> f64 {
 /// Applies a command to the project. Pure: no I/O, no UI, no players. Effect shortcuts are
 /// re-pointed afterwards so they keep following their effect (see `shortcuts::rebind`).
 pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
+    let cmd = resolve_layer_name(p, cmd);
     // Empty names are rejected for every user edit; undo/redo go through `restore` because
     // a name that was already empty must be restorable.
     if let Command::RenameLayer { name, .. }
@@ -1446,7 +1471,119 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
     {
         return Err(Error::InvalidValue);
     }
-    restore(p, cmd)
+    // A locked layer ignores trigger, eject, drop and clear from the user. Undo/redo go
+    // through `restore` and are not gated.
+    let mut touched = vec![];
+    touched_layers(&cmd, &mut touched);
+    if touched.iter().any(|l| is_locked(p, *l)) {
+        return Err(Error::Locked);
+    }
+    // Fader start fires only for the user's own opacity edit, never for undo/redo.
+    let rise = match &cmd {
+        Command::SetOpacity { layer, value } => p
+            .composition
+            .layers
+            .iter()
+            .find(|l| l.id == *layer)
+            .filter(|l| l.fader_start && !l.lock_content)
+            .is_some_and(|l| number(&l.track.opacity.value) <= 0.0 && *value > 0.0)
+            .then_some(*layer),
+        _ => None,
+    };
+    let mut applied = restore(p, cmd)?;
+    if let Some(layer) = rise {
+        applied.events.push(Event::FaderStart { layer });
+    }
+    Ok(applied)
+}
+
+/// Layers whose content a command would change or play (looks inside `Batch`).
+fn touched_layers(cmd: &Command, out: &mut Vec<LayerId>) {
+    match cmd {
+        Command::ImportMedia { layer, .. }
+        | Command::SetClip { layer, .. }
+        | Command::SetGenerator { layer, .. }
+        | Command::ClearCell { layer, .. }
+        | Command::TriggerClip { layer, .. }
+        | Command::StepClip { layer, .. }
+        | Command::ClearLayer { layer }
+        | Command::ClearLayerClips { layer, .. }
+        | Command::RemoveLayerWithClips { layer } => out.push(*layer),
+        Command::MoveClip { from, to, copy, .. } => {
+            if !*copy {
+                out.push(from.0);
+            }
+            out.push(to.0);
+        }
+        Command::Batch { commands } => commands.iter().for_each(|c| touched_layers(c, out)),
+        _ => {}
+    }
+}
+
+/// A layer rename with '#' becomes the final name ('#' = the layer's number, bottom = 1),
+/// so the stored command (and its undo) holds the name as it was set.
+pub fn resolve_layer_name(p: &Project, cmd: Command) -> Command {
+    match cmd {
+        Command::RenameLayer { layer, name } if name.contains('#') => {
+            let name = match p.composition.layers.iter().position(|l| l.id == layer) {
+                Some(i) => name.replace('#', &(p.composition.layers.len() - i).to_string()),
+                None => name,
+            };
+            Command::RenameLayer { layer, name }
+        }
+        c => c,
+    }
+}
+
+/// Group a layer inserted at `index` (0 = top) must join: the neighbours' group when both
+/// share one, so the group stays contiguous.
+pub fn insert_group_at(p: &Project, index: usize) -> Option<GroupId> {
+    let ls = &p.composition.layers;
+    let above = index.checked_sub(1).and_then(|i| ls.get(i))?.group?;
+    (ls.get(index)?.group == Some(above)).then_some(above)
+}
+
+/// True when the layer exists and has its content locked.
+pub fn is_locked(p: &Project, layer: LayerId) -> bool {
+    p.composition
+        .layers
+        .iter()
+        .any(|l| l.id == layer && l.lock_content)
+}
+
+/// Layer number as shown to the user: the bottom layer is 1.
+pub fn layer_number(p: &Project, layer: LayerId) -> Option<usize> {
+    let i = p.composition.layers.iter().position(|l| l.id == layer)?;
+    Some(p.composition.layers.len() - i)
+}
+
+/// Command that puts a copy of the layer (clips, effects, params; fresh ids) right above
+/// it. Undo removes the copy with its clips. None when the layer does not exist.
+pub fn duplicate_layer_command(p: &Project, layer: LayerId) -> Option<Command> {
+    let i = p.composition.layers.iter().position(|l| l.id == layer)?;
+    let mut copy = p.composition.layers[i].clone();
+    copy.id = Uuid::new_v4();
+    copy.name = format!("{} copy", copy.name);
+    for e in &mut copy.track.effects {
+        e.id = Uuid::new_v4();
+    }
+    let mut clips = vec![];
+    for d in &p.composition.decks {
+        let own = d.clips.iter().filter(|c| c.layer == layer);
+        for (at, cc) in (d.clips.len()..).zip(own) {
+            let mut n = cc.clone();
+            n.layer = copy.id;
+            n.clip = clone_with_fresh_ids(&cc.clip);
+            clips.push((d.id, at, n));
+        }
+    }
+    Some(Command::RestoreLayer {
+        layer: copy,
+        index: i,
+        clips,
+        slices: vec![],
+        cues: vec![],
+    })
 }
 
 /// `apply` without the user-input checks: for undo/redo replays.
@@ -1763,6 +1900,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 .composition
                 .layers
                 .iter()
+                .filter(|l| !l.lock_content)
                 .map(|l| Event::LayerCleared { layer: l.id })
                 .collect(),
         }),
@@ -1851,6 +1989,69 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 },
                 vec![],
             )
+        }
+        Command::ClearLayerClips { deck, layer } => {
+            layer_idx(p, layer)?;
+            let d = deck_mut(p, deck)?;
+            let deck_id = d.id;
+            let removed: Vec<CellClip> = d
+                .clips
+                .iter()
+                .filter(|c| c.layer == layer)
+                .cloned()
+                .collect();
+            if removed.is_empty() {
+                return Ok(Applied {
+                    inverse: None,
+                    events: vec![],
+                });
+            }
+            d.clips.retain(|c| c.layer != layer);
+            let events = removed
+                .iter()
+                .map(|c| Event::CellChanged {
+                    deck: deck_id,
+                    layer,
+                    column: c.column,
+                })
+                .collect();
+            let commands = removed
+                .into_iter()
+                .map(|c| Command::SetClip {
+                    deck: deck_id,
+                    layer,
+                    column: c.column,
+                    clip: c.clip,
+                })
+                .collect();
+            undoable(Command::Batch { commands }, events)
+        }
+        Command::SetLayerLock { layer, locked } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].lock_content, locked);
+            undoable(
+                Command::SetLayerLock {
+                    layer,
+                    locked: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetLayerFaderStart { layer, enabled } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].fader_start, enabled);
+            undoable(
+                Command::SetLayerFaderStart {
+                    layer,
+                    enabled: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetLayerMaskMode { layer, mode } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].mask_mode, mode);
+            undoable(Command::SetLayerMaskMode { layer, mode: prev }, vec![])
         }
         Command::ClearLayer { layer } => {
             layer_idx(p, layer)?;
@@ -2342,6 +2543,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         }
         Command::RenameLayer { layer, name } => {
             let i = layer_idx(p, layer)?;
+
             let prev = std::mem::replace(&mut p.composition.layers[i].name, name);
             undoable(Command::RenameLayer { layer, name: prev }, vec![])
         }
@@ -3116,6 +3318,7 @@ impl History {
         now: Instant,
     ) -> Result<Vec<Event>, Error> {
         // Resolve the clip id now so redo recreates the very same clip.
+        let cmd = resolve_layer_name(p, cmd);
         let cmd = match cmd {
             Command::ImportMedia {
                 deck,
@@ -3437,6 +3640,9 @@ mod tests {
             video: true,
             trigger_mode: vjc_model::TriggerMode::Restart,
             ignore_column_trigger: false,
+            lock_content: false,
+            fader_start: false,
+            mask_mode: Default::default(),
             group: None,
         }
     }
@@ -7386,6 +7592,449 @@ mod tests {
             h.undo(&mut p).unwrap().unwrap();
         }
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn duplicate_layer_copies_clips_effects_with_fresh_ids_and_undoes() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l2, 0);
+        let fx = vjc_model::Effect {
+            id: Uuid::new_v4(),
+            kind: "Invert".into(),
+            bypass: false,
+            dry_wet: 1.0,
+            params: vec![],
+        };
+        p.composition.layers[1].track.effects.push(fx);
+        let before = p.clone();
+        let cmd = duplicate_layer_command(&p, l2).unwrap();
+        let mut h = History::new();
+        h.exec(&mut p, cmd, Instant::now()).unwrap();
+        let ls = &p.composition.layers;
+        assert_eq!(ls.len(), 4);
+        // Inserted right above the original.
+        assert_eq!(ls[2].id, l2);
+        let copy = &ls[1];
+        assert_ne!(copy.id, l2);
+        assert_eq!(copy.track.effects.len(), 1);
+        assert_ne!(copy.track.effects[0].id, ls[2].track.effects[0].id);
+        let a = clip_in(&p, A, l2, 0).unwrap();
+        let b = clip_in(&p, A, copy.id, 0).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.source, b.source);
+        // Control: the other layers got no clips.
+        assert!(clip_in(&p, A, l1, 0).is_none());
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.layers.len(), 4);
+        assert!(duplicate_layer_command(&p, Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn locked_layer_ignores_trigger_eject_drop_clear_and_column() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        gen_cell(&mut p, l2, 0);
+        let trig = |l| Command::TriggerClip {
+            deck: A,
+            layer: l,
+            column: 0,
+        };
+        // Control: unlocked, all of it works.
+        assert!(apply(&mut p, trig(l2)).is_ok());
+        apply(
+            &mut p,
+            Command::SetLayerLock {
+                layer: l2,
+                locked: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(apply(&mut p, trig(l2)).unwrap_err(), Error::Locked);
+        assert_eq!(
+            apply(&mut p, Command::ClearLayer { layer: l2 }).unwrap_err(),
+            Error::Locked
+        );
+        assert_eq!(
+            apply(
+                &mut p,
+                Command::ClearCell {
+                    deck: A,
+                    layer: l2,
+                    column: 0
+                }
+            )
+            .unwrap_err(),
+            Error::Locked
+        );
+        assert_eq!(
+            apply(&mut p, Command::ClearLayerClips { deck: A, layer: l2 }).unwrap_err(),
+            Error::Locked
+        );
+        let c = clip_in(&p, A, l1, 0).unwrap().clone();
+        assert_eq!(
+            apply(
+                &mut p,
+                Command::SetClip {
+                    deck: A,
+                    layer: l2,
+                    column: 0,
+                    clip: c.clone()
+                }
+            )
+            .unwrap_err(),
+            Error::Locked
+        );
+        // Moving a clip into, or out of, the locked layer is refused; a copy out is fine.
+        let mv = |from, to, copy| Command::MoveClip {
+            deck: A,
+            from,
+            to,
+            copy,
+        };
+        assert_eq!(
+            apply(&mut p, mv((l1, 0), (l2, 0), false)).unwrap_err(),
+            Error::Locked
+        );
+        assert_eq!(
+            apply(&mut p, mv((l2, 0), (l1, 0), false)).unwrap_err(),
+            Error::Locked
+        );
+        assert!(apply(&mut p, mv((l2, 0), (l1, 0), true)).is_ok());
+        // Column trigger and clear-all leave the locked layer alone.
+        let touches = |ev: &[Event], l| {
+            ev.iter().any(|e| {
+                matches!(e, Event::GeneratorStarted { layer, .. }
+                    | Event::LayerCleared { layer } if *layer == l)
+            })
+        };
+        let ev = apply(&mut p, Command::TriggerColumn { deck: A, column: 0 })
+            .unwrap()
+            .events;
+        assert!(touches(&ev, l1) && !touches(&ev, l2));
+        let ev = apply(&mut p, Command::ClearAll).unwrap().events;
+        assert!(touches(&ev, l1) && !touches(&ev, l2));
+        // Unlocking restores everything; the lock itself undoes.
+        apply(
+            &mut p,
+            Command::SetLayerLock {
+                layer: l2,
+                locked: false,
+            },
+        )
+        .unwrap();
+        assert!(apply(&mut p, trig(l2)).is_ok());
+        roundtrip(
+            &mut p,
+            Command::SetLayerLock {
+                layer: l2,
+                locked: true,
+            },
+        );
+    }
+
+    #[test]
+    fn fader_start_fires_only_on_rise_from_zero_with_flag_and_no_lock() {
+        let (mut p, [_, l2, _]) = three_layers();
+        let set = |p: &mut Project, v| {
+            apply(
+                p,
+                Command::SetOpacity {
+                    layer: l2,
+                    value: v,
+                },
+            )
+            .unwrap()
+            .events
+        };
+        let fired = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::FaderStart { .. }));
+        set(&mut p, 0.0);
+        // Control: flag off, no event.
+        assert!(!fired(&set(&mut p, 0.5)));
+        set(&mut p, 0.0);
+        apply(
+            &mut p,
+            Command::SetLayerFaderStart {
+                layer: l2,
+                enabled: true,
+            },
+        )
+        .unwrap();
+        assert!(fired(&set(&mut p, 0.4)));
+        // Moving a fader that is already up does not retrigger.
+        assert!(!fired(&set(&mut p, 0.8)));
+        // Dropping to zero does not either.
+        assert!(!fired(&set(&mut p, 0.0)));
+        // Locked layers ignore the trigger.
+        apply(
+            &mut p,
+            Command::SetLayerLock {
+                layer: l2,
+                locked: true,
+            },
+        )
+        .unwrap();
+        assert!(!fired(&set(&mut p, 0.6)));
+        roundtrip(
+            &mut p,
+            Command::SetLayerFaderStart {
+                layer: l2,
+                enabled: false,
+            },
+        );
+    }
+
+    #[test]
+    fn clear_layer_clips_keeps_layer_and_undoes() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        gen_cell(&mut p, l2, 0);
+        let before = p.clone();
+        let mut h = History::new();
+        let ev = h
+            .exec(
+                &mut p,
+                Command::ClearLayerClips { deck: A, layer: l2 },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, Event::CellChanged { layer, .. } if *layer == l2))
+        );
+        assert!(clip_in(&p, A, l2, 0).is_none());
+        assert_eq!(p.composition.layers.len(), 3);
+        // Control: the neighbour keeps its clip.
+        assert!(clip_in(&p, A, l1, 0).is_some());
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn rename_layer_hash_becomes_number() {
+        let (mut p, [l1, _, l3]) = three_layers();
+        let n = p.composition.layers.len();
+        let top = p.composition.layers[0].id;
+        apply(
+            &mut p,
+            Command::RenameLayer {
+                layer: top,
+                name: "Fx #".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(p.composition.layers[0].name, format!("Fx {n}"));
+        // Control: no '#', name untouched.
+        apply(
+            &mut p,
+            Command::RenameLayer {
+                layer: l3,
+                name: "Plain".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(layer_number(&p, top), Some(n));
+        let _ = l1;
+        roundtrip(
+            &mut p,
+            Command::RenameLayer {
+                layer: top,
+                name: "#-#".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn mask_mode_command_undoes() {
+        let (mut p, [l1, ..]) = three_layers();
+        roundtrip(
+            &mut p,
+            Command::SetLayerMaskMode {
+                layer: l1,
+                mode: vjc_model::MaskMode::OneBelow,
+            },
+        );
+        apply(
+            &mut p,
+            Command::SetLayerMaskMode {
+                layer: l1,
+                mode: vjc_model::MaskMode::AllBelow,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            p.composition
+                .layers
+                .iter()
+                .find(|l| l.id == l1)
+                .unwrap()
+                .mask_mode,
+            vjc_model::MaskMode::AllBelow
+        );
+    }
+
+    #[test]
+    fn fader_start_fires_inside_a_batch() {
+        let (mut p, [_, l2, _]) = three_layers();
+        for c in [
+            Command::SetLayerFaderStart {
+                layer: l2,
+                enabled: true,
+            },
+            Command::SetOpacity {
+                layer: l2,
+                value: 0.0,
+            },
+        ] {
+            apply(&mut p, c).unwrap();
+        }
+        let ev = apply(
+            &mut p,
+            Command::Batch {
+                commands: vec![Command::SetOpacity {
+                    layer: l2,
+                    value: 0.7,
+                }],
+            },
+        )
+        .unwrap()
+        .events;
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, Event::FaderStart { layer } if *layer == l2))
+        );
+    }
+
+    #[test]
+    fn fader_start_not_fired_by_undo_redo() {
+        let (mut p, [_, l2, _]) = three_layers();
+        let mut h = History::new();
+        let now = Instant::now();
+        apply(
+            &mut p,
+            Command::SetLayerFaderStart {
+                layer: l2,
+                enabled: true,
+            },
+        )
+        .unwrap();
+        let fired = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::FaderStart { .. }));
+        let set = |h: &mut History, p: &mut Project, v, t| {
+            h.exec(
+                p,
+                Command::SetOpacity {
+                    layer: l2,
+                    value: v,
+                },
+                t,
+            )
+            .unwrap()
+        };
+        set(&mut h, &mut p, 0.0, now);
+        // Direct edit fires.
+        assert!(fired(&set(
+            &mut h,
+            &mut p,
+            0.7,
+            now + Duration::from_secs(5)
+        )));
+        // Undo to 0 and redo back up to 0.7: neither restarts the clip.
+        assert!(!fired(&h.undo(&mut p).unwrap().unwrap()));
+        assert!(!fired(&h.redo(&mut p).unwrap().unwrap()));
+    }
+
+    #[test]
+    fn hash_rename_stores_final_name_and_undo_keeps_literal_hash() {
+        let (mut p, [l1, ..]) = three_layers();
+        p.composition
+            .layers
+            .iter_mut()
+            .find(|l| l.id == l1)
+            .unwrap()
+            .name = "Old #".into();
+        let mut h = History::new();
+        h.exec(
+            &mut p,
+            Command::RenameLayer {
+                layer: l1,
+                name: "New #".into(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let name = |p: &Project| {
+            p.composition
+                .layers
+                .iter()
+                .find(|l| l.id == l1)
+                .unwrap()
+                .name
+                .clone()
+        };
+        assert_eq!(name(&p), "New 3");
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(name(&p), "Old #", "literal '#' survives undo");
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(name(&p), "New 3");
+    }
+
+    #[test]
+    fn batch_cannot_get_around_the_lock() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        gen_cell(&mut p, l2, 0);
+        apply(
+            &mut p,
+            Command::SetLayerLock {
+                layer: l2,
+                locked: true,
+            },
+        )
+        .unwrap();
+        let trig = |l| Command::TriggerClip {
+            deck: A,
+            layer: l,
+            column: 0,
+        };
+        let before = p.clone();
+        let b = Command::Batch {
+            commands: vec![
+                trig(l1),
+                Command::Batch {
+                    commands: vec![trig(l2)],
+                },
+            ],
+        };
+        assert_eq!(apply(&mut p, b).unwrap_err(), Error::Locked);
+        assert_eq!(p, before);
+        // Control: the same batch on the unlocked layer passes.
+        assert!(
+            apply(
+                &mut p,
+                Command::Batch {
+                    commands: vec![trig(l1)]
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn insert_group_at_joins_only_between_same_group_layers() {
+        let (mut p, [l1, l2, l3]) = three_layers();
+        let g = Uuid::new_v4();
+        for l in &mut p.composition.layers {
+            if l.id == l1 || l.id == l2 {
+                l.group = Some(g);
+            }
+        }
+        let _ = l3;
+        // Between the two grouped layers: joins. Edges and next to ungrouped: no.
+        assert_eq!(insert_group_at(&p, 1), Some(g));
+        assert_eq!(insert_group_at(&p, 0), None);
+        assert_eq!(insert_group_at(&p, 2), None);
+        assert_eq!(insert_group_at(&p, 3), None);
     }
 }
 
