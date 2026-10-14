@@ -208,6 +208,12 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
             "{n} screen(s) shared a monitor with another screen and were set to a window"
         ));
     }
+    let n = vjc_core::mapping::sanitize_slice_effects(&mut project.output);
+    if n > 0 {
+        warnings.push(format!(
+            "{n} slice(s) had an invalid mask or soft edge and were repaired"
+        ));
+    }
     project.resume_paused();
     let n = project.normalize_groups();
     if n > 0 {
@@ -293,6 +299,43 @@ mod tests {
         let (q, warns) = open(&f).unwrap();
         assert_eq!(q.output.screens[1].device, vjc_model::OutputDevice::Window);
         assert!(warns.iter().any(|w| w.contains("share")), "{warns:?}");
+    }
+
+    #[test]
+    fn open_repairs_invalid_mask_and_soft_edge() {
+        let d = tmp("badmask");
+        let mut p = Project::new("T");
+        let mut s = vjc_core::mapping::new_screen("A", 100, 100);
+        let mut a = vjc_core::mapping::new_slice(100, 100);
+        a.mask = Some(vec![(0.0, 0.0)]); // too few points
+        a.soft_edge = Some(vjc_model::SoftEdge {
+            left: 9.0,
+            right: 0.1,
+            top: 0.0,
+            bottom: 0.0,
+            gamma: 2.0,
+        });
+        let mut b = vjc_core::mapping::new_slice(100, 100);
+        b.mask = Some(vec![(-1.0, 0.0), (2.0, 0.0), (0.0, 1.0)]);
+        s.slices = vec![a, b];
+        p.output.screens.push(s);
+        let f = d.join("p.vjc");
+        save(&p, &f).unwrap();
+        let (q, warns) = open(&f).unwrap();
+        let sl = &q.output.screens[0].slices;
+        assert_eq!(sl[0].mask, None);
+        assert_eq!(sl[0].soft_edge.as_ref().unwrap().left, 0.5);
+        assert_eq!(sl[1].mask, Some(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]));
+        assert!(warns.iter().any(|w| w.contains("mask")), "{warns:?}");
+        // The repaired state round-trips through the command, so undo cannot fail.
+        let (screen, slice, mask) = (q.output.screens[0].id, sl[1].id, sl[1].mask.clone());
+        let mut q = q;
+        let cmd = vjc_core::Command::SetSliceMask {
+            screen,
+            slice,
+            mask,
+        };
+        vjc_core::apply(&mut q, cmd).unwrap();
     }
 
     #[test]

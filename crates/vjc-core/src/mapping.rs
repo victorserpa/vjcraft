@@ -318,6 +318,27 @@ pub fn clamp_soft_edge(s: &vjc_model::SoftEdge) -> Option<vjc_model::SoftEdge> {
     })
 }
 
+/// Repairs masks and soft edges read from disk so later edits and their undo never fail:
+/// an invalid mask is dropped, points are clamped to 0..1, soft edge values are clamped (or
+/// dropped when not finite). Returns how many slices changed.
+pub fn sanitize_slice_effects(out: &mut vjc_model::OutputSetup) -> usize {
+    let mut changed = 0;
+    for sl in out.screens.iter_mut().flat_map(|s| &mut s.slices) {
+        let before = (sl.mask.clone(), sl.soft_edge.clone());
+        if sl.mask.as_ref().is_some_and(|m| !mask_valid(m)) {
+            sl.mask = None;
+        }
+        sl.mask = sl.mask.take().map(|m| {
+            m.into_iter()
+                .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
+                .collect()
+        });
+        sl.soft_edge = sl.soft_edge.as_ref().and_then(clamp_soft_edge);
+        changed += usize::from(before != (sl.mask.clone(), sl.soft_edge.clone()));
+    }
+    changed
+}
+
 /// Even-odd point-in-polygon test (the shader runs the same algorithm).
 pub fn point_in_polygon(poly: &[Pt], p: Pt) -> bool {
     let mut inside = false;

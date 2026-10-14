@@ -278,3 +278,15 @@ fn bench_inference_ms() {
         );
     }
 }
+
+#[test]
+fn frame_without_finite_values_keeps_the_depth_range() {
+    let first = smooth_range(None, &[1.0, 5.0]).unwrap();
+    assert_eq!(first, (1.0, 5.0));
+    assert_eq!(smooth_range(Some(first), &[f32::NAN, f32::INFINITY]), None);
+    // The caller keeps `first`, so the next good frame eases from it, not from (0, 0).
+    let next = smooth_range(Some(first), &[1.0, 5.0]).unwrap();
+    assert_eq!(next, (1.0, 5.0));
+    // Negative control: easing from a crushed (0, 0) range would give 0.7 here.
+    assert_ne!(smooth_range(Some((0.0, 0.0)), &[1.0, 5.0]).unwrap(), next);
+}

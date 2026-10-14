@@ -131,6 +131,7 @@ fn clamp(setup: &mut OutputSetup) {
         s.height = s.height.clamp(1, 16384);
     }
     mapping::normalize_output(setup);
+    mapping::sanitize_slice_effects(setup);
     for sl in setup.screens.iter_mut().flat_map(|s| &mut s.slices) {
         if sl.input.len() < 3
             || sl
@@ -140,15 +141,6 @@ fn clamp(setup: &mut OutputSetup) {
         {
             sl.input = mapping::full_input();
         }
-        if sl.mask.as_ref().is_some_and(|m| !mapping::mask_valid(m)) {
-            sl.mask = None;
-        }
-        sl.mask = sl.mask.take().map(|m| {
-            m.into_iter()
-                .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
-                .collect()
-        });
-        sl.soft_edge = sl.soft_edge.as_ref().and_then(mapping::clamp_soft_edge);
     }
 }
 

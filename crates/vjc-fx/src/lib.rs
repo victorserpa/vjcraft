@@ -563,6 +563,9 @@ const TYPES: &[&str] = &[
 /// the effect is rejected with a clear message instead. Comments are skipped.
 fn declared_input(body: &str, names: &[&str]) -> Option<String> {
     let c: Vec<char> = body.chars().collect();
+    // User struct types declare variables like the built-in ones (`Light amount;`).
+    let mut structs: Vec<String> = vec![];
+    let mut after_struct = false;
     let mut i = 0;
     let mut prev_type = false;
     // Nesting depth, and the depth of the declaration whose declarator list is open
@@ -586,13 +589,17 @@ fn declared_input(body: &str, names: &[&str]) -> Option<String> {
                 i += 1;
             }
             let id: String = c[st..i].iter().collect();
+            if after_struct {
+                structs.push(id.clone());
+            }
+            after_struct = id == "struct";
             if prev_type && names.contains(&id.as_str()) {
                 return Some(id);
             }
             if prev_type {
                 decl = Some(depth);
             }
-            prev_type = TYPES.contains(&id.as_str());
+            prev_type = TYPES.contains(&id.as_str()) || structs.contains(&id);
         } else {
             let ch = c[i];
             if !ch.is_whitespace() {
@@ -930,6 +937,11 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
         ] {
             assert_eq!(declared_input(b, &n).as_deref(), Some("amount"), "{b}");
         }
+        // A user struct type declares variables too.
+        let b = "struct Light { float k; }; void main() { Light amount; }";
+        assert_eq!(declared_input(b, &n).as_deref(), Some("amount"));
+        let b = "struct Light { float k; }; void main() { Light l; x = amount; }";
+        assert_eq!(declared_input(b, &n), None);
         // Uses in calls, initializers and later statements are not declarations.
         for b in [
             "void main() { float a = f(1.0, amount); }",

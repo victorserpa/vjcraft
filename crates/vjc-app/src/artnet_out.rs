@@ -149,7 +149,10 @@ impl Pub {
                                 Src::Cpu(v) => v,
                                 Src::Gpu(_) => &scratch,
                             };
-                            if ready && dmx::valid(&set.fixture) {
+                            if !dmx::valid(&set.fixture) {
+                                // Reported once; the sender restarts on the next change.
+                                fail("fixture is empty or too large".into());
+                            } else if ready {
                                 seq = dmx::next_seq(seq);
                                 // UDP errors (unreachable host, link down) must not stop the show.
                                 let _ = send_frame(&sock, target, &set, rgba, (f.w, f.h), seq);
@@ -520,5 +523,47 @@ mod tests {
         };
         out.pubs[&w.id].tx.as_ref().unwrap().send(frame()).unwrap();
         assert_eq!(recv_dmx(&rx).universe, 4);
+    }
+
+    #[test]
+    fn fixture_made_invalid_at_runtime_is_reported() {
+        let (_rx, addr) = local();
+        let mut w = want(addr, fixture(1, 1, PixelFormat::Rgb), 0);
+        let mut p = Pub::start(w.clone());
+        w.fixture.width = 0;
+        p.update(&w);
+        p.tx.as_ref()
+            .unwrap()
+            .send(Frame {
+                w: 1,
+                h: 1,
+                src: Src::Cpu(vec![1, 2, 3, 255]),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            if p.failed() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Negative control: before the fix the frame was skipped without any error.
+        assert!(p.failed());
+    }
+
+    #[test]
+    fn valid_fixture_does_not_report_errors() {
+        let (rx, addr) = local();
+        let w = want(addr, fixture(1, 1, PixelFormat::Rgb), 0);
+        let p = Pub::start(w);
+        p.tx.as_ref()
+            .unwrap()
+            .send(Frame {
+                w: 1,
+                h: 1,
+                src: Src::Cpu(vec![1, 2, 3, 255]),
+            })
+            .unwrap();
+        recv_dmx(&rx);
+        assert!(!p.failed());
     }
 }

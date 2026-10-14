@@ -455,6 +455,14 @@ impl Drop for Server {
     }
 }
 
+/// Starts a named thread; injectable so tests can make it fail.
+pub type Spawner =
+    dyn Fn(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> + Send + Sync;
+
+fn spawn_named(name: &str, f: Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new().name(name.into()).spawn(f)
+}
+
 impl Server {
     pub fn start(
         http: SocketAddr,
@@ -462,6 +470,19 @@ impl Server {
         tx: Sender<Msg>,
         wake: Wake,
         status: SharedStatus,
+    ) -> std::io::Result<Server> {
+        Self::start_with(http, ws, tx, wake, status, &spawn_named)
+    }
+
+    /// `start` with the thread spawner injected, so a spawn failure is testable.
+    /// If the second spawn fails, the first thread is stopped and joined (no leak).
+    pub fn start_with(
+        http: SocketAddr,
+        ws: SocketAddr,
+        tx: Sender<Msg>,
+        wake: Wake,
+        status: SharedStatus,
+        spawn: &Spawner,
     ) -> std::io::Result<Server> {
         let link = Link { tx, wake };
         let server = tiny_http::Server::http(http).map_err(std::io::Error::other)?;
@@ -476,14 +497,23 @@ impl Server {
         let any = ws.ip().is_unspecified();
         let (s1, l1, st1) = (stop.clone(), link.clone(), status);
         let http_port = http_addr.port();
-        let t1 = std::thread::Builder::new()
-            .name("api-http".into())
-            .spawn(move || http_loop(server, s1, l1, any, http_port, st1))?;
+        let t1 = spawn(
+            "api-http",
+            Box::new(move || http_loop(server, s1, l1, any, http_port, st1)),
+        )?;
         let s2 = stop.clone();
         let ws_port = ws_addr.port();
-        let t2 = std::thread::Builder::new()
-            .name("api-ws".into())
-            .spawn(move || ws_accept_loop(listener, s2, link, any, ws_port))?;
+        let t2 = match spawn(
+            "api-ws",
+            Box::new(move || ws_accept_loop(listener, s2, link, any, ws_port)),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = t1.join();
+                return Err(e);
+            }
+        };
         Ok(Server {
             stop,
             http_addr,
@@ -1298,5 +1328,33 @@ mod tests {
             }
             assert!(tungstenite::client(rq, s).is_err(), "{path} {origin:?}");
         }
+    }
+
+    #[test]
+    fn failed_ws_spawn_joins_the_http_thread() {
+        use std::sync::atomic::AtomicUsize;
+        let finished = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (f2, c2) = (finished.clone(), calls.clone());
+        let spawn: Box<Spawner> = Box::new(move |name, f| {
+            if c2.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(std::io::Error::other("no threads"));
+            }
+            let f2 = f2.clone();
+            spawn_named(
+                name,
+                Box::new(move || {
+                    f();
+                    f2.store(true, Ordering::SeqCst);
+                }),
+            )
+        });
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let r = Server::start_with(lo, lo, tx, Arc::new(|| {}), Default::default(), &*spawn);
+        assert!(r.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // Negative control: without stop+join in the error path this stays false.
+        assert!(finished.load(Ordering::SeqCst), "http thread leaked");
     }
 }

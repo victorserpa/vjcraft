@@ -14,6 +14,12 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// A failed decode is tried again after this long (file may have appeared / finished copying).
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// Wait before retry number `failures` (1-based): doubles each time up to 64x, so a clip
+/// whose file is gone is not decoded every few seconds forever.
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_AFTER * (1u32 << failures.saturating_sub(1).min(6))
+}
+
 /// Most thumbnails kept at once; past this the least recently shown ones are dropped
 /// (they are decoded again if shown later).
 const MAX_THUMBS: usize = 512;
@@ -32,6 +38,8 @@ pub struct ClipThumbs {
     frame_start: u64,
     pending: HashMap<ClipId, (PathBuf, Instant)>,
     failed: HashMap<ClipId, (PathBuf, Instant)>,
+    /// Consecutive failures per clip, for the retry backoff.
+    failures: HashMap<ClipId, u32>,
     req: Sender<(ClipId, PathBuf)>,
     done: Receiver<(ClipId, PathBuf, Option<Frame>)>,
 }
@@ -56,6 +64,7 @@ impl ClipThumbs {
             frame_start: 0,
             pending: HashMap::new(),
             failed: HashMap::new(),
+            failures: HashMap::new(),
             req,
             done,
         }
@@ -80,11 +89,13 @@ impl ClipThumbs {
                         &f.data,
                     );
                     let h = ctx.load_texture("clip-thumb", img, egui::TextureOptions::LINEAR);
+                    self.failures.remove(&id);
                     self.tick += 1;
                     self.textures.insert(id, (path, h, self.tick));
                     self.evict();
                 }
                 None => {
+                    *self.failures.entry(id).or_insert(0) += 1;
                     self.failed.insert(id, (path, Instant::now()));
                 }
             }
@@ -112,10 +123,9 @@ impl ClipThumbs {
             .pending
             .get(&id)
             .is_some_and(|(p, at)| p == path && at.elapsed() < PENDING_TIMEOUT);
-        let failed = self
-            .failed
-            .get(&id)
-            .is_some_and(|(p, at)| p == path && at.elapsed() < RETRY_AFTER);
+        let failed = self.failed.get(&id).is_some_and(|(p, at)| {
+            p == path && at.elapsed() < retry_delay(self.failures.get(&id).copied().unwrap_or(1))
+        });
         if !busy && !failed {
             self.failed.remove(&id);
             if self.req.send((id, path.to_path_buf())).is_ok() {
@@ -242,6 +252,34 @@ mod tests {
         t.failed.get_mut(&c).unwrap().1 = Instant::now() - RETRY_AFTER - Duration::from_secs(1);
         t.texture(c, p);
         assert!(t.pending.contains_key(&c));
+    }
+
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        assert_eq!(retry_delay(1), RETRY_AFTER);
+        assert_eq!(retry_delay(2), RETRY_AFTER * 2);
+        assert_eq!(retry_delay(3), RETRY_AFTER * 4);
+        assert_eq!(retry_delay(50), RETRY_AFTER * 64);
+    }
+
+    #[test]
+    fn second_failure_waits_longer_than_the_first() {
+        let mut t = ClipThumbs::new();
+        let c = id();
+        let p = Path::new("/nonexistent/a.mp4");
+        for round in 1..=2u32 {
+            t.texture(c, p);
+            wait_done(&mut t);
+            assert_eq!(t.failures[&c], round);
+            // Past the first delay: round 1 retries, round 2 (doubled) must not yet.
+            t.failed.get_mut(&c).unwrap().1 = Instant::now() - RETRY_AFTER - Duration::from_secs(1);
+            t.texture(c, p);
+            assert_eq!(t.pending.contains_key(&c), round == 1, "round {round}");
+            if round == 2 {
+                break;
+            }
+            wait_done(&mut t);
+        }
     }
 
     #[test]

@@ -135,6 +135,21 @@ pub fn normalize_u8(v: &[f32], lo: f32, hi: f32) -> Vec<u8> {
         .collect()
 }
 
+/// Depth range for this frame: min/max of the finite values, eased towards the previous
+/// range (30% per frame) so the scale does not flicker. None when nothing is finite.
+pub fn smooth_range(prev: Option<(f32, f32)>, d: &[f32]) -> Option<(f32, f32)> {
+    let finite = d.iter().copied().filter(|v| v.is_finite());
+    let lo = finite.clone().fold(f32::INFINITY, f32::min);
+    let hi = finite.fold(f32::NEG_INFINITY, f32::max);
+    if !(lo.is_finite() && hi.is_finite()) {
+        return None;
+    }
+    Some(match prev {
+        Some((plo, phi)) => (plo + (lo - plo) * 0.3, phi + (hi - phi) * 0.3),
+        None => (lo, hi),
+    })
+}
+
 // ---------------------------------------------------------------- models
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -203,18 +218,14 @@ impl Depth {
         if d.len() != (w * h) as usize {
             return Err(format!("unexpected depth output of {} values", d.len()));
         }
-        let finite = d.iter().copied().filter(|v| v.is_finite());
-        let lo = finite.clone().fold(f32::INFINITY, f32::min);
-        let hi = finite.fold(f32::NEG_INFINITY, f32::max);
-        let (lo, hi) = if lo.is_finite() && hi.is_finite() {
-            match self.range {
-                Some((plo, phi)) => (plo + (lo - plo) * 0.3, phi + (hi - phi) * 0.3),
-                None => (lo, hi),
+        // A frame without finite values leaves the running range alone.
+        let (lo, hi) = match smooth_range(self.range, d) {
+            Some(r) => {
+                self.range = Some(r);
+                r
             }
-        } else {
-            (0.0, 0.0)
+            None => (0.0, 0.0),
         };
-        self.range = Some((lo, hi));
         Ok(Mask {
             w,
             h,
