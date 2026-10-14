@@ -52,21 +52,51 @@ pub fn elide(
     (galley, elided)
 }
 
-/// A clip cell: picture on top, name strip below. `label` is the accessible name.
+/// Responses of a cell: the picture (select + trigger) and the name strip (select only).
+/// An empty cell has no strip: its picture covers the whole cell.
+pub struct CellResponse {
+    pub pic: egui::Response,
+    pub strip: Option<egui::Response>,
+}
+
+impl CellResponse {
+    /// Both parts as one response (hover, context menu, drops).
+    pub fn all(&self) -> egui::Response {
+        match &self.strip {
+            Some(s) => self.pic.union(s.clone()),
+            None => self.pic.clone(),
+        }
+    }
+}
+
+/// A clip cell: picture on top, name strip below. `label` is the accessible name of the
+/// picture; the strip is named "Select <label>". `id` must come from the cell identity
+/// (layer, column), not from its position, so drags survive a scrolling grid.
 pub fn cell(
     ui: &mut egui::Ui,
+    id: egui::Id,
     label: &str,
     name: &str,
     tile: Tile,
     state: CellState,
-) -> egui::Response {
+) -> CellResponse {
     let CellState { playing, selected } = state;
     let size = egui::vec2(theme::CELL_W, theme::THUMB_H + theme::NAME_H);
-    let (rect, mut r) = ui.allocate_exact_size(size, Sense::click());
-    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
-    let p = ui.painter();
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let filled = !matches!(tile, Tile::Empty);
     let pic = egui::Rect::from_min_size(rect.min, egui::vec2(size.x, theme::THUMB_H));
     let strip = egui::Rect::from_min_max(egui::pos2(rect.left(), pic.bottom()), rect.max);
+    let pic_sense = Sense::click_and_drag();
+    let pic_hit = if filled { pic } else { rect };
+    let r = ui.interact(pic_hit, id.with("pic"), pic_sense);
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let mut strip_r = filled.then(|| {
+        let sr = ui.interact(strip, id.with("strip"), Sense::click());
+        let sl = format!("Select {label}");
+        sr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, sl.clone()));
+        sr
+    });
+    let p = ui.painter();
     let round = theme::CELL_ROUNDING;
     p.rect_filled(rect, round, theme::CELL_EMPTY);
     match tile {
@@ -94,7 +124,6 @@ pub fn cell(
             );
         }
     }
-    let filled = !matches!(tile, Tile::Empty);
     if filled {
         let strip_fill = if playing {
             theme::CELL_PLAYING
@@ -116,11 +145,12 @@ pub fn cell(
         );
         let pos = strip.left_center() + egui::vec2(theme::SP_2, -galley.size().y / 2.0);
         ui.painter().galley(pos, galley, ink);
-        if elided {
-            r = r.on_hover_text(name);
+        if elided && let Some(sr) = strip_r.take() {
+            strip_r = Some(sr.on_hover_text(name));
         }
     }
     let p = ui.painter();
+    let strip_hot = strip_r.as_ref().is_some_and(|s| s.hovered());
     if r.hovered() && filled {
         p.rect_filled(pic, round, egui::Color32::from_white_alpha(22));
     }
@@ -150,7 +180,7 @@ pub fn cell(
         )
     } else if r.has_focus() {
         (egui::Stroke::new(2.0, theme::ACCENT), StrokeKind::Inside)
-    } else if r.hovered() {
+    } else if r.hovered() || strip_hot {
         (egui::Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside)
     } else {
         (egui::Stroke::NONE, StrokeKind::Inside)
@@ -158,7 +188,10 @@ pub fn cell(
     if stroke.width > 0.0 {
         p.rect_stroke(rect, round, stroke, kind);
     }
-    r
+    CellResponse {
+        pic: r,
+        strip: strip_r,
+    }
 }
 
 /// Flat tool button placed in `rect`. `on` marks a toggle; `on_fill` colors it when lit.

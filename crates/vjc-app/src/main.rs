@@ -143,6 +143,20 @@ struct State {
     last_pointer: Option<egui::Pos2>,
     /// Cell selected by click; fallback target for drops.
     selected: Option<(LayerId, u32)>,
+    /// Deck `selected` was picked in (None: the current deck); Delete targets it.
+    selected_deck: Option<DeckId>,
+    /// Layer whose name is being dragged to a new place in the stack.
+    layer_drag: Option<LayerId>,
+    /// Clip copied or cut from a cell, for Paste.
+    clip_clipboard: Option<vjc_model::Clip>,
+    /// Cell whose thumbnail is being dragged to another cell (move; Alt copies).
+    cell_drag: Option<(LayerId, u32)>,
+    /// What the Preview monitor shows (see `PreviewTarget`).
+    preview_target: PreviewTarget,
+    /// Player of a `PreviewTarget::Clip` (runtime only, never in `players`).
+    clip_prev: Option<ClipPreview>,
+    /// The preview texture holds a fresh render this frame.
+    prev_live: bool,
     /// Group shown in the Group tab.
     sel_group: Option<vjc_model::GroupId>,
     /// Column last triggered (by column, cell or step); the "selected" column of shortcuts.
@@ -245,8 +259,54 @@ struct State {
     save_layout: Option<String>,
     /// Name of an existing custom layout waiting for overwrite confirmation.
     overwrite_layout: Option<String>,
+    /// Playing layer waiting for the Yes/No before it is removed with its clips.
+    remove_layer_confirm: Option<LayerId>,
     /// Help text key under the pointer in the previous frame.
     help_shown: Option<&'static str>,
+}
+
+/// Layer and column of a grid cell.
+type Cell = (LayerId, u32);
+
+/// Index (0 = top) the dragged layer ends at when released at height `y`: the number of
+/// other layer rows whose centre is above it. `rows` is top to bottom.
+fn layer_drop_index(rows: &[(egui::Rect, LayerId)], dragged: LayerId, y: f32) -> usize {
+    rows.iter()
+        .filter(|(r, l)| *l != dragged && r.center().y < y)
+        .count()
+}
+
+/// Entries of the clip cell menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellAct {
+    Trigger,
+    Preview,
+    Cut,
+    Copy,
+    Paste,
+    Clear,
+}
+
+/// What the Preview monitor shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PreviewTarget {
+    /// One clip on its own player; never reaches the composition or the output.
+    Clip(DeckId, LayerId, u32),
+    /// The layer alone, as it is mixed in the composition.
+    Layer(LayerId),
+    /// The whole composition (nothing picked).
+    #[default]
+    Composition,
+}
+
+/// Own player of the clip shown by the Preview monitor (separate from `players`).
+struct ClipPreview {
+    key: (DeckId, LayerId, u32),
+    /// Clip the player was opened for: a new clip in the same cell reopens it.
+    clip: Uuid,
+    /// `None` for sources that need no decoder (generators).
+    player: Option<Player>,
+    since: std::time::Instant,
 }
 
 /// Caption of the preview monitor. A layer with its video off is not drawn, so the monitor
@@ -985,6 +1045,13 @@ impl State {
             thumbs: clip_thumbs::ClipThumbs::new(),
             last_pointer: None,
             selected: None,
+            selected_deck: None,
+            layer_drag: None,
+            clip_clipboard: None,
+            cell_drag: None,
+            preview_target: PreviewTarget::Composition,
+            clip_prev: None,
+            prev_live: false,
             sel_group: None,
             col_sel: None,
             learn: false,
@@ -1068,6 +1135,7 @@ impl State {
             transport_h: theme::TRANSPORT_H,
             save_layout: None,
             overwrite_layout: None,
+            remove_layer_confirm: None,
             help_shown: None,
             renaming: None,
             col_renaming: None,
@@ -1089,12 +1157,33 @@ impl State {
         self.audio.clone()
     }
 
+    /// Forgets a layer or cell drag whose layer, column or clip no longer exists.
+    fn prune_drags(&mut self) {
+        let comp = &self.project.composition;
+        if self
+            .layer_drag
+            .is_some_and(|l| !comp.layers.iter().any(|x| x.id == l))
+        {
+            self.layer_drag = None;
+        }
+        if let Some((l, c)) = self.cell_drag
+            && vjc_core::clip_in(&self.project, comp.current_deck, l, c).is_none()
+        {
+            self.cell_drag = None;
+        }
+    }
+
     fn reset_players(&mut self) {
         self.flow = Flow::default();
         self.players.clear();
         self.gens.clear();
         self.history.clear();
         self.selected = None;
+        self.selected_deck = None;
+        self.layer_drag = None;
+        self.cell_drag = None;
+        self.preview_target = PreviewTarget::Composition;
+        self.clip_prev = None;
     }
 
     /// Asks what to do with unsaved changes. Returns false to cancel.
@@ -1320,6 +1409,61 @@ impl State {
         }
     }
 
+    /// Removes `layer` with its clips (undoable). A layer that is playing asks first.
+    fn request_remove_layer(&mut self, layer: LayerId) {
+        if self.active(layer).is_some() {
+            self.remove_layer_confirm = Some(layer);
+        } else {
+            self.remove_layer_now(layer);
+        }
+    }
+
+    fn remove_layer_now(&mut self, layer: LayerId) {
+        if self.exec_ok(Command::RemoveLayerWithClips { layer }) {
+            if self.selected.is_some_and(|s| s.0 == layer) {
+                self.selected = None;
+                self.selected_deck = None;
+            }
+            if self.preview_target == PreviewTarget::Layer(layer) {
+                self.preview_target = PreviewTarget::Composition;
+            }
+        }
+    }
+
+    fn remove_layer_modal(&mut self, ctx: &egui::Context) {
+        let Some(layer) = self.remove_layer_confirm else {
+            return;
+        };
+        let name = self
+            .project
+            .composition
+            .layers
+            .iter()
+            .find(|l| l.id == layer)
+            .map(|l| l.name.clone());
+        let Some(name) = name else {
+            self.remove_layer_confirm = None;
+            return;
+        };
+        let (mut yes, mut no) = (false, false);
+        let m = egui::Modal::new(egui::Id::new("remove_layer_modal")).show(ctx, |ui| {
+            ui.heading("Remove layer?");
+            ui.label(format!(
+                "\"{name}\" is playing. Remove it with all its clips? You can undo this."
+            ));
+            ui.horizontal(|ui| {
+                yes = ui.button("Yes").clicked();
+                no = ui.button("No").clicked();
+            });
+        });
+        if yes {
+            self.remove_layer_confirm = None;
+            self.remove_layer_now(layer);
+        } else if no || m.should_close() {
+            self.remove_layer_confirm = None;
+        }
+    }
+
     fn overwrite_layout_window(&mut self, ctx: &egui::Context) {
         let Some(name) = self.overwrite_layout.clone() else {
             return;
@@ -1481,12 +1625,18 @@ impl State {
 
     /// Every `autosave_secs` while dirty (if enabled), writes the recovery file.
     fn autosave(&mut self) {
+        let path = self.recovery_path();
+        self.autosave_to(path);
+    }
+
+    /// `autosave` with an explicit recovery file (`None` = nowhere to write).
+    fn autosave_to(&mut self, path: Option<PathBuf>) {
         let every = std::time::Duration::from_secs(self.prefs.general.autosave_secs.into());
         if !self.prefs.general.autosave || !self.dirty || self.last_autosave.elapsed() < every {
             return;
         }
         self.last_autosave = std::time::Instant::now();
-        if let Some(r) = self.recovery_path() {
+        if let Some(r) = path {
             if let Some(d) = r.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
@@ -1798,11 +1948,185 @@ impl State {
                         self.gens.remove(&layer);
                     }
                 }
+                Event::ClipsMoved { deck, moves } => self.follow_moves(deck, &moves),
                 Event::DeckRemoved { deck } => {
                     self.flow.outgoing.clear();
                     self.players.retain(|_, (d, _, _)| *d != deck);
                     self.gens.retain(|_, (d, _, _)| *d != deck);
                 }
+            }
+        }
+    }
+
+    /// While a layer name is dragged: the insertion line between the layer rows.
+    fn paint_layer_drop_line(&self, ctx: &egui::Context) {
+        let Some(dragged) = self.layer_drag else {
+            return;
+        };
+        let Some(p) = ctx.input(|i| i.pointer.latest_pos()) else {
+            return;
+        };
+        let rows: Vec<&(egui::Rect, LayerId)> = self
+            .layer_rects
+            .iter()
+            .filter(|(_, l)| self.project.composition.layers.iter().any(|x| x.id == *l))
+            .collect();
+        let at = layer_drop_index(&self.layer_rects, dragged, p.y);
+        let others: Vec<&&(egui::Rect, LayerId)> =
+            rows.iter().filter(|(_, l)| *l != dragged).collect();
+        let half = theme::LAYER_ROW_H / 2.0;
+        let y = match (others.get(at), others.last()) {
+            (Some((r, _)), _) => r.center().y - half,
+            (None, Some((r, _))) => r.center().y + half,
+            _ => return,
+        };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("layer_drop_line"),
+        ));
+        let g = self.grid_rect;
+        painter.line_segment(
+            [egui::pos2(g.left(), y), egui::pos2(g.right(), y)],
+            egui::Stroke::new(2.5, theme::CELL_DROP),
+        );
+    }
+
+    /// A cell menu entry or key on cell (`layer`, `col`) of deck `deck`. Edits become
+    /// commands (undoable); Copy and the selection only touch runtime state.
+    fn cell_act(
+        &mut self,
+        deck: DeckId,
+        (layer, column): Cell,
+        act: CellAct,
+        cmds: &mut Vec<Command>,
+    ) {
+        let clip = vjc_core::clip_in(&self.project, deck, layer, column).cloned();
+        self.selected = Some((layer, column));
+        self.selected_deck = Some(deck);
+        match (act, clip) {
+            (CellAct::Trigger, Some(_)) => cmds.push(Command::TriggerClip {
+                deck,
+                layer,
+                column,
+            }),
+            (CellAct::Preview, Some(_)) => {
+                self.preview_target = PreviewTarget::Clip(deck, layer, column);
+            }
+            (CellAct::Copy, Some(k)) => self.clip_clipboard = Some(k),
+            (CellAct::Cut, Some(k)) => {
+                self.clip_clipboard = Some(k);
+                cmds.push(Command::ClearCell {
+                    deck,
+                    layer,
+                    column,
+                });
+            }
+            (CellAct::Clear, Some(_)) => cmds.push(Command::ClearCell {
+                deck,
+                layer,
+                column,
+            }),
+            (CellAct::Paste, _) => {
+                if let Some(k) = &self.clip_clipboard {
+                    cmds.push(Command::SetClip {
+                        deck,
+                        layer,
+                        column,
+                        clip: vjc_core::clone_with_fresh_ids(k),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Clips changed cells: the selection, the clip preview and any playing source follow
+    /// their clip, all at once (a swap exchanges two). A playing clip whose target layer
+    /// is busy with a clip that stays put is stopped instead of displacing it.
+    fn follow_moves(&mut self, deck: DeckId, moves: &[(Cell, Cell)]) {
+        let dest = |cell: (LayerId, u32)| moves.iter().find(|m| m.0 == cell).map(|m| m.1);
+        if let Some(sel) = self.selected.and_then(dest) {
+            self.selected = Some(sel);
+        }
+        if let PreviewTarget::Clip(d, l, c) = self.preview_target
+            && d == deck
+            && let Some((l, c)) = dest((l, c))
+        {
+            self.preview_target = PreviewTarget::Clip(d, l, c);
+        }
+        let playing = |s: &Self, cell: (LayerId, u32)| {
+            active_of(&s.players, &s.gens, cell.0) == Some((deck, cell.1))
+        };
+        /// Per-layer flow state that travels with a clip moved to another layer.
+        #[derive(Default)]
+        struct Carried {
+            loops: Option<vjc_core::playback::LoopCounter>,
+            beat_loop: Option<(f64, (f64, f64))>,
+            region: Option<(f64, f64)>,
+            gen_bar: Option<(i64, u32)>,
+            pos: Option<f64>,
+        }
+        type Taken = (
+            (LayerId, u32),
+            Option<Player>,
+            Option<f64>,
+            Option<Playhead>,
+            Option<Carried>,
+        );
+        let mut taken: Vec<Taken> = vec![];
+        for &(from, to) in moves {
+            if !playing(self, from) {
+                continue;
+            }
+            let busy = to.0 != from.0
+                && active_of(&self.players, &self.gens, to.0)
+                    .is_some_and(|(d, c)| !(d == deck && dest((to.0, c)).is_some()));
+            let player = self.players.remove(&from.0).map(|p| p.2);
+            let gen_t = self.gens.remove(&from.0).map(|g| g.2);
+            let head = self.heads.remove(&from.0);
+            let carried = (to.0 != from.0).then(|| Carried {
+                loops: self.flow.loops.remove(&from.0),
+                beat_loop: self.flow.beat_loops.remove(&from.0),
+                region: self.flow.regions.remove(&from.0),
+                gen_bar: self.flow.gen_bars.remove(&from.0),
+                pos: self.flow.pos.remove(&from.0),
+            });
+            if busy {
+                continue;
+            }
+            taken.push((to, player, gen_t, head, carried));
+        }
+        for (to, player, gen_t, head, carried) in taken {
+            if let Some(c) = carried {
+                self.flow.outgoing.remove(&to.0);
+                self.flow.loops.remove(&to.0);
+                self.flow.beat_loops.remove(&to.0);
+                self.flow.regions.remove(&to.0);
+                self.flow.gen_bars.remove(&to.0);
+                if let Some(v) = c.loops {
+                    self.flow.loops.insert(to.0, v);
+                }
+                if let Some(v) = c.beat_loop {
+                    self.flow.beat_loops.insert(to.0, v);
+                }
+                if let Some(v) = c.region {
+                    self.flow.regions.insert(to.0, v);
+                }
+                if let Some(v) = c.gen_bar {
+                    self.flow.gen_bars.insert(to.0, v);
+                }
+                if let Some(v) = c.pos {
+                    self.flow.pos.insert(to.0, v);
+                }
+            }
+            if let Some(p) = player {
+                self.players.insert(to.0, (deck, to.1, p));
+            }
+            if let Some(t) = gen_t {
+                self.gens.insert(to.0, (deck, to.1, t));
+            }
+            if let Some(h) = head {
+                self.heads.insert(to.0, h);
             }
         }
     }
@@ -2292,13 +2616,67 @@ impl State {
         }
     }
 
+    /// Keeps the clip preview player in step with `preview_target`: opened when a file clip
+    /// is picked, dropped when something else is. It loops on its own clock, apart from
+    /// `players` (which feed the composition).
+    fn sync_clip_preview(&mut self) {
+        let want = match self.preview_target {
+            PreviewTarget::Clip(d, l, c) => vjc_core::clip_in(&self.project, d, l, c)
+                .map(|k| ((d, l, c), k.id, k.source.clone())),
+            _ => None,
+        };
+        let Some((key, clip, source)) = want else {
+            self.clip_prev = None;
+            // The clip was removed or replaced under the preview.
+            if matches!(self.preview_target, PreviewTarget::Clip(..)) {
+                self.preview_target = PreviewTarget::Composition;
+            }
+            return;
+        };
+        if self
+            .clip_prev
+            .as_ref()
+            .is_some_and(|p| p.key == key && p.clip == clip)
+        {
+            let p = self.clip_prev.as_ref().unwrap();
+            if let Some(pl) = &p.player {
+                let pos = pl
+                    .duration()
+                    .map_or(0.0, |d| (p.since.elapsed().as_secs_f64() / d).fract());
+                pl.set_position(pos);
+            }
+            return;
+        }
+        let player = match source {
+            vjc_model::Source::File { path } if path.exists() => Some(Player::open_scrub(path)),
+            _ => None,
+        };
+        self.clip_prev = Some(ClipPreview {
+            key,
+            clip,
+            player,
+            since: std::time::Instant::now(),
+        });
+    }
+
     fn compose(&mut self, frame: &eframe::Frame) {
         let Some(rs) = frame.wgpu_render_state() else {
             return;
         };
+        self.sync_clip_preview();
         let routes = self.active_routes();
         let want_preview = std::mem::take(&mut self.monitor_seen) || self.preview_routed();
-        let preview_src = self.selected.map(|(l, _)| vjc_model::SliceSource::Layer(l));
+        let preview_src = match self.preview_target {
+            PreviewTarget::Layer(l) => Some(vjc_model::SliceSource::Layer(l)),
+            PreviewTarget::Clip(..) => {
+                Some(vjc_model::SliceSource::Layer(compositor::PREVIEW_CLIP_ID))
+            }
+            PreviewTarget::Composition => None,
+        };
+        let prev_frame: Option<Frame> = self
+            .clip_prev
+            .as_ref()
+            .and_then(|p| p.player.as_ref()?.latest_frame());
         let c = &self.project.composition;
         let (w, h) = (c.width.max(1), c.height.max(1));
         let dials = self.dials();
@@ -2499,6 +2877,67 @@ impl State {
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
             });
         }
+        // The previewed clip, drawn alone with its own effects: last in the list, so the
+        // compositor keeps it out of the composition.
+        if want_preview
+            && let PreviewTarget::Clip(d, l, col) = self.preview_target
+            && let Some(k) = vjc_core::clip_in(&self.project, d, l, col)
+        {
+            let t = self
+                .clip_prev
+                .as_ref()
+                .map_or(0.0, |p| p.since.elapsed().as_secs_f32());
+            let size = prev_frame.as_ref().map_or((w, h), |f| (f.width, f.height));
+            let generator = match &k.source {
+                vjc_model::Source::Generator { kind, params } => {
+                    self.fx.request(kind);
+                    let ready = self.fx.status(kind) == Some(&fx::Status::Ready);
+                    self.fx.isf(kind).filter(|_| ready).map(|isf| EffectDraw {
+                        kind: kind.clone(),
+                        uniforms: isf.pack(&vjc_core::anim::resolve(params, &actx), t, (w, h)),
+                        dry_wet: 1.0,
+                        ml: None,
+                        persistent: None,
+                    })
+                }
+                _ => None,
+            };
+            let src_tag = {
+                use std::hash::{Hash, Hasher};
+                let mut hs = std::collections::hash_map::DefaultHasher::new();
+                (d, l, col, "preview").hash(&mut hs);
+                hs.finish()
+            };
+            let effects = draw_chain(
+                &mut self.fx,
+                &mut self.ml,
+                Some(src_tag),
+                &k.track.effects,
+                time,
+                size,
+                &actx,
+            );
+            let frame = prev_frame
+                .as_ref()
+                .map(|f| (f.width, f.height, f.data.as_slice(), f.seq));
+            if frame.is_some() || generator.is_some() {
+                draw_groups.push(None);
+                draws.push(LayerDraw {
+                    id: compositor::PREVIEW_CLIP_ID,
+                    opacity: 1.0,
+                    blend: vjc_model::BlendMode::Normal,
+                    fit: k.fit,
+                    effects,
+                    generator,
+                    transition: None,
+                    transform: vjc_core::transform::Affine::inverse_of(
+                        &vjc_core::transform::Resolved::of(&k.track.transform, &actx),
+                    ),
+                    channels: k.channels,
+                    frame,
+                });
+            }
+        }
         let master = draw_chain(
             &mut self.fx,
             &mut self.ml,
@@ -2556,6 +2995,8 @@ impl State {
             (&master, master_opacity),
             &routes,
         );
+        self.prev_live =
+            want_preview && comp.routed_view(vjc_model::SliceSource::Preview).is_some();
         if want_preview && let Some(v) = comp.routed_view(vjc_model::SliceSource::Preview) {
             let mut r = rs.renderer.write();
             match self.prev_tex {
@@ -2847,6 +3288,24 @@ impl State {
         }
         if ctx.memory(|m| m.focused().is_some()) {
             return;
+        }
+        if pressed.contains(&egui::Key::Escape) {
+            self.preview_target = PreviewTarget::Composition;
+        }
+        // Delete / Backspace clear the selected cell (undoable).
+        if pressed
+            .iter()
+            .any(|k| matches!(k, egui::Key::Delete | egui::Key::Backspace))
+            && let Some(cell) = self.selected
+        {
+            let mut cmds = vec![];
+            let deck = self
+                .selected_deck
+                .unwrap_or(self.project.composition.current_deck);
+            self.cell_act(deck, cell, CellAct::Clear, &mut cmds);
+            for c in cmds {
+                self.exec(c);
+            }
         }
         let rt = self.rt_ctx();
         for key in pressed {
@@ -3348,6 +3807,7 @@ impl State {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.prune_screen_state();
         self.ui_body(ui);
+        self.sync_clip_preview();
         // The help bar is drawn before the widgets, so it shows last frame's hover. If this
         // frame's hover differs (also when the pointer left a control), draw once more.
         let ctx = ui.ctx();
@@ -3424,6 +3884,22 @@ impl State {
                     ui.close();
                     self.redo();
                 }
+            });
+            ui.menu_button("Layer", |ui| {
+                let sel = self.selected.map(|s| s.0);
+                if ui
+                    .add_enabled(sel.is_some(), egui::Button::new("Remove layer"))
+                    .clicked()
+                    && let Some(l) = sel
+                {
+                    ui.close();
+                    self.request_remove_layer(l);
+                }
+            })
+            .response
+            // The panel tab is also called "Layer".
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Layer menu")
             });
             ui.menu_button("View", |ui| self.view_menu(ui));
             ui.menu_button("Shortcuts", |ui| {
@@ -3697,6 +4173,7 @@ impl State {
         self.prefs_window(&ctx);
         self.save_layout_window(&ctx);
         self.overwrite_layout_window(&ctx);
+        self.remove_layer_modal(&ctx);
         self.output_setup_window(&ctx);
         self.display_info_window(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
@@ -3739,13 +4216,46 @@ impl State {
                 None => self.status = "No grid cells to drop on".into(),
             }
         }
+        self.prune_drags();
         let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let drag_target = if dragging {
             resolve_drop(&self.cells, self.last_pointer, self.selected).map(|(l, c, _)| (l, c))
+        } else if let Some(src) = self.cell_drag {
+            let alt = ctx.input(|i| i.modifiers.alt);
+            let at = ctx.input(|i| i.pointer.latest_pos());
+            if let Some(p) = at {
+                let name = self
+                    .project
+                    .composition
+                    .decks
+                    .iter()
+                    .find(|d| d.id == self.project.composition.current_deck)
+                    .and_then(|d| d.clip_at(src.0, src.1))
+                    .map_or("", |k| k.name.as_str());
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    egui::Id::new("cell_drag_ghost"),
+                ));
+                painter.text(
+                    p + egui::vec2(12.0, 12.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{} {name}", if alt { "Copy" } else { "Move" }),
+                    egui::FontId::proportional(theme::FS_SM),
+                    theme::CELL_NAME_TEXT,
+                );
+            }
+            at.and_then(|p| self.cells.iter().find(|c| c.rect.contains(p)))
+                .map(|c| (c.layer, c.col))
+                .filter(|t| *t != src)
         } else {
             None
         };
         let mut pick: Option<(LayerId, u32)> = None;
+        let mut acts: Vec<(LayerId, u32, CellAct)> = vec![];
+        let mut layer_dropped: Option<LayerId> = None;
+        let mut remove_layer_req: Option<LayerId> = None;
+        self.paint_layer_drop_line(&ctx);
+        let has_clipboard = self.clip_clipboard.is_some();
 
         if !self.warnings.is_empty() {
             ui.collapsing(format!("{} import warnings", self.warnings.len()), |ui| {
@@ -3807,6 +4317,13 @@ impl State {
             let mut gui = ui.new_child(egui::UiBuilder::new().max_rect(area));
             gui.set_clip_rect(area.intersect(ui.clip_rect()));
             let parent_ui = &mut *ui;
+            // Registered under the cells: a click that lands on none of them.
+            let empty_click = gui
+                .interact(area, gui.id().with("grid_empty"), egui::Sense::click())
+                .clicked();
+            if empty_click {
+                self.preview_target = PreviewTarget::Composition;
+            }
             let ui = &mut gui;
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
@@ -4044,14 +4561,27 @@ impl State {
                                         .size(theme::FS_XS),
                                     )
                                     .truncate()
-                                    .sense(egui::Sense::click()),
+                                    .sense(egui::Sense::click_and_drag()),
                                 );
+                                if name.drag_started() && !in_group {
+                                    self.layer_drag = Some(lid);
+                                }
+                                if name.drag_stopped() && self.layer_drag == Some(lid) {
+                                    layer_dropped = Some(lid);
+                                }
                                 let name = help(name.on_hover_text(&layer.name), "layer-name");
                                 self.layer_rects.push((name.rect, lid));
                                 if name.clicked() || name.secondary_clicked() {
                                     self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
+                                    self.selected_deck = Some(cur);
+                                    self.preview_target = PreviewTarget::Layer(lid);
                                 }
                                 name.context_menu(|ui| {
+                                    if ui.button("Remove layer").clicked() {
+                                        remove_layer_req = Some(lid);
+                                        ui.close();
+                                    }
+                                    ui.separator();
                                     let from = active_of(&self.players, &self.gens, lid)
                                         .filter(|(d, _)| *d == cur)
                                         .map(|(_, c)| c);
@@ -4311,21 +4841,87 @@ impl State {
                                         grid_ui::Tile::Color("router")
                                     }
                                 };
+                                let cell_id =
+                                    egui::Id::new(("cell", lid, comp.columns[ci as usize].id));
+                                let cell = grid_ui::cell(
+                                    ui,
+                                    cell_id,
+                                    label,
+                                    label,
+                                    tile,
+                                    grid_ui::CellState {
+                                        playing: on,
+                                        selected: self.selected == Some((lid, ci)),
+                                    },
+                                );
                                 let r = help(
-                                    grid_ui::cell(
-                                        ui,
-                                        label,
-                                        label,
-                                        tile,
-                                        grid_ui::CellState {
-                                            playing: on,
-                                            selected: self.selected == Some((lid, ci)),
-                                        },
-                                    ),
+                                    cell.all(),
                                     if clip.is_some() { "cell" } else { "cell-empty" },
                                 );
                                 if clip.is_some() {
                                     r.context_menu(|ui| {
+                                        for (txt, act) in [
+                                            ("Trigger", CellAct::Trigger),
+                                            ("Preview", CellAct::Preview),
+                                            ("Cut", CellAct::Cut),
+                                            ("Copy", CellAct::Copy),
+                                        ] {
+                                            if ui.button(txt).clicked() {
+                                                acts.push((lid, ci, act));
+                                                ui.close();
+                                            }
+                                        }
+                                        ui.add_enabled_ui(has_clipboard, |ui| {
+                                            if ui.button("Paste").clicked() {
+                                                acts.push((lid, ci, CellAct::Paste));
+                                                ui.close();
+                                            }
+                                        });
+                                        if ui.button("Clear").clicked() {
+                                            acts.push((lid, ci, CellAct::Clear));
+                                            ui.close();
+                                        }
+                                        ui.menu_button("Rename...", |ui| {
+                                            let key = ui.id().with(("rename_clip", lid, ci));
+                                            let mut buf: String = ui
+                                                .data_mut(|d| d.get_temp(key))
+                                                .unwrap_or_else(|| label.to_owned());
+                                            let e = ui.add(
+                                                egui::TextEdit::singleline(&mut buf)
+                                                    .desired_width(140.0),
+                                            );
+                                            e.widget_info(|| {
+                                                egui::WidgetInfo::labeled(
+                                                    egui::WidgetType::TextEdit,
+                                                    true,
+                                                    "Clip name",
+                                                )
+                                            });
+                                            if !e.has_focus() && !e.lost_focus() {
+                                                e.request_focus();
+                                            }
+                                            let enter =
+                                                ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                                ui.data_mut(|d| d.remove_temp::<String>(key));
+                                                ui.close();
+                                            } else if e.lost_focus()
+                                                && enter
+                                                && !buf.trim().is_empty()
+                                            {
+                                                cmds.push(Command::RenameClip {
+                                                    deck: cur,
+                                                    layer: lid,
+                                                    column: ci,
+                                                    name: buf.trim().to_string(),
+                                                });
+                                                ui.data_mut(|d| d.remove_temp::<String>(key));
+                                                ui.close();
+                                            } else {
+                                                ui.data_mut(|d| d.insert_temp(key, buf));
+                                            }
+                                        });
+                                        ui.separator();
                                         let t = EffectTarget::Clip {
                                             deck: cur,
                                             layer: lid,
@@ -4336,6 +4932,12 @@ impl State {
                                 }
                                 if clip.is_none() {
                                     r.context_menu(|ui| {
+                                        ui.add_enabled_ui(has_clipboard, |ui| {
+                                            if ui.button("Paste").clicked() {
+                                                acts.push((lid, ci, CellAct::Paste));
+                                                ui.close();
+                                            }
+                                        });
                                         if ui.button("Import file...").clicked() {
                                             pick = Some((lid, ci));
                                             ui.close();
@@ -4362,17 +4964,48 @@ impl State {
                                         egui::StrokeKind::Outside,
                                     );
                                 }
-                                if r.clicked() || r.secondary_clicked() {
+                                // The name strip only selects; the picture selects and triggers.
+                                let strip_clicked =
+                                    cell.strip.as_ref().is_some_and(|s| s.clicked());
+                                if cell.pic.clicked() || strip_clicked || r.secondary_clicked() {
                                     self.selected = Some((lid, ci));
+                                    self.selected_deck = Some(cur);
                                 }
-                                if r.clicked() && clip.is_some() {
+                                if cell.pic.drag_started() && clip.is_some() {
+                                    self.cell_drag = Some((lid, ci));
+                                }
+                                if cell.pic.drag_stopped() && self.cell_drag == Some((lid, ci)) {
+                                    self.cell_drag = None;
+                                    let (at, alt) =
+                                        ui.input(|i| (i.pointer.latest_pos(), i.modifiers.alt));
+                                    let to = at
+                                        .and_then(|p| {
+                                            self.cells.iter().find(|c| c.rect.contains(p))
+                                        })
+                                        .map(|c| (c.layer, c.col))
+                                        .filter(|t| *t != (lid, ci));
+                                    if let Some(to) = to {
+                                        cmds.push(Command::MoveClip {
+                                            deck: cur,
+                                            from: (lid, ci),
+                                            to,
+                                            copy: alt,
+                                        });
+                                    }
+                                }
+                                if strip_clicked && clip.is_some() {
+                                    self.preview_target = PreviewTarget::Clip(cur, lid, ci);
+                                } else if cell.pic.clicked() && clip.is_some() {
+                                    self.preview_target = PreviewTarget::Layer(lid);
+                                }
+                                if cell.pic.clicked() && clip.is_some() {
                                     cmds.push(Command::TriggerClip {
                                         deck: cur,
                                         layer: lid,
                                         column: ci,
                                     });
                                 }
-                                if clip.is_none() && r.double_clicked() {
+                                if clip.is_none() && cell.pic.double_clicked() {
                                     pick = Some((lid, ci));
                                 }
                             }
@@ -4425,6 +5058,21 @@ impl State {
             self.topbars_h = strip_h + theme::DECK_TABS_H;
         }
         self.cells = cells;
+        if let Some(l) = remove_layer_req {
+            self.request_remove_layer(l);
+        }
+        if let Some(l) = layer_dropped {
+            self.layer_drag = None;
+            if let Some(p) = ctx.input(|i| i.pointer.latest_pos()) {
+                cmds.push(Command::MoveLayer {
+                    layer: l,
+                    to_index: layer_drop_index(&self.layer_rects, l, p.y),
+                });
+            }
+        }
+        for (l, c, act) in acts {
+            self.cell_act(cur, (l, c), act, &mut cmds);
+        }
         if let Some((l, c)) = pick
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(
@@ -4451,6 +5099,27 @@ impl State {
         }
     }
 
+    /// Caption of the Preview monitor.
+    fn preview_caption(&self) -> String {
+        let comp = &self.project.composition;
+        match self.preview_target {
+            PreviewTarget::Clip(d, l, c) => {
+                let name =
+                    vjc_core::clip_in(&self.project, d, l, c).map_or("?", |k| k.name.as_str());
+                format!("Clip preview: {name}")
+            }
+            PreviewTarget::Layer(l) => {
+                let off = comp
+                    .layers
+                    .iter()
+                    .find(|x| x.id == l)
+                    .is_some_and(|x| !x.video);
+                preview_note(true, off).to_owned()
+            }
+            PreviewTarget::Composition => preview_note(false, false).to_owned(),
+        }
+    }
+
     /// Left column of the bottom area: Composition monitor over Preview monitor. Each has a
     /// Fit / Fill / 1:1 dropdown, drag to pan (double click resets) and the composition size.
     /// The Preview shows the selected layer alone (the composition when none is selected).
@@ -4464,7 +5133,14 @@ impl State {
         let head_h = theme::PANEL_HEAD_H;
         let each = ((ui.available_height() - 4.0 * head_h) / 2.0).max(0.0);
         let w = ui.available_width();
-        let preview_tex = self.selected.and(self.prev_tex);
+        let preview_tex = if self.prev_live {
+            match self.preview_target {
+                PreviewTarget::Composition => None,
+                _ => self.prev_tex,
+            }
+        } else {
+            None
+        };
         for (i, name) in ["Composition monitor", "Preview monitor"]
             .into_iter()
             .enumerate()
@@ -4488,7 +5164,10 @@ impl State {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, theme::MONITOR_BG);
             let tex = if i == 1 {
-                preview_tex.or(self.comp_tex)
+                match self.preview_target {
+                    PreviewTarget::Clip(..) => preview_tex,
+                    _ => preview_tex.or(self.comp_tex),
+                }
             } else {
                 self.comp_tex
             };
@@ -4512,11 +5191,7 @@ impl State {
                 }
             }
             if i == 1 {
-                let video_off = self
-                    .selected
-                    .and_then(|(l, _)| self.project.composition.layers.iter().find(|x| x.id == l))
-                    .is_some_and(|l| !l.video);
-                let note = preview_note(preview_tex.is_some(), video_off);
+                let note = self.preview_caption();
                 painter.text(
                     rect.left_top() + egui::vec2(4.0, 2.0),
                     egui::Align2::LEFT_TOP,

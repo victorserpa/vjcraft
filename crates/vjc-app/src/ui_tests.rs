@@ -2819,3 +2819,748 @@ fn column_rename_is_dropped_when_the_column_is_gone() {
     settle(&mut h);
     assert!(h.state().col_renaming.is_none());
 }
+
+/// Primary click at `pos`, like the mouse.
+fn click_at(h: &mut Harness<'_, State>, pos: egui::Pos2) {
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.hover_at(pos);
+    h.step();
+    h.event(button(true));
+    h.step();
+    h.event(button(false));
+    settle(h);
+}
+
+/// Generator clip in layer 0, column 1, stopped and unselected. Returns (layer, clip name).
+fn stopped_generator(h: &mut Harness<'_, State>) -> (LayerId, String) {
+    let lid = playing_generator(h);
+    h.state_mut().exec(Command::ClearAll);
+    h.state_mut().selected = None;
+    settle(h);
+    assert!(h.state().gens.is_empty() && h.state().players.is_empty());
+    let deck = h.state().project.composition.current_deck;
+    let name = vjc_core::clip_in(&h.state().project, deck, lid, 1)
+        .unwrap()
+        .name
+        .clone();
+    (lid, name)
+}
+
+// #208: the name strip only selects; the thumbnail selects and triggers.
+#[test]
+fn cell_name_strip_selects_without_triggering_thumbnail_triggers() {
+    let mut h = app();
+    let (lid, name) = stopped_generator(&mut h);
+    click(&mut h, &format!("Select {name}"));
+    assert_eq!(h.state().selected, Some((lid, 1)));
+    assert!(h.state().gens.is_empty(), "strip click must not trigger");
+    assert!(h.state().players.is_empty());
+    // Negative control: the same cell's thumbnail does trigger.
+    h.state_mut().selected = None;
+    let (_, centre) = cell_center(&h, 0, 1);
+    click_at(&mut h, egui::pos2(centre.x, centre.y - theme::NAME_H / 2.0));
+    assert_eq!(h.state().selected, Some((lid, 1)));
+    assert!(
+        h.state().gens.contains_key(&lid),
+        "thumbnail click triggers"
+    );
+}
+
+// #208: the Preview follows what was clicked; the clip preview has its own player.
+#[test]
+fn preview_target_follows_clicks_and_clip_preview_stays_off_the_players() {
+    let mut h = app();
+    let (lid, name) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    assert_eq!(h.state().preview_target, PreviewTarget::Composition);
+    // Name strip: Clip target, nothing plays, caption names the clip.
+    click(&mut h, &format!("Select {name}"));
+    assert_eq!(h.state().preview_target, PreviewTarget::Clip(deck, lid, 1));
+    assert!(h.state().gens.is_empty() && h.state().players.is_empty());
+    assert_eq!(h.state().preview_caption(), format!("Clip preview: {name}"));
+    // Esc: back to the composition.
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(h.state().preview_target, PreviewTarget::Composition);
+    // Negative control: without Esc the target stays.
+    click(&mut h, &format!("Select {name}"));
+    settle(&mut h);
+    assert_eq!(h.state().preview_target, PreviewTarget::Clip(deck, lid, 1));
+    // Click on empty grid area: composition.
+    let last = h
+        .state()
+        .cells
+        .iter()
+        .map(|c| c.rect.max.x)
+        .fold(0.0, f32::max);
+    let top = h.state().cells[0].rect.center().y;
+    click_at(&mut h, egui::pos2(last + 40.0, top));
+    assert_eq!(h.state().preview_target, PreviewTarget::Composition);
+    // Thumbnail: the layer; layer name: the layer.
+    let (_, centre) = cell_center(&h, 0, 1);
+    click_at(&mut h, egui::pos2(centre.x, centre.y - theme::NAME_H / 2.0));
+    assert_eq!(h.state().preview_target, PreviewTarget::Layer(lid));
+    h.state_mut().preview_target = PreviewTarget::Composition;
+    let layer_name = h.state().project.composition.layers[0].name.clone();
+    click(&mut h, &layer_name);
+    assert_eq!(h.state().preview_target, PreviewTarget::Layer(lid));
+}
+
+#[test]
+fn clip_preview_player_is_separate_and_dropped_with_the_target() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    // A file clip in column 2 (the file only has to exist for the player to open).
+    let file = tmp_vjc("preview-clip.mp4");
+    std::fs::write(&file, b"x").unwrap();
+    let clip = {
+        let mut k = vjc_core::clip_in(&h.state().project, deck, lid, 1)
+            .unwrap()
+            .clone();
+        k.id = Uuid::new_v4();
+        k.source = vjc_model::Source::File { path: file };
+        k
+    };
+    h.state_mut().exec(Command::SetClip {
+        deck,
+        layer: lid,
+        column: 2,
+        clip,
+    });
+    h.state_mut().exec(Command::ClearAll);
+    h.state_mut().preview_target = PreviewTarget::Clip(deck, lid, 2);
+    settle(&mut h);
+    assert!(h.state().clip_prev.is_some(), "preview player opened");
+    assert!(
+        h.state().players.is_empty(),
+        "players (the output) untouched"
+    );
+    h.state_mut().preview_target = PreviewTarget::Composition;
+    settle(&mut h);
+    assert!(h.state().clip_prev.is_none(), "dropped with the target");
+}
+
+/// Drags with `mods` held at the release.
+fn drag_mod(h: &mut Harness<'_, State>, from: egui::Pos2, to: egui::Pos2, mods: egui::Modifiers) {
+    let button = |pos, pressed, modifiers| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers,
+    };
+    h.hover_at(from);
+    h.step();
+    h.event(button(from, true, egui::Modifiers::NONE));
+    h.step();
+    for i in 1..=6 {
+        h.event(egui::Event::PointerMoved(from.lerp(to, i as f32 / 6.0)));
+        h.step();
+    }
+    h.event_modifiers(button(to, false, mods), mods);
+    settle(h);
+}
+
+fn thumb_of(h: &Harness<'_, State>, layer_idx: usize, col: u32) -> egui::Pos2 {
+    let (_, c) = cell_center(h, layer_idx, col);
+    egui::pos2(c.x, c.y - theme::NAME_H / 2.0)
+}
+
+fn clip_id_at(h: &Harness<'_, State>, lid: LayerId, col: u32) -> Option<Uuid> {
+    let deck = h.state().project.composition.current_deck;
+    vjc_core::clip_in(&h.state().project, deck, lid, col).map(|k| k.id)
+}
+
+// #208: dragging a thumbnail moves the clip; the playing source follows it.
+#[test]
+fn dragging_a_thumbnail_moves_the_clip_and_playback_follows() {
+    let mut h = app();
+    let lid = playing_generator(&mut h); // layer 0, column 1, playing
+    let id = clip_id_at(&h, lid, 1).unwrap();
+    let (from, to) = (thumb_of(&h, 0, 1), thumb_of(&h, 0, 3));
+    // Negative control: a drag that starts on the name strip moves nothing.
+    let strip = egui::pos2(from.x, from.y + theme::THUMB_H / 2.0 + theme::NAME_H / 2.0);
+    drag(&mut h, strip, to);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(id));
+    assert_eq!(clip_id_at(&h, lid, 3), None);
+    // The thumbnail drag moves it.
+    drag(&mut h, from, to);
+    assert_eq!(clip_id_at(&h, lid, 1), None);
+    assert_eq!(clip_id_at(&h, lid, 3), Some(id));
+    assert_eq!(
+        h.state().gens.get(&lid).map(|g| g.1),
+        Some(3),
+        "playback follows"
+    );
+    // Undo puts it back and playback follows back.
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(id));
+    assert_eq!(h.state().gens.get(&lid).map(|g| g.1), Some(1));
+}
+
+#[test]
+fn alt_drag_copies_and_leaves_the_source_playing() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let id = clip_id_at(&h, lid, 1).unwrap();
+    let (from, to) = (thumb_of(&h, 0, 1), thumb_of(&h, 0, 2));
+    let alt = egui::Modifiers {
+        alt: true,
+        ..Default::default()
+    };
+    drag_mod(&mut h, from, to, alt);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(id), "source stays");
+    let copy = clip_id_at(&h, lid, 2).expect("copy made");
+    assert_ne!(copy, id);
+    assert_eq!(
+        h.state().gens.get(&lid).map(|g| g.1),
+        Some(1),
+        "still playing the source"
+    );
+}
+
+#[test]
+fn dragging_onto_an_occupied_cell_swaps_and_playback_follows_across_layers() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let other = h.state().project.composition.layers[1].id;
+    let deck = h.state().project.composition.current_deck;
+    let clip = vjc_core::clip_in(&h.state().project, deck, lid, 1)
+        .unwrap()
+        .clone();
+    let mut b = vjc_core::clone_with_fresh_ids(&clip);
+    b.name = "other".into();
+    h.state_mut().exec(Command::SetClip {
+        deck,
+        layer: other,
+        column: 2,
+        clip: b,
+    });
+    settle(&mut h);
+    let (a_id, b_id) = (
+        clip_id_at(&h, lid, 1).unwrap(),
+        clip_id_at(&h, other, 2).unwrap(),
+    );
+    let (from, to) = (thumb_of(&h, 0, 1), thumb_of(&h, 1, 2));
+    drag(&mut h, from, to);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(b_id));
+    assert_eq!(clip_id_at(&h, other, 2), Some(a_id));
+    assert!(!h.state().gens.contains_key(&lid), "left the old layer");
+    assert_eq!(
+        h.state().gens.get(&other).map(|g| (g.0, g.1)),
+        Some((deck, 2))
+    );
+}
+
+// #208: a dirty project is written to the recovery file once the interval passed, and the
+// file opens again (what is left after a kill -9).
+#[test]
+fn dirty_project_autosaves_a_recoverable_file_after_the_interval() {
+    let mut p = prefs();
+    p.general.autosave = true;
+    p.general.autosave_secs = 30;
+    let mut st = State::headless(p);
+    let file = tmp_vjc("autosave-recovery.vjc");
+    let _ = std::fs::remove_file(&file);
+    let old = std::time::Instant::now() - std::time::Duration::from_secs(31);
+    // Negative controls: clean project, interval not over, autosave off: nothing written.
+    st.last_autosave = old;
+    st.autosave_to(Some(file.clone()));
+    assert!(!file.exists(), "clean project writes nothing");
+    st.exec(Command::AddColumn {
+        column: vjc_model::Column {
+            id: Uuid::new_v4(),
+            name: "extra".into(),
+        },
+    });
+    st.dirty = true;
+    st.last_autosave = std::time::Instant::now();
+    st.autosave_to(Some(file.clone()));
+    assert!(!file.exists(), "interval not over");
+    st.prefs.general.autosave = false;
+    st.last_autosave = old;
+    st.autosave_to(Some(file.clone()));
+    assert!(!file.exists(), "autosave off");
+    // The real case.
+    st.prefs.general.autosave = true;
+    st.last_autosave = old;
+    st.autosave_to(Some(file.clone()));
+    assert!(file.exists(), "recovery file written");
+    let back = vjc_io::open(&file).expect("recovery file opens");
+    assert_eq!(
+        back.0.composition.columns.len(),
+        st.project.composition.columns.len()
+    );
+}
+
+fn right_click_at(h: &mut Harness<'_, State>, pos: egui::Pos2) {
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.hover_at(pos);
+    h.step();
+    h.event(button(true));
+    h.step();
+    h.event(button(false));
+    settle(h);
+}
+
+/// Right click on the thumbnail of cell (`layer_idx`, `col`).
+fn right_click_cell(h: &mut Harness<'_, State>, layer_idx: usize, col: u32) {
+    let p = thumb_of(h, layer_idx, col);
+    right_click_at(h, p);
+}
+
+// #208: cell context menu.
+#[test]
+fn cell_menu_copy_paste_cut_clear_are_undoable_and_trigger_preview_work() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let src = clip_id_at(&h, lid, 1).unwrap();
+    // Copy, then Paste into an empty cell: a new clip with its own id.
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Copy");
+    assert!(h.state().clip_clipboard.is_some());
+    right_click_cell(&mut h, 0, 3);
+    click(&mut h, "Paste");
+    let pasted = clip_id_at(&h, lid, 3).expect("pasted");
+    assert_ne!(pasted, src);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(src), "copy keeps the source");
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 3), None, "paste undone");
+    // Cut removes it (undoable).
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Cut");
+    assert_eq!(clip_id_at(&h, lid, 1), None);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(src), "cut undone");
+    // Clear.
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Clear");
+    assert_eq!(clip_id_at(&h, lid, 1), None);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(src));
+    // Preview: Clip target, nothing plays. Trigger: plays.
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Preview");
+    assert_eq!(h.state().preview_target, PreviewTarget::Clip(deck, lid, 1));
+    assert!(h.state().gens.is_empty());
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Trigger");
+    assert!(h.state().gens.contains_key(&lid));
+}
+
+#[test]
+fn paste_without_a_copied_clip_does_nothing() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let mut cmds = vec![];
+    h.state_mut()
+        .cell_act(deck, (lid, 3), CellAct::Paste, &mut cmds);
+    assert!(cmds.is_empty(), "nothing copied, nothing pasted");
+    h.state_mut().clip_clipboard = vjc_core::clip_in(&h.state().project, deck, lid, 1).cloned();
+    h.state_mut()
+        .cell_act(deck, (lid, 3), CellAct::Paste, &mut cmds);
+    assert_eq!(cmds.len(), 1);
+}
+
+#[test]
+fn cell_menu_rename_changes_the_clip_name() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    right_click_cell(&mut h, 0, 1);
+    click_menu(&mut h, "Rename");
+    h.get_by_label("Clip name").focus();
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_by_label("Clip name").type_text("Opener");
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let k = vjc_core::clip_in(&h.state().project, deck, lid, 1).unwrap();
+    assert_eq!(k.name, "Opener");
+    h.state_mut().undo();
+    settle(&mut h);
+    let k = vjc_core::clip_in(&h.state().project, deck, lid, 1).unwrap();
+    assert_ne!(k.name, "Opener", "rename undone");
+}
+
+// #208: Delete / Backspace on the selected cell, undoable; a focused text field keeps them.
+#[test]
+fn delete_and_backspace_clear_the_selected_cell_with_undo_but_not_while_typing() {
+    let mut h = app();
+    let (lid, name) = stopped_generator(&mut h);
+    let id = clip_id_at(&h, lid, 1).unwrap();
+    click(&mut h, &format!("Select {name}"));
+    h.key_press(egui::Key::Delete);
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 1), None, "Delete clears the cell");
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(id), "undo restores it");
+    h.key_press(egui::Key::Backspace);
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 1), None, "Backspace too");
+    h.state_mut().undo();
+    settle(&mut h);
+    // Negative control: while a text field has focus the key is for the field.
+    let col = h.state().project.composition.columns[0].id;
+    h.state_mut().col_renaming = Some((col, "x".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Delete);
+    settle(&mut h);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(id), "typing keeps the cell");
+}
+
+// #208: Space and the arrows do nothing by themselves; a mapped key never fires while a
+// text field is being edited.
+#[test]
+fn space_and_arrows_are_inert_and_mapped_keys_wait_for_the_text_field() {
+    let mut h = app();
+    let before = h.state().project.clone();
+    for k in [
+        egui::Key::Space,
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+    ] {
+        h.key_press(k);
+        settle(&mut h);
+    }
+    assert_eq!(
+        h.state().project,
+        before,
+        "no default binding changes the project"
+    );
+    assert!(h.state().players.is_empty() && h.state().gens.is_empty());
+    // Map Space to master bypass.
+    h.state_mut().exec(Command::AddShortcut {
+        shortcut: vjc_model::Shortcut {
+            id: Uuid::new_v4(),
+            source: vjc_model::ControlSource::Key {
+                code: "Space".into(),
+            },
+            target: "/comp/master/bypass".into(),
+            mode: vjc_model::ShortcutMode::Toggle,
+            range: (0.0, 1.0),
+            invert: false,
+            effect: None,
+        },
+        index: 0,
+    });
+    settle(&mut h);
+    // Text field open: the key belongs to the field.
+    let col = h.state().project.composition.columns[0].id;
+    h.state_mut().col_renaming = Some((col, "x".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Space);
+    settle(&mut h);
+    assert!(
+        !h.state().master_bypass,
+        "Space typed into the field, not fired"
+    );
+    // Control: with the field closed the same key fires.
+    h.state_mut().col_renaming = None;
+    settle(&mut h);
+    h.key_press(egui::Key::Space);
+    settle(&mut h);
+    assert!(
+        h.state().master_bypass,
+        "mapped key fires with no field open"
+    );
+}
+
+// #208: switching deck only changes what the grid shows, never what plays on the output.
+#[test]
+fn switching_deck_does_not_change_what_is_playing() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let deck_a = h.state().project.composition.current_deck;
+    let playing = |h: &Harness<'_, State>| {
+        h.state()
+            .gens
+            .iter()
+            .map(|(l, (d, c, _))| (*l, *d, *c))
+            .collect::<Vec<_>>()
+    };
+    let before = playing(&h);
+    assert_eq!(before, vec![(lid, deck_a, 1)]);
+    click(&mut h, "Add deck");
+    let deck_b = h.state().project.composition.current_deck;
+    assert_ne!(deck_b, deck_a, "the new deck is shown");
+    assert_eq!(
+        playing(&h),
+        before,
+        "adding and showing a deck keeps the output"
+    );
+    click(&mut h, "Previous deck");
+    assert_eq!(h.state().project.composition.current_deck, deck_a);
+    click(&mut h, "Next deck");
+    assert_eq!(h.state().project.composition.current_deck, deck_b);
+    assert_eq!(
+        playing(&h),
+        before,
+        "switching back and forth keeps the output"
+    );
+    // Control: stopping does change what the probe sees.
+    h.state_mut().exec(Command::ClearAll);
+    assert_ne!(playing(&h), before);
+}
+
+fn layer_ids(h: &Harness<'_, State>) -> Vec<LayerId> {
+    h.state()
+        .project
+        .composition
+        .layers
+        .iter()
+        .map(|l| l.id)
+        .collect()
+}
+
+fn name_rect(h: &Harness<'_, State>, layer: LayerId) -> egui::Rect {
+    h.state()
+        .layer_rects
+        .iter()
+        .find(|(_, l)| *l == layer)
+        .expect("layer name drawn")
+        .0
+}
+
+// #208: dragging a layer name reorders the stack, undoable.
+#[test]
+fn dragging_a_layer_name_moves_the_layer_with_undo() {
+    let mut h = app_with(State::headless(prefs()), egui::vec2(1280.0, 800.0));
+    let ids = layer_ids(&h);
+    assert_eq!(ids.len(), 3);
+    let from = name_rect(&h, ids[0]).center();
+    // Negative control: released on its own row, nothing changes (and no undo step).
+    drag(&mut h, from, from + egui::vec2(0.0, 3.0));
+    assert_eq!(layer_ids(&h), ids);
+    // Dropped below the last row's centre: it ends at the bottom.
+    let below = name_rect(&h, ids[2]).center() + egui::vec2(0.0, 20.0);
+    drag(&mut h, from, below);
+    assert_eq!(layer_ids(&h), vec![ids[1], ids[2], ids[0]]);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(layer_ids(&h), ids);
+}
+
+#[test]
+fn layer_drop_index_counts_the_other_rows_above_the_pointer() {
+    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let row = |y: f32| egui::Rect::from_center_size(egui::pos2(0.0, y), egui::vec2(10.0, 10.0));
+    let rows = [(row(10.0), a), (row(60.0), b), (row(110.0), c)];
+    assert_eq!(layer_drop_index(&rows, a, 0.0), 0);
+    assert_eq!(layer_drop_index(&rows, a, 70.0), 1, "a leaves, b is above");
+    assert_eq!(layer_drop_index(&rows, a, 500.0), 2);
+    assert_eq!(layer_drop_index(&rows, c, 30.0), 1);
+}
+
+// Review: Delete clears the clip the user selected, even after switching decks.
+#[test]
+fn delete_targets_the_selected_clip_after_a_deck_switch() {
+    let mut h = app();
+    let (lid, name) = stopped_generator(&mut h);
+    let a = h.state().project.composition.current_deck;
+    let id = clip_id_at(&h, lid, 1).unwrap();
+    click(&mut h, &format!("Select {name}"));
+    let b = uuid::Uuid::new_v4();
+    let other = vjc_core::clip_from_path("/x/b.mov".into());
+    let other_id = other.id;
+    h.state_mut()
+        .project
+        .composition
+        .decks
+        .push(vjc_model::Deck {
+            id: b,
+            name: "B".into(),
+            clips: vec![vjc_model::CellClip {
+                layer: lid,
+                column: 1,
+                clip: other,
+            }],
+        });
+    h.state_mut().exec(Command::SelectDeck { deck: b });
+    settle(&mut h);
+    h.key_press(egui::Key::Delete);
+    settle(&mut h);
+    let p = &h.state().project;
+    assert_eq!(
+        vjc_core::clip_in(p, b, lid, 1).map(|k| k.id),
+        Some(other_id)
+    );
+    assert_eq!(vjc_core::clip_in(p, a, lid, 1).map(|k| k.id), None);
+    let _ = id;
+}
+
+// Review: the clip preview reopens when the cell gets another clip.
+#[test]
+fn clip_preview_follows_a_clip_replaced_in_the_same_cell() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let old = clip_id_at(&h, lid, 1).unwrap();
+    let st = h.state_mut();
+    st.preview_target = PreviewTarget::Clip(deck, lid, 1);
+    st.sync_clip_preview();
+    assert_eq!(st.clip_prev.as_ref().map(|p| p.clip), Some(old));
+    let new = vjc_core::clip_from_path("/x/new.mov".into());
+    let new_id = new.id;
+    st.exec(Command::SetClip {
+        deck,
+        layer: lid,
+        column: 1,
+        clip: new,
+    });
+    st.sync_clip_preview();
+    assert_eq!(st.clip_prev.as_ref().map(|p| p.clip), Some(new_id));
+}
+
+// Review: a clip moved to another layer keeps its loop / region / bar state.
+#[test]
+fn moving_a_playing_clip_across_layers_carries_its_flow_state() {
+    let mut h = app();
+    let l0 = playing_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let l1 = h.state().project.composition.layers[1].id;
+    let st = h.state_mut();
+    st.flow.regions.insert(l0, (0.25, 0.75));
+    st.flow.beat_loops.insert(l0, (4.0, (0.1, 0.2)));
+    st.flow.gen_bars.insert(l0, (3, 1));
+    st.flow.loops.insert(l0, Default::default());
+    st.follow_moves(deck, &[((l0, 1), (l1, 1))]);
+    assert!(st.gens.contains_key(&l1) && !st.gens.contains_key(&l0));
+    assert_eq!(st.flow.regions.get(&l1), Some(&(0.25, 0.75)));
+    assert_eq!(st.flow.beat_loops.get(&l1), Some(&(4.0, (0.1, 0.2))));
+    assert_eq!(st.flow.gen_bars.get(&l1), Some(&(3, 1)));
+    assert!(st.flow.loops.contains_key(&l1));
+    assert!(!st.flow.regions.contains_key(&l0) && !st.flow.gen_bars.contains_key(&l0));
+}
+
+// Review: cell widget ids come from the cell identity, not from where it is drawn.
+#[test]
+fn cell_widget_id_does_not_depend_on_the_scroll_offset() {
+    let ctx = egui::Context::default();
+    let id = egui::Id::new(("cell", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()));
+    let mut ids = vec![];
+    for offset in [0.0, 37.0] {
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            ui.add_space(offset);
+            let state = grid_ui::CellState {
+                playing: false,
+                selected: false,
+            };
+            let c = grid_ui::cell(ui, id, "a", "a", grid_ui::Tile::Pending, state);
+            ids.push((c.pic.id, c.strip.map(|s| s.id)));
+        });
+        out.textures_delta.clear();
+    }
+    assert_eq!(ids[0], ids[1]);
+}
+
+// Review: drags of layers/cells that vanish (or a project reset) do not linger.
+#[test]
+fn stale_layer_and_cell_drags_are_cleared() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let st = h.state_mut();
+    st.layer_drag = Some(uuid::Uuid::new_v4());
+    st.cell_drag = Some((lid, 3)); // empty cell
+    settle(&mut h);
+    assert_eq!(h.state().layer_drag, None, "unknown layer");
+    assert_eq!(h.state().cell_drag, None, "cell without a clip");
+    let st = h.state_mut();
+    st.layer_drag = Some(lid);
+    st.cell_drag = Some((lid, 1));
+    st.reset_players();
+    assert!(st.layer_drag.is_none() && st.cell_drag.is_none());
+}
+
+// Review: Esc in the clip rename menu drops the typed text.
+#[test]
+fn escape_in_the_rename_menu_discards_the_typed_name() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let before = vjc_core::clip_in(&h.state().project, deck, lid, 1)
+        .unwrap()
+        .name
+        .clone();
+    right_click_cell(&mut h, 0, 1);
+    click_menu(&mut h, "Rename");
+    h.get_by_label("Clip name").focus();
+    settle(&mut h);
+    h.get_by_label("Clip name").type_text("Typed");
+    settle(&mut h);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    right_click_cell(&mut h, 0, 1);
+    click_menu(&mut h, "Rename");
+    assert!(has_text(&h, &before), "buffer back to the clip name");
+    assert!(!has_text(&h, &format!("{before}Typed")));
+}
+
+fn open_layer_menu(h: &mut Harness<'_, State>) {
+    click(h, "Layer menu");
+}
+
+// Owner request: remove a layer with clips from the Layer menu / header menu; a playing
+// layer asks first (modal Yes/No); undo restores everything.
+#[test]
+fn remove_layer_with_clips_asks_when_playing_and_undo_restores_it() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let id = clip_id_at(&h, lid, 1).unwrap();
+    let n = h.state().project.composition.layers.len();
+    // No: nothing changes.
+    open_layer_menu(&mut h);
+    click_menu(&mut h, "Remove layer");
+    assert!(exists(&h, "Remove layer?"), "modal asks first");
+    assert_eq!(h.state().project.composition.layers.len(), n);
+    click(&mut h, "No");
+    assert!(!exists(&h, "Remove layer?"));
+    assert_eq!(h.state().project.composition.layers.len(), n);
+    // Yes: layer and clips go, playback stops.
+    open_layer_menu(&mut h);
+    click_menu(&mut h, "Remove layer");
+    click(&mut h, "Yes");
+    assert_eq!(h.state().project.composition.layers.len(), n - 1);
+    assert!(h.state().gens.is_empty());
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(h.state().project.composition.layers.len(), n);
+    assert_eq!(clip_id_at(&h, lid, 1), Some(id), "clip restored");
+}
+
+#[test]
+fn remove_layer_from_header_menu_needs_no_confirmation_when_stopped() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let n = h.state().project.composition.layers.len();
+    let r = h
+        .state()
+        .layer_rects
+        .iter()
+        .find(|(_, l)| *l == lid)
+        .unwrap()
+        .0;
+    right_click_at(&mut h, r.center());
+    click_menu(&mut h, "Remove layer");
+    assert!(!exists(&h, "Remove layer?"));
+    assert_eq!(h.state().project.composition.layers.len(), n - 1);
+}

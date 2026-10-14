@@ -605,6 +605,10 @@ impl Fx {
     }
 }
 
+/// Id of the `LayerDraw` that carries a clip shown only in the Preview monitor. It goes last
+/// in the list and is never part of the composition (see `render_routed`).
+pub const PREVIEW_CLIP_ID: LayerId = uuid::Uuid::from_u128(u128::MAX);
+
 pub struct LayerDraw<'a> {
     pub id: LayerId,
     pub opacity: f32,
@@ -1369,20 +1373,26 @@ impl Compositor {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        (layers_bottom_to_top, groups): (&[LayerDraw], &[GroupDraw]),
+        (all_layers, groups): (&[LayerDraw], &[GroupDraw]),
         (master, master_opacity): (&[EffectDraw], f32),
         routes: &[SliceSource],
     ) {
+        // A preview-only clip sits last: it gets a slot and can be routed to the Preview,
+        // but the composition below is built without it.
+        let layers_bottom_to_top = match all_layers.split_last() {
+            Some((l, rest)) if l.id == PREVIEW_CLIP_ID => rest,
+            _ => all_layers,
+        };
         self.fx.next = 0;
         self.fx.mix_next = 0;
         self.fx.scratch.begin_frame();
-        let live: Vec<LayerId> = layers_bottom_to_top
+        let live: Vec<LayerId> = all_layers
             .iter()
             .filter(|l| l.frame.is_some() || l.generator.is_some())
             .map(|l| l.id)
             .collect();
         self.slots.retain(|k, _| live.contains(k));
-        for l in layers_bottom_to_top {
+        for l in all_layers {
             let (w, h, data, seq) = match (&l.frame, &l.generator) {
                 (Some((w, h, data, seq)), _) => (*w, *h, Some(*data), *seq),
                 (None, Some(_)) => (self.size.0.max(1), self.size.1.max(1), None, u64::MAX),
@@ -1600,7 +1610,7 @@ impl Compositor {
                 queue,
                 &mut enc,
                 (key, content),
-                (layers_bottom_to_top, groups),
+                (all_layers, groups),
                 (extent, fade > 0.0, &mut group_no),
             );
         }
@@ -3211,6 +3221,40 @@ mod tests {
             &img[4..7]
         );
         assert!(comp.routed_view(SliceSource::Preview).is_none());
+    }
+
+    /// A preview-only clip (last in the list, `PREVIEW_CLIP_ID`) reaches the Preview texture
+    /// but never the composition. Control: the same draw under another id is composed.
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_preview_clip_stays_out_of_the_composition() {
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (red, green) = ([255u8, 0, 0, 255], [0u8, 255, 0, 255]);
+        let mut comp = Compositor::new(&device, 1, 1);
+        let mut run = |id: LayerId| {
+            let mut clip = solid(9, &green, 1.0);
+            clip.id = id;
+            let layers = [solid(1, &red, 1.0), clip];
+            comp.preview = Some(SliceSource::Layer(PREVIEW_CLIP_ID));
+            comp.render_routed(&device, &queue, (&layers, &[]), (&[], 1.0), &[]);
+            let target = read_px(&device, &queue, &comp);
+            let prev = comp.routed_view(SliceSource::Preview).is_some();
+            (target, prev)
+        };
+        let (target, prev) = run(PREVIEW_CLIP_ID);
+        assert!(prev, "preview rendered");
+        assert!(
+            target[0] > 200 && target[1] < 20,
+            "composition stays red {target:?}"
+        );
+        let (target, _) = run(uuid::Uuid::from_u128(9));
+        assert!(
+            target[1] > 200,
+            "control: a normal layer is composed {target:?}"
+        );
     }
 
     /// Channel toggles: a mid-grey-blue layer with G off loses its green; with A off an

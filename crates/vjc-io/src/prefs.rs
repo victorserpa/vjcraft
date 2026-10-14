@@ -75,7 +75,7 @@ impl Default for General {
     fn default() -> Self {
         General {
             autosave: true,
-            autosave_secs: 60,
+            autosave_secs: 30,
             open_last_project: false,
             last_project: None,
             browser_folder: None,
@@ -637,6 +637,20 @@ mod tests {
         let d = std::env::temp_dir().join(format!("vjc-prefs-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d.join("prefs.json")
+    }
+
+    #[test]
+    fn autosave_is_on_by_default_and_at_most_every_30_seconds() {
+        let g = Prefs::default().general;
+        assert!(g.autosave && g.autosave_secs <= 30, "{g:?}");
+        // A prefs file that never mentioned autosave gets the same defaults.
+        let g = Prefs::from_json("{}").0.general;
+        assert!(g.autosave && g.autosave_secs <= 30);
+        // Negative control: an explicit choice is kept.
+        let g = Prefs::from_json(r#"{"general":{"autosave":false,"autosave_secs":120}}"#)
+            .0
+            .general;
+        assert!(!g.autosave && g.autosave_secs == 120);
     }
 
     #[test]

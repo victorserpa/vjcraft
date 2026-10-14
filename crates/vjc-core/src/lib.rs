@@ -26,9 +26,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use vjc_model::{
-    BlendMode, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId, FitMode,
-    GroupId, Layer, LayerId, Param, PlayMode, Project, Source, Timecode, TimecodeCue, Track,
-    TransformField, Transport, Value,
+    BlendMode, CellClip, Clip, Column, ColumnIdx, Deck, DeckId, Direction, Effect, EffectId,
+    FitMode, GroupId, Layer, LayerId, Param, PlayMode, Project, Source, Timecode, TimecodeCue,
+    Track, TransformField, Transport, Value,
 };
 
 /// Continuous commands on the same target within this window merge into one undo step.
@@ -71,6 +71,15 @@ pub enum Command {
         deck: DeckId,
         layer: LayerId,
         column: ColumnIdx,
+    },
+    /// Moves the clip of cell `from` to cell `to` of the same deck. An occupied target
+    /// swaps the two clips. With `copy` the source stays and a copy (fresh ids) replaces
+    /// whatever is in the target. A playing source is followed by the app (`ClipsMoved`).
+    MoveClip {
+        deck: DeckId,
+        from: (LayerId, ColumnIdx),
+        to: (LayerId, ColumnIdx),
+        copy: bool,
     },
     /// Plays the cell's clip on its layer. Runtime only: not undoable.
     TriggerClip {
@@ -415,6 +424,12 @@ pub enum Command {
     MoveLayerOutOfGroup {
         layer: LayerId,
     },
+    /// Moves an ungrouped layer so it ends at `to_index` (0 = top, clamped). It never lands
+    /// inside a group: it goes above the group it hit.
+    MoveLayer {
+        layer: LayerId,
+        to_index: usize,
+    },
     /// Inserts a layer at `index` (0 = top).
     AddLayer {
         layer: Layer,
@@ -423,6 +438,18 @@ pub enum Command {
     /// Removes an empty layer (no clips).
     RemoveLayer {
         layer: LayerId,
+    },
+    /// Removes a layer together with its clips in every deck. Undo restores the layer, the
+    /// clips (effects included) and their place in each deck.
+    RemoveLayerWithClips {
+        layer: LayerId,
+    },
+    /// Inverse of `RemoveLayerWithClips`: the layer at `index` and its clips as
+    /// (deck, position in the deck's clip list, clip).
+    RestoreLayer {
+        layer: Layer,
+        index: usize,
+        clips: Vec<(DeckId, usize, CellClip)>,
     },
     AddColumn {
         column: Column,
@@ -774,6 +801,12 @@ pub enum Event {
         layer: LayerId,
         column: ColumnIdx,
     },
+    /// Clips changed cells (a move or a swap): playback of a moved clip follows it. All
+    /// moves of one event happen at once.
+    ClipsMoved {
+        deck: DeckId,
+        moves: Vec<((LayerId, ColumnIdx), (LayerId, ColumnIdx))>,
+    },
     /// A deck left the project: clips playing from it must stop.
     DeckRemoved {
         deck: DeckId,
@@ -1036,6 +1069,83 @@ fn set_clip(
     )
 }
 
+/// A copy of `clip` that shares no id with it (clip and effects).
+pub fn clone_with_fresh_ids(clip: &Clip) -> Clip {
+    let mut c = clip.clone();
+    c.id = Uuid::new_v4();
+    for e in &mut c.track.effects {
+        e.id = Uuid::new_v4();
+    }
+    c
+}
+
+fn move_clip(
+    p: &mut Project,
+    deck: DeckId,
+    from: (LayerId, ColumnIdx),
+    to: (LayerId, ColumnIdx),
+    copy: bool,
+) -> Result<Applied, Error> {
+    check_cell(p, from.0, from.1)?;
+    check_cell(p, to.0, to.1)?;
+    let d = deck_mut(p, deck)?;
+    let deck_id = d.id;
+    let src = d.clip_at(from.0, from.1).cloned().ok_or(Error::NoClip)?;
+    if from == to {
+        return Ok(Applied {
+            inverse: None,
+            events: vec![],
+        });
+    }
+    let dst = d.clip_at(to.0, to.1).cloned();
+    let changed = |(layer, column)| Event::CellChanged {
+        deck: deck_id,
+        layer,
+        column,
+    };
+    if copy {
+        d.set_clip(to.0, to.1, clone_with_fresh_ids(&src));
+        let inverse = match dst {
+            Some(clip) => Command::SetClip {
+                deck: deck_id,
+                layer: to.0,
+                column: to.1,
+                clip,
+            },
+            None => Command::ClearCell {
+                deck: deck_id,
+                layer: to.0,
+                column: to.1,
+            },
+        };
+        return undoable(inverse, vec![changed(to)]);
+    }
+    for c in &mut d.clips {
+        if (c.layer, c.column) == from {
+            (c.layer, c.column) = to;
+        } else if (c.layer, c.column) == to {
+            (c.layer, c.column) = from;
+        }
+    }
+    let mut moves = vec![(from, to)];
+    if dst.is_some() {
+        moves.push((to, from));
+    }
+    // The undo moves it back (or swaps back: the origin is occupied again by then).
+    undoable(
+        Command::MoveClip {
+            deck: deck_id,
+            from: to,
+            to: from,
+            copy: false,
+        },
+        vec![Event::ClipsMoved {
+            deck: deck_id,
+            moves,
+        }],
+    )
+}
+
 /// Event that starts the clip in the cell, or `NoClip` / `NotPlayable`.
 fn trigger_event(
     p: &Project,
@@ -1170,6 +1280,12 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 }],
             )
         }
+        Command::MoveClip {
+            deck,
+            from,
+            to,
+            copy,
+        } => move_clip(p, deck, from, to, copy),
         Command::TriggerClip {
             deck,
             layer,
@@ -2025,6 +2141,30 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             ls.insert(index, layer);
             undoable(Command::RemoveLayer { layer: id }, vec![])
         }
+        Command::MoveLayer { layer, to_index } => {
+            let from = layer_idx(p, layer)?;
+            if p.composition.layers[from].group.is_some() {
+                return Err(Error::BadGroup);
+            }
+            let ls = &mut p.composition.layers;
+            let l = ls.remove(from);
+            let mut to = to_index.min(ls.len());
+            if to > 0 && to < ls.len() && ls[to].group.is_some() && ls[to - 1].group == ls[to].group
+            {
+                let g = ls[to].group;
+                while to > 0 && ls[to - 1].group == g {
+                    to -= 1;
+                }
+            }
+            ls.insert(to, l);
+            Ok(Applied {
+                inverse: (to != from).then_some(Command::MoveLayer {
+                    layer,
+                    to_index: from,
+                }),
+                events: vec![],
+            })
+        }
         Command::RemoveLayer { layer } => {
             let i = layer_idx(p, layer)?;
             if p.composition
@@ -2047,6 +2187,54 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 },
                 vec![Event::LayerCleared { layer }],
             )
+        }
+        Command::RemoveLayerWithClips { layer } => {
+            let i = layer_idx(p, layer)?;
+            if let Some(g) = p.composition.layers[i].group
+                && groups::members(p, g).len() < 2
+            {
+                return Err(Error::BadGroup);
+            }
+            let mut clips = vec![];
+            for d in &mut p.composition.decks {
+                let mut at = 0;
+                while at < d.clips.len() {
+                    if d.clips[at].layer == layer {
+                        clips.push((d.id, at, d.clips.remove(at)));
+                    } else {
+                        at += 1;
+                    }
+                }
+            }
+            let removed = p.composition.layers.remove(i);
+            undoable(
+                Command::RestoreLayer {
+                    layer: removed,
+                    index: i,
+                    clips,
+                },
+                vec![Event::LayerCleared { layer }],
+            )
+        }
+        Command::RestoreLayer {
+            layer,
+            index,
+            clips,
+        } => {
+            let id = layer.id;
+            let ls = &mut p.composition.layers;
+            ls.insert(index.min(ls.len()), layer);
+            // Ascending positions per deck rebuild the original order.
+            for (deck, at, clip) in clips {
+                let d = p
+                    .composition
+                    .decks
+                    .iter_mut()
+                    .find(|d| d.id == deck)
+                    .ok_or(Error::NoDeck)?;
+                d.clips.insert(at.min(d.clips.len()), clip);
+            }
+            undoable(Command::RemoveLayerWithClips { layer: id }, vec![])
         }
         Command::AddColumn { column } => {
             let id = column.id;
@@ -3685,6 +3873,60 @@ mod tests {
             apply(&mut p, Command::RemoveColumn { column: first }),
             Err(Error::InUse)
         );
+    }
+
+    #[test]
+    fn remove_layer_with_clips_undo_restores_layer_clips_and_effects_in_all_decks() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let b = Deck {
+            id: Uuid::new_v4(),
+            name: "B".into(),
+            clips: vec![],
+        };
+        let b_id = b.id;
+        apply(
+            &mut p,
+            Command::AddDeck {
+                deck: b,
+                index: 1,
+                select: None,
+            },
+        )
+        .unwrap();
+        let mut k = clip_from_path("/x/b.mov".into());
+        k.track.effects.push(fx("blur"));
+        p.composition
+            .decks
+            .iter_mut()
+            .find(|d| d.id == b_id)
+            .unwrap()
+            .clips
+            .push(CellClip {
+                layer: l,
+                column: 0,
+                clip: k,
+            });
+        let before = p.clone();
+        let mut h = History::new();
+        h.exec(
+            &mut p,
+            Command::RemoveLayerWithClips { layer: l },
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(p.composition.layers.iter().all(|x| x.id != l));
+        assert!(
+            p.composition
+                .decks
+                .iter()
+                .all(|d| d.clips.iter().all(|c| c.layer != l))
+        );
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before, "layer, clips and effects restored in every deck");
+        h.redo(&mut p).unwrap().unwrap();
+        assert!(p.composition.layers.iter().all(|x| x.id != l));
     }
 
     #[test]
@@ -5798,5 +6040,259 @@ mod tests {
         assert_eq!(m[3], (500.0, 1000.0));
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(p, before);
+    }
+
+    /// Two layers x three columns, clips "a" at (l1,0) and "b" at (l2,1).
+    fn two_clips() -> (Project, LayerId, LayerId) {
+        let (mut p, l1) = setup();
+        for n in 2..=3 {
+            p.composition.columns.push(Column {
+                id: Uuid::new_v4(),
+                name: n.to_string(),
+            });
+        }
+        let l2 = layer(2);
+        let l2id = l2.id;
+        p.composition.layers.push(l2);
+        let t = Instant::now();
+        let mut h = History::default();
+        for (l, col, f) in [(l1, 0, "/x/a.mov"), (l2id, 1, "/x/b.mov")] {
+            h.exec(
+                &mut p,
+                Command::ImportMedia {
+                    deck: A,
+                    layer: l,
+                    column: col,
+                    path: f.into(),
+                },
+                t,
+            )
+            .unwrap();
+        }
+        (p, l1, l2id)
+    }
+
+    fn name_at(p: &Project, l: LayerId, c: u32) -> Option<String> {
+        clip_in(p, A, l, c).map(|k| k.name.clone())
+    }
+
+    #[test]
+    fn move_clip_to_empty_cell_moves_and_undoes() {
+        let (mut p, l1, l2) = two_clips();
+        let before = p.clone();
+        let mut h = History::default();
+        let ev = h
+            .exec(
+                &mut p,
+                Command::MoveClip {
+                    deck: A,
+                    from: (l1, 0),
+                    to: (l2, 2),
+                    copy: false,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(name_at(&p, l1, 0), None, "source vacated");
+        assert_eq!(name_at(&p, l2, 2).as_deref(), Some("a"));
+        assert!(matches!(
+            &ev[..],
+            [Event::ClipsMoved { moves, .. }] if moves == &vec![((l1, 0), (l2, 2))]
+        ));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        // Redo moves it again.
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(name_at(&p, l2, 2).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn move_clip_onto_occupied_cell_swaps_and_undoes() {
+        let (mut p, l1, l2) = two_clips();
+        let before = p.clone();
+        let mut h = History::default();
+        let ev = h
+            .exec(
+                &mut p,
+                Command::MoveClip {
+                    deck: A,
+                    from: (l1, 0),
+                    to: (l2, 1),
+                    copy: false,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(name_at(&p, l1, 0).as_deref(), Some("b"));
+        assert_eq!(name_at(&p, l2, 1).as_deref(), Some("a"));
+        assert!(matches!(
+            &ev[..],
+            [Event::ClipsMoved { moves, .. }] if moves.len() == 2
+        ));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn copy_clip_keeps_source_uses_fresh_ids_and_undoes() {
+        let (mut p, l1, l2) = two_clips();
+        let before = p.clone();
+        let src_id = clip_in(&p, A, l1, 0).unwrap().id;
+        let mut h = History::default();
+        h.exec(
+            &mut p,
+            Command::MoveClip {
+                deck: A,
+                from: (l1, 0),
+                to: (l2, 2),
+                copy: true,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(name_at(&p, l1, 0).as_deref(), Some("a"), "source stays");
+        let copy = clip_in(&p, A, l2, 2).unwrap();
+        assert_eq!(copy.name, "a");
+        assert_ne!(copy.id, src_id, "the copy has its own id");
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        // Copy over an occupied cell replaces it; undo brings it back.
+        h.exec(
+            &mut p,
+            Command::MoveClip {
+                deck: A,
+                from: (l1, 0),
+                to: (l2, 1),
+                copy: true,
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(name_at(&p, l2, 1).as_deref(), Some("a"));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn move_clip_rejects_empty_source_and_ignores_same_cell() {
+        let (mut p, l1, l2) = two_clips();
+        let before = p.clone();
+        let mv = |from, to| Command::MoveClip {
+            deck: A,
+            from,
+            to,
+            copy: false,
+        };
+        assert!(matches!(
+            apply(&mut p, mv((l1, 2), (l2, 2))),
+            Err(Error::NoClip)
+        ));
+        assert!(matches!(
+            apply(&mut p, mv((l1, 0), (l2, 9))),
+            Err(Error::NoColumn)
+        ));
+        let r = apply(&mut p, mv((l1, 0), (l1, 0))).unwrap();
+        assert!(r.inverse.is_none() && r.events.is_empty(), "no-op");
+        assert_eq!(p, before);
+    }
+
+    fn layer_order(p: &Project) -> Vec<LayerId> {
+        p.composition.layers.iter().map(|l| l.id).collect()
+    }
+
+    #[test]
+    fn move_layer_reorders_with_undo_and_clamps() {
+        let (mut p, a) = setup();
+        let b = layer(2);
+        let c = layer(3);
+        let (bid, cid) = (b.id, c.id);
+        p.composition.layers.extend([b, c]);
+        let before = p.clone();
+        let mut h = History::default();
+        let t = Instant::now();
+        h.exec(
+            &mut p,
+            Command::MoveLayer {
+                layer: a,
+                to_index: 2,
+            },
+            t,
+        )
+        .unwrap();
+        assert_eq!(layer_order(&p), vec![bid, cid, a]);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        // Past the end clamps to the bottom.
+        h.exec(
+            &mut p,
+            Command::MoveLayer {
+                layer: a,
+                to_index: 99,
+            },
+            t,
+        )
+        .unwrap();
+        assert_eq!(layer_order(&p), vec![bid, cid, a]);
+        h.undo(&mut p).unwrap().unwrap();
+        // Moving to the current place is not an undo step.
+        let r = apply(
+            &mut p,
+            Command::MoveLayer {
+                layer: bid,
+                to_index: 1,
+            },
+        )
+        .unwrap();
+        assert!(r.inverse.is_none());
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn move_layer_never_splits_a_group_nor_moves_a_grouped_layer() {
+        let (mut p, a) = setup();
+        let (b, c) = (layer(2), layer(3));
+        let (bid, cid) = (b.id, c.id);
+        p.composition.layers.extend([b, c]);
+        let group = vjc_model::LayerGroup::new("g");
+        let gid = group.id;
+        apply(
+            &mut p,
+            Command::CreateGroup {
+                group,
+                layers: vec![bid, cid],
+            },
+        )
+        .unwrap();
+        // a is on top, the group below it: landing between b and c goes above the group.
+        let r = apply(
+            &mut p,
+            Command::MoveLayer {
+                layer: a,
+                to_index: 1,
+            },
+        );
+        assert!(r.is_ok());
+        assert_eq!(layer_order(&p), vec![a, bid, cid]);
+        let r = apply(
+            &mut p,
+            Command::MoveLayer {
+                layer: a,
+                to_index: 2,
+            },
+        )
+        .unwrap();
+        assert!(r.inverse.is_some());
+        assert_eq!(layer_order(&p), vec![bid, cid, a]);
+        assert_eq!(p.composition.layers[0].group, Some(gid));
+        assert!(matches!(
+            apply(
+                &mut p,
+                Command::MoveLayer {
+                    layer: bid,
+                    to_index: 2
+                }
+            ),
+            Err(Error::BadGroup)
+        ));
     }
 }
