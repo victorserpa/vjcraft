@@ -88,6 +88,9 @@ pub fn chain(p: &Project, t: EffectTarget) -> Option<&[Effect]> {
     }
 }
 
+/// Longest string a text parameter keeps (bad data guard; the shader reads fewer).
+pub const MAX_TEXT_CHARS: usize = 256;
+
 fn pos(fx: &[Effect], id: EffectId) -> Result<usize, Error> {
     fx.iter().position(|e| e.id == id).ok_or(Error::NoEffect)
 }
@@ -204,6 +207,9 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     if let Value::Choice { selected: s, .. } = &mut prm.value {
                         *s = selected;
                     }
+                }
+                Value::Text(t) => {
+                    prm.value = Value::Text(t.chars().take(MAX_TEXT_CHARS).collect());
                 }
                 v => prm.value = v,
             }

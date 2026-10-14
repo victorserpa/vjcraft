@@ -21,6 +21,7 @@ mod output_overlay;
 mod output_presets_ui;
 mod output_ui;
 mod params;
+mod persist;
 mod prefs_ui;
 mod slice_inspector;
 mod slice_render;
@@ -341,6 +342,7 @@ fn draw_chain(
                 uniforms: isf.pack(&vjc_core::anim::resolve(&e.params, ctx), time, size),
                 dry_wet: e.dry_wet,
                 ml: ml_draw,
+                persistent: isf.persistent.then_some(e.id),
             });
         }
     }
@@ -663,6 +665,24 @@ fn param_widget(
                 let b = ui.add(egui::Slider::new(&mut x[1], min[1] as f32..=max[1] as f32));
                 if a.changed() || b.changed() {
                     out = Some(V::Color(x));
+                }
+            }
+            (K::Text { .. }, V::Text(t)) => {
+                let id = ui.id().with(("fxtext", name));
+                let mut buf: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| t.clone());
+                let e = ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .char_limit(vjc_fx::TEXT_CHARS)
+                        .desired_width(140.0),
+                );
+                // Commit on Enter or focus loss: one undo step per edit, not per key.
+                if e.lost_focus() {
+                    if buf != *t {
+                        out = Some(V::Text(buf));
+                    }
+                    ui.data_mut(|d| d.remove_temp::<String>(id));
+                } else if e.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(id, buf));
                 }
             }
             (K::Long { labels, .. }, V::Choice { selected, options }) => {
@@ -2340,6 +2360,7 @@ impl State {
                         ),
                         dry_wet: 1.0,
                         ml: None,
+                        persistent: None,
                     })
                 }
                 _ => None,

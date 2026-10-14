@@ -4138,6 +4138,55 @@ mod tests {
     }
 
     #[test]
+    fn text_param_sets_undoes_redoes_and_rejects_wrong_type() {
+        let (mut p, l) = setup();
+        let t = EffectTarget::Layer(l);
+        let mut e = fx("text");
+        e.params = vec![vjc_model::Param {
+            name: "message".into(),
+            value: Value::Text("A".into()),
+            default: Value::Text("A".into()),
+            range: None,
+            animation: None,
+        }];
+        let id = e.id;
+        let mut h = History::new();
+        let t0 = Instant::now();
+        let get = |p: &Project| effects::chain(p, t).unwrap()[0].params[0].value.clone();
+        h.exec(
+            &mut p,
+            Command::AddEffect {
+                target: t,
+                effect: e,
+                index: 0,
+            },
+            t0,
+        )
+        .unwrap();
+        let set = |value| Command::SetEffectParam {
+            target: t,
+            effect: id,
+            param: 0,
+            value,
+        };
+        h.exec(&mut p, set(Value::Text("HELLO".into())), t0)
+            .unwrap();
+        assert_eq!(get(&p), Value::Text("HELLO".into()));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(get(&p), Value::Text("A".into()));
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(get(&p), Value::Text("HELLO".into()));
+        // Negative controls: wrong type is refused; absurd length is truncated.
+        assert_eq!(
+            h.exec(&mut p, set(Value::Number(1.0)), t0),
+            Err(Error::InvalidValue)
+        );
+        h.exec(&mut p, set(Value::Text("x".repeat(10_000))), t0)
+            .unwrap();
+        assert_eq!(get(&p), Value::Text("x".repeat(effects::MAX_TEXT_CHARS)));
+    }
+
+    #[test]
     fn effect_param_validates_clamps_and_coalesces() {
         let (mut p, l) = setup();
         let t = EffectTarget::Layer(l);

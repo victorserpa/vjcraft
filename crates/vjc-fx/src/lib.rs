@@ -1,7 +1,7 @@
 //! ISF effects: header parser and GLSL -> WGSL translation through naga.
 //!
 //! An ISF file is a JSON header in a `/*{ ... }*/` comment followed by a GLSL fragment
-//! body. Only single-pass image filters are supported (no PASSES, no persistent buffers).
+//! body. Only single-pass image filters are supported (no PASSES); `"PERSISTENT": true` gives the shader its previous output as `PREV_PIXEL`.
 //! Everything here is pure CPU work and returns errors instead of panicking, so the app
 //! can run it on a worker thread and disable the effect on failure.
 
@@ -165,6 +165,8 @@ pub const BUILTIN: &[(&str, &str)] = &[
         include_str!("../../../assets/effects/vhs_noise.fs"),
     ),
     ("wave", include_str!("../../../assets/effects/wave.fs")),
+    ("trails", include_str!("../../../assets/effects/trails.fs")),
+    ("echo", include_str!("../../../assets/effects/echo.fs")),
     (
         "zoom_blur",
         include_str!("../../../assets/effects/zoom_blur.fs"),
@@ -209,6 +211,7 @@ pub const GENERATORS: &[(&str, &str)] = &[
         include_str!("../../../assets/generators/voronoi.fs"),
     ),
     ("waves", include_str!("../../../assets/generators/waves.fs")),
+    ("text", include_str!("../../../assets/generators/text.fs")),
 ];
 
 /// Source of a bundled effect or generator.
@@ -264,6 +267,40 @@ pub enum InputKind {
         labels: Vec<String>,
         default: usize,
     },
+    /// String input: `TEXT_CHARS` character codes packed into `TEXT_SLOTS` uniform slots.
+    /// The shader reads them through `isf_u.p[<name> + i / 4][i % 4]`.
+    Text {
+        default: String,
+    },
+}
+
+/// Characters a text input carries.
+pub const TEXT_CHARS: usize = 16;
+/// Uniform slots a text input takes (4 character codes per slot).
+pub const TEXT_SLOTS: usize = TEXT_CHARS / 4;
+
+impl InputKind {
+    /// Uniform slots this input takes.
+    pub fn slots(&self) -> usize {
+        match self {
+            InputKind::Text { .. } => TEXT_SLOTS,
+            _ => 1,
+        }
+    }
+}
+
+/// Character codes of `s` as the shader reads them: ASCII only, padded with spaces,
+/// anything else becomes a space.
+pub fn text_codes(s: &str) -> [f32; TEXT_CHARS] {
+    let mut out = [32.0; TEXT_CHARS];
+    for (o, c) in out.iter_mut().zip(s.chars()) {
+        *o = if c.is_ascii() && !c.is_ascii_control() {
+            c as u32 as f32
+        } else {
+            32.0
+        };
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +315,9 @@ pub struct Isf {
     pub categories: Vec<String>,
     /// Controllable inputs, in file order (the image input is not listed).
     pub inputs: Vec<Input>,
+    /// The effect keeps a per-instance buffer with its previous output (`PREV_PIXEL`):
+    /// trails, echo, feedback. Header: `"PERSISTENT": true`.
+    pub persistent: bool,
     /// GLSL after the header.
     pub body: String,
 }
@@ -387,6 +427,15 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
                     default,
                 }
             }
+            "text" => InputKind::Text {
+                default: i
+                    .get("DEFAULT")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(TEXT_CHARS)
+                    .collect(),
+            },
             other => return err(format!("unsupported input type {other} ({name})")),
         };
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -400,10 +449,15 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
         }
         inputs.push(Input { name, kind });
     }
-    if inputs.len() >= MAX_SLOTS {
+    if inputs.iter().map(|i| i.kind.slots()).sum::<usize>() >= MAX_SLOTS {
         return err("too many inputs");
     }
+    let persistent = json
+        .get("PERSISTENT")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Ok(Isf {
+        persistent,
         description: str_of("DESCRIPTION"),
         categories,
         inputs,
@@ -426,6 +480,8 @@ const RESERVED: &[&str] = &[
     "IMG_NORM_PIXEL",
     "IMG_THIS_PIXEL",
     "IMG_SIZE",
+    "PREV_PIXEL",
+    "PREV_THIS_PIXEL",
     "inputImage",
     "main",
     "void",
@@ -633,6 +689,7 @@ impl Isf {
                         Value::Color([default[0] as f32, default[1] as f32, 0.0, 1.0]),
                         Some((min[0].min(min[1]), max[0].max(max[1]))),
                     ),
+                    InputKind::Text { default } => (Value::Text(default.clone()), None),
                     InputKind::Long {
                         labels, default, ..
                     } => (
@@ -660,12 +717,24 @@ impl Isf {
         let mut u = [[0.0; 4]; MAX_SLOTS];
         u[0] = [time, size.0 as f32, size.1 as f32, 0.0];
         let defaults = self.default_params();
-        for (n, (inp, def)) in self.inputs.iter().zip(&defaults).enumerate() {
+        for ((inp, def), n) in self.inputs.iter().zip(&defaults).zip(self.first_slots()) {
             let v = params
                 .iter()
                 .find(|p| p.name == inp.name)
                 .map_or(&def.value, |p| &p.value);
-            u[n + 1] = match (&inp.kind, v) {
+            if let (InputKind::Text { .. }, Value::Text(t)) = (&inp.kind, v) {
+                for (k, c) in text_codes(t).chunks(4).enumerate() {
+                    u[n + k] = [c[0], c[1], c[2], c[3]];
+                }
+                continue;
+            }
+            if let InputKind::Text { default } = &inp.kind {
+                for (k, c) in text_codes(default).chunks(4).enumerate() {
+                    u[n + k] = [c[0], c[1], c[2], c[3]];
+                }
+                continue;
+            }
+            u[n] = match (&inp.kind, v) {
                 (InputKind::Float { .. }, Value::Number(x)) => [*x as f32, 0.0, 0.0, 0.0],
                 (InputKind::Bool { .. }, Value::Bool(b)) => [*b as u8 as f32, 0.0, 0.0, 0.0],
                 (InputKind::Color { .. }, Value::Color(c)) => *c,
@@ -713,6 +782,9 @@ pub fn glsl_source(isf: &Isf) -> String {
          layout(set = 0, binding = 1) uniform texture2D inputImage;\n\
          layout(set = 0, binding = 2) uniform sampler isf_smp;\n\
          layout(set = 0, binding = 3) uniform texture2D vjc_mask;\n\
+         layout(set = 0, binding = 4) uniform texture2D vjc_prev;\n\
+         #define PREV_PIXEL(uv) textureLod(sampler2D(vjc_prev, isf_smp), vec2((uv).x, 1.0 - (uv).y), 0.0)\n\
+         #define PREV_THIS_PIXEL PREV_PIXEL(isf_FragNormCoord)\n\
          #define gl_FragColor isf_FragColor\n\
          #define TIME isf_u.p[0].x\n\
          #define RENDERSIZE isf_u.p[0].yz\n\
@@ -729,6 +801,7 @@ pub fn glsl_source(isf: &Isf) -> String {
             InputKind::Color { .. } => slot,
             InputKind::Point2D { .. } => format!("{slot}.xy"),
             InputKind::Long { .. } => format!("int(floor({slot}.x + 0.5))"),
+            InputKind::Text { .. } => n.to_string(),
         };
         s.push_str(&format!("#define vjc_u_{} {}\n", i.name, expr));
     }
@@ -738,13 +811,26 @@ pub fn glsl_source(isf: &Isf) -> String {
 }
 
 impl Isf {
+    /// First uniform slot of every input (slot 0 is TIME/RENDERSIZE).
+    fn first_slots(&self) -> Vec<usize> {
+        let mut n = 1;
+        self.inputs
+            .iter()
+            .map(|i| {
+                let at = n;
+                n += i.kind.slots();
+                at
+            })
+            .collect()
+    }
+
     fn inputs_iter(&self) -> impl Iterator<Item = (usize, &Input)> {
-        self.inputs.iter().enumerate().map(|(n, i)| (n + 1, i))
+        self.first_slots().into_iter().zip(&self.inputs)
     }
 }
 
 /// Translates ISF to a WGSL fragment module (entry point `main`; bindings: 0 uniform
-/// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects); `@location(0)` input is the ISF y-up uv).
+/// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects), 4 previous output of this instance (persistent effects only; blank otherwise); `@location(0)` input is the ISF y-up uv).
 pub fn translate(isf: &Isf) -> Result<String, FxError> {
     use naga::{back::wgsl, front::glsl, valid};
     let names: Vec<&str> = isf.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -1039,5 +1125,39 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
         let u = isf.pack(&p, 0.0, (1, 1));
         assert_eq!(u[1], [0.0, 0.0, 0.5, 1.0]);
         assert_eq!(u[2], [0.0; 4]);
+    }
+
+    #[test]
+    fn text_input_packs_character_codes_over_four_slots() {
+        let (isf, _) = compile(builtin_source("text").unwrap()).unwrap();
+        assert!(!isf.persistent);
+        let mut params = isf.default_params();
+        params[0].value = Value::Text("Hi!".into());
+        let u = isf.pack(&params, 0.0, (64, 64));
+        assert_eq!(u[1], [72.0, 105.0, 33.0, 32.0]);
+        // Padding is spaces; the next input starts after the 4 text slots.
+        assert_eq!(u[4], [32.0; 4]);
+        assert_eq!(u[1 + TEXT_SLOTS], [0.0, 0.0, 0.0, 1.0]);
+        // Negative control: another string gives other codes.
+        params[0].value = Value::Text("Z".into());
+        assert_eq!(isf.pack(&params, 0.0, (64, 64))[1][0], 90.0);
+        // Non-ASCII and over-long input never overflows or yields NaN.
+        params[0].value = Value::Text("é".repeat(40));
+        let u = isf.pack(&params, 0.0, (64, 64));
+        assert!(u[1..5].iter().flatten().all(|c| *c == 32.0));
+        // A mistyped value falls back to the default text.
+        params[0].value = Value::Number(1.0);
+        assert_eq!(isf.pack(&params, 0.0, (64, 64))[1][0], 86.0);
+    }
+
+    #[test]
+    fn persistent_header_flag_is_read() {
+        let on =
+            parse(r#"/*{"PERSISTENT": true}*/ void main(){ gl_FragColor = PREV_THIS_PIXEL; }"#)
+                .unwrap();
+        assert!(on.persistent);
+        assert!(translate(&on).is_ok());
+        let off = parse(r#"/*{}*/ void main(){ gl_FragColor = vec4(1.0); }"#).unwrap();
+        assert!(!off.persistent);
     }
 }

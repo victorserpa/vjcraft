@@ -1170,6 +1170,23 @@ mod tests {
     }
 
     #[test]
+    fn text_param_serde_roundtrip() {
+        let prm = Param {
+            name: "message".into(),
+            value: Value::Text("OLÁ \"VJ\"".into()),
+            default: Value::Text("A".into()),
+            range: None,
+            animation: None,
+        };
+        let json = serde_json::to_string(&prm).unwrap();
+        assert_eq!(serde_json::from_str::<Param>(&json).unwrap(), prm);
+        // Negative control: a Text is not read back as another variant.
+        let num: Value =
+            serde_json::from_str(&serde_json::to_string(&Value::Number(1.0)).unwrap()).unwrap();
+        assert_ne!(num, Value::Text("1".into()));
+    }
+
+    #[test]
     fn project_json_roundtrip() {
         let mut p = Project::new("t");
         let lid = Uuid::new_v4();

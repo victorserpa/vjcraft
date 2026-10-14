@@ -10,6 +10,7 @@ use vjc_model::{BlendMode, FitMode, GroupId, LayerId, SliceSource};
 
 use crate::ml_gpu::MlStore;
 pub use crate::ml_gpu::{MlDraw, MlFrame};
+use crate::persist::PersistStore;
 
 /// Fraction of the destination frame (x, y) covered by a `src` video for the given mode.
 pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) {
@@ -233,6 +234,9 @@ pub struct EffectDraw {
     /// Set for ML effects: the effect reads a mask produced by an ML worker and is skipped
     /// until the first one arrives.
     pub ml: Option<MlDraw>,
+    /// Instance id of a persistent effect (trails, echo): the effect gets its own previous
+    /// output as `PREV_PIXEL`. None for ordinary effects.
+    pub persistent: Option<uuid::Uuid>,
 }
 
 /// What an effect with this dry/wet costs.
@@ -288,6 +292,8 @@ struct Fx {
     mix_bufs: Vec<wgpu::Buffer>,
     mix_next: usize,
     ml: MlStore,
+    /// Previous output of each persistent effect instance.
+    persist: PersistStore<(wgpu::Texture, wgpu::TextureView)>,
 }
 
 fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
@@ -314,6 +320,26 @@ fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
     [mk(), mk(), mk()]
 }
 
+/// Texture holding a persistent effect's previous output (zeroed by wgpu on creation).
+fn make_history(device: &wgpu::Device, (w, h): (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
+    let t = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fx_history"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let v = t.create_view(&Default::default());
+    (t, v)
+}
+
 /// One fullscreen fragment pass of an effect or generator shader: `src` is bound as
 /// `inputImage`, the result replaces `dst`.
 #[allow(clippy::too_many_arguments)]
@@ -327,6 +353,7 @@ pub(crate) fn draw_pass(
     src: &wgpu::TextureView,
     dst: &wgpu::TextureView,
     mask: &wgpu::TextureView,
+    prev: &wgpu::TextureView,
 ) {
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("fx_bg"),
@@ -347,6 +374,10 @@ pub(crate) fn draw_pass(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::TextureView(mask),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(prev),
             },
         ],
     });
@@ -418,7 +449,9 @@ impl Fx {
         let buf = &self.bufs[self.next];
         self.next += 1;
         queue.write_buffer(buf, 0, bytemuck::cast_slice(&g.uniforms));
-        draw_pass(device, enc, bgl, sampler, pipe, buf, blank, dst, blank);
+        draw_pass(
+            device, enc, bgl, sampler, pipe, buf, blank, dst, blank, blank,
+        );
     }
 
     /// Runs `effects` in order, ping-ponging between two scratch textures of `size`.
@@ -484,6 +517,13 @@ impl Fx {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
+            // Persistent effect: its previous output is bound as PREV_PIXEL, and this
+            // frame's result is copied back after the pass.
+            let hist = e.persistent.map(|id| {
+                self.persist
+                    .acquire(id, size, || make_history(device, size))
+                    .0
+            });
             draw_pass(
                 device,
                 enc,
@@ -494,7 +534,19 @@ impl Fx {
                 src,
                 &scratch[out].1,
                 mask.unwrap_or(src),
+                hist.map_or(src, |h| &h.1),
             );
+            if let Some(h) = hist {
+                enc.copy_texture_to_texture(
+                    scratch[out].0.as_image_copy(),
+                    h.0.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
             if let MixPlan::Blend(t) = plan {
                 if self.mix_bufs.len() <= self.mix_next {
                     self.mix_bufs
@@ -741,7 +793,7 @@ impl Compositor {
         // Effect passes: the layer bindings plus the ML mask texture.
         let fx_bgl = {
             let mut e: Vec<wgpu::BindGroupLayoutEntry> = vec![];
-            for binding in 0..4u32 {
+            for binding in 0..5u32 {
                 e.push(wgpu::BindGroupLayoutEntry {
                     binding,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -959,6 +1011,7 @@ impl Compositor {
             mix_pipe,
             mix_bufs: vec![],
             mix_next: 0,
+            persist: PersistStore::default(),
         };
         let (target, target_view) = make_target(device, w, h);
         let (base, base_bind) = make_base(device, &base_bgl, w, h);
@@ -1557,6 +1610,7 @@ impl Compositor {
         }
         let used = std::mem::take(&mut self.fx.used);
         self.fx.scratch.retain(|k, _| used.contains(k));
+        self.fx.persist.sweep();
         queue.submit(Some(enc.finish()));
         self.fx.ml.dispatch(device, queue);
     }
@@ -1981,6 +2035,7 @@ mod tests {
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet: 1.0,
             ml: None,
+            persistent: None,
         };
         let src = [51u8, 102, 204, 255];
         for on_master in [false, true] {
@@ -2066,6 +2121,7 @@ mod tests {
                 uniforms: isf.pack(&params, 0.0, (1, 1)),
                 dry_wet: 1.0,
                 ml: None,
+                persistent: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -2141,6 +2197,7 @@ mod tests {
                 uniforms: isf.pack(&params, 0.0, (w, h)),
                 dry_wet: 1.0,
                 ml: None,
+                persistent: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -2303,6 +2360,7 @@ mod tests {
                     uniforms: isf.pack(&isf.default_params(), 0.1, (w, h)),
                     dry_wet: 1.0,
                     ml: None,
+                    persistent: None,
                 };
                 let (effects, gen_draw, fr) = if generator {
                     (vec![], Some(draw), None)
@@ -2369,6 +2427,7 @@ mod tests {
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet,
             ml: None,
+            persistent: None,
         };
         let src = [255u8, 255, 255, 255];
         // (chain, expected red)
@@ -2442,6 +2501,58 @@ mod tests {
             return None;
         };
         Some(dq)
+    }
+
+    /// Trails keep the previous output of the same effect instance: a bright frame
+    /// followed by a black one still shows the decayed trail. Negative control: without an
+    /// instance id (ordinary effect path) the second frame is black. Skipped without a GPU.
+    #[test]
+    fn gpu_persistent_effect_keeps_previous_output_per_instance() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("trails").unwrap()).unwrap();
+        assert!(isf.persistent);
+        let run = |instance_id: Option<uuid::Uuid>| {
+            let mut comp = Compositor::new(&device, 1, 1);
+            comp.add_effect(&device, "trails", &wgsl).unwrap();
+            let fx = EffectDraw {
+                kind: "trails".into(),
+                uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
+                dry_wet: 1.0,
+                ml: None,
+                persistent: instance_id,
+            };
+            let mut last = [0u8; 4];
+            for (serial, px) in [[255u8; 4], [0, 0, 0, 255]].iter().enumerate() {
+                let layer = [LayerDraw {
+                    id: uuid::Uuid::from_u128(1),
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    fit: FitMode::Stretch,
+                    effects: vec![fx.clone()],
+                    frame: Some((1, 1, px, serial as u64 + 1)),
+                    generator: None,
+                    transition: None,
+                    transform: Affine::IDENTITY,
+                    channels: Default::default(),
+                }];
+                comp.render(&device, &queue, &layer, &[], 1.0);
+                last = read_px(&device, &queue, &comp);
+            }
+            last
+        };
+        let kept = run(Some(uuid::Uuid::from_u128(7)));
+        assert!(kept[0].abs_diff(217) <= 3, "{kept:?}");
+        assert_eq!(run(None)[0], 0);
     }
 
     fn read_px(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor) -> [u8; 4] {
@@ -2552,6 +2663,7 @@ mod tests {
                         uniforms: isf.pack(&isf.default_params(), 0.0, (2, 1)),
                         dry_wet: 1.0,
                         ml: Some(ml.clone()),
+                        persistent: None,
                     }],
                     frame: Some((2, 1, &red, 1)),
                     generator: None,
@@ -2654,6 +2766,7 @@ mod tests {
                     uniforms: isf.pack(&isf.default_params(), 0.0, (1, 4)),
                     dry_wet,
                     ml: None,
+                    persistent: None,
                 }],
                 frame: Some((1, 4, &img, 1)),
                 generator: None,
@@ -2825,6 +2938,7 @@ mod tests {
                         uniforms: isf.pack(&isf.default_params(), 0.0, (1, 4)),
                         dry_wet: 1.0,
                         ml: Some(ml.clone()),
+                        persistent: None,
                     }],
                     frame: Some((1, 4, &red, 1)),
                     generator: None,
@@ -2930,6 +3044,7 @@ mod tests {
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet: 1.0,
             ml: None,
+            persistent: None,
         };
         let (below, src) = ([255u8, 0, 0, 255], [51u8, 102, 204, 255]);
         let layers = [solid(1, &below, 1.0), solid(2, &src, 1.0)];
