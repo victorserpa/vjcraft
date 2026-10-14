@@ -1095,6 +1095,21 @@ fn drop_with_default_fit_is_one_undo_step() {
 }
 
 #[test]
+fn drop_loads_without_triggering() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let on_air = h.state().active(lid);
+    assert!(on_air.is_some());
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut()
+        .drop_cell(lid, 3, PathBuf::from("/nonexistent/b.mp4"));
+    settle(&mut h);
+    assert_eq!(h.state().active(lid), on_air, "on air unchanged");
+    assert!(vjc_core::clip_in(&h.state().project, deck, lid, 3).is_some());
+    assert_eq!(h.state().selected, Some((lid, 3)));
+}
+
+#[test]
 fn save_as_records_last_project() {
     let mut st = State::headless(prefs());
     let f = tmp_vjc("lastproj");
@@ -3977,10 +3992,12 @@ fn whole_gig_through_the_ui() {
             );
         }
     }
-    // A drop plays the clip (by design): each layer ends on the last file dropped on it.
+    // A drop only loads the clip: nothing goes on air.
     for (_, a) in on_air(&h) {
-        assert_eq!(a, Some((deck, 2)));
+        assert_eq!(a, None);
     }
+    // Put the last column on air so the steps below start from a playing grid.
+    click(&mut h, "Trigger column 3");
 
     // 2. Name strip: only the Preview changes, the output stays as it was.
     let before = on_air(&h);

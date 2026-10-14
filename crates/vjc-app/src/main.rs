@@ -3061,7 +3061,7 @@ impl State {
         let cell = self.cells.iter().find(|c| c.rect.contains(pos)).copied();
         match item {
             browser::Item::File(path) => match cell {
-                Some(c) => self.drop_file(c.layer, c.col, path),
+                Some(c) => self.drop_cell(c.layer, c.col, path),
                 None => self.status = "Drop the file on a grid cell".into(),
             },
             browser::Item::Generator(id) => match cell {
@@ -3128,7 +3128,37 @@ impl State {
         }
     }
 
+    /// A file dropped on a cell: loads and selects it (Preview), never triggers.
+    fn drop_cell(&mut self, layer: LayerId, column: u32, path: PathBuf) {
+        let deck = self.project.composition.current_deck;
+        // A cell already on air must reload, or the wall keeps the old clip.
+        let live = active_of(&self.players, &self.gens, layer) == Some((deck, column));
+        self.load_file(layer, column, path);
+        if live {
+            self.exec(Command::TriggerClip {
+                deck,
+                layer,
+                column,
+            });
+        }
+        self.selected = Some((layer, column));
+        self.selected_deck = Some(deck);
+        self.preview_target = PreviewTarget::Clip(deck, layer, column);
+    }
+
+    /// Loads `path` into the cell and plays it.
     fn drop_file(&mut self, layer: LayerId, column: u32, path: PathBuf) {
+        self.load_file(layer, column, path);
+        let deck = self.project.composition.current_deck;
+        self.exec(Command::TriggerClip {
+            deck,
+            layer,
+            column,
+        });
+    }
+
+    /// Loads `path` into the cell without triggering it: what is on air stays.
+    fn load_file(&mut self, layer: LayerId, column: u32, path: PathBuf) {
         let deck = self.project.composition.current_deck;
         // One undo step: the default fit is set on the clip before it is placed.
         let mut clip = vjc_core::clip_from_path(path);
@@ -3138,11 +3168,6 @@ impl State {
             layer,
             column,
             clip,
-        });
-        self.exec(Command::TriggerClip {
-            deck,
-            layer,
-            column,
         });
     }
 
@@ -4866,7 +4891,7 @@ impl State {
         self.transport_h = r.response.rect.height();
         match opened {
             Some(browser::Opened::File(path)) => match self.selected {
-                Some((l, c)) => self.drop_file(l, c, path),
+                Some((l, c)) => self.drop_cell(l, c, path),
                 None => self.status = "Select a cell to load the file".into(),
             },
             Some(browser::Opened::Project(path)) if self.confirm_discard() => {
@@ -4952,7 +4977,7 @@ impl State {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    self.drop_file(l, c, path);
+                    self.drop_cell(l, c, path);
                     self.status = format!("Dropped {name} on column {} ({how})", c + 1);
                 }
                 None => self.status = "No grid cells to drop on".into(),
@@ -5899,7 +5924,7 @@ impl State {
                 )
                 .pick_file()
         {
-            self.drop_file(l, c, path);
+            self.drop_cell(l, c, path);
         }
         self.learn_pass(ui, &mut cmds);
         for c in cmds {
