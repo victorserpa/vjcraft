@@ -5,6 +5,7 @@
 pub mod anim;
 pub mod blend;
 pub mod clock;
+pub mod comp_autopilot;
 pub mod crossfader;
 pub mod dmx;
 pub mod effects;
@@ -446,6 +447,15 @@ pub enum Command {
         mode: vjc_model::TriggerMode,
     },
     /// Trigger style of the composition (clips with `Composition` follow it). Undoable.
+    /// Composition autopilot (which column plays next, and when). Undoable.
+    SetCompAutopilot {
+        autopilot: vjc_model::CompAutopilot,
+    },
+    /// Autopilot override of one column. Undoable.
+    SetColumnAutopilot {
+        column: uuid::Uuid,
+        autopilot: vjc_model::ColumnAutopilot,
+    },
     SetCompTriggerStyle {
         style: vjc_model::TriggerStyle,
     },
@@ -2635,6 +2645,26 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.layers[i].trigger_mode, mode);
             undoable(Command::SetLayerTriggerMode { layer, mode: prev }, vec![])
         }
+        Command::SetCompAutopilot { autopilot } => {
+            let prev = std::mem::replace(&mut p.composition.autopilot, autopilot);
+            undoable(Command::SetCompAutopilot { autopilot: prev }, vec![])
+        }
+        Command::SetColumnAutopilot { column, autopilot } => {
+            let c = p
+                .composition
+                .columns
+                .iter_mut()
+                .find(|c| c.id == column)
+                .ok_or(Error::NoColumn)?;
+            let prev = std::mem::replace(&mut c.autopilot, autopilot);
+            undoable(
+                Command::SetColumnAutopilot {
+                    column,
+                    autopilot: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetCompTriggerStyle { style } => {
             let prev = std::mem::replace(&mut p.composition.trigger_style, style);
             undoable(Command::SetCompTriggerStyle { style: prev }, vec![])
@@ -3655,6 +3685,7 @@ mod tests {
         let id = l.id;
         p.composition.layers.push(l);
         p.composition.columns.push(Column {
+            autopilot: Default::default(),
             id: Uuid::new_v4(),
             name: "1".into(),
         });
@@ -3720,6 +3751,7 @@ mod tests {
         let mut h = History::new();
         let id = Uuid::new_v4();
         p.composition.columns.push(Column {
+            autopilot: Default::default(),
             id,
             name: "1".into(),
         });
@@ -4621,6 +4653,7 @@ mod tests {
             &mut p,
             Command::AddColumn {
                 column: Column {
+                    autopilot: Default::default(),
                     id: Uuid::new_v4(),
                     name: "2".into(),
                 },
@@ -5606,6 +5639,7 @@ mod tests {
         p.composition.layers.push(l2);
         for n in 2..=3 {
             p.composition.columns.push(Column {
+                autopilot: Default::default(),
                 id: Uuid::new_v4(),
                 name: n.to_string(),
             });
@@ -7068,6 +7102,7 @@ mod tests {
         let (mut p, l1) = setup();
         for n in 2..=3 {
             p.composition.columns.push(Column {
+                autopilot: Default::default(),
                 id: Uuid::new_v4(),
                 name: n.to_string(),
             });

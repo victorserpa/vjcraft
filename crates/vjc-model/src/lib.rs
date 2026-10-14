@@ -57,6 +57,99 @@ pub struct Composition {
     /// Default trigger style of clips that defer to the composition.
     #[serde(default)]
     pub trigger_style: TriggerStyle,
+    /// Plays columns by itself. Old files lack it: Off.
+    #[serde(default)]
+    pub autopilot: CompAutopilot,
+}
+
+/// Which column the composition autopilot plays when its time is up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColumnTarget {
+    #[default]
+    Off,
+    Next,
+    Previous,
+    Random,
+}
+
+/// What the composition autopilot waits for before it plays the next column.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColumnDuration {
+    #[default]
+    Beats,
+    Seconds,
+    ShortestClip,
+    LongestClip,
+    TopClip,
+    BottomClip,
+}
+
+/// How a random pick is drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RandomKind {
+    /// Any column, the current one included.
+    #[default]
+    Any,
+    /// Any column but the current one.
+    Other,
+    /// Shuffled: no column repeats until all have played.
+    Bag,
+}
+
+fn default_ap_beats() -> f64 {
+    4.0
+}
+
+fn default_ap_secs() -> f64 {
+    10.0
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompAutopilot {
+    pub target: ColumnTarget,
+    pub duration: ColumnDuration,
+    pub beats: f64,
+    pub seconds: f64,
+    pub random: RandomKind,
+    /// Next/Previous wrap around at the ends when on; off stops there.
+    #[serde(rename = "loop")]
+    pub looping: bool,
+}
+
+impl Default for CompAutopilot {
+    fn default() -> Self {
+        CompAutopilot {
+            target: ColumnTarget::Off,
+            duration: ColumnDuration::Beats,
+            beats: default_ap_beats(),
+            seconds: default_ap_secs(),
+            random: RandomKind::Any,
+            looping: true,
+        }
+    }
+}
+
+/// Per-column override of the composition autopilot; `None` defers to the composition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ColumnAutopilot {
+    /// What plays after this column. `Some(Off)` stops here.
+    pub target: Option<ColumnTarget>,
+    pub duration: Option<ColumnDuration>,
+    pub beats: f64,
+    pub seconds: f64,
+}
+
+impl Default for ColumnAutopilot {
+    fn default() -> Self {
+        ColumnAutopilot {
+            target: None,
+            duration: None,
+            beats: default_ap_beats(),
+            seconds: default_ap_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,6 +267,9 @@ pub struct Column {
     /// Header label; older projects may lack it.
     #[serde(default)]
     pub name: String,
+    /// Autopilot override of this column. Old files lack it: defers to the composition.
+    #[serde(default)]
+    pub autopilot: ColumnAutopilot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1356,6 +1452,7 @@ impl Project {
         Project {
             format_version: 1,
             composition: Composition {
+                autopilot: Default::default(),
                 id: Uuid::new_v4(),
                 name: name.into(),
                 width: 1920,
@@ -1640,6 +1737,7 @@ mod tests {
     #[test]
     fn column_name_roundtrips_and_defaults_when_absent() {
         let c = Column {
+            autopilot: Default::default(),
             id: Uuid::new_v4(),
             name: "Drop".into(),
         };
@@ -1783,6 +1881,36 @@ mod tests {
         assert_eq!(p.value, Value::Number(1.0));
     }
 
+    #[test]
+    fn comp_autopilot_round_trips_and_old_files_are_off() {
+        let mut c = fixture();
+        c.autopilot.target = ColumnTarget::Random;
+        c.autopilot.random = RandomKind::Bag;
+        c.autopilot.looping = false;
+        c.columns.push(Column {
+            id: Uuid::new_v4(),
+            name: "c".into(),
+            autopilot: ColumnAutopilot {
+                duration: Some(ColumnDuration::BottomClip),
+                ..Default::default()
+            },
+        });
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(serde_json::from_value::<Composition>(v.clone()).unwrap(), c);
+        // A project saved before the autopilot existed: no key at all.
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("autopilot");
+        for col in old["columns"].as_array_mut().unwrap() {
+            col.as_object_mut().unwrap().remove("autopilot");
+        }
+        let o: Composition = serde_json::from_value(old).unwrap();
+        assert_eq!(o.autopilot.target, ColumnTarget::Off);
+        assert!(
+            o.columns
+                .iter()
+                .all(|c| c.autopilot == ColumnAutopilot::default())
+        );
+    }
     #[test]
     fn old_projects_without_timecode_fields_load() {
         let mut v = serde_json::to_value(Project::new("x")).unwrap();

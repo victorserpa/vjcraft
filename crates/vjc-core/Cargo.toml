@@ -9,3 +9,6 @@ vjc-fx = { path = "../vjc-fx" }
 vjc-model = { path = "../vjc-model" }
 uuid.workspace = true
 rosc = "0.11.4"
+
+[dev-dependencies]
+serde_json.workspace = true

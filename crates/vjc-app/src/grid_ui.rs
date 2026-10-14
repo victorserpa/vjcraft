@@ -354,6 +354,7 @@ pub fn composition_header(
     {
         cmds.push(Command::AddColumn {
             column: vjc_model::Column {
+                autopilot: Default::default(),
                 id: uuid::Uuid::new_v4(),
                 name: (m.columns + 1).to_string(),
             },

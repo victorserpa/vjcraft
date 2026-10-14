@@ -280,6 +280,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     });
     comp.columns = (0..ncols)
         .map(|i| Column {
+            autopilot: Default::default(),
             id: Uuid::new_v4(),
             name: col_names
                 .get(&i)

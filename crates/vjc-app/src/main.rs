@@ -2,6 +2,7 @@ mod api_io;
 mod artnet_out;
 mod artnet_scan;
 mod audio_react;
+mod autopilot_ui;
 mod browser;
 mod capture;
 mod clip_thumbs;
@@ -300,6 +301,8 @@ struct State {
     phase: f64,
     /// Triggers and beat loops waiting for their beat or bar (beat snap).
     snap_pending: Vec<(f64, Held)>,
+    /// Composition autopilot: which column is on air and since when (runtime only).
+    comp_ap: vjc_core::comp_autopilot::State,
     nudge_dir: i8,
     /// Visual only for now. TODO(#9): click sound (see build-log).
     metronome: bool,
@@ -1351,6 +1354,7 @@ fn fresh_project(prefs: &Prefs) -> Project {
     }
     for i in 1..=9 {
         c.columns.push(Column {
+            autopilot: Default::default(),
             id: Uuid::new_v4(),
             name: format!("{i}"),
         });
@@ -1527,6 +1531,7 @@ impl State {
             beat: 0,
             phase: 0.0,
             snap_pending: vec![],
+            comp_ap: Default::default(),
             nudge_dir: 0,
             metronome: false,
             link: link_io::Link::new(120.0),
@@ -1584,6 +1589,7 @@ impl State {
         self.gens.clear();
         self.history.clear();
         self.snap_pending.clear();
+        self.comp_ap.reset();
         self.selected = None;
         self.selected_deck = None;
         self.layer_drag = None;
@@ -2263,6 +2269,7 @@ impl State {
                 self.link_sync.note_project_replaced();
                 self.history.clear();
                 self.snap_pending.clear();
+                self.comp_ap.reset();
                 self.flow = Flow::default();
                 self.players.clear();
                 self.gens.clear();
@@ -2389,6 +2396,11 @@ impl State {
             })),
             _ => None,
         };
+        let on_air = match &cmd {
+            Command::TriggerColumn { column, .. } => Some(*column),
+            Command::StepColumn { .. } => col_after,
+            _ => None,
+        };
         let is_step = matches!(cmd, Command::StepClip { .. });
         let deck_switch = matches!(cmd, Command::SelectDeck { .. });
         let is_set_bpm = matches!(cmd, Command::SetBpm { .. });
@@ -2404,6 +2416,10 @@ impl State {
                 if col_after.is_some() {
                     self.col_sel = col_after;
                 }
+                // Only a column trigger or step puts a column on air.
+                if let Some(c) = on_air {
+                    self.comp_ap.on_air(c, self.phase);
+                }
                 if is_step {
                     // The step lands on the first playable clip: follow it.
                     let landed = events.iter().find_map(|e| match e {
@@ -2418,6 +2434,7 @@ impl State {
                 if deck_switch {
                     self.col_sel = None;
                     self.snap_pending.clear();
+                    self.comp_ap.reset();
                     let cur = self.project.composition.current_deck;
                     self.preload_deck(cur);
                 }
@@ -2987,6 +3004,26 @@ impl State {
         };
     }
 
+    /// Seconds each layer's clip of the column runs (top to bottom); `None` where the layer
+    /// has no clip playing from that column or it has no end (generator, live source).
+    fn column_clip_secs(&self, col: u32) -> Vec<Option<f64>> {
+        let comp = &self.project.composition;
+        comp.layers
+            .iter()
+            .map(|l| {
+                let (deck, c, player) = self.players.get(&l.id)?;
+                if *c != col {
+                    return None;
+                }
+                let tr = &vjc_core::clip_in(&self.project, *deck, l.id, col)?.transport;
+                let reg = vjc_core::playback::region(tr);
+                let rate = vjc_core::playback_rate(tr.speed, 1.0, comp.master_speed);
+                let secs = player.duration()? * (reg.1 - reg.0) / rate;
+                (secs.is_finite() && secs > 0.0).then_some(secs)
+            })
+            .collect()
+    }
+
     /// Column the layer's autopilot would play next, if any.
     fn autopilot_target(&self, layer: LayerId) -> Option<(DeckId, u32)> {
         let l = self
@@ -3345,6 +3382,30 @@ impl State {
                 });
             }
         }
+        // Composition autopilot: plays the next column when the time of this one is up.
+        // `exec` (not `exec_ok`) defers the trigger to the beat grid when beat snap is on.
+        if let Some(cur) = self.comp_ap.current() {
+            let clip_secs = self.column_clip_secs(cur);
+            let rand = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |d| d.as_nanos() as u64);
+            let running = !self.clock.is_paused();
+            let comp = &self.project.composition;
+            if let Some(next) = self.comp_ap.tick(
+                &comp.autopilot,
+                &comp.columns,
+                &clip_secs,
+                vjc_core::comp_autopilot::Frame {
+                    phase: self.phase,
+                    dt,
+                    running,
+                    rand,
+                },
+            ) {
+                let deck = comp.current_deck;
+                self.exec(Command::TriggerColumn { deck, column: next });
+            }
+        }
     }
 
     /// Browser drop at `pos`: files and generators go to a cell, effects to a cell,
@@ -3458,6 +3519,7 @@ impl State {
         for i in have..column + files.len() as u32 {
             commands.push(Command::AddColumn {
                 column: vjc_model::Column {
+                    autopilot: Default::default(),
                     id: Uuid::new_v4(),
                     name: (i + 1).to_string(),
                 },
@@ -5670,11 +5732,13 @@ impl State {
                             } else if nr.clicked() {
                                 self.col_sel = Some(ci as u32);
                             }
+                            let col_ap = comp.columns[ci].autopilot.clone();
                             nr.context_menu(|ui| {
                                 if ui.button("Rename column").clicked() {
                                     self.col_renaming = Some((*cid, n.clone()));
                                     ui.close();
                                 }
+                                autopilot_ui::column_menu(ui, *cid, &col_ap, &mut cmds);
                             });
                         }
 
@@ -5693,6 +5757,7 @@ impl State {
                                 if ui.button("Add column").clicked() {
                                     cmds.push(Command::AddColumn {
                                         column: vjc_model::Column {
+                                            autopilot: Default::default(),
                                             id: Uuid::new_v4(),
                                             name: (ncols + 1).to_string(),
                                         },
@@ -6254,6 +6319,7 @@ impl State {
                                     if ui.button("Add column").clicked() {
                                         cmds.push(Command::AddColumn {
                                             column: vjc_model::Column {
+                                                autopilot: Default::default(),
                                                 id: Uuid::new_v4(),
                                                 name: (ncols + 1).to_string(),
                                             },
@@ -6693,6 +6759,9 @@ impl State {
             if let Some(blend) = params::combo(ui, "cfblend", "Crossfader blend", &cur, &modes) {
                 cmds.push(Command::SetCrossfaderBlend { blend });
             }
+        }
+        if params::section(ui, "sec-comp-autopilot", "Autopilot") {
+            autopilot_ui::comp_section(ui, &c.autopilot, cmds);
         }
         if params::section(ui, "sec-comp-audio", "Master audio") {
             self.audio_rows(ui, AudioTarget::Master, &c.master, cmds);

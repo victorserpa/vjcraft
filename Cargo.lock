@@ -4703,6 +4703,7 @@ name = "vjc-core"
 version = "0.1.0"
 dependencies = [
  "rosc",
+ "serde_json",
  "uuid",
  "vjc-fx",
  "vjc-model",

@@ -3060,6 +3060,7 @@ fn col_sel_is_cleared_when_its_column_goes_or_the_deck_changes() {
     let extra = Uuid::new_v4();
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
+            autopilot: Default::default(),
             id: extra,
             name: "extra".into(),
         },
@@ -3072,6 +3073,7 @@ fn col_sel_is_cleared_when_its_column_goes_or_the_deck_changes() {
     st.col_sel = Some(0);
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
+            autopilot: Default::default(),
             id: extra,
             name: "extra".into(),
         },
@@ -3415,6 +3417,7 @@ fn dirty_project_autosaves_a_recoverable_file_after_the_interval() {
     assert!(!file.exists(), "clean project writes nothing");
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
+            autopilot: Default::default(),
             id: Uuid::new_v4(),
             name: "extra".into(),
         },
@@ -4905,4 +4908,102 @@ fn fader_start_does_not_reopen_the_clip() {
     });
     settle(&mut h);
     assert!(h.state().gens.contains_key(&lid), "still on air");
+}
+
+/// Two generator clips on layer 0 (columns 1 and 2) and the autopilot set up; returns the
+/// deck and the layer.
+fn autopilot_stage(
+    h: &mut Harness<'_, State>,
+    target: vjc_model::ColumnTarget,
+) -> (vjc_model::DeckId, vjc_model::LayerId) {
+    for col in 1..=2u32 {
+        let (gen_id, _) = vjc_fx::GENERATORS[col as usize - 1];
+        let (_, pos) = cell_center(h, 0, col);
+        browser_drag(h, "Generators", &fx_label(gen_id), pos);
+    }
+    let deck = h.state().project.composition.current_deck;
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().exec(Command::SetCompAutopilot {
+        autopilot: vjc_model::CompAutopilot {
+            target,
+            duration: vjc_model::ColumnDuration::Beats,
+            beats: 4.0,
+            ..Default::default()
+        },
+    });
+    (deck, layer)
+}
+
+/// A clock whose phase is `secs` seconds (at 120 bpm: 2 beats each) ahead of a fresh one.
+fn clock_ahead(secs: u64) -> vjc_core::clock::Clock {
+    vjc_core::clock::Clock::new(
+        120.0,
+        std::time::Instant::now() - std::time::Duration::from_secs(secs),
+    )
+}
+
+#[test]
+fn composition_autopilot_plays_the_next_column_when_the_beats_are_up() {
+    let mut h = app();
+    let (deck, layer) = autopilot_stage(&mut h, vjc_model::ColumnTarget::Next);
+    h.state_mut().clock = clock_ahead(0);
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    let on = |h: &Harness<'_, State>| active_of(&h.state().players, &h.state().gens, layer);
+    assert_eq!(on(&h), Some((deck, 1)));
+    // 10 s at 120 bpm = 20 beats later (fake time): 4 beats are long gone.
+    h.state_mut().clock = clock_ahead(10);
+    settle(&mut h);
+    assert_eq!(on(&h), Some((deck, 2)));
+}
+
+#[test]
+fn composition_autopilot_off_never_fires_and_selecting_does_not_play() {
+    let mut h = app();
+    let (deck, layer) = autopilot_stage(&mut h, vjc_model::ColumnTarget::Off);
+    let on = |h: &Harness<'_, State>| active_of(&h.state().players, &h.state().gens, layer);
+    h.state_mut().clock = clock_ahead(0);
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    h.state_mut().clock = clock_ahead(600);
+    settle(&mut h);
+    assert_eq!(on(&h), Some((deck, 1)), "Off must not move the column");
+    // Next is on but nothing was triggered: selecting a column and time passing play nothing.
+    let mut h = app();
+    let (_, layer) = autopilot_stage(&mut h, vjc_model::ColumnTarget::Next);
+    settle(&mut h);
+    let before = active_of(&h.state().players, &h.state().gens, layer);
+    h.state_mut().col_sel = Some(1);
+    h.state_mut().clock = clock_ahead(600);
+    settle(&mut h);
+    assert_eq!(
+        active_of(&h.state().players, &h.state().gens, layer),
+        before,
+        "selecting must not put a column on air"
+    );
+    assert_eq!(h.state().comp_ap.current(), None);
+}
+
+#[test]
+fn composition_autopilot_respects_beat_snap() {
+    let mut h = app();
+    let (deck, layer) = autopilot_stage(&mut h, vjc_model::ColumnTarget::Next);
+    h.state_mut().clock = clock_ahead(0);
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Bar;
+    // 10.25 s = 20.5 beats: mid-bar, so the autopilot's trigger waits for the bar.
+    h.state_mut().clock = vjc_core::clock::Clock::new(
+        120.0,
+        std::time::Instant::now() - std::time::Duration::from_millis(10_250),
+    );
+    settle(&mut h);
+    assert_eq!(h.state().snap_pending.len(), 1);
+    assert_eq!(
+        active_of(&h.state().players, &h.state().gens, layer),
+        Some((deck, 1))
+    );
 }
