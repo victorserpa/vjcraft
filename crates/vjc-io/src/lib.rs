@@ -412,6 +412,24 @@ mod tests {
         let mut p = p;
         let mut g = vjc_model::LayerGroup::new("G");
         g.speed = 2.0;
+        // A group needs a member to survive opening.
+        p.composition.layers.push(vjc_model::Layer {
+            id: uuid::Uuid::new_v4(),
+            name: "L".into(),
+            track: vjc_model::Track::new(vjc_model::BlendMode::Normal),
+            solo: false,
+            bypass: false,
+            transition: vjc_model::Transition {
+                kind: "cut".into(),
+                duration_beats: None,
+                duration_secs: 0.0,
+            },
+            autopilot: Default::default(),
+            crossfader_bus: None,
+            audio: true,
+            video: true,
+            group: Some(g.id),
+        });
         p.composition.groups.push(g);
         let f2 = d.join("new.vjc");
         save(&p, &f2).unwrap();

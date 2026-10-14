@@ -964,6 +964,10 @@ impl Project {
                 }
             }
         }
+        // A group left without members (all ungrouped above, or empty in the file) is dropped.
+        let used: std::collections::HashSet<GroupId> =
+            c.layers.iter().filter_map(|l| l.group).collect();
+        c.groups.retain(|g| used.contains(&g.id));
         changed
     }
 

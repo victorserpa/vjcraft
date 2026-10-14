@@ -633,11 +633,13 @@ enum Target {
     Transform(EffectTarget, TransformField),
     Anim(AnimTarget),
     SliceMesh(Uuid),
-    SliceMask(Uuid),
+    /// Slice and point count (0 = cleared): create, drag, add point and clear are separate steps.
+    SliceMask(Uuid, usize),
     SliceSoftEdge(Uuid),
     SliceInput(Uuid, Uuid),
     ScreenSize(Uuid),
-    ScreenDevice(Uuid),
+    /// Screen and device kind: switching type is its own undo step, editing the IP is not.
+    ScreenDevice(Uuid, std::mem::Discriminant<vjc_model::OutputDevice>),
 }
 
 impl Command {
@@ -662,9 +664,14 @@ impl Command {
             } => Some(Target::InOut(*deck, *layer, *column)),
             Command::SetScreenSize { screen, .. } => Some(Target::ScreenSize(*screen)),
             // Typing / dragging in the Art-Net setup emits one command per change.
-            Command::SetScreenDevice { screen, .. } => Some(Target::ScreenDevice(*screen)),
+            Command::SetScreenDevice { screen, device } => Some(Target::ScreenDevice(
+                *screen,
+                std::mem::discriminant(device),
+            )),
             Command::SetSliceMesh { slice, .. } => Some(Target::SliceMesh(*slice)),
-            Command::SetSliceMask { slice, .. } => Some(Target::SliceMask(*slice)),
+            Command::SetSliceMask { slice, mask, .. } => {
+                Some(Target::SliceMask(*slice, mask.as_ref().map_or(0, Vec::len)))
+            }
             Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),
             Command::SetSliceInput { screen, slice, .. } => {
                 Some(Target::SliceInput(*screen, *slice))
@@ -5555,6 +5562,58 @@ mod tests {
         assert_eq!(p, mid);
         h2.exec(&mut p, mask(None), now).unwrap();
         assert!(p.output.screens[0].slices[0].mask.is_none());
+    }
+
+    #[test]
+    fn mask_steps_do_not_coalesce_across_shape_changes() {
+        let (mut p, sid, lid) = one_screen_slice();
+        let mut h = History::new();
+        let now = Instant::now();
+        let mask = |m| Command::SetSliceMask {
+            screen: sid,
+            slice: lid,
+            mask: m,
+        };
+        let tri = |x: f32| vec![(x, 0.0), (1.0, 0.0), (0.0, 1.0)];
+        let mut quad = tri(0.2);
+        quad.push((1.0, 1.0));
+        let state = |p: &Project| p.output.screens[0].slices[0].mask.clone();
+        h.exec(&mut p, mask(Some(tri(0.0))), now).unwrap();
+        h.exec(&mut p, mask(Some(tri(0.1))), now).unwrap(); // drag: same step
+        h.exec(&mut p, mask(Some(quad.clone())), now).unwrap(); // add point
+        h.exec(&mut p, mask(None), now).unwrap(); // clear
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(state(&p), Some(quad));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(state(&p), Some(tri(0.1)));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(state(&p), None);
+    }
+
+    #[test]
+    fn device_type_switch_and_ip_edit_are_separate_undo_steps() {
+        use vjc_model::OutputDevice as D;
+        let (mut p, sid, _) = one_screen_slice();
+        let mut h = History::new();
+        let now = Instant::now();
+        let art = |ip: &str| D::ArtNet {
+            ip: ip.into(),
+            universe: 0,
+            fixture: Default::default(),
+        };
+        let set = |d| Command::SetScreenDevice {
+            screen: sid,
+            device: d,
+        };
+        let before = p.output.screens[0].device.clone();
+        h.exec(&mut p, set(art("10.0.0.1")), now).unwrap();
+        h.exec(&mut p, set(art("10.0.0.2")), now).unwrap(); // same kind: one step
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.output.screens[0].device, before);
+        h.exec(&mut p, set(art("10.0.0.1")), now).unwrap();
+        h.exec(&mut p, set(D::Syphon), now).unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.output.screens[0].device, art("10.0.0.1"));
     }
 
     #[test]

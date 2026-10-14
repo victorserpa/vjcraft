@@ -509,6 +509,10 @@ fn declared_input(body: &str, names: &[&str]) -> Option<String> {
     let c: Vec<char> = body.chars().collect();
     let mut i = 0;
     let mut prev_type = false;
+    // Nesting depth, and the depth of the declaration whose declarator list is open
+    // (`float a, amount;`: the comma at that depth starts another declarator).
+    let mut depth = 0i32;
+    let mut decl: Option<i32> = None;
     while i < c.len() {
         if c[i] == '/' && c.get(i + 1) == Some(&'/') {
             while i < c.len() && c[i] != '\n' {
@@ -529,10 +533,26 @@ fn declared_input(body: &str, names: &[&str]) -> Option<String> {
             if prev_type && names.contains(&id.as_str()) {
                 return Some(id);
             }
+            if prev_type {
+                decl = Some(depth);
+            }
             prev_type = TYPES.contains(&id.as_str());
         } else {
-            if !c[i].is_whitespace() {
+            let ch = c[i];
+            if !ch.is_whitespace() {
                 prev_type = false;
+            }
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if decl.is_some_and(|d| depth < d) {
+                        decl = None;
+                    }
+                }
+                ';' => decl = None,
+                ',' if decl == Some(depth) => prev_type = true,
+                _ => {}
             }
             i += 1;
         }
@@ -806,6 +826,26 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
             "x2",
         );
         assert!(declared_input(&m.body, &["x"]).is_none());
+    }
+
+    #[test]
+    fn declared_input_sees_declarator_lists() {
+        let n = ["amount"];
+        for b in [
+            "void main() { float a, amount; }",
+            "void main() { float a = 1.0, amount = 2.0; }",
+            "void main() { float a = mix(0.0, 1.0, 0.5), b, amount; }",
+        ] {
+            assert_eq!(declared_input(b, &n).as_deref(), Some("amount"), "{b}");
+        }
+        // Uses in calls, initializers and later statements are not declarations.
+        for b in [
+            "void main() { float a = f(1.0, amount); }",
+            "void main() { float a, b; c = vec2(a, amount); }",
+            "void main() { float a; x = a, amount; }",
+        ] {
+            assert_eq!(declared_input(b, &n), None, "{b}");
+        }
     }
 
     #[test]

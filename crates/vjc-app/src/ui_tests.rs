@@ -170,9 +170,21 @@ fn test_video(name: &str) -> Option<PathBuf> {
         .args(["-t", "2", "-pix_fmt", "yuv420p"])
         .arg(&out)
         .status()
-        .ok()?
-        .success();
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok && ffmpeg_required() {
+        panic!(
+            "ffmpeg is required here (CI or VJC_REQUIRE_FFMPEG set) but could not make a test video"
+        );
+    }
     ok.then_some(out)
+}
+
+/// In CI a missing ffmpeg must fail the video tests instead of letting them pass empty.
+fn ffmpeg_required() -> bool {
+    ["CI", "VJC_REQUIRE_FFMPEG"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
 #[derive(Debug)]

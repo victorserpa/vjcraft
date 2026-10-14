@@ -231,6 +231,13 @@ mod tests {
         p.composition.layers[1].group = None;
         assert_eq!(p.normalize_groups(), 2);
         assert!(p.composition.layers.iter().all(|l| l.group.is_none()));
+        // The group left without members is dropped, and so is one empty in the file.
+        assert!(p.composition.groups.is_empty());
+        p.composition
+            .groups
+            .push(vjc_model::LayerGroup::new("empty"));
+        p.normalize_groups();
+        assert!(p.composition.groups.is_empty());
     }
 
     #[test]
