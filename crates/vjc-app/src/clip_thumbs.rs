@@ -14,10 +14,17 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// A failed decode is tried again after this long (file may have appeared / finished copying).
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// Most thumbnails kept at once; past this the least recently shown ones are dropped
+/// (they are decoded again if shown later).
+const MAX_THUMBS: usize = 512;
+
 /// Cache entries remember the path they were made for: a clip whose source path changes
 /// gets a fresh thumbnail.
 pub struct ClipThumbs {
-    textures: HashMap<ClipId, (PathBuf, egui::TextureHandle)>,
+    textures: HashMap<ClipId, (PathBuf, egui::TextureHandle, u64)>,
+    /// Logical clock for LRU: bumped on every insert and hit.
+    tick: u64,
+    cap: usize,
     pending: HashMap<ClipId, (PathBuf, Instant)>,
     failed: HashMap<ClipId, (PathBuf, Instant)>,
     req: Sender<(ClipId, PathBuf)>,
@@ -38,6 +45,8 @@ impl ClipThumbs {
         });
         ClipThumbs {
             textures: HashMap::new(),
+            tick: 0,
+            cap: MAX_THUMBS,
             pending: HashMap::new(),
             failed: HashMap::new(),
             req,
@@ -62,7 +71,9 @@ impl ClipThumbs {
                         &f.data,
                     );
                     let h = ctx.load_texture("clip-thumb", img, egui::TextureOptions::LINEAR);
-                    self.textures.insert(id, (path, h));
+                    self.tick += 1;
+                    self.textures.insert(id, (path, h, self.tick));
+                    self.evict();
                 }
                 None => {
                     self.failed.insert(id, (path, Instant::now()));
@@ -78,8 +89,11 @@ impl ClipThumbs {
         id: ClipId,
         path: &std::path::Path,
     ) -> Option<(egui::TextureId, f32)> {
-        if let Some((p, t)) = self.textures.get(&id) {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some((p, t, used)) = self.textures.get_mut(&id) {
             if p == path {
+                *used = tick;
                 let sz = t.size_vec2();
                 return Some((t.id(), sz.x / sz.y.max(1.0)));
             }
@@ -105,6 +119,21 @@ impl ClipThumbs {
             }
         }
         None
+    }
+
+    /// Drops the least recently used thumbnails until at most `cap` remain.
+    fn evict(&mut self) {
+        while self.textures.len() > self.cap {
+            let Some(oldest) = self
+                .textures
+                .iter()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.textures.remove(&oldest);
+        }
     }
 
     #[cfg(test)]
@@ -139,6 +168,42 @@ mod tests {
             }
         }
         panic!("worker never answered");
+    }
+
+    fn put(t: &mut ClipThumbs, ctx: &egui::Context, c: ClipId) {
+        let img = egui::ColorImage::filled([1, 1], egui::Color32::WHITE);
+        let h = ctx.load_texture("t", img, egui::TextureOptions::LINEAR);
+        t.tick += 1;
+        t.textures.insert(c, (PathBuf::from("/x.mp4"), h, t.tick));
+        t.evict();
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used_over_cap() {
+        let ctx = egui::Context::default();
+        let mut t = ClipThumbs::new();
+        t.cap = 2;
+        let (a, b, c) = (id(), id(), id());
+        put(&mut t, &ctx, a);
+        put(&mut t, &ctx, b);
+        // Touch a: b becomes the oldest.
+        assert!(t.texture(a, Path::new("/x.mp4")).is_some());
+        put(&mut t, &ctx, c);
+        assert!(t.ready(a) && t.ready(c), "recent ones stay");
+        assert!(!t.ready(b), "oldest evicted");
+        assert_eq!(t.textures.len(), 2);
+    }
+
+    #[test]
+    fn negative_control_no_eviction_under_cap() {
+        let ctx = egui::Context::default();
+        let mut t = ClipThumbs::new();
+        t.cap = 3;
+        let ids = [id(), id(), id()];
+        for c in ids {
+            put(&mut t, &ctx, c);
+        }
+        assert!(ids.iter().all(|c| t.ready(*c)));
     }
 
     #[test]

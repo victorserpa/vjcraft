@@ -5,6 +5,7 @@ mod capture;
 mod clip_thumbs;
 mod compositor;
 mod dmx_io;
+mod frame_stats;
 mod fx;
 mod grid_ui;
 mod help;
@@ -22,6 +23,7 @@ mod output_presets_ui;
 mod output_ui;
 mod params;
 mod persist;
+mod pool;
 mod prefs_ui;
 mod slice_inspector;
 mod slice_render;
@@ -69,6 +71,8 @@ struct State {
     history: History,
     warnings: Vec<String>,
     status: String,
+    frame_ms: frame_stats::FrameStats,
+    frames: u64,
     /// Playing clip per layer: (deck it was triggered from, column, player). One clip per
     /// layer. Lookups of the playing clip use this deck, never `current_deck`.
     players: HashMap<LayerId, (DeckId, u32, Player)>,
@@ -936,6 +940,8 @@ impl State {
             history: History::new(),
             warnings: vec![],
             status: "Drop video files on the grid cells.".into(),
+            frame_ms: frame_stats::FrameStats::new(),
+            frames: 0,
             players: HashMap::new(),
             audio: None,
             metro: None,
@@ -3516,6 +3522,11 @@ impl State {
                                 .monospace()
                                 .color(theme::CLOCK_TEXT),
                         );
+                        if self.frame_ms.len() > 0 {
+                            ui.separator();
+                            ui.weak(self.frame_ms.label())
+                                .on_hover_text("Frame time (CPU, last 240 frames)");
+                        }
                     });
                 });
             });
@@ -5752,12 +5763,19 @@ impl State {
 
 impl eframe::App for State {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let t0 = std::time::Instant::now();
         self.poll_monitors();
         self.tick_clock();
         self.compose(frame);
         State::ui(self, ui);
         let ctx = ui.ctx().clone();
         self.output_window(&ctx);
+        self.frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
+        // VJC_FRAME_LOG=1 prints the counter every 120 frames (measuring N layers).
+        self.frames += 1;
+        if self.frames.is_multiple_of(120) && std::env::var_os("VJC_FRAME_LOG").is_some() {
+            eprintln!("frame time: {}", self.frame_ms.label());
+        }
         // Video is live: keep repainting. With nothing playing or published, wake up
         // at a low rate (input events still repaint at once).
         if self.is_live() {
@@ -5819,10 +5837,19 @@ fn main() -> eframe::Result {
                 s.load(p);
             }
             // Debug aid: VJC_AUTOPLAY=/path/video.mov loads it in the bottom layer, column 1.
+            // Several paths (separated like PATH) fill layers from the bottom up, to measure
+            // N layers together with VJC_FRAME_LOG=1.
             if let Some(p) = std::env::var_os("VJC_AUTOPLAY") {
-                let l = s.project.composition.layers.last().map(|l| l.id);
-                if let Some(l) = l {
-                    s.drop_file(l, 0, PathBuf::from(p));
+                let ids: Vec<_> = s
+                    .project
+                    .composition
+                    .layers
+                    .iter()
+                    .rev()
+                    .map(|l| l.id)
+                    .collect();
+                for (l, path) in ids.into_iter().zip(std::env::split_paths(&p)) {
+                    s.drop_file(l, 0, path);
                 }
             }
             // Debug aid: VJC_NETOUT=syphon|ndi publishes the composition on a new screen;

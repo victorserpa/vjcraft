@@ -11,6 +11,7 @@ use vjc_model::{BlendMode, FitMode, GroupId, LayerId, SliceSource};
 use crate::ml_gpu::MlStore;
 pub use crate::ml_gpu::{MlDraw, MlFrame};
 use crate::persist::PersistStore;
+use crate::pool::Pool;
 
 /// Fraction of the destination frame (x, y) covered by a `src` video for the given mode.
 pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) {
@@ -285,8 +286,7 @@ struct Fx {
     pipes: HashMap<String, wgpu::RenderPipeline>,
     bufs: Vec<wgpu::Buffer>,
     next: usize,
-    scratch: HashMap<(u32, u32), Scratch>,
-    used: Vec<(u32, u32)>,
+    scratch: Pool<(u32, u32), Scratch>,
     mix_bgl: wgpu::BindGroupLayout,
     mix_pipe: wgpu::RenderPipeline,
     mix_bufs: Vec<wgpu::Buffer>,
@@ -493,13 +493,7 @@ impl Fx {
                     None => continue,
                 },
             };
-            if !self.used.contains(&size) {
-                self.used.push(size);
-            }
-            let scratch = self
-                .scratch
-                .entry(size)
-                .or_insert_with(|| make_scratch(device, size));
+            let scratch = self.scratch.acquire(size, || make_scratch(device, size));
             if self.bufs.len() <= self.next {
                 self.bufs
                     .push(device.create_buffer(&wgpu::BufferDescriptor {
@@ -1005,8 +999,7 @@ impl Compositor {
             pipes: HashMap::new(),
             bufs: vec![],
             next: 0,
-            scratch: HashMap::new(),
-            used: vec![],
+            scratch: Pool::new(),
             mix_bgl,
             mix_pipe,
             mix_bufs: vec![],
@@ -1379,7 +1372,7 @@ impl Compositor {
     ) {
         self.fx.next = 0;
         self.fx.mix_next = 0;
-        self.fx.used.clear();
+        self.fx.scratch.begin_frame();
         let live: Vec<LayerId> = layers_bottom_to_top
             .iter()
             .filter(|l| l.frame.is_some() || l.generator.is_some())
@@ -1608,8 +1601,7 @@ impl Compositor {
                 (extent, fade > 0.0, &mut group_no),
             );
         }
-        let used = std::mem::take(&mut self.fx.used);
-        self.fx.scratch.retain(|k, _| used.contains(k));
+        self.fx.scratch.sweep();
         self.fx.persist.sweep();
         queue.submit(Some(enc.finish()));
         self.fx.ml.dispatch(device, queue);
@@ -3255,5 +3247,59 @@ mod tests {
             "opaque alpha keeps colour {no_a:?}"
         );
         assert!(all[0] < 150, "half alpha over black darkens {all:?}");
+    }
+
+    /// Measures ms/frame of N 1080p layers with one effect each (CPU submit + GPU wait):
+    /// `VJC_BENCH_LAYERS=8 cargo test -p vjc-app --release bench_layers -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_layers() {
+        let n: usize = std::env::var("VJC_BENCH_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let data = vec![128u8; (w * h * 4) as usize];
+        let mut comp = Compositor::new(&device, w, h);
+        let mut stats = crate::frame_stats::FrameStats::new();
+        for i in 0..130 {
+            let layers: Vec<LayerDraw> = (0..n)
+                .map(|k| LayerDraw {
+                    id: uuid::Uuid::from_u128(k as u128 + 1),
+                    opacity: 0.8,
+                    blend: BlendMode::Normal,
+                    fit: FitMode::Fit,
+                    effects: vec![],
+                    frame: Some((w, h, &data, i as u64 + 1)),
+                    generator: None,
+                    transition: None,
+                    transform: Affine::IDENTITY,
+                    channels: Default::default(),
+                })
+                .collect();
+            let t = std::time::Instant::now();
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            if i >= 10 {
+                stats.push(t.elapsed().as_secs_f32() * 1000.0);
+            }
+        }
+        eprintln!(
+            "bench_layers n={n} {w}x{h}: avg {:.2} ms, p99 {:.2} ms",
+            stats.avg(),
+            stats.p99()
+        );
     }
 }
