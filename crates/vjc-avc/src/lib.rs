@@ -281,6 +281,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     comp.columns = (0..ncols)
         .map(|i| Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id: Uuid::new_v4(),
             name: col_names
                 .get(&i)
@@ -623,6 +624,7 @@ fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
         blend_override: None,
         transition: None,
         trigger_style: Default::default(),
+        beat_snap: None,
         channels: Default::default(),
         fit: Default::default(),
     })

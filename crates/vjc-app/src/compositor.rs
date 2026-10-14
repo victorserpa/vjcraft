@@ -47,7 +47,9 @@ const SHADER: &str = r#"
 // the outgoing clip, which is drawn first. tkind 0 = none.
 // m/t: inverse transform, output px (centred on the frame, y down) -> picture px:
 // c = M * p + t.xy, with t.zw = frame size in px. t.z == 0 means no transform.
-struct U { opacity: f32, mode: u32, scale: vec2<f32>, prog: f32, tkind: u32, out: u32, pad: u32, m: vec4<f32>, t: vec4<f32> };
+// p.w != 0: perspective, c is divided by p.xy . p0 + p.z and the pixel is dropped where
+// that is not positive (behind the camera / edge on).
+struct U { opacity: f32, mode: u32, scale: vec2<f32>, prog: f32, tkind: u32, out: u32, pad: u32, m: vec4<f32>, t: vec4<f32>, p: vec4<f32> };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var smp: sampler;
@@ -185,7 +187,13 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     if (u.t.z > 0.0) {
         let p0 = (in.uv - vec2(0.5)) * u.t.zw;
         let c = vec2(u.m.x * p0.x + u.m.y * p0.y, u.m.z * p0.x + u.m.w * p0.y) + u.t.xy;
-        q = c / (u.t.zw * u.scale) + vec2(0.5);
+        var cc = c;
+        if (u.p.w != 0.0) {
+            let den = u.p.x * p0.x + u.p.y * p0.y + u.p.z;
+            if (den <= 1e-6) { discard; }
+            cc = c / den;
+        }
+        q = cc / (u.t.zw * u.scale) + vec2(0.5);
     }
     var tmix = 1.0;
     var tblack = 0.0;
@@ -337,11 +345,12 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// The 16 uniform words of a layer pass: the 8 base words, then the inverse transform
-/// (`m`, then `t.xy` and the frame size). An identity transform leaves the last four zero,
-/// which the shader reads as "no transform" (the exact pre-transform mapping).
-fn uniform_words(base: [u32; 8], xf: &Affine, size: (u32, u32)) -> [u32; 16] {
-    let mut w = [0u32; 16];
+/// The 20 uniform words of a layer pass: the 8 base words, then the inverse transform
+/// (`m`, then `t.xy` and the frame size), then the perspective row. An identity transform
+/// leaves the last twelve zero, which the shader reads as "no transform" (the exact
+/// pre-transform mapping); without X/Y rotation the perspective words stay zero too.
+fn uniform_words(base: [u32; 8], xf: &Affine, size: (u32, u32)) -> [u32; 20] {
+    let mut w = [0u32; 20];
     w[..8].copy_from_slice(&base);
     if !xf.is_identity() {
         let f = |v: f64| (v as f32).to_bits();
@@ -350,6 +359,10 @@ fn uniform_words(base: [u32; 8], xf: &Affine, size: (u32, u32)) -> [u32; 16] {
         w[13] = f(xf.t[1]);
         w[14] = (size.0.max(1) as f32).to_bits();
         w[15] = (size.1.max(1) as f32).to_bits();
+        if xf.has_perspective() {
+            w[16..19].copy_from_slice(&xf.p.map(f));
+            w[19] = 1.0f32.to_bits();
+        }
     }
     w
 }
@@ -1145,7 +1158,7 @@ impl Compositor {
         });
         let fade_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fade_u"),
-            size: 64,
+            size: 80,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1600,7 +1613,7 @@ impl Compositor {
             gb.uniforms
                 .push(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("group_u"),
-                    size: 64,
+                    size: 80,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
@@ -1801,7 +1814,7 @@ impl Compositor {
                 });
                 let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("layer_u"),
-                    size: 64,
+                    size: 80,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -2063,7 +2076,7 @@ impl Compositor {
             });
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("composition_xf_u"),
-                size: 64,
+                size: 80,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -3921,6 +3934,92 @@ mod tests {
         let img = render(&mut comp, Affine::IDENTITY, xf(half));
         assert_eq!(at(&img, 3, 3), white);
         assert_eq!(at(&img, 0, 0), [0, 0, 0, 255]);
+    }
+
+    /// Rotation X/Y at 0 is the flat path, pixel for pixel (a gradient, so a shift or a
+    /// resample would show); Y at 90 degrees is edge on and the picture has no width;
+    /// Y at 45 narrows it but keeps the centre. Skipped without adapter.
+    #[test]
+    fn gpu_rotation_xy_zero_is_identity_and_y_90_has_no_width() {
+        use vjc_core::transform::Resolved;
+        let Some((device, queue)) = gpu() else { return };
+        let n = 16u32;
+        let mut comp = Compositor::new(&device, n, n);
+        let gdata = grad_data();
+        let render = |comp: &mut Compositor, xf: Affine, grad: bool| {
+            let white = [255u8; 4];
+            let mut l = solid(1, &white, 1.0);
+            if grad {
+                l.frame = Some((n, n, &gdata, 1));
+            }
+            l.transform = xf;
+            comp.render(&device, &queue, &[l], &[], 1.0);
+            read_all(&device, &queue, comp, (n, n))
+        };
+        fn grad_data() -> Vec<u8> {
+            (0..256u32)
+                .flat_map(|i| {
+                    [
+                        (i % 16 * 16) as u8,
+                        (i / 16 * 16) as u8,
+                        (i % 251) as u8,
+                        255,
+                    ]
+                })
+                .collect()
+        }
+        let flat = render(&mut comp, Affine::IDENTITY, true);
+        // Pivot depth alone, or X/Y at exactly 0, must not change one pixel.
+        let zero = Resolved {
+            anchor_z: 300.0,
+            rotation_x: 0.0,
+            rotation_y: 0.0,
+            ..Resolved::IDENTITY
+        };
+        let img = render(
+            &mut comp,
+            Affine::inverse_of_sized(&zero, (n as f64, n as f64)),
+            true,
+        );
+        assert_eq!(img, flat, "rotation X/Y 0 changed pixels");
+        let opaque_white = [255, 255, 255, 255];
+        let at = |img: &[[u8; 4]], x: usize, y: usize| img[y * n as usize + x];
+        // Edge on: nothing of the white picture is left.
+        let edge = Resolved {
+            rotation_y: 90.0,
+            ..Resolved::IDENTITY
+        };
+        let img = render(
+            &mut comp,
+            Affine::inverse_of_sized(&edge, (n as f64, n as f64)),
+            false,
+        );
+        let lit = img.iter().filter(|p| **p == opaque_white).count();
+        assert!(lit <= n as usize, "{lit} white pixels at Y 90");
+        let edge_x = Resolved {
+            rotation_x: 90.0,
+            ..Resolved::IDENTITY
+        };
+        let img = render(
+            &mut comp,
+            Affine::inverse_of_sized(&edge_x, (n as f64, n as f64)),
+            false,
+        );
+        let lit = img.iter().filter(|p| **p == opaque_white).count();
+        assert!(lit <= n as usize, "{lit} white pixels at X 90");
+        // 45 degrees: narrower than the frame, centre still lit.
+        let half = Resolved {
+            rotation_y: 45.0,
+            ..Resolved::IDENTITY
+        };
+        let img = render(
+            &mut comp,
+            Affine::inverse_of_sized(&half, (n as f64, n as f64)),
+            false,
+        );
+        let lit = img.iter().filter(|p| **p == opaque_white).count();
+        assert_eq!(at(&img, 8, 8), opaque_white);
+        assert!(lit > 0 && lit < (n * n) as usize, "{lit}");
     }
 
     /// A mask with the top half 0 and the bottom half 255 clears the top half. Skipped

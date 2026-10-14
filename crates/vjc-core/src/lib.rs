@@ -477,6 +477,22 @@ pub enum Command {
     SetCompTriggerStyle {
         style: vjc_model::TriggerStyle,
     },
+    /// Beat snap of the composition (None = the app preference). Undoable.
+    SetCompBeatSnap {
+        snap: Option<vjc_model::BeatSnap>,
+    },
+    /// Beat snap override of one column (None = the composition's). Undoable.
+    SetColumnBeatSnap {
+        column: uuid::Uuid,
+        snap: Option<vjc_model::BeatSnap>,
+    },
+    /// Beat snap override of one clip (None = the column's). Undoable.
+    SetClipBeatSnap {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        snap: Option<vjc_model::BeatSnap>,
+    },
     /// Column triggers skip this layer. Undoable.
     SetLayerIgnoreColumn {
         layer: LayerId,
@@ -1242,6 +1258,7 @@ pub fn clip_from_path(path: PathBuf) -> Clip {
         blend_override: None,
         transition: None,
         trigger_style: Default::default(),
+        beat_snap: None,
         channels: Default::default(),
         fit: FitMode::default(),
     }
@@ -1432,6 +1449,39 @@ pub fn trigger_style_of(
     clip_in(p, deck, layer, column).map_or(vjc_model::TriggerStyle::Normal, |k| {
         k.trigger_style.resolve(p.composition.trigger_style)
     })
+}
+
+/// Beat snap that governs `cmd`: a clip trigger uses the clip's override, then its
+/// column's, then the composition's (`pref` stands in when the composition has none); a
+/// column trigger uses the column's, then the composition's. Other commands: the
+/// composition's.
+pub fn effective_beat_snap(
+    p: &Project,
+    pref: vjc_model::BeatSnap,
+    cmd: &Command,
+) -> vjc_model::BeatSnap {
+    let comp = p.composition.beat_snap.unwrap_or(pref);
+    let col = |i: ColumnIdx| {
+        p.composition
+            .columns
+            .get(i as usize)
+            .and_then(|c| c.beat_snap)
+    };
+    match *cmd {
+        Command::TriggerClip {
+            deck,
+            layer,
+            column,
+        } => vjc_model::BeatSnap::effective(
+            clip_in(p, deck, layer, column).and_then(|k| k.beat_snap),
+            col(column),
+            comp,
+        ),
+        Command::TriggerColumn { column, .. } => {
+            vjc_model::BeatSnap::effective(None, col(column), comp)
+        }
+        _ => comp,
+    }
 }
 
 /// Turns a user's `TriggerClip` on a Toggle clip that is already playing into an eject of
@@ -2745,6 +2795,38 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetCompBeatSnap { snap } => {
+            let prev = std::mem::replace(&mut p.composition.beat_snap, snap);
+            undoable(Command::SetCompBeatSnap { snap: prev }, vec![])
+        }
+        Command::SetColumnBeatSnap { column, snap } => {
+            let c = p
+                .composition
+                .columns
+                .iter_mut()
+                .find(|c| c.id == column)
+                .ok_or(Error::NoColumn)?;
+            let prev = std::mem::replace(&mut c.beat_snap, snap);
+            undoable(Command::SetColumnBeatSnap { column, snap: prev }, vec![])
+        }
+        Command::SetClipBeatSnap {
+            deck,
+            layer,
+            column,
+            snap,
+        } => {
+            let k = clip_mut(p, deck, layer, column)?;
+            let prev = std::mem::replace(&mut k.beat_snap, snap);
+            undoable(
+                Command::SetClipBeatSnap {
+                    deck,
+                    layer,
+                    column,
+                    snap: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetCompTriggerStyle { style } => {
             let prev = std::mem::replace(&mut p.composition.trigger_style, style);
             undoable(Command::SetCompTriggerStyle { style: prev }, vec![])
@@ -3786,7 +3868,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (Project, LayerId) {
+    pub(super) fn setup() -> (Project, LayerId) {
         let mut p = Project::new("t");
         p.composition.decks[0].id = A;
         p.composition.current_deck = A;
@@ -3795,6 +3877,7 @@ mod tests {
         p.composition.layers.push(l);
         p.composition.columns.push(Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id: Uuid::new_v4(),
             name: "1".into(),
         });
@@ -3861,6 +3944,7 @@ mod tests {
         let id = Uuid::new_v4();
         p.composition.columns.push(Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id,
             name: "1".into(),
         });
@@ -4805,6 +4889,7 @@ mod tests {
             Command::AddColumn {
                 column: Column {
                     autopilot: Default::default(),
+                    beat_snap: None,
                     id: Uuid::new_v4(),
                     name: "2".into(),
                 },
@@ -5791,6 +5876,7 @@ mod tests {
         for n in 2..=3 {
             p.composition.columns.push(Column {
                 autopilot: Default::default(),
+                beat_snap: None,
                 id: Uuid::new_v4(),
                 name: n.to_string(),
             });
@@ -7299,6 +7385,7 @@ mod tests {
         for n in 2..=3 {
             p.composition.columns.push(Column {
                 autopilot: Default::default(),
+                beat_snap: None,
                 id: Uuid::new_v4(),
                 name: n.to_string(),
             });
@@ -8327,5 +8414,94 @@ mod screen_color_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod beat_snap_tests {
+    use super::tests::setup;
+    use super::*;
+    use vjc_model::BeatSnap as S;
+
+    fn project() -> (Project, Command, uuid::Uuid) {
+        let (p, layer) = setup();
+        let deck = p.composition.current_deck;
+        let col = p.composition.columns[0].id;
+        (
+            p,
+            Command::TriggerClip {
+                deck,
+                layer,
+                column: 0,
+            },
+            col,
+        )
+    }
+
+    #[test]
+    fn effective_snap_is_clip_then_column_then_composition() {
+        let (mut p, trig, col) = project();
+        let Command::TriggerClip { deck, layer, .. } = trig else {
+            unreachable!()
+        };
+        let pref = S::Off;
+        // Nothing set: the app preference.
+        assert_eq!(effective_beat_snap(&p, S::Bars4, &trig), S::Bars4);
+        // Composition beats the preference.
+        apply(&mut p, Command::SetCompBeatSnap { snap: Some(S::Bar) }).unwrap();
+        assert_eq!(effective_beat_snap(&p, pref, &trig), S::Bar);
+        // Column beats the composition; a column None-division is an override too.
+        apply(
+            &mut p,
+            Command::SetColumnBeatSnap {
+                column: col,
+                snap: Some(S::Half),
+            },
+        )
+        .unwrap();
+        assert_eq!(effective_beat_snap(&p, pref, &trig), S::Half);
+        apply(
+            &mut p,
+            Command::SetColumnBeatSnap {
+                column: col,
+                snap: Some(S::Off),
+            },
+        )
+        .unwrap();
+        assert_eq!(effective_beat_snap(&p, pref, &trig), S::Off);
+        // Clip beats the column.
+        let k = Command::SetClipBeatSnap {
+            deck,
+            layer,
+            column: 0,
+            snap: Some(S::Bars2),
+        };
+        // Negative control: with no clip in the cell the override cannot be set.
+        assert!(apply(&mut p, k.clone()).is_err());
+        assert_eq!(effective_beat_snap(&p, pref, &trig), S::Off);
+        let cmd = Command::ImportMedia {
+            deck,
+            layer,
+            column: 0,
+            path: "/x/a.mov".into(),
+        };
+        apply(&mut p, cmd).unwrap();
+        apply(&mut p, k).unwrap();
+        assert_eq!(effective_beat_snap(&p, pref, &trig), S::Bars2);
+        // A column trigger ignores the clip override.
+        let ct = Command::TriggerColumn { deck, column: 0 };
+        assert_eq!(effective_beat_snap(&p, pref, &ct), S::Off);
+        // Clearing the clip override falls back to the column.
+        apply(
+            &mut p,
+            Command::SetClipBeatSnap {
+                deck,
+                layer,
+                column: 0,
+                snap: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(effective_beat_snap(&p, pref, &trig), S::Off);
     }
 }

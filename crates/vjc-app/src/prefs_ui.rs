@@ -174,12 +174,8 @@ impl State {
                         );
                         ui.horizontal(|ui| {
                             ui.label("Beat snap");
-                            for (m, l) in [
-                                (vjc_model::BeatSnap::Off, "Off"),
-                                (vjc_model::BeatSnap::Beat, "Beat"),
-                                (vjc_model::BeatSnap::Bar, "Bar"),
-                            ] {
-                                ui.selectable_value(&mut p.control.beat_snap, m, l);
+                            for m in vjc_model::BeatSnap::ALL {
+                                ui.selectable_value(&mut p.control.beat_snap, m, m.label());
                             }
                         });
                         help(ui, "Clip triggers and beat loops wait for the next beat or bar.");

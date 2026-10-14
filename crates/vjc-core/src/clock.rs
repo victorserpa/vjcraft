@@ -376,10 +376,8 @@ const SNAP_EPS: f64 = 1e-6;
 /// Phase (in beats) at which an action requested at `phase` should run: the next beat or
 /// bar line, or `phase` itself when snap is off or the request lands on a line.
 pub fn snap_target(phase: f64, snap: vjc_model::BeatSnap) -> f64 {
-    let grid = match snap {
-        vjc_model::BeatSnap::Off => return phase,
-        vjc_model::BeatSnap::Beat => 1.0,
-        vjc_model::BeatSnap::Bar => BEATS_PER_BAR,
+    let Some(grid) = snap.beats() else {
+        return phase;
     };
     if !phase.is_finite() {
         return phase;
@@ -392,15 +390,18 @@ pub fn snap_target(phase: f64, snap: vjc_model::BeatSnap) -> f64 {
     }
 }
 
+/// Coarsest snap (8 bars), in beats: no snapped target is ever further ahead than this.
+pub const SNAP_MAX_AHEAD: f64 = 8.0 * BEATS_PER_BAR;
+
 /// Removes and returns the actions whose target phase has come. A target further ahead
-/// than one bar can only come from a clock jump back (resync, Link), so it runs at once
-/// instead of waiting for the phase to catch up.
+/// than the coarsest snap can only come from a clock jump back (resync, Link), so it runs
+/// at once instead of waiting for the phase to catch up.
 pub fn take_due<T>(pending: &mut Vec<(f64, T)>, phase: f64) -> Vec<T> {
     let mut due = vec![];
     let mut i = 0;
     while i < pending.len() {
         let t = pending[i].0;
-        if phase >= t || t - phase > BEATS_PER_BAR + SNAP_EPS || !t.is_finite() {
+        if phase >= t || t - phase > SNAP_MAX_AHEAD + SNAP_EPS || !t.is_finite() {
             due.push(pending.remove(i).1);
         } else {
             i += 1;
@@ -778,6 +779,13 @@ mod tests {
         assert_eq!(snap_target(8.0, Bar), 8.0);
         assert_eq!(snap_target(2.0000001, Beat), 2.0000001);
         assert_eq!(snap_target(0.0, Bar), 0.0);
+        // The wider divisions: half bar = 2 beats, 2/4/8 bars = 8/16/32 beats.
+        assert_eq!(snap_target(1.3, Half), 2.0);
+        assert_eq!(snap_target(2.3, Half), 4.0);
+        assert_eq!(snap_target(4.2, Bars2), 8.0);
+        assert_eq!(snap_target(8.5, Bars4), 16.0);
+        assert_eq!(snap_target(16.5, Bars8), 32.0);
+        assert_eq!(snap_target(32.0, Bars8), 32.0);
         assert!(snap_target(f64::NAN, Beat).is_nan());
     }
 
@@ -813,5 +821,18 @@ mod stop_tests {
         }
         c.play(t1);
         assert_eq!(c.tick(t1).beat, Some(0), "play starts on the downbeat");
+    }
+
+    #[test]
+    fn eight_bar_target_waits_but_a_jump_back_beyond_it_runs_now() {
+        let mut q = vec![(31.0, 'a')];
+        assert!(take_due(&mut q, 0.5).is_empty(), "8-bar snap must wait");
+        assert_eq!(take_due(&mut q, 31.0), vec!['a']);
+        let mut far = vec![(40.0, 'b')];
+        assert_eq!(
+            take_due(&mut far, 0.0),
+            vec!['b'],
+            "beyond 8 bars = clock jump"
+        );
     }
 }

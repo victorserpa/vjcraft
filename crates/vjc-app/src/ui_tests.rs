@@ -1702,7 +1702,7 @@ fn property_sections_collapse() {
     // Tall bottom area so the Dashboard header is on screen and clickable.
     let mut h = app_sized(1400.0, 1500.0);
     h.state_mut().apply_layout(Layout {
-        params_h: 900.0,
+        params_h: 1000.0,
         ..Layout::default()
     });
     settle(&mut h);
@@ -3061,6 +3061,7 @@ fn col_sel_is_cleared_when_its_column_goes_or_the_deck_changes() {
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id: extra,
             name: "extra".into(),
         },
@@ -3074,6 +3075,7 @@ fn col_sel_is_cleared_when_its_column_goes_or_the_deck_changes() {
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id: extra,
             name: "extra".into(),
         },
@@ -3418,6 +3420,7 @@ fn dirty_project_autosaves_a_recoverable_file_after_the_interval() {
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id: Uuid::new_v4(),
             name: "extra".into(),
         },
@@ -4467,6 +4470,79 @@ fn beat_snap_holds_a_trigger_until_the_bar() {
     );
 }
 
+// The composition's 1/4 bar waits for the next quarter, a column override of None
+// releases at once, and a clip override beats the column's.
+#[test]
+fn beat_snap_quarter_bar_and_overrides_decide_the_hold() {
+    let mut h = app();
+    let (gen_id, _) = vjc_fx::GENERATORS[0];
+    let (_, pos) = cell_center(&h, 0, 1);
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    let deck = h.state().project.composition.current_deck;
+    let layer = h.state().project.composition.layers[0].id;
+    let col_id = h.state().project.composition.columns[1].id;
+    let mid_beat = || {
+        // 0.2 beats in at 120 bpm.
+        vjc_core::clock::Clock::new(
+            120.0,
+            std::time::Instant::now() - std::time::Duration::from_millis(100),
+        )
+    };
+    h.state_mut().exec(Command::SetCompBeatSnap {
+        snap: Some(vjc_model::BeatSnap::Beat),
+    });
+    h.state_mut().clock = mid_beat();
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    // Held for the next quarter of the bar (one beat), not the bar.
+    assert_eq!(h.state().snap_pending.len(), 1);
+    assert!(h.state().snap_pending[0].0 <= 1.5 && h.state().snap_pending[0].0 >= 0.9);
+    h.state_mut().run_snapped(0.9, std::time::Instant::now());
+    assert_eq!(h.state().snap_pending.len(), 1);
+    h.state_mut().run_snapped(1.0, std::time::Instant::now());
+    settle(&mut h);
+    assert!(h.state().snap_pending.is_empty());
+    assert_eq!(
+        active_of(&h.state().players, &h.state().gens, layer),
+        Some((deck, 1))
+    );
+    h.state_mut().exec(Command::ClearAll);
+    settle(&mut h);
+    // Column override None (the division) wins over the composition's 1/4 bar.
+    h.state_mut().exec(Command::SetColumnBeatSnap {
+        column: col_id,
+        snap: Some(vjc_model::BeatSnap::Off),
+    });
+    h.state_mut().clock = mid_beat();
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    assert!(h.state().snap_pending.is_empty());
+    assert_eq!(
+        active_of(&h.state().players, &h.state().gens, layer),
+        Some((deck, 1))
+    );
+    h.state_mut().exec(Command::ClearAll);
+    settle(&mut h);
+    // Clip override (1 bar) wins over the column's None for a clip trigger.
+    h.state_mut().exec(Command::SetClipBeatSnap {
+        deck,
+        layer,
+        column: 1,
+        snap: Some(vjc_model::BeatSnap::Bar),
+    });
+    h.state_mut().clock = mid_beat();
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer,
+        column: 1,
+    });
+    settle(&mut h);
+    assert_eq!(h.state().snap_pending.len(), 1);
+    assert!(h.state().snap_pending[0].0 > 3.5);
+}
+
 #[test]
 fn beat_snap_defers_beat_loop_start_but_not_its_clear() {
     let mut h = app();
@@ -4553,6 +4629,25 @@ fn snap_pending_is_cleared_by_new_project_and_deck_change() {
     h.state_mut().project.composition.columns.clear();
     h.state_mut().run_snapped(0.1, std::time::Instant::now());
     assert!(h.state().snap_pending.is_empty());
+}
+
+#[test]
+fn eight_bar_snap_is_not_released_early_by_the_wall_time_guard() {
+    let mut h = app();
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Bars8;
+    h.state_mut().clock = vjc_core::clock::Clock::new(
+        120.0,
+        std::time::Instant::now() - std::time::Duration::from_millis(100),
+    );
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 0 });
+    assert_eq!(h.state().snap_pending.len(), 1);
+    let t0 = std::time::Instant::now();
+    // 10 s at 120 bpm = 20 beats: an 8-bar (32-beat) snap is still waiting.
+    h.state_mut()
+        .run_snapped(0.2, t0 + std::time::Duration::from_secs(10));
+    assert_eq!(h.state().snap_pending.len(), 1);
 }
 
 #[test]

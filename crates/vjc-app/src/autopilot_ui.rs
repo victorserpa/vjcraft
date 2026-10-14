@@ -169,3 +169,35 @@ pub fn column_menu(
         });
     }
 }
+
+/// Beat snap selector: `none_label` stands for "no override" (the level above decides);
+/// the divisions follow. Returns the new value when the user picks one.
+pub fn snap_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    current: Option<vjc_model::BeatSnap>,
+    none_label: &str,
+) -> Option<Option<vjc_model::BeatSnap>> {
+    let mut opts: Vec<(Option<vjc_model::BeatSnap>, String)> = vec![(None, none_label.into())];
+    opts.extend(
+        vjc_model::BeatSnap::ALL
+            .into_iter()
+            .map(|s| (Some(s), s.label().to_string())),
+    );
+    params::combo(ui, id, label, &current, &opts)
+}
+
+/// Column menu entry for the column's beat snap ("Composition" = no override).
+pub fn column_snap_menu(
+    ui: &mut egui::Ui,
+    column: uuid::Uuid,
+    current: Option<vjc_model::BeatSnap>,
+    cmds: &mut Vec<Command>,
+) {
+    widgets::section(ui, "Beat snap", |ui| {
+        if let Some(snap) = snap_combo(ui, "cbs", "Snap", current, "Composition") {
+            cmds.push(Command::SetColumnBeatSnap { column, snap });
+        }
+    });
+}

@@ -226,6 +226,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 name: format!("c{i}"),
                 autopilot: Default::default(),
+                beat_snap: None,
             })
             .collect()
     }

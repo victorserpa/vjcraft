@@ -903,6 +903,18 @@ fn generator_menu(
     });
 }
 
+/// Inverse map of a track transform for a frame of `frame_px` (perspective distance).
+fn xf_inverse(
+    t: &vjc_model::Transform,
+    ctx: &vjc_core::anim::AnimCtx,
+    frame_px: (f64, f64),
+) -> vjc_core::transform::Affine {
+    vjc_core::transform::Affine::inverse_of_sized(
+        &vjc_core::transform::Resolved::of(t, ctx),
+        frame_px,
+    )
+}
+
 /// Slider range and -/+ step of a transform field in the panel (a few frames wide, not the
 /// whole model range, so a drag is usable).
 fn transform_ui_range(field: TransformField, (w, h): (f64, f64)) -> ((f64, f64), f64) {
@@ -915,6 +927,8 @@ fn transform_ui_range(field: TransformField, (w, h): (f64, f64)) -> ((f64, f64),
             ((0.0, 4.0), 0.01)
         }
         TransformField::Rotation => ((-360.0, 360.0), 1.0),
+        TransformField::RotationX | TransformField::RotationY => ((-180.0, 180.0), 1.0),
+        TransformField::AnchorZ => ((-w, w), 1.0),
     }
 }
 
@@ -1385,6 +1399,7 @@ fn fresh_project(prefs: &Prefs) -> Project {
     for i in 1..=9 {
         c.columns.push(Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id: Uuid::new_v4(),
             name: format!("{i}"),
         });
@@ -2342,7 +2357,8 @@ impl State {
             return Some(cmd);
         }
         let phase = self.clock.phase(std::time::Instant::now());
-        let target = vjc_core::clock::snap_target(phase, self.prefs.control.beat_snap);
+        let snap = vjc_core::effective_beat_snap(&self.project, self.prefs.control.beat_snap, &cmd);
+        let target = vjc_core::clock::snap_target(phase, snap);
         if target > phase {
             self.snap_pending.push((
                 target,
@@ -2377,11 +2393,14 @@ impl State {
     /// `SNAP_MAX_BARS` of wall time (the clock may be stalled).
     fn run_snapped(&mut self, phase: f64, now: std::time::Instant) {
         self.prune_snapped();
-        let max = std::time::Duration::from_secs_f64(
-            SNAP_MAX_BARS * vjc_core::clock::BEATS_PER_BAR * 60.0 / self.clock.bpm().max(1.0),
-        );
-        // Overdue actions get a due target so `take_due` releases them with the rest.
+        let beat_s = 60.0 / self.clock.bpm().max(1.0);
+        let bar = vjc_core::clock::BEATS_PER_BAR;
+        // Overdue actions get a due target so `take_due` releases them with the rest. The
+        // wait allowed covers the snap itself (up to 8 bars) plus one bar, never less than
+        // `SNAP_MAX_BARS`.
         for (t, h) in &mut self.snap_pending {
+            let beats = (SNAP_MAX_BARS * bar).max((*t - phase).max(0.0) + bar);
+            let max = std::time::Duration::from_secs_f64(beats * beat_s);
             if now.saturating_duration_since(h.at) >= max {
                 *t = f64::NEG_INFINITY;
             }
@@ -3015,7 +3034,12 @@ impl State {
             return;
         };
         let phase = self.clock.phase(std::time::Instant::now());
-        let target = vjc_core::clock::snap_target(phase, self.prefs.control.beat_snap);
+        let snap = self
+            .project
+            .composition
+            .beat_snap
+            .unwrap_or(self.prefs.control.beat_snap);
+        let target = vjc_core::clock::snap_target(phase, snap);
         if target > phase {
             self.snap_pending
                 .retain(|(_, a)| !matches!(a.act, SnapAct::BeatLoop(l, _) if l == layer));
@@ -3560,6 +3584,7 @@ impl State {
             commands.push(Command::AddColumn {
                 column: vjc_model::Column {
                     autopilot: Default::default(),
+                    beat_snap: None,
                     id: Uuid::new_v4(),
                     name: (i + 1).to_string(),
                 },
@@ -3730,6 +3755,7 @@ impl State {
             .as_ref()
             .and_then(|p| p.player.as_ref()?.latest_frame());
         let c = &self.project.composition;
+        let frame_px = (f64::from(c.width), f64::from(c.height));
         let (w, h) = (c.width.max(1), c.height.max(1));
         let dials = self.dials();
         let actx = self.anim_ctx(&dials);
@@ -3870,13 +3896,9 @@ impl State {
                 &lctx,
             ));
             // Clip transform first, then the layer's (see vjc_core::transform).
-            let layer_xf = vjc_core::transform::Affine::inverse_of(
-                &vjc_core::transform::Resolved::of(&l.track.transform, &lctx),
-            );
+            let layer_xf = xf_inverse(&l.track.transform, &lctx, frame_px);
             let xf = clip.map_or(layer_xf, |k| {
-                layer_xf.through(&vjc_core::transform::Affine::inverse_of(
-                    &vjc_core::transform::Resolved::of(&k.track.transform, &lctx),
-                ))
+                layer_xf.through(&xf_inverse(&k.track.transform, &lctx, frame_px))
             });
             let cross = self
                 .flow
@@ -4001,9 +4023,7 @@ impl State {
                     effects,
                     generator,
                     transition: None,
-                    transform: vjc_core::transform::Affine::inverse_of(
-                        &vjc_core::transform::Resolved::of(&k.track.transform, &pctx),
-                    ),
+                    transform: xf_inverse(&k.track.transform, &pctx, frame_px),
                     channels: k.channels,
                     mask: Default::default(),
                     frame,
@@ -4056,9 +4076,7 @@ impl State {
             }
             i += len;
         }
-        comp.master_transform = vjc_core::transform::Affine::inverse_of(
-            &vjc_core::transform::Resolved::of(&c.master.transform, &actx),
-        );
+        comp.master_transform = xf_inverse(&c.master.transform, &actx, frame_px);
         comp.preview = if want_preview { preview_src } else { None };
         comp.render_routed(
             &rs.device,
@@ -5793,12 +5811,14 @@ impl State {
                                 self.col_sel = Some(ci as u32);
                             }
                             let col_ap = comp.columns[ci].autopilot.clone();
+                            let col_snap = comp.columns[ci].beat_snap;
                             nr.context_menu(|ui| {
                                 if ui.button("Rename column").clicked() {
                                     self.col_renaming = Some((*cid, n.clone()));
                                     ui.close();
                                 }
                                 autopilot_ui::column_menu(ui, *cid, &col_ap, &mut cmds);
+                                autopilot_ui::column_snap_menu(ui, *cid, col_snap, &mut cmds);
                             });
                         }
 
@@ -5818,6 +5838,7 @@ impl State {
                                     cmds.push(Command::AddColumn {
                                         column: vjc_model::Column {
                                             autopilot: Default::default(),
+                                            beat_snap: None,
                                             id: Uuid::new_v4(),
                                             name: (ncols + 1).to_string(),
                                         },
@@ -6380,6 +6401,7 @@ impl State {
                                         cmds.push(Command::AddColumn {
                                             column: vjc_model::Column {
                                                 autopilot: Default::default(),
+                                                beat_snap: None,
                                                 id: Uuid::new_v4(),
                                                 name: (ncols + 1).to_string(),
                                             },
@@ -6746,6 +6768,11 @@ impl State {
                 &styles,
             ) {
                 cmds.push(Command::SetCompTriggerStyle { style });
+            }
+            if let Some(snap) =
+                autopilot_ui::snap_combo(ui, "cbsnap", "Beat snap", c.beat_snap, "App default")
+            {
+                cmds.push(Command::SetCompBeatSnap { snap });
             }
         }
         if params::section(ui, "sec-crossfader", "Crossfader") {
@@ -7241,6 +7268,7 @@ impl State {
         let actx = self.anim_ctx(&dials);
         let t = &k.transport;
         let clip_style = k.trigger_style;
+        let clip_snap = k.beat_snap;
         if let Some(name) = params::text_field(ui, ("kname", layer, column), "Name", &k.name) {
             cmds.push(Command::RenameClip {
                 deck,
@@ -7371,6 +7399,16 @@ impl State {
                     layer,
                     column,
                     style,
+                });
+            }
+            if let Some(snap) =
+                autopilot_ui::snap_combo(ui, "kbsnap", "Beat snap", clip_snap, "Composition")
+            {
+                cmds.push(Command::SetClipBeatSnap {
+                    deck,
+                    layer,
+                    column,
+                    snap,
                 });
             }
             let dirs = labeled(&[
@@ -8872,6 +8910,7 @@ mod tests {
             blend_override: None,
             transition: None,
             trigger_style: Default::default(),
+            beat_snap: None,
             fit: Default::default(),
             channels: Default::default(),
         };

@@ -60,6 +60,9 @@ pub struct Composition {
     /// Plays columns by itself. Old files lack it: Off.
     #[serde(default)]
     pub autopilot: CompAutopilot,
+    /// Beat snap of the composition. None (old files): the app preference decides.
+    #[serde(default)]
+    pub beat_snap: Option<BeatSnap>,
 }
 
 /// Which column the composition autopilot plays when its time is up.
@@ -270,6 +273,9 @@ pub struct Column {
     /// Autopilot override of this column. Old files lack it: defers to the composition.
     #[serde(default)]
     pub autopilot: ColumnAutopilot,
+    /// Beat snap override of this column (None = the composition's).
+    #[serde(default)]
+    pub beat_snap: Option<BeatSnap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -304,6 +310,9 @@ pub struct Clip {
     /// Normal / toggle; `Composition` defers to the composition's style.
     #[serde(default)]
     pub trigger_style: TriggerStyle,
+    /// Beat snap override of this clip (None = the column's, then the composition's).
+    #[serde(default)]
+    pub beat_snap: Option<BeatSnap>,
 }
 
 /// How a trigger behaves over time (not where the clip starts: see `TriggerMode`).
@@ -607,6 +616,33 @@ pub struct Transform {
     pub rotation: Param,
     pub anchor_x: Param,
     pub anchor_y: Param,
+    /// Degrees about the horizontal axis (3D); old files lack it: 0.
+    #[serde(default = "default_rotation_x")]
+    pub rotation_x: Param,
+    /// Degrees about the vertical axis (3D); old files lack it: 0.
+    #[serde(default = "default_rotation_y")]
+    pub rotation_y: Param,
+    /// Depth of the pivot, px; old files lack it: 0.
+    #[serde(default = "default_anchor_z")]
+    pub anchor_z: Param,
+}
+
+fn default_rotation_x() -> Param {
+    Param::number(
+        "Rotation X",
+        0.0,
+        Some((-TRANSFORM_ROT_MAX, TRANSFORM_ROT_MAX)),
+    )
+}
+fn default_rotation_y() -> Param {
+    Param::number(
+        "Rotation Y",
+        0.0,
+        Some((-TRANSFORM_ROT_MAX, TRANSFORM_ROT_MAX)),
+    )
+}
+fn default_anchor_z() -> Param {
+    Param::number("Anchor Z", 0.0, Some((-TRANSFORM_PX_MAX, TRANSFORM_PX_MAX)))
 }
 
 /// Largest position / anchor offset in px (the composition size limit).
@@ -633,6 +669,9 @@ impl Default for Transform {
             ),
             anchor_x: Param::number("Anchor X", 0.0, px),
             anchor_y: Param::number("Anchor Y", 0.0, px),
+            rotation_x: default_rotation_x(),
+            rotation_y: default_rotation_y(),
+            anchor_z: default_anchor_z(),
         }
     }
 }
@@ -648,10 +687,13 @@ pub enum TransformField {
     Rotation,
     AnchorX,
     AnchorY,
+    RotationX,
+    RotationY,
+    AnchorZ,
 }
 
 impl TransformField {
-    pub const ALL: [TransformField; 8] = [
+    pub const ALL: [TransformField; 11] = [
         TransformField::X,
         TransformField::Y,
         TransformField::Scale,
@@ -660,6 +702,9 @@ impl TransformField {
         TransformField::Rotation,
         TransformField::AnchorX,
         TransformField::AnchorY,
+        TransformField::RotationX,
+        TransformField::RotationY,
+        TransformField::AnchorZ,
     ];
 
     /// Last segment of the `/comp/.../transform/<name>` address.
@@ -673,6 +718,9 @@ impl TransformField {
             TransformField::Rotation => "rotation",
             TransformField::AnchorX => "anchor_x",
             TransformField::AnchorY => "anchor_y",
+            TransformField::RotationX => "rotation_x",
+            TransformField::RotationY => "rotation_y",
+            TransformField::AnchorZ => "anchor_z",
         }
     }
 
@@ -692,6 +740,9 @@ impl Transform {
             TransformField::Rotation => &self.rotation,
             TransformField::AnchorX => &self.anchor_x,
             TransformField::AnchorY => &self.anchor_y,
+            TransformField::RotationX => &self.rotation_x,
+            TransformField::RotationY => &self.rotation_y,
+            TransformField::AnchorZ => &self.anchor_z,
         }
     }
 
@@ -705,6 +756,9 @@ impl Transform {
             TransformField::Rotation => &mut self.rotation,
             TransformField::AnchorX => &mut self.anchor_x,
             TransformField::AnchorY => &mut self.anchor_y,
+            TransformField::RotationX => &mut self.rotation_x,
+            TransformField::RotationY => &mut self.rotation_y,
+            TransformField::AnchorZ => &mut self.anchor_z,
         }
     }
 }
@@ -952,8 +1006,59 @@ impl DialScope {
 pub enum BeatSnap {
     #[default]
     Off,
+    /// A quarter of a bar (one beat in 4/4): "1/4 bar".
     Beat,
+    /// Half a bar ("1/2 bar").
+    Half,
+    /// One bar.
     Bar,
+    Bars2,
+    Bars4,
+    Bars8,
+}
+
+impl BeatSnap {
+    /// Every division, coarsest last.
+    pub const ALL: [BeatSnap; 7] = [
+        BeatSnap::Off,
+        BeatSnap::Beat,
+        BeatSnap::Half,
+        BeatSnap::Bar,
+        BeatSnap::Bars2,
+        BeatSnap::Bars4,
+        BeatSnap::Bars8,
+    ];
+
+    /// Grid length in beats (4/4); None when off.
+    pub fn beats(self) -> Option<f64> {
+        match self {
+            BeatSnap::Off => None,
+            BeatSnap::Beat => Some(1.0),
+            BeatSnap::Half => Some(2.0),
+            BeatSnap::Bar => Some(4.0),
+            BeatSnap::Bars2 => Some(8.0),
+            BeatSnap::Bars4 => Some(16.0),
+            BeatSnap::Bars8 => Some(32.0),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BeatSnap::Off => "None",
+            BeatSnap::Beat => "1/4 bar",
+            BeatSnap::Half => "1/2 bar",
+            BeatSnap::Bar => "1 bar",
+            BeatSnap::Bars2 => "2 bars",
+            BeatSnap::Bars4 => "4 bars",
+            BeatSnap::Bars8 => "8 bars",
+        }
+    }
+
+    /// Effective snap: the clip's override wins over the column's, which wins over the
+    /// composition's (`comp`, already resolved against the app preference).
+    pub fn effective(clip: Option<BeatSnap>, column: Option<BeatSnap>, comp: BeatSnap) -> BeatSnap {
+        clip.or(column).unwrap_or(comp)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1486,6 +1591,7 @@ impl Project {
             format_version: 1,
             composition: Composition {
                 autopilot: Default::default(),
+                beat_snap: None,
                 id: Uuid::new_v4(),
                 name: name.into(),
                 width: 1920,
@@ -1528,6 +1634,9 @@ impl Track {
             &tf.rotation,
             &tf.anchor_x,
             &tf.anchor_y,
+            &tf.rotation_x,
+            &tf.rotation_y,
+            &tf.anchor_z,
         ]) {
             f(p);
         }
@@ -1771,6 +1880,7 @@ mod tests {
     fn column_name_roundtrips_and_defaults_when_absent() {
         let c = Column {
             autopilot: Default::default(),
+            beat_snap: None,
             id: Uuid::new_v4(),
             name: "Drop".into(),
         };
@@ -1874,6 +1984,7 @@ mod tests {
                 blend_override: None,
                 transition: None,
                 trigger_style: Default::default(),
+                beat_snap: None,
                 channels: Default::default(),
             },
         );
@@ -1928,6 +2039,7 @@ mod tests {
                 duration: Some(ColumnDuration::BottomClip),
                 ..Default::default()
             },
+            beat_snap: None,
         });
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(serde_json::from_value::<Composition>(v.clone()).unwrap(), c);
@@ -2023,6 +2135,7 @@ mod tests {
             blend_override: None,
             transition: None,
             trigger_style: Default::default(),
+            beat_snap: None,
             fit: FitMode::Fit,
             channels: Channels::default(),
         };
@@ -2143,6 +2256,7 @@ mod tests {
                 duration_secs: 0.5,
             }),
             trigger_style: Default::default(),
+            beat_snap: None,
             fit: FitMode::Fit,
             channels: Channels::default(),
         };
@@ -2175,6 +2289,64 @@ mod tests {
             TriggerStyle::Composition.resolve(old.composition.trigger_style),
             TriggerStyle::Normal
         );
+    }
+
+    #[test]
+    fn beat_snap_and_3d_transform_roundtrip_and_old_projects_default() {
+        // Values already on disk keep their names.
+        for (v, n) in [
+            (BeatSnap::Off, "\"Off\""),
+            (BeatSnap::Beat, "\"Beat\""),
+            (BeatSnap::Bar, "\"Bar\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), n);
+        }
+        let mut p = Project::new("t");
+        if p.composition.columns.is_empty() {
+            p.composition.columns.push(Column {
+                id: Uuid::new_v4(),
+                name: "1".into(),
+                autopilot: Default::default(),
+                beat_snap: None,
+            });
+        }
+        p.composition.beat_snap = Some(BeatSnap::Bars4);
+        p.composition.columns[0].beat_snap = Some(BeatSnap::Half);
+        let tf = &mut p.composition.master.transform;
+        tf.rotation_x = Param::number("Rotation X", 30.0, None);
+        tf.rotation_y.default = Value::Number(-45.0);
+        tf.anchor_z.default = Value::Number(120.0);
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+        // An old file has none of the new keys and opens as before.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let comp = v["composition"].as_object_mut().unwrap();
+        comp.remove("beat_snap");
+        comp["columns"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("beat_snap");
+        let t = comp["master"]["transform"].as_object_mut().unwrap();
+        for k in ["rotation_x", "rotation_y", "anchor_z"] {
+            assert!(t.remove(k).is_some(), "{k}");
+        }
+        let old: Project = serde_json::from_value(v).unwrap();
+        assert_eq!(old.composition.beat_snap, None);
+        assert_eq!(old.composition.columns[0].beat_snap, None);
+        assert_eq!(old.composition.master.transform, Transform::default());
+    }
+
+    #[test]
+    fn beat_snap_resolves_clip_then_column_then_composition() {
+        use BeatSnap::*;
+        assert_eq!(BeatSnap::effective(Some(Bar), Some(Half), Beat), Bar);
+        assert_eq!(BeatSnap::effective(None, Some(Half), Beat), Half);
+        assert_eq!(BeatSnap::effective(None, None, Beat), Beat);
+        // A None division is an override, not "unset".
+        assert_eq!(BeatSnap::effective(Some(Off), Some(Half), Beat), Off);
+        assert_eq!(Bars8.beats(), Some(32.0));
+        assert_eq!(Off.beats(), None);
     }
 
     #[test]
