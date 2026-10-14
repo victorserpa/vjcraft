@@ -13,11 +13,62 @@ pub struct AnimCtx<'a> {
     /// Master clock phase, in beats.
     pub beat_phase: f64,
     pub time_secs: f64,
-    /// FFT levels 0..1: low, low-mid, mid, high, then raw bins. TODO(#24): no audio input
-    /// yet (cpal/rustfft are not dependencies), the app passes an empty slice.
+    /// Audio levels 0..1: low, low-mid, mid, high, overall level, then raw bins. Empty when
+    /// there is no audio input.
     pub fft_bands: &'a [f32],
+    /// Holds attack/release state of audio animations; `None` skips the smoothing.
+    pub smoother: Option<&'a AudioSmoother>,
     /// Dial values 0..1 (missing dials read 0).
     pub dashboard: &'a [f64],
+}
+
+/// One step of attack/release smoothing: `prev` moves toward `target` with time constant
+/// `attack` (rising) or `release` (falling), both in seconds; 0 means instant.
+pub fn smooth_step(prev: f64, target: f64, dt: f64, attack: f64, release: f64) -> f64 {
+    let tau = if target > prev { attack } else { release };
+    if tau <= 0.0 || !tau.is_finite() || dt.is_nan() {
+        return target;
+    }
+    prev + (target - prev) * (1.0 - (-dt.max(0.0) / tau).exp())
+}
+
+type SmoothKey = [u32; 6];
+
+/// Entry count above which unused smoothing states are pruned.
+const PRUNE_ABOVE: usize = 64;
+/// A state not touched for this many seconds is unused.
+const STALE_SECS: f64 = 5.0;
+
+/// Smoothing state of audio animations. Two params with identical audio settings read the
+/// same signal, so they share one state, keyed by the settings; the state moves once per
+/// distinct `time_secs`, so evaluating the same frame many times is idempotent.
+#[derive(Debug, Default)]
+pub struct AudioSmoother {
+    state: std::sync::Mutex<std::collections::HashMap<SmoothKey, (f64, f64)>>,
+}
+
+impl AudioSmoother {
+    fn apply(&self, key: SmoothKey, target: f64, time: f64, attack: f64, release: f64) -> f64 {
+        let mut m = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.entry(key).or_insert((time, target));
+        if time > e.0 {
+            e.1 = smooth_step(e.1, target, time - e.0, attack, release);
+            e.0 = time;
+        } else if time < e.0 {
+            *e = (time, target);
+        }
+        let out = e.1;
+        // Dragging a setting makes a new key per value: drop the ones not read lately.
+        if m.len() > PRUNE_ABOVE {
+            m.retain(|_, v| (time - v.0).abs() <= STALE_SECS);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.lock().unwrap().len()
+    }
 }
 
 fn hash01(n: i64) -> f64 {
@@ -73,7 +124,8 @@ fn band(b: &FftBand, bands: &[f32]) -> f64 {
         FftBand::LowMid => 1,
         FftBand::Mid => 2,
         FftBand::High => 3,
-        FftBand::Bin(n) => 4 + *n as usize,
+        FftBand::Level => 4,
+        FftBand::Bin(n) => 5usize.saturating_add(*n as usize),
     };
     bands.get(i).copied().map_or(0.0, f64::from)
 }
@@ -94,13 +146,45 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
             band: b,
             gain,
             threshold,
+            attack,
+            release,
+            min,
+            max,
         } => {
             let v = band(b, ctx.fft_bands);
-            if v < f64::from(*threshold) {
+            let raw = if v < f64::from(*threshold) {
                 0.0
             } else {
-                v * f64::from(*gain)
-            }
+                (v * f64::from(*gain)).clamp(0.0, 1.0)
+            };
+            let level = match ctx.smoother {
+                Some(sm) if raw.is_finite() => {
+                    let key = [
+                        match b {
+                            FftBand::Low => 0,
+                            FftBand::LowMid => 1,
+                            FftBand::Mid => 2,
+                            FftBand::High => 3,
+                            FftBand::Level => 4,
+                            FftBand::Bin(n) => 5u32.saturating_add(*n),
+                        },
+                        gain.to_bits(),
+                        threshold.to_bits(),
+                        attack.to_bits(),
+                        release.to_bits(),
+                        0,
+                    ];
+                    sm.apply(
+                        key,
+                        raw,
+                        ctx.time_secs,
+                        f64::from(*attack),
+                        f64::from(*release),
+                    )
+                }
+                _ => raw,
+            };
+            f64::from(*min) + level * f64::from(*max - *min)
         }
         Animation::Envelope { points, beats } => envelope(points, safe_div(ctx.beat_phase, *beats)),
         Animation::Dashboard { dial } => ctx.dashboard.get(*dial as usize).copied().unwrap_or(0.0),
@@ -158,6 +242,7 @@ mod tests {
             beat_phase: beat,
             time_secs: time,
             fft_bands: fft,
+            smoother: None,
             dashboard: dash,
         }
     }
@@ -169,6 +254,42 @@ mod tests {
     }
     fn at(c: Curve, beat: f64) -> f64 {
         evaluate(&p((0.0, 10.0)), &beats(c), &ctx(beat, 0.0, &[], &[]))
+    }
+
+    #[test]
+    fn smoother_prunes_unused_keys() {
+        let sm = AudioSmoother::default();
+        for i in 0..1000u32 {
+            let key = [i, 0, 0, 0, 0, 0];
+            sm.apply(key, 0.5, f64::from(i) * 0.1, 0.1, 0.1);
+        }
+        assert!(sm.len() <= 64 + 51, "{}", sm.len());
+        // A key in use survives pruning.
+        let live = [9999, 0, 0, 0, 0, 0];
+        for i in 0..1000u32 {
+            let t = 200.0 + f64::from(i) * 0.1;
+            sm.apply(live, 1.0, t, 0.1, 0.1);
+            sm.apply([i, 1, 0, 0, 0, 0], 0.0, t, 0.1, 0.1);
+        }
+        assert!(sm.state.lock().unwrap().contains_key(&live));
+        assert!(sm.len() <= 64 + 51);
+    }
+
+    #[test]
+    fn bin_u32_max_does_not_overflow() {
+        let a = Animation::Audio {
+            band: FftBand::Bin(u32::MAX),
+            gain: 1.0,
+            threshold: 0.0,
+            attack: 0.5,
+            release: 0.5,
+            min: 0.0,
+            max: 1.0,
+        };
+        let sm = AudioSmoother::default();
+        let mut c = ctx(0.0, 1.0, &[0.5; 8], &[]);
+        c.smoother = Some(&sm);
+        assert_eq!(evaluate(&p((0.0, 1.0)), &a, &c), 0.0);
     }
 
     #[test]
@@ -218,6 +339,10 @@ mod tests {
             band: FftBand::Mid,
             gain: 2.0,
             threshold: 0.1,
+            attack: 0.0,
+            release: 0.0,
+            min: 0.0,
+            max: 1.0,
         };
         let pr = p((0.0, 1.0));
         assert_eq!(
@@ -241,6 +366,10 @@ mod tests {
             band: FftBand::Low,
             gain: 50.0,
             threshold: 0.0,
+            attack: 0.0,
+            release: 0.0,
+            min: 0.0,
+            max: 1.0,
         });
         let c = ctx(0.0, 0.0, &[1.0], &[]);
         assert_eq!(effective_number(&pr, &c), 3.0);
@@ -250,5 +379,69 @@ mod tests {
             curve: Curve::Saw,
         };
         assert_eq!(evaluate(&pr, &bad, &c), 2.0);
+    }
+
+    fn audio(attack: f32, release: f32, min: f32, max: f32) -> Animation {
+        Animation::Audio {
+            band: FftBand::Low,
+            gain: 1.0,
+            threshold: 0.0,
+            attack,
+            release,
+            min,
+            max,
+        }
+    }
+
+    #[test]
+    fn audio_attack_release_smooth_and_idempotent_per_frame() {
+        let sm = AudioSmoother::default();
+        let a = audio(0.5, 1.0, 0.0, 1.0);
+        let pr = p((0.0, 1.0));
+        let at = |t: f64, lvl: f32| {
+            let f = [lvl];
+            let c = AnimCtx {
+                time_secs: t,
+                fft_bands: &f,
+                smoother: Some(&sm),
+                ..AnimCtx::default()
+            };
+            evaluate(&pr, &a, &c)
+        };
+        assert_eq!(at(0.0, 0.0), 0.0);
+        let up = at(0.1, 1.0);
+        assert!(up > 0.0 && up < 1.0, "attack is gradual: {up}");
+        assert_eq!(at(0.1, 1.0), up, "same frame, same value");
+        let top = at(5.0, 1.0);
+        assert!(top > 0.99);
+        let down = at(5.1, 0.0);
+        assert!(
+            down < top && down > 0.5,
+            "release is slower than attack: {down}"
+        );
+        // negative control: no smoother means the raw value
+        let raw = AnimCtx {
+            fft_bands: &[1.0],
+            ..AnimCtx::default()
+        };
+        assert_eq!(evaluate(&pr, &a, &raw), 1.0);
+    }
+
+    #[test]
+    fn audio_min_max_window() {
+        let a = audio(0.0, 0.0, 0.25, 0.75);
+        let pr = p((0.0, 1.0));
+        let c = |l: &'static [f32]| AnimCtx {
+            fft_bands: l,
+            ..AnimCtx::default()
+        };
+        assert_eq!(evaluate(&pr, &a, &c(&[0.0])), 0.25);
+        assert_eq!(evaluate(&pr, &a, &c(&[1.0])), 0.75);
+    }
+
+    #[test]
+    fn smooth_step_instant_when_zero() {
+        assert_eq!(smooth_step(0.0, 1.0, 0.016, 0.0, 0.0), 1.0);
+        assert!(smooth_step(0.0, 1.0, 0.016, 1.0, 0.0) < 0.05);
     }
 }

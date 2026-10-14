@@ -1,7 +1,7 @@
 //! Reusable parameter widget (slider + typed value + reset) and its pure helpers.
 
 use eframe::egui;
-use vjc_model::{Animation, Curve, Value};
+use vjc_model::{Animation, Curve, FftBand, Value};
 
 /// "0.5", "1", "-2.25": at most 3 decimals, no trailing zeros.
 pub fn format_value(v: f64) -> String {
@@ -165,7 +165,27 @@ pub fn default_animation(kind: &str) -> Option<Animation> {
             beats: 4.0,
         }),
         "Dashboard" => Some(Animation::Dashboard { dial: 0 }),
+        "Audio" => Some(Animation::Audio {
+            band: FftBand::Low,
+            gain: 1.0,
+            threshold: 0.0,
+            attack: 0.02,
+            release: 0.2,
+            min: 0.0,
+            max: 1.0,
+        }),
         _ => None,
+    }
+}
+
+fn band_name(b: &FftBand) -> &'static str {
+    match b {
+        FftBand::Low => "Low",
+        FftBand::LowMid => "Low-mid",
+        FftBand::Mid => "Mid",
+        FftBand::High => "High",
+        FftBand::Level => "Level",
+        FftBand::Bin(_) => "Bin",
     }
 }
 
@@ -194,7 +214,7 @@ fn anim_menu(
 ) -> Option<Option<Animation>> {
     let mut a = cur.clone();
     let mut changed = false;
-    for k in ["Off", "Timeline", "Beats", "Envelope", "Dashboard"] {
+    for k in ["Off", "Timeline", "Beats", "Envelope", "Audio", "Dashboard"] {
         if ui.selectable_label(anim_kind(cur) == k, k).clicked() && anim_kind(cur) != k {
             a = default_animation(k);
             changed = true;
@@ -267,8 +287,45 @@ fn anim_menu(
                 .changed();
             *dial = n - 1;
         }
-        // TODO(#24): audio needs cpal + rustfft; the variant is evaluated but fed no bands.
-        Some(Animation::Audio { .. }) | None => {}
+        Some(Animation::Audio {
+            band,
+            gain,
+            threshold,
+            attack,
+            release,
+            min,
+            max,
+        }) => {
+            let before = band.clone();
+            egui::ComboBox::from_id_salt(id.with("band"))
+                .selected_text(band_name(band))
+                .show_ui(ui, |ui| {
+                    for b in [
+                        FftBand::Low,
+                        FftBand::LowMid,
+                        FftBand::Mid,
+                        FftBand::High,
+                        FftBand::Level,
+                    ] {
+                        let n = band_name(&b);
+                        ui.selectable_value(band, b, n);
+                    }
+                });
+            changed |= *band != before;
+            let mut f =
+                |ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>, p: &str| {
+                    changed |= ui
+                        .add(egui::DragValue::new(v).range(r).speed(0.01).prefix(p))
+                        .changed();
+                };
+            f(ui, gain, 0.0..=16.0, "Gain ");
+            f(ui, threshold, 0.0..=1.0, "Threshold ");
+            f(ui, attack, 0.0..=5.0, "Attack s ");
+            f(ui, release, 0.0..=5.0, "Release s ");
+            f(ui, min, 0.0..=1.0, "Min ");
+            f(ui, max, 0.0..=1.0, "Max ");
+        }
+        None => {}
     }
     changed.then_some(a)
 }

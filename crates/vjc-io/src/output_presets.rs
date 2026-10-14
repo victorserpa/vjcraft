@@ -84,7 +84,7 @@ pub fn clean_name(name: &str) -> Option<String> {
 
 /// File stem of a preset name: letters, digits, space, `-`, `_` and `.` survive; anything
 /// else (path separators included) becomes `_`; never starts with a dot.
-fn stem(name: &str) -> String {
+pub(crate) fn stem(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {

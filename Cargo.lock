@@ -4736,6 +4736,7 @@ dependencies = [
  "cpal",
  "ffmpeg-next",
  "image",
+ "rustfft",
 ]
 
 [[package]]

@@ -223,6 +223,97 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetEffectParams {
+            target,
+            effect,
+            params,
+        } => {
+            let fx = &mut track_mut(p, target)?.effects;
+            let i = pos(fx, effect)?;
+            let prev = fx[i].params.clone();
+            for new in params {
+                let Some(prm) = fx[i].params.iter_mut().find(|q| q.name == new.name) else {
+                    continue;
+                };
+                merge_param(prm, new);
+            }
+            undoable(
+                Command::SetEffectParams {
+                    target,
+                    effect,
+                    params: prev,
+                },
+                vec![],
+            )
+        }
         _ => Err(Error::InvalidValue),
+    }
+}
+
+/// Copies the value and animation of `new` onto `prm` when they fit it; what does not fit
+/// (other kind, bad number, choice out of range) is left as it was.
+fn merge_param(prm: &mut vjc_model::Param, new: vjc_model::Param) {
+    let accepted = match (&mut prm.value, new.value) {
+        (Value::Number(_), Value::Number(n)) if n.is_finite() => {
+            prm.set_number(n);
+            true
+        }
+        (Value::Bool(b), Value::Bool(n)) => {
+            *b = n;
+            true
+        }
+        (Value::Text(t), Value::Text(n)) => {
+            *t = n.chars().take(MAX_TEXT_CHARS).collect();
+            true
+        }
+        (
+            Value::Choice {
+                selected, options, ..
+            },
+            Value::Choice { selected: n, .. },
+        ) if (n as usize) < options.len() => {
+            *selected = n;
+            true
+        }
+        (Value::Color(c), Value::Color(n)) if n.iter().all(|x| x.is_finite()) => {
+            *c = n.map(|x| x.clamp(0.0, 1.0));
+            true
+        }
+        _ => false,
+    };
+    if accepted && matches!(prm.value, Value::Number(_)) {
+        prm.animation = new.animation;
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use vjc_model::{Animation, Param};
+
+    fn anim() -> Animation {
+        Animation::Dashboard { dial: 1 }
+    }
+
+    #[test]
+    fn accepted_value_takes_animation() {
+        let mut prm = Param::number("x", 0.5, Some((0.0, 1.0)));
+        let mut new = Param::number("x", 0.7, Some((0.0, 1.0)));
+        new.animation = Some(anim());
+        merge_param(&mut prm, new);
+        assert_eq!(prm.animation, Some(anim()));
+    }
+
+    #[test]
+    fn skipped_value_keeps_live_animation() {
+        for bad in [Value::Number(f64::NAN), Value::Bool(true)] {
+            let mut prm = Param::number("x", 0.5, Some((0.0, 1.0)));
+            prm.animation = Some(anim());
+            let mut new = Param::number("x", 0.0, Some((0.0, 1.0)));
+            new.value = bad;
+            new.animation = None;
+            merge_param(&mut prm, new);
+            assert_eq!(prm.animation, Some(anim()));
+        }
     }
 }

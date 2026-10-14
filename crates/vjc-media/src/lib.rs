@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub mod analysis;
 pub mod audio;
 pub mod capture;
 pub mod ltc_in;

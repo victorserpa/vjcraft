@@ -612,6 +612,14 @@ pub enum Command {
         param: usize,
         value: Value,
     },
+    /// Loads saved values onto the effect: each given param replaces the effect's param of
+    /// the same name (kind must match; numbers are clamped, a choice keeps its options).
+    /// Others stay. One undo step; the inverse restores every param exactly.
+    SetEffectParams {
+        target: EffectTarget,
+        effect: EffectId,
+        params: Vec<vjc_model::Param>,
+    },
     /// Clock input (not undoable, not in history): the app forwards these to its `Clock`.
     Tap {
         at: Instant,
@@ -2755,7 +2763,8 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::MoveEffect { .. }
         | Command::SetEffectBypass { .. }
         | Command::SetEffectDryWet { .. }
-        | Command::SetEffectParam { .. } => effects::apply(p, cmd),
+        | Command::SetEffectParam { .. }
+        | Command::SetEffectParams { .. } => effects::apply(p, cmd),
         Command::CreateGroup { .. }
         | Command::RestoreEmptyGroup { .. }
         | Command::Ungroup { .. }
@@ -4792,6 +4801,57 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn set_effect_params_merges_by_name_clamps_and_undoes() {
+        let (mut p, l) = setup();
+        let t = EffectTarget::Layer(l);
+        let mut e = fx("a");
+        e.params
+            .push(vjc_model::Param::number("other", 0.5, Some((0.0, 1.0))));
+        let id = e.id;
+        let mut h = History::new();
+        let now = Instant::now();
+        h.exec(
+            &mut p,
+            Command::AddEffect {
+                target: t,
+                effect: e,
+                index: 0,
+            },
+            now,
+        )
+        .unwrap();
+        let before = p.clone();
+        let mut loud = vjc_model::Param::number("amount", 9.0, Some((0.0, 100.0)));
+        loud.animation = Some(vjc_model::Animation::Dashboard { dial: 1 });
+        let stray = vjc_model::Param::number("nope", 1.0, None);
+        let wrong = vjc_model::Param {
+            value: Value::Text("x".into()),
+            ..vjc_model::Param::number("other", 0.0, None)
+        };
+        h.exec(
+            &mut p,
+            Command::SetEffectParams {
+                target: t,
+                effect: id,
+                params: vec![loud, stray, wrong],
+            },
+            now,
+        )
+        .unwrap();
+        let ps = &effects::chain(&p, t).unwrap()[0].params;
+        assert_eq!(
+            ps[0].value,
+            Value::Number(1.0),
+            "clamped to the effect range"
+        );
+        assert!(ps[0].animation.is_some());
+        assert_eq!(ps[1].value, Value::Number(0.5), "wrong kind ignored");
+        assert_eq!(ps.len(), 2);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
     }
 
     #[test]

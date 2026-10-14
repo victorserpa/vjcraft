@@ -2515,6 +2515,50 @@ fn output_presets_save_load_rename_delete_with_undo() {
 }
 
 #[test]
+fn effect_preset_loads_onto_another_instance_and_undoes() {
+    use vjc_io::effect_presets as fp;
+    let dir = presets_tmp("fxp");
+    let mut h = precise_slice_setup();
+    let mk = |v: f64| vjc_model::Effect {
+        id: uuid::Uuid::new_v4(),
+        kind: "blur".into(),
+        bypass: false,
+        dry_wet: 1.0,
+        params: vec![vjc_model::Param::number("amount", v, Some((0.0, 1.0)))],
+    };
+    let (a, b) = (mk(0.8), mk(0.1));
+    let (ia, ib) = (a.id, b.id);
+    let t = vjc_core::EffectTarget::Master;
+    for (i, e) in [a, b].into_iter().enumerate() {
+        h.state_mut().exec(Command::AddEffect {
+            target: t,
+            effect: e,
+            index: i,
+        });
+    }
+    let amount = |h: &egui_kittest::Harness<'_, State>, id| {
+        let fx = vjc_core::effects::chain(&h.state().project, t).unwrap();
+        let e = fx.iter().find(|e| e.id == id).unwrap();
+        e.params[0].value.clone()
+    };
+    let src = vjc_core::effects::chain(&h.state().project, t).unwrap()[0].clone();
+    fp::save(&dir, &src.kind, "Big", &src.params).unwrap();
+    assert_eq!(fp::list(&dir, "blur"), vec!["Big"]);
+    assert!(fp::list(&dir, "glow").is_empty(), "presets are per effect");
+    let loaded = fp::load(&dir, "blur", "Big").unwrap();
+    h.state_mut().exec(Command::SetEffectParams {
+        target: t,
+        effect: ib,
+        params: loaded.params,
+    });
+    assert_eq!(amount(&h, ib), vjc_model::Value::Number(0.8));
+    assert_eq!(amount(&h, ia), vjc_model::Value::Number(0.8));
+    h.state_mut().undo();
+    assert_eq!(amount(&h, ib), vjc_model::Value::Number(0.1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn output_preset_with_a_missing_display_loads_as_window_with_a_warning() {
     let dir = presets_tmp("missing");
     let mut h = precise_slice_setup();

@@ -1,5 +1,6 @@
 mod api_io;
 mod artnet_out;
+mod audio_react;
 mod browser;
 mod capture;
 mod clip_thumbs;
@@ -59,6 +60,20 @@ use vjc_model::{
 const DURATION_STEP: f64 = 0.1;
 
 /// GPU target of one output screen with slices.
+/// Per-frame inputs of animations, owned (dials 0..1 and audio levels).
+struct AnimIn {
+    dials: Vec<f64>,
+    bands: [f32; vjc_media::analysis::BANDS],
+    smoother: std::sync::Arc<vjc_core::anim::AudioSmoother>,
+}
+
+impl std::ops::Deref for AnimIn {
+    type Target = [f64];
+    fn deref(&self) -> &[f64] {
+        &self.dials
+    }
+}
+
 struct ScreenRt {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
@@ -116,6 +131,7 @@ struct State {
     fx: fx::FxLib,
     ml: ml_fx::MlHub,
     fx_epoch: std::time::Instant,
+    audio_react: audio_react::AudioReact,
     /// Tab of the bottom parameter panel.
     panel_tab: PanelTab,
     comp_tex: Option<egui::TextureId>,
@@ -211,6 +227,8 @@ struct State {
     sel_pt_in: Option<usize>,
     sel_pt_out: Option<usize>,
     snap: bool,
+    /// Root folder of effect presets; `None` in tests.
+    fx_presets_dir: Option<PathBuf>,
     /// Folder of output presets; `None` in tests (nothing touches the user's folder).
     presets_dir: Option<PathBuf>,
     /// Preset names in the folder; `None` = read again.
@@ -1073,6 +1091,7 @@ impl State {
             fx: fx::FxLib::new(),
             ml: ml_fx::MlHub::new(),
             fx_epoch: std::time::Instant::now(),
+            audio_react: audio_react::AudioReact::default(),
             panel_tab: PanelTab::Composition,
             comp_tex: None,
             prev_tex: None,
@@ -1153,6 +1172,9 @@ impl State {
             sel_pt_in: None,
             sel_pt_out: None,
             snap: false,
+            fx_presets_dir: live
+                .then(|| data_dir().map(|d| d.join("effect-presets")))
+                .flatten(),
             presets_dir: live
                 .then(|| data_dir().map(|d| d.join("output-presets")))
                 .flatten(),
@@ -2738,21 +2760,26 @@ impl State {
         });
     }
 
-    /// Dashboard dial values 0..1 (missing dials read 0).
-    fn dials(&self) -> Vec<f64> {
+    /// Dashboard dials and audio levels of this frame, owned so no borrow of the app is held.
+    fn dials(&self) -> AnimIn {
         let d = &self.project.composition.dashboard;
-        (0..vjc_core::anim::DIALS)
-            .map(|i| d.get(i).map_or(0.0, |p| number_of(&p.value)))
-            .collect()
+        AnimIn {
+            dials: (0..vjc_core::anim::DIALS)
+                .map(|i| d.get(i).map_or(0.0, |p| number_of(&p.value)))
+                .collect(),
+            bands: self.audio_react.levels,
+            smoother: self.audio_react.smoother.clone(),
+        }
     }
 
-    /// Animation inputs of this frame. TODO(#24): no FFT bands until audio input exists.
-    fn anim_ctx<'a>(&self, dials: &'a [f64]) -> vjc_core::anim::AnimCtx<'a> {
+    /// Animation inputs of this frame.
+    fn anim_ctx<'a>(&self, input: &'a AnimIn) -> vjc_core::anim::AnimCtx<'a> {
         vjc_core::anim::AnimCtx {
             beat_phase: self.clock.phase(std::time::Instant::now()),
             time_secs: self.fx_epoch.elapsed().as_secs_f64(),
-            fft_bands: &[],
-            dashboard: dials,
+            fft_bands: &input.bands,
+            smoother: Some(&input.smoother),
+            dashboard: &input.dials,
         }
     }
 
@@ -6678,6 +6705,10 @@ impl State {
                                 });
                                 ui.close();
                             }
+                            if let Some(root) = self.fx_presets_dir.clone() {
+                                ui.separator();
+                                fx_preset_menu(ui, &root, target, e, &mut self.status, cmds);
+                            }
                         });
                         let dw = ui
                             .push_id((e.id, "dry_wet"), |ui| {
@@ -7137,6 +7168,7 @@ impl eframe::App for State {
         let t0 = std::time::Instant::now();
         self.poll_monitors();
         self.tick_clock();
+        self.audio_react.refresh(&self.project.composition);
         self.compose(frame);
         if let Some(rs) = frame.wgpu_render_state() {
             self.browser
@@ -7604,4 +7636,69 @@ fn tab_text(ui: &egui::Ui, t: &str, on: bool) -> egui::RichText {
     egui::RichText::new(t)
         .font(theme::bold_font(ui.ctx(), theme::FS_SM))
         .color(if on { theme::TEXT } else { theme::TEXT_MUTED })
+}
+
+/// Context-menu part of an effect row: saved presets of this effect (click to load onto
+/// this instance, undoable) and a name box that saves the current params.
+fn fx_preset_menu(
+    ui: &mut egui::Ui,
+    root: &std::path::Path,
+    target: EffectTarget,
+    e: &vjc_model::Effect,
+    status: &mut String,
+    cmds: &mut Vec<Command>,
+) {
+    use vjc_io::effect_presets as fp;
+    let names = fp::list(root, &e.kind);
+    ui.menu_button("Load preset", |ui| {
+        if names.is_empty() {
+            ui.weak("No presets yet");
+        }
+        for n in &names {
+            ui.horizontal(|ui| {
+                if ui.button(n).clicked() {
+                    match fp::load(root, &e.kind, n) {
+                        Ok(p) => {
+                            cmds.push(Command::SetEffectParams {
+                                target,
+                                effect: e.id,
+                                params: p.params,
+                            });
+                            ui.close();
+                        }
+                        Err(err) => *status = format!("Preset: {err}"),
+                    }
+                }
+                if icons::button(ui, icons::i::X, "Delete preset").clicked() {
+                    match fp::delete(root, &e.kind, n) {
+                        Ok(()) => ui.close(),
+                        Err(err) => *status = format!("Preset: {err}"),
+                    }
+                }
+            });
+        }
+    });
+    let id = ui.id().with(("fx-preset-name", e.id));
+    let mut name: String = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .hint_text("Preset name")
+                .desired_width(120.0),
+        );
+        let ok = ui
+            .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+            .clicked();
+        if ok {
+            match fp::save(root, &e.kind, &name, &e.params) {
+                Ok(_) => {
+                    *status = format!("Saved preset {}", name.trim());
+                    name.clear();
+                    ui.close();
+                }
+                Err(err) => *status = format!("Preset: {err}"),
+            }
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(id, name));
 }

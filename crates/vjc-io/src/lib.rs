@@ -1,6 +1,7 @@
 //! Save/open of `.vjc` project files (JSON, `format_version`), with relative
 //! media paths, missing-media warnings, migration and atomic writes.
 
+pub mod effect_presets;
 pub mod output_presets;
 pub mod prefs;
 

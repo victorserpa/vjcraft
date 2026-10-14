@@ -634,6 +634,10 @@ pub enum Value {
     Color([f32; 4]),
 }
 
+fn one_f32() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Animation {
     Timeline {
@@ -648,6 +652,17 @@ pub enum Animation {
         band: FftBand,
         gain: f32,
         threshold: f32,
+        /// Seconds to rise to a louder level (0 = instant).
+        #[serde(default)]
+        attack: f32,
+        /// Seconds to fall to a quieter level (0 = instant).
+        #[serde(default)]
+        release: f32,
+        /// Output window as a fraction of the param range.
+        #[serde(default)]
+        min: f32,
+        #[serde(default = "one_f32")]
+        max: f32,
     },
     Envelope {
         points: Vec<(f64, f64)>,
@@ -673,6 +688,8 @@ pub enum FftBand {
     LowMid,
     Mid,
     High,
+    /// Overall level (RMS) of the input.
+    Level,
     Bin(u32),
 }
 
@@ -1068,7 +1085,48 @@ impl Project {
     }
 }
 
+impl Track {
+    /// Visits every param of the track: mix, transform and effect params.
+    pub fn for_each_param(&self, f: &mut dyn FnMut(&Param)) {
+        let tf = &self.transform;
+        for p in [&self.opacity, &self.volume, &self.pan].into_iter().chain([
+            &tf.x,
+            &tf.y,
+            &tf.scale,
+            &tf.scale_w,
+            &tf.scale_h,
+            &tf.rotation,
+            &tf.anchor_x,
+            &tf.anchor_y,
+        ]) {
+            f(p);
+        }
+        self.effects
+            .iter()
+            .for_each(|e| e.params.iter().for_each(&mut *f));
+    }
+}
+
 impl Composition {
+    /// Visits every `Param` in the composition (master, layers, groups, clips and their
+    /// generator params, crossfader, dashboard). Allocation free. Any new `Param`-holding
+    /// field must be added here; `for_each_param_covers_every_location` guards it.
+    pub fn for_each_param(&self, f: &mut dyn FnMut(&Param)) {
+        self.master.for_each_param(f);
+        self.layers.iter().for_each(|l| l.track.for_each_param(f));
+        self.groups.iter().for_each(|g| g.track.for_each_param(f));
+        for c in self.decks.iter().flat_map(|d| &d.clips) {
+            c.clip.track.for_each_param(f);
+            if let Source::Generator { params, .. } = &c.clip.source {
+                params.iter().for_each(&mut *f);
+            }
+        }
+        if let Some(x) = &self.crossfader {
+            f(&x.position);
+        }
+        self.dashboard.iter().for_each(&mut *f);
+    }
+
     /// True when the layer is not rendered: bypassed, or another layer is soloed.
     pub fn layer_off(&self, l: &Layer) -> bool {
         let g = l.group.and_then(|id| self.group(id));
@@ -1349,5 +1407,122 @@ mod tests {
         t.as_object_mut().unwrap().remove("timecode_start");
         let t: Transport = serde_json::from_value(t).unwrap();
         assert_eq!(t.timecode_start, None);
+    }
+
+    fn audio_anim() -> Animation {
+        Animation::Audio {
+            band: FftBand::Low,
+            gain: 1.0,
+            threshold: 0.0,
+            attack: 0.0,
+            release: 0.0,
+            min: 0.0,
+            max: 1.0,
+        }
+    }
+
+    fn fixture() -> Composition {
+        let mut c = Project::new("t").composition;
+        let p = || Param::number("p", 0.0, None);
+        let eff = || Effect {
+            id: Uuid::new_v4(),
+            kind: "k".into(),
+            bypass: false,
+            dry_wet: 1.0,
+            params: vec![p()],
+        };
+        c.master.effects.push(eff());
+        c.layers.clear();
+        c.layers.push(Layer {
+            id: Uuid::new_v4(),
+            name: "L".into(),
+            track: Track::new(BlendMode::Normal),
+            solo: false,
+            bypass: false,
+            crossfader_bus: None,
+            audio: true,
+            video: true,
+            trigger_mode: TriggerMode::Restart,
+            transition: Transition {
+                kind: "cut".into(),
+                duration_beats: None,
+                duration_secs: 0.0,
+            },
+            autopilot: Default::default(),
+            group: None,
+        });
+        c.layers[0].track.effects.push(eff());
+        let mut g = LayerGroup::new("g");
+        g.track.effects.push(eff());
+        c.groups = vec![g];
+        let mut deck = c.decks[0].clone();
+        let mut clip = Clip {
+            id: Uuid::new_v4(),
+            name: "c".into(),
+            source: Source::Generator {
+                kind: "g".into(),
+                params: vec![p()],
+            },
+            transport: Transport::default(),
+            track: Track::new(BlendMode::Normal),
+            blend_override: None,
+            fit: FitMode::Fit,
+            channels: Channels::default(),
+        };
+        clip.track.effects.push(eff());
+        deck.clips = vec![CellClip {
+            layer: c.layers[0].id,
+            column: Default::default(),
+            clip,
+        }];
+        c.decks = vec![deck];
+        c.crossfader = Some(Crossfader {
+            position: p(),
+            curve: "linear".into(),
+            behaviour: Default::default(),
+            blend: None,
+        });
+        c.dashboard = vec![p()];
+        c
+    }
+
+    #[test]
+    fn for_each_param_covers_every_location() {
+        fn walk(v: &mut serde_json::Value, i: usize, seen: &mut usize) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if m.contains_key("animation") {
+                        if *seen == i {
+                            m.insert(
+                                "animation".into(),
+                                serde_json::to_value(Some(audio_anim())).unwrap(),
+                            );
+                        }
+                        *seen += 1;
+                    }
+                    m.values_mut().for_each(|x| walk(x, i, seen));
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(|x| walk(x, i, seen)),
+                _ => {}
+            }
+        }
+        let base = fixture();
+        let json = serde_json::to_string(&base).unwrap();
+        // Every param serializes one "animation" key: the visitor must see all of them.
+        let expected = json.matches("\"animation\"").count();
+        let mut n = 0;
+        base.for_each_param(&mut |_| n += 1);
+        assert_eq!(n, expected);
+        // And each one individually is detected when it carries an audio animation.
+        for i in 0..n {
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            walk(&mut v, i, &mut 0);
+            let c: Composition = serde_json::from_value(v).unwrap();
+            let mut found = 0;
+            c.for_each_param(&mut |p| {
+                found += matches!(p.animation, Some(Animation::Audio { .. })) as usize
+            });
+            assert_eq!(found, 1, "param #{i} not visited");
+        }
     }
 }
