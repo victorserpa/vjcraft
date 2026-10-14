@@ -205,6 +205,7 @@ pub fn presets() -> Vec<Fixture> {
         order: ChannelOrder::Rgb,
         gamma,
         serpentine,
+        ..Fixture::default()
     };
     vec![
         f("Strip 1x16 RGB", 16, 1, PixelFormat::Rgb, 1.0, false),
@@ -216,7 +217,15 @@ pub fn presets() -> Vec<Fixture> {
 
 /// Whether the fixture can be mapped (non-empty, not absurdly large).
 pub fn valid(f: &Fixture) -> bool {
-    f.width >= 1
+    (1..=MAX_CHANNELS as u16).contains(&f.start_channel)
+        && f.input.w.is_finite()
+        && f.input.h.is_finite()
+        && f.input.x.is_finite()
+        && f.input.y.is_finite()
+        && f.input.rotation.is_finite()
+        && f.input.w > 0.0
+        && f.input.h > 0.0
+        && f.width >= 1
         && f.height >= 1
         && u64::from(f.width) * u64::from(f.height) <= u64::from(MAX_PIXELS)
 }
@@ -251,9 +260,23 @@ fn gamma_lut(g: f32) -> [u8; 256] {
     std::array::from_fn(|i| ((i as f32 / 255.0).powf(g) * 255.0).round() as u8)
 }
 
-/// Samples `rgba` (w x h, 4 bytes per pixel) on the fixture grid by averaging each cell's
-/// source pixels, applies gamma, and lays the channels out in fixture order. Empty when the
-/// fixture is invalid or the buffer is shorter than w*h*4.
+/// Fixture colour on an averaged pixel: brightness and white balance, then contrast around
+/// mid grey.
+fn tint(c: &vjc_model::SliceColor, rgb: [u8; 3]) -> [u8; 3] {
+    let gain = [c.r, c.g, c.b];
+    std::array::from_fn(|i| {
+        let v = f32::from(rgb[i]) / 255.0 * c.brightness * gain[i];
+        let v = (v - 0.5) * c.contrast + 0.5;
+        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+    })
+}
+
+/// Samples `rgba` (w x h, 4 bytes per pixel) on the fixture grid, applies the fixture colour
+/// and gamma, and lays the channels out in fixture order. With the default input (the whole
+/// screen) each grid cell averages its source pixels; with a moved, scaled or rotated input
+/// rectangle each cell averages a 3x3 set of points inside it (black outside the screen).
+/// Flips mirror the picture, not the channel order. Empty when the fixture is invalid or the
+/// buffer is shorter than w*h*4.
 pub fn map_pixels(f: &Fixture, rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     let need = u64::from(w) * u64::from(h) * 4;
     if !valid(f) || w == 0 || h == 0 || (rgba.len() as u64) < need {
@@ -262,22 +285,22 @@ pub fn map_pixels(f: &Fixture, rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     let cpp = channels_per_pixel(f.format);
     let lut = gamma_lut(f.gamma);
     let ord = order_idx(f.order);
+    let plain = f.input.is_full();
+    let tinted = f.color != vjc_model::SliceColor::default();
     let cell = |g: u32, n: u32, src: u32| {
         let a = (u64::from(g) * u64::from(src) / u64::from(n)) as u32;
         let b = ((u64::from(g) + 1) * u64::from(src) / u64::from(n)) as u32;
         (a, b.max(a + 1).min(src))
     };
-    let mut out = Vec::with_capacity((f.width * f.height) as usize * cpp);
-    for gy in 0..f.height {
-        let (y0, y1) = cell(gy, f.height, h);
-        for col in 0..f.width {
-            let gx = if f.serpentine && gy % 2 == 1 {
-                f.width - 1 - col
-            } else {
-                col
-            };
-            let (x0, x1) = cell(gx, f.width, w);
-            let (mut sr, mut sg, mut sb, mut n) = (0u64, 0u64, 0u64, 0u64);
+    let (sin, cos) = f.input.rotation.to_radians().sin_cos();
+    let (fw, fh) = (w as f32, h as f32);
+    const SUB: u32 = 3;
+    // Average colour of grid cell (cx, cy).
+    let sample = |cx: u32, cy: u32| -> [u8; 3] {
+        let (mut sr, mut sg, mut sb, mut n) = (0u64, 0u64, 0u64, 0u64);
+        if plain {
+            let (x0, x1) = cell(cx, f.width, w);
+            let (y0, y1) = cell(cy, f.height, h);
             for y in y0..y1 {
                 let row = (y as usize * w as usize + x0 as usize) * 4;
                 for px in rgba[row..row + (x1 - x0) as usize * 4].as_chunks::<4>().0 {
@@ -287,8 +310,42 @@ pub fn map_pixels(f: &Fixture, rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
                     n += 1;
                 }
             }
-            let avg = |s: u64| ((s + n / 2) / n.max(1)) as u8;
-            let (r, g, b) = (avg(sr), avg(sg), avg(sb));
+        } else {
+            for j in 0..SUB {
+                for i in 0..SUB {
+                    let u = (cx as f32 + (i as f32 + 0.5) / SUB as f32) / f.width as f32 - 0.5;
+                    let v = (cy as f32 + (j as f32 + 0.5) / SUB as f32) / f.height as f32 - 0.5;
+                    let (lx, ly) = (u * f.input.w * fw, v * f.input.h * fh);
+                    let px = f.input.x * fw + lx * cos - ly * sin;
+                    let py = f.input.y * fh + lx * sin + ly * cos;
+                    n += 1;
+                    if px >= 0.0 && py >= 0.0 && px < fw && py < fh {
+                        let k = (py as usize * w as usize + px as usize) * 4;
+                        sr += u64::from(rgba[k]);
+                        sg += u64::from(rgba[k + 1]);
+                        sb += u64::from(rgba[k + 2]);
+                    }
+                }
+            }
+        }
+        let avg = |s: u64| ((s + n / 2) / n.max(1)) as u8;
+        [avg(sr), avg(sg), avg(sb)]
+    };
+    let mut out = Vec::with_capacity((f.width * f.height) as usize * cpp);
+    for gy in 0..f.height {
+        let cy = if f.flip_v { f.height - 1 - gy } else { gy };
+        for col in 0..f.width {
+            let gx = if f.serpentine && gy % 2 == 1 {
+                f.width - 1 - col
+            } else {
+                col
+            };
+            let cx = if f.flip_h { f.width - 1 - gx } else { gx };
+            let mut rgb = sample(cx, cy);
+            if tinted {
+                rgb = tint(&f.color, rgb);
+            }
+            let [r, g, b] = rgb;
             match f.format {
                 PixelFormat::W => {
                     let y = (2126 * u32::from(r) + 7152 * u32::from(g) + 722 * u32::from(b) + 5000)
@@ -318,17 +375,35 @@ pub fn map_pixels(f: &Fixture, rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// Splits channel data over consecutive universes starting at `start`, `chunk` values each
-/// (see `universe_chunk`, so pixels never straddle two universes). Stops at the 15-bit limit.
-pub fn split_universes(start: u16, data: &[u8], chunk: usize) -> Vec<(u16, &[u8])> {
-    let chunk = chunk.clamp(1, MAX_CHANNELS);
-    data.chunks(chunk)
-        .enumerate()
-        .map_while(|(i, c)| {
-            let u = u32::from(start) + i as u32;
-            (u <= u32::from(MAX_UNIVERSE)).then_some((u as u16, c))
-        })
-        .collect()
+/// Splits channel data over consecutive universes. `start_channel` (1..=512) is where the
+/// data begins inside universe `start`; `cpp` channels per pixel keep pixels from straddling
+/// two universes (when not even one fits in the rest of a universe, the data moves to the
+/// next one). Each part is `(universe, first channel 0-based, values)`. Stops at the 15-bit
+/// limit.
+pub fn split_universes(
+    start: u16,
+    start_channel: u16,
+    data: &[u8],
+    cpp: usize,
+) -> Vec<(u16, usize, &[u8])> {
+    let cpp = cpp.clamp(1, MAX_CHANNELS);
+    let mut offset = usize::from(start_channel.clamp(1, MAX_CHANNELS as u16)) - 1;
+    let mut universe = u32::from(start);
+    if (MAX_CHANNELS - offset) / cpp == 0 {
+        offset = 0;
+        universe += 1;
+    }
+    let mut rest = data;
+    let mut out = vec![];
+    while !rest.is_empty() && universe <= u32::from(MAX_UNIVERSE) {
+        let room = (MAX_CHANNELS - offset) / cpp * cpp;
+        let (head, tail) = rest.split_at(room.min(rest.len()));
+        out.push((universe as u16, offset, head));
+        rest = tail;
+        offset = 0;
+        universe += 1;
+    }
+    out
 }
 
 /// Channels per universe that hold whole pixels (510 for RGB, 512 for RGBW and W).
@@ -336,27 +411,75 @@ pub fn universe_chunk(f: PixelFormat) -> usize {
     MAX_CHANNELS / channels_per_pixel(f) * channels_per_pixel(f)
 }
 
-/// ArtDmx packets for one frame: the fixture sampled from `rgba`, split over universes
-/// from `start`. `seq` is the Art-Net sequence byte (1..=255; 0 disables ordering).
+/// How many universes `channels` values starting at `start_channel` span (same rule as
+/// `split_universes`).
+pub fn universes_used(start_channel: u16, channels: usize, cpp: usize) -> usize {
+    let cpp = cpp.clamp(1, MAX_CHANNELS);
+    if channels == 0 {
+        return 0;
+    }
+    let offset = usize::from(start_channel.clamp(1, MAX_CHANNELS as u16)) - 1;
+    let first = (MAX_CHANNELS - offset) / cpp * cpp;
+    let per = MAX_CHANNELS / cpp * cpp;
+    if first == 0 {
+        channels.div_ceil(per)
+    } else {
+        1 + channels.saturating_sub(first).div_ceil(per)
+    }
+}
+
+/// ArtDmx packets for one frame: every fixture sampled from `rgba` and placed at its
+/// `start_channel`, from universe `start` upward. Fixtures that share a universe go in the
+/// same packet; where they overlap the later one wins. `black` sends zeros with the same
+/// layout, whatever the fixture colour does. `seq` is the Art-Net sequence byte (1..=255; 0
+/// disables ordering).
 pub fn frame_packets(
-    f: &Fixture,
+    fixtures: &[Fixture],
     start: u16,
     rgba: &[u8],
     (w, h): (u32, u32),
     seq: u8,
+    black: bool,
 ) -> Vec<Vec<u8>> {
-    let data = map_pixels(f, rgba, w, h);
-    split_universes(start, &data, universe_chunk(f.format))
-        .into_iter()
-        .filter_map(|(universe, d)| {
+    let mut unis: std::collections::BTreeMap<u16, Vec<u8>> = Default::default();
+    for f in fixtures {
+        let mut data = map_pixels(f, rgba, w, h);
+        if black {
+            data.fill(0);
+        }
+        let cpp = channels_per_pixel(f.format);
+        for (u, off, d) in split_universes(start, f.start_channel, &data, cpp) {
+            let buf = unis.entry(u).or_default();
+            if buf.len() < off + d.len() {
+                buf.resize(off + d.len(), 0);
+            }
+            buf[off..off + d.len()].copy_from_slice(d);
+        }
+    }
+    unis.into_iter()
+        .filter_map(|(universe, data)| {
             encode_dmx(&ArtDmx {
                 sequence: seq,
                 physical: 0,
                 universe,
-                data: d.to_vec(),
+                data,
             })
         })
         .collect()
+}
+
+/// Net (7 bits), sub-net (4) and universe (4) of a 15-bit port-address.
+pub fn split_port(port: u16) -> (u8, u8, u8) {
+    (
+        ((port >> 8) & 0x7F) as u8,
+        ((port >> 4) & 0x0F) as u8,
+        (port & 0x0F) as u8,
+    )
+}
+
+/// Port-address from net, sub-net and universe (each clamped to its width).
+pub fn join_port(net: u8, sub: u8, uni: u8) -> u16 {
+    u16::from(net.min(0x7F)) << 8 | u16::from(sub.min(0x0F)) << 4 | u16::from(uni.min(0x0F))
 }
 
 /// Next sequence number, skipping 0.
@@ -626,6 +749,7 @@ mod tests {
             order: ChannelOrder::Rgb,
             gamma: 1.0,
             serpentine: false,
+            ..Fixture::default()
         }
     }
 
@@ -741,23 +865,23 @@ mod tests {
         let f = fx(PixelFormat::Rgb, 200, 1); // 600 channels
         let img = solid(200, 1, [5, 5, 5, 255]);
         let data = map_pixels(&f, &img, 200, 1);
-        let parts = split_universes(3, &data, universe_chunk(f.format));
+        let parts = split_universes(3, 1, &data, 3);
         assert_eq!(universe_chunk(PixelFormat::Rgb), 510);
         assert_eq!(universe_chunk(PixelFormat::Rgbw), 512);
         assert_eq!(parts.len(), 2);
-        assert_eq!((parts[0].0, parts[0].1.len()), (3, 510));
-        assert_eq!((parts[1].0, parts[1].1.len()), (4, 90));
+        assert_eq!((parts[0].0, parts[0].2.len()), (3, 510));
+        assert_eq!((parts[1].0, parts[1].2.len()), (4, 90));
         // limit of 15 bits
-        let p = split_universes(0x7FFF, &data, 510);
+        let p = split_universes(0x7FFF, 1, &data, 3);
         assert_eq!(p.len(), 1);
-        assert!(split_universes(0, &[], 510).is_empty());
+        assert!(split_universes(0, 1, &[], 3).is_empty());
     }
 
     #[test]
     fn frame_packets_are_decodable_and_consecutive() {
         let f = fx(PixelFormat::Rgbw, 200, 1); // 800 channels
         let img = solid(200, 1, [10, 20, 30, 255]);
-        let pk = frame_packets(&f, 10, &img, (200, 1), 5);
+        let pk = frame_packets(&[f], 10, &img, (200, 1), 5, false);
         assert_eq!(pk.len(), 2);
         let ds: Vec<ArtDmx> = pk
             .iter()
@@ -772,6 +896,173 @@ mod tests {
         assert_eq!(ds[0].sequence, 5);
         assert_eq!(next_seq(255), 1);
         assert_eq!(next_seq(1), 2);
+    }
+
+    fn decode_all(pk: &[Vec<u8>]) -> Vec<ArtDmx> {
+        pk.iter()
+            .map(|b| match decode(b) {
+                Some(Packet::Dmx(d)) => d,
+                _ => panic!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn start_channel_shifts_the_channels() {
+        let img = solid(1, 1, [9, 8, 7, 255]);
+        let mut f = fx(PixelFormat::Rgb, 1, 1);
+        let at = |f: &Fixture| {
+            decode_all(&frame_packets(
+                std::slice::from_ref(f),
+                2,
+                &img,
+                (1, 1),
+                1,
+                false,
+            ))
+        };
+        assert_eq!(at(&f)[0].data, [9, 8, 7, 0]); // padded to even length
+        f.start_channel = 11;
+        let d = &at(&f)[0];
+        assert_eq!(d.universe, 2);
+        assert_eq!(&d.data[..10], &[0; 10]);
+        assert_eq!(&d.data[10..13], &[9, 8, 7]);
+        // No room for a whole pixel in the rest of the universe: next universe, channel 1.
+        let p = split_universes(2, 512, &[1, 2, 3], 3);
+        assert_eq!((p[0].0, p[0].1), (3, 0));
+        // Pixels never straddle: 2 RGB pixels from channel 509 -> one fits (509..511 is
+        // 3 channels), the second moves on.
+        let p = split_universes(0, 509, &[0; 6], 3);
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].1, p[0].2.len(), p[1].0, p[1].1), (508, 3, 1, 0));
+    }
+
+    #[test]
+    fn two_fixtures_in_one_universe_do_not_overlap() {
+        let img = solid(1, 1, [1, 2, 3, 255]);
+        let a = fx(PixelFormat::Rgb, 2, 1); // channels 1..=6
+        let mut b = fx(PixelFormat::Rgb, 1, 1);
+        b.start_channel = 7;
+        b.color.brightness = 0.0; // distinguishable from `a`: zeros
+        let pk = frame_packets(&[a, b.clone()], 0, &img, (1, 1), 1, false);
+        assert_eq!(pk.len(), 1);
+        let d = &decode_all(&pk)[0];
+        assert_eq!(d.data, [1, 2, 3, 1, 2, 3, 0, 0, 0, 0]);
+        // Negative control: starting at the same channel, b overwrites a.
+        b.start_channel = 1;
+        let d = &decode_all(&frame_packets(
+            &[fx(PixelFormat::Rgb, 2, 1), b],
+            0,
+            &img,
+            (1, 1),
+            1,
+            false,
+        ))[0];
+        assert_eq!(&d.data[..6], &[0, 0, 0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn flip_reverses_the_order_and_only_then() {
+        let img = [10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255];
+        let mut f = fx(PixelFormat::Rgb, 3, 1);
+        assert_eq!(map_pixels(&f, &img, 3, 1), [10, 0, 0, 20, 0, 0, 30, 0, 0]);
+        f.flip_h = true;
+        assert_eq!(map_pixels(&f, &img, 3, 1), [30, 0, 0, 20, 0, 0, 10, 0, 0]);
+        f.flip_h = false;
+        f.flip_v = true; // one row: unchanged
+        assert_eq!(map_pixels(&f, &img, 3, 1), [10, 0, 0, 20, 0, 0, 30, 0, 0]);
+        let tall = [1, 0, 0, 255, 2, 0, 0, 255];
+        let mut g = fx(PixelFormat::Rgb, 1, 2);
+        g.flip_v = true;
+        assert_eq!(map_pixels(&g, &tall, 1, 2), [2, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn input_rect_moves_scales_and_rotates() {
+        // 4x1 image: 10 20 30 40 in red.
+        let img = [10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255];
+        let mut f = fx(PixelFormat::Rgb, 2, 1);
+        f.input.w = 0.5; // right half, centred at 0.75
+        f.input.x = 0.75;
+        let r: Vec<u8> = map_pixels(&f, &img, 4, 1).chunks(3).map(|c| c[0]).collect();
+        assert_eq!(r, [30, 40]);
+        // 180 degrees about the centre of the screen reverses the picture.
+        let mut g = fx(PixelFormat::Rgb, 4, 1);
+        g.input.rotation = 180.0;
+        let r: Vec<u8> = map_pixels(&g, &img, 4, 1).chunks(3).map(|c| c[0]).collect();
+        assert_eq!(r, [40, 30, 20, 10]);
+        // Outside the screen is black.
+        let mut o = fx(PixelFormat::Rgb, 1, 1);
+        o.input.x = 3.0;
+        assert_eq!(map_pixels(&o, &img, 4, 1), [0, 0, 0]);
+    }
+
+    #[test]
+    fn fixture_colour_applies_and_black_ignores_it() {
+        let img = solid(1, 1, [100, 100, 100, 255]);
+        let mut f = fx(PixelFormat::Rgb, 1, 1);
+        f.color.brightness = 0.5;
+        f.color.b = 0.0;
+        assert_eq!(map_pixels(&f, &img, 1, 1), [50, 50, 0]);
+        // Contrast below 1 lifts black to grey; the black-out must still send zeros.
+        f.color = Default::default();
+        f.color.contrast = 0.5;
+        let dark = solid(1, 1, [0, 0, 0, 255]);
+        assert!(map_pixels(&f, &dark, 1, 1).iter().all(|&v| v > 0));
+        let d = &decode_all(&frame_packets(&[f], 0, &dark, (1, 1), 1, true))[0];
+        assert!(d.data.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn universes_used_matches_the_splitter() {
+        for sc in [1u16, 2, 11, 509, 510, 511, 512] {
+            for cpp in [1usize, 3, 4] {
+                for n in [0usize, 1, 3, 4, 100, 600, 1200] {
+                    let n = n / cpp * cpp;
+                    let data = vec![0u8; n];
+                    assert_eq!(
+                        universes_used(sc, n, cpp),
+                        split_universes(0, sc, &data, cpp).len(),
+                        "sc {sc} cpp {cpp} n {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn port_address_splits_into_net_sub_universe() {
+        assert_eq!(split_port(0x1234), (0x12, 3, 4));
+        assert_eq!(join_port(0x12, 3, 4), 0x1234);
+        assert_eq!(join_port(0xFF, 0xFF, 0xFF), MAX_UNIVERSE);
+        assert_eq!(
+            join_port(
+                split_port(0x7FFF).0,
+                split_port(0x7FFF).1,
+                split_port(0x7FFF).2
+            ),
+            0x7FFF
+        );
+    }
+
+    #[test]
+    fn poll_reply_parses_from_a_real_layout() {
+        let r = PollReply {
+            ip: [192, 168, 1, 50],
+            port: PORT,
+            net: 1,
+            sub: 2,
+            short_name: "Pixie".into(),
+            long_name: "Pixie LED controller".into(),
+            num_ports: 4,
+            mac: [1, 2, 3, 4, 5, 6],
+        };
+        match decode(&encode_poll_reply(&r)) {
+            Some(Packet::PollReply(g)) => assert_eq!(g, r),
+            o => panic!("{o:?}"),
+        }
+        // Negative control: a truncated reply is refused.
+        assert!(decode(&encode_poll_reply(&r)[..200]).is_none());
     }
 
     #[test]

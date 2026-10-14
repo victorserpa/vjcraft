@@ -6804,7 +6804,9 @@ mod tests {
         let art = |ip: &str| D::ArtNet {
             ip: ip.into(),
             universe: 0,
-            fixture: Default::default(),
+            fixtures: vec![Default::default()],
+            fps: 0.0,
+            delay_ms: 0,
         };
         let set = |d| Command::SetScreenDevice {
             screen: sid,

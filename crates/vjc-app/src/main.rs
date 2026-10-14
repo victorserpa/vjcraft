@@ -1,5 +1,6 @@
 mod api_io;
 mod artnet_out;
+mod artnet_scan;
 mod audio_react;
 mod browser;
 mod capture;
@@ -160,6 +161,7 @@ struct State {
     /// Syphon / NDI publishers of the screens set to those devices (runtime only).
     netout: netout::NetOut,
     artnet: artnet_out::ArtNetOut,
+    artnet_scan: artnet_scan::Scanner,
     /// Start/stop requested by a command, served in `compose` (it owns the GPU handles).
     rec_request: Option<bool>,
     /// Display id of the monitor the output window is on, while open.
@@ -1345,6 +1347,7 @@ impl State {
             capture: None,
             netout: Default::default(),
             artnet: Default::default(),
+            artnet_scan: Default::default(),
             rec_request: None,
             output: None,
             monitors: if live { monitors::list() } else { vec![] },
@@ -4038,12 +4041,16 @@ impl State {
                 OutputDevice::ArtNet {
                     ip,
                     universe,
-                    fixture,
+                    fixtures,
+                    fps,
+                    delay_ms,
                 } => Some(artnet_out::Want {
                     id: s.id,
                     ip: ip.clone(),
                     universe: *universe,
-                    fixture: fixture.clone(),
+                    fixtures: fixtures.clone(),
+                    fps: *fps,
+                    delay_ms: *delay_ms,
                 }),
                 _ => None,
             })

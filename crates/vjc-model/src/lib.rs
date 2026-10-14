@@ -894,9 +894,37 @@ pub enum OutputDevice {
         ip: String,
         #[serde(default)]
         universe: u16,
+        /// One or more fixtures. Projects saved with a single `fixture` load as a list of one.
+        #[serde(
+            default = "default_fixtures",
+            alias = "fixture",
+            deserialize_with = "one_or_many_fixtures"
+        )]
+        fixtures: Vec<Fixture>,
+        /// Send rate limit in Hz (0 = the app default, 40).
         #[serde(default)]
-        fixture: Fixture,
+        fps: f32,
+        /// Delay of the whole device, in milliseconds.
+        #[serde(default)]
+        delay_ms: u32,
     },
+}
+
+fn default_fixtures() -> Vec<Fixture> {
+    vec![Fixture::default()]
+}
+
+fn one_or_many_fixtures<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Fixture>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Many(Vec<Fixture>),
+        One(Fixture),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::Many(v) => v,
+        OneOrMany::One(f) => vec![f],
+    })
 }
 
 /// Channels of one fixture pixel.
@@ -934,6 +962,44 @@ pub struct Fixture {
     pub gamma: f32,
     /// Odd rows run right to left (zig-zag wired matrices).
     pub serpentine: bool,
+    /// First DMX channel (1..=512) inside the device's first universe.
+    pub start_channel: u16,
+    /// Part of the screen this fixture samples (the whole screen by default).
+    pub input: FixtureInput,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    pub color: SliceColor,
+}
+
+/// Input rectangle of a fixture, normalized to the screen: centre, size and rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FixtureInput {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Degrees, clockwise.
+    pub rotation: f32,
+}
+
+impl Default for FixtureInput {
+    fn default() -> Self {
+        FixtureInput {
+            x: 0.5,
+            y: 0.5,
+            w: 1.0,
+            h: 1.0,
+            rotation: 0.0,
+        }
+    }
+}
+
+impl FixtureInput {
+    /// The whole screen, unrotated.
+    pub fn is_full(&self) -> bool {
+        *self == FixtureInput::default()
+    }
 }
 
 impl Default for Fixture {
@@ -946,6 +1012,11 @@ impl Default for Fixture {
             order: ChannelOrder::Rgb,
             gamma: 1.0,
             serpentine: false,
+            start_channel: 1,
+            input: FixtureInput::default(),
+            flip_h: false,
+            flip_v: false,
+            color: SliceColor::default(),
         }
     }
 }
@@ -1456,6 +1527,44 @@ impl std::fmt::Display for Timecode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn artnet_device_loads_the_old_single_fixture_format() {
+        let old = r#"{"ArtNet":{"ip":"10.0.0.9","universe":3,"fixture":{"name":"M","width":8,"height":8,"format":"Rgb","order":"Grb","gamma":2.2,"serpentine":true}}}"#;
+        let d: OutputDevice = serde_json::from_str(old).unwrap();
+        let OutputDevice::ArtNet {
+            ip,
+            universe,
+            fixtures,
+            fps,
+            delay_ms,
+        } = &d
+        else {
+            panic!()
+        };
+        assert_eq!((ip.as_str(), *universe, fixtures.len()), ("10.0.0.9", 3, 1));
+        assert_eq!((fixtures[0].width, fixtures[0].start_channel), (8, 1));
+        assert!(fixtures[0].input.is_full() && !fixtures[0].flip_h);
+        assert_eq!((*fps, *delay_ms), (0.0, 0));
+        // New format round-trips; a missing field still gives one default fixture.
+        let mut d2 = d.clone();
+        if let OutputDevice::ArtNet { fixtures, .. } = &mut d2 {
+            fixtures.push(Fixture {
+                start_channel: 100,
+                flip_v: true,
+                ..Fixture::default()
+            });
+        }
+        let back: OutputDevice =
+            serde_json::from_str(&serde_json::to_string(&d2).unwrap()).unwrap();
+        assert_eq!(back, d2);
+        let bare: OutputDevice = serde_json::from_str(r#"{"ArtNet":{"ip":"x"}}"#).unwrap();
+        assert!(
+            matches!(bare, OutputDevice::ArtNet { fixtures, .. } if fixtures == [Fixture::default()])
+        );
+        // Negative control: without the migration a list-only reader would reject the old form.
+        assert!(serde_json::from_str::<Vec<Fixture>>(r#"{"name":"M"}"#).is_err());
+    }
+
     #[test]
     fn old_slice_without_color_loads_as_identity() {
         let s = r#"{"id":"00000000-0000-0000-0000-000000000001","input":[],"output_mesh":[],"mesh_cols":2,"mask":null,"soft_edge":null}"#;

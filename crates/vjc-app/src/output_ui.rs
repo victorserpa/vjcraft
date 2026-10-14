@@ -17,7 +17,8 @@ use crate::widgets::{self, Kind};
 /// Largest screen size, fixture grid side and Art-Net universe the fields accept.
 const MAX_SCREEN_PX: u32 = 16384;
 const MAX_FIXTURE_SIDE: u32 = 1024;
-const MAX_UNIVERSE: i32 = 32767;
+/// Height of the Art-Net fixture list before it scrolls.
+const ARTNET_LIST_H: f32 = 320.0;
 /// A new mask is an inset square; a new soft edge starts 10% wide on the sides.
 const MASK_INSET: f32 = 0.1;
 const SOFT_EDGE_DEFAULT: f32 = 0.1;
@@ -402,7 +403,9 @@ impl State {
                         device: OutputDevice::ArtNet {
                             ip: "127.0.0.1".into(),
                             universe: 0,
-                            fixture: Default::default(),
+                            fixtures: vec![Default::default()],
+                            fps: 0.0,
+                            delay_ms: 0,
                         },
                     });
                 }
@@ -469,57 +472,152 @@ impl State {
         self.artnet_setup(ui, c, cmds);
     }
 
-    /// Art-Net device: target IP, first universe and the fixture (pick, edit, save to the
-    /// library in the preferences).
+    /// Art-Net device: target IP (typed or picked from the nodes found on the network),
+    /// port-address as net / sub-net / universe, rate and delay, and the list of fixtures.
     fn artnet_setup(&mut self, ui: &mut egui::Ui, scr: &Screen, cmds: &mut Vec<Command>) {
         let OutputDevice::ArtNet {
             ip,
             universe,
-            fixture,
+            fixtures,
+            fps,
+            delay_ms,
         } = &scr.device
         else {
             return;
         };
         ui.separator();
-        ui.strong("Art-Net");
-        let set = |ip: String, universe: u16, fixture: Fixture| Command::SetScreenDevice {
-            screen: scr.id,
-            device: OutputDevice::ArtNet {
-                ip,
-                universe,
-                fixture,
-            },
-        };
-        // The text is applied when the field loses focus, not on every key.
-        let ip_id = egui::Id::new(("artnet_ip", scr.id));
-        let mut text = ui
-            .data_mut(|d| d.get_temp::<String>(ip_id))
-            .unwrap_or_else(|| ip.clone());
-        ui.horizontal(|ui| {
-            ui.label("IP");
-            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(FIELD_W_MD));
-            if r.lost_focus() && text.trim() != ip {
-                cmds.push(set(text.trim().to_owned(), *universe, fixture.clone()));
+        let mut new_ip = ip.clone();
+        let mut new_uni = *universe;
+        let mut new_fx = fixtures.clone();
+        let (mut new_fps, mut new_delay) = (*fps, *delay_ms);
+        widgets::section(ui, "Art-Net", |ui| {
+            // The text is applied when the field loses focus, not on every key.
+            let ip_id = egui::Id::new(("artnet_ip", scr.id));
+            let mut text = ui
+                .data_mut(|d| d.get_temp::<String>(ip_id))
+                .unwrap_or_else(|| ip.clone());
+            ui.horizontal(|ui| {
+                ui.label("IP");
+                let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(FIELD_W_MD));
+                if r.lost_focus() && text.trim() != ip {
+                    new_ip = text.trim().to_owned();
+                }
+                if r.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(ip_id, text.clone()));
+                } else {
+                    ui.data_mut(|d| d.remove_temp::<String>(ip_id));
+                }
+                let scanning = self.artnet_scan.running();
+                let label = if scanning {
+                    "Scanning..."
+                } else {
+                    "Find nodes"
+                };
+                if ui
+                    .add_enabled_ui(!scanning, |ui| widgets::btn(ui, label, Kind::Secondary))
+                    .inner
+                    .clicked()
+                {
+                    self.artnet_scan.start();
+                }
+            });
+            widgets::help(ui, "host or host:port (default port 6454)");
+            for n in self.artnet_scan.nodes() {
+                if widgets::btn(ui, &format!("{}  {}", n.ip, n.name), Kind::Secondary).clicked() {
+                    new_ip = n.ip.to_string();
+                    ui.data_mut(|d| d.remove_temp::<String>(ip_id));
+                }
             }
-            if r.has_focus() {
-                ui.data_mut(|d| d.insert_temp(ip_id, text.clone()));
-            } else {
-                ui.data_mut(|d| d.remove_temp::<String>(ip_id));
+            let (mut net, mut sub, mut uni) = {
+                let (n, s, u) = dmx::split_port(*universe);
+                (f32::from(n), f32::from(s), f32::from(u))
+            };
+            ui.horizontal(|ui| {
+                ui.label("Net");
+                let a = widgets::field_num(ui, &mut net, 0.0..=127.0, 0.2).changed();
+                ui.label("Sub-net");
+                let b = widgets::field_num(ui, &mut sub, 0.0..=15.0, 0.1).changed();
+                ui.label("Universe");
+                let c = widgets::field_num(ui, &mut uni, 0.0..=15.0, 0.1).changed();
+                if a || b || c {
+                    new_uni = dmx::join_port(net as u8, sub as u8, uni as u8);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Max Hz");
+                let mut hz = if *fps > 0.0 { *fps } else { artnet_out::MAX_HZ };
+                if widgets::field_num(ui, &mut hz, 1.0..=artnet_out::TOP_HZ, 0.2).changed() {
+                    new_fps = hz;
+                }
+                ui.label("Delay ms");
+                let mut d = *delay_ms as f32;
+                if widgets::field_num(ui, &mut d, 0.0..=1000.0, 1.0).changed() {
+                    new_delay = d.round() as u32;
+                }
+            });
+            let mut remove = None;
+            let count = new_fx.len();
+            // Several fixtures would make the panel taller than a small screen.
+            egui::ScrollArea::vertical()
+                .id_salt(("artnet_fixtures", scr.id))
+                .max_height(ARTNET_LIST_H)
+                .show(ui, |ui| {
+                    for (i, f) in new_fx.iter_mut().enumerate() {
+                        ui.push_id(("artnet_fixture", scr.id, i), |ui| {
+                            ui.group(|ui| {
+                                if self.artnet_fixture(ui, f, scr.id, i, count > 1) {
+                                    remove = Some(i);
+                                }
+                            });
+                        });
+                    }
+                });
+            if let Some(i) = remove {
+                new_fx.remove(i);
+            }
+            if widgets::btn(ui, "Add fixture", Kind::Secondary).clicked() {
+                let mut f = new_fx.last().cloned().unwrap_or_default();
+                let used = u64::from(f.width)
+                    * u64::from(f.height)
+                    * dmx::channels_per_pixel(f.format) as u64;
+                let next = u64::from(f.start_channel) + used;
+                f.start_channel = if next <= dmx::MAX_CHANNELS as u64 {
+                    next as u16
+                } else {
+                    1
+                };
+                new_fx.push(f);
             }
         });
-        ui.weak("host or host:port (default port 6454)");
-        let mut u = i32::from(*universe);
-        if ui
-            .add(
-                egui::DragValue::new(&mut u)
-                    .range(0..=MAX_UNIVERSE)
-                    .prefix("Universe "),
-            )
-            .changed()
+        if new_ip != *ip
+            || new_uni != *universe
+            || new_fx != *fixtures
+            || new_fps != *fps
+            || new_delay != *delay_ms
         {
-            cmds.push(set(ip.clone(), u as u16, fixture.clone()));
+            cmds.push(Command::SetScreenDevice {
+                screen: scr.id,
+                device: OutputDevice::ArtNet {
+                    ip: new_ip,
+                    universe: new_uni,
+                    fixtures: new_fx,
+                    fps: new_fps,
+                    delay_ms: new_delay,
+                },
+            });
         }
-        let mut f = fixture.clone();
+    }
+
+    /// One fixture of an Art-Net device: library pick, grid, mapping, input rectangle, flips
+    /// and colour. Returns true when its Remove button was clicked.
+    fn artnet_fixture(
+        &mut self,
+        ui: &mut egui::Ui,
+        f: &mut Fixture,
+        screen: uuid::Uuid,
+        index: usize,
+        can_remove: bool,
+    ) -> bool {
         let library: Vec<Fixture> = dmx::presets()
             .into_iter()
             .chain(self.prefs.dmx.fixtures.iter().cloned())
@@ -528,35 +626,70 @@ impl State {
             .selected_text(&f.name)
             .show_ui(ui, |ui| {
                 for l in &library {
-                    if ui.selectable_label(l == fixture, &l.name).clicked() {
-                        f = l.clone();
+                    if ui.selectable_label(l.name == f.name, &l.name).clicked() {
+                        // The library holds the grid and wiring; where it sits stays.
+                        *f = Fixture {
+                            start_channel: f.start_channel,
+                            input: f.input,
+                            flip_h: f.flip_h,
+                            flip_v: f.flip_v,
+                            color: f.color,
+                            ..l.clone()
+                        };
                     }
                 }
             });
-        self.fixture_editor(ui, &mut f, egui::Id::new(("artnet_fx_name", scr.id)));
-        if f != *fixture {
-            cmds.push(set(ip.clone(), *universe, f));
-        }
-        let cpp = dmx::channels_per_pixel(fixture.format);
-        let channels = u64::from(fixture.width) * u64::from(fixture.height) * cpp as u64;
-        let per = dmx::universe_chunk(fixture.format) as u64;
-        ui.weak(format!(
-            "{} channels, {} universe(s), up to {} Hz",
-            channels,
-            channels.div_ceil(per.max(1)),
-            artnet_out::MAX_HZ
-        ));
+        self.fixture_editor(ui, f, egui::Id::new(("artnet_fx_name", screen, index)));
+        let mut sc = f32::from(f.start_channel);
+        ui.horizontal(|ui| {
+            ui.label("Start channel");
+            if widgets::field_num(ui, &mut sc, 1.0..=512.0, 1.0).changed() {
+                f.start_channel = sc.round().clamp(1.0, 512.0) as u16;
+            }
+        });
+        let cpp = dmx::channels_per_pixel(f.format);
+        let channels = (u64::from(f.width) * u64::from(f.height)) as usize * cpp;
+        widgets::help(
+            ui,
+            &format!(
+                "Channels {}-{}, {} universe(s)",
+                f.start_channel,
+                usize::from(f.start_channel) + channels.saturating_sub(1),
+                dmx::universes_used(f.start_channel, channels, cpp)
+            ),
+        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut f.flip_h, "Flip H");
+            ui.checkbox(&mut f.flip_v, "Flip V");
+        });
+        ui.label("Input (centre, size, rotation)");
+        ui.horizontal(|ui| {
+            widgets::field_num(ui, &mut f.input.x, -2.0..=3.0, 0.005);
+            widgets::field_num(ui, &mut f.input.y, -2.0..=3.0, 0.005);
+            widgets::field_num(ui, &mut f.input.w, 0.01..=4.0, 0.005);
+            widgets::field_num(ui, &mut f.input.h, 0.01..=4.0, 0.005);
+            widgets::field_num(ui, &mut f.input.rotation, -360.0..=360.0, 0.5);
+            if widgets::btn(ui, "Whole screen", Kind::Secondary).clicked() {
+                f.input = Default::default();
+            }
+        });
+        widgets::slider(ui, &mut f.color.brightness, 0.0..=2.0, "Brightness");
+        widgets::slider(ui, &mut f.color.contrast, 0.0..=2.0, "Contrast");
+        widgets::slider(ui, &mut f.color.r, 0.0..=2.0, "Red");
+        widgets::slider(ui, &mut f.color.g, 0.0..=2.0, "Green");
+        widgets::slider(ui, &mut f.color.b, 0.0..=2.0, "Blue");
+        let mut remove = false;
         ui.horizontal(|ui| {
             let saved = self
                 .prefs
                 .dmx
                 .fixtures
                 .iter()
-                .position(|l| l.name == fixture.name);
+                .position(|l| l.name == f.name);
             if widgets::btn(ui, "Save to library", Kind::Secondary).clicked() {
                 match saved {
-                    Some(i) => self.prefs.dmx.fixtures[i] = fixture.clone(),
-                    None => self.prefs.dmx.fixtures.push(fixture.clone()),
+                    Some(i) => self.prefs.dmx.fixtures[i] = f.clone(),
+                    None => self.prefs.dmx.fixtures.push(f.clone()),
                 }
                 self.save_prefs();
             }
@@ -571,7 +704,17 @@ impl State {
                 self.prefs.dmx.fixtures.remove(i);
                 self.save_prefs();
             }
+            if ui
+                .add_enabled_ui(can_remove, |ui| {
+                    widgets::btn(ui, "Remove fixture", Kind::Danger)
+                })
+                .inner
+                .clicked()
+            {
+                remove = true;
+            }
         });
+        remove
     }
 
     /// Basic fixture fields: name, pixel grid, channels per pixel, order, gamma, wiring.

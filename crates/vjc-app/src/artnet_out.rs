@@ -18,7 +18,7 @@ use crate::capture::{
     Inflight, MAX_INFLIGHT, blacken, readback_buffer, start_readback_into, unpad_into,
 };
 use eframe::egui_wgpu::wgpu;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,34 @@ use vjc_core::dmx;
 use vjc_model::Fixture;
 
 pub const MAX_HZ: f32 = 40.0;
+/// Highest rate a device may ask for (the DMX512 refresh limit is about 44 Hz).
+pub const TOP_HZ: f32 = 44.0;
+
+/// Time between two sends for a device rate (`fps` <= 0 or not a number = `MAX_HZ`).
+pub fn period(fps: f32) -> Duration {
+    let hz = if fps.is_finite() && fps > 0.0 {
+        fps.clamp(1.0, TOP_HZ)
+    } else {
+        MAX_HZ
+    };
+    Duration::from_secs_f64(1.0 / f64::from(hz))
+}
+
+/// Lets a frame through at most once per period.
+#[derive(Default)]
+struct Pacer {
+    next: Option<Instant>,
+}
+
+impl Pacer {
+    fn allow(&mut self, now: Instant, period: Duration) -> bool {
+        if self.next.is_some_and(|n| now < n) {
+            return false;
+        }
+        self.next = Some(now + period);
+        true
+    }
+}
 
 /// What a screen wants to send.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,7 +64,11 @@ pub struct Want {
     /// "host" or "host:port" (default port 6454).
     pub ip: String,
     pub universe: u16,
-    pub fixture: Fixture,
+    pub fixtures: Vec<Fixture>,
+    /// Rate limit in Hz (0 = `MAX_HZ`).
+    pub fps: f32,
+    /// Output delay in milliseconds.
+    pub delay_ms: u32,
 }
 
 /// Where a frame's pixels live.
@@ -55,10 +87,27 @@ struct Frame {
     black: bool,
 }
 
-/// Fixture and first universe of a running sender.
+/// Fixtures, first universe, rate and delay of a running sender.
 struct Settings {
     universe: u16,
-    fixture: Fixture,
+    fixtures: Vec<Fixture>,
+    fps: f32,
+    delay_ms: u32,
+}
+
+impl Settings {
+    fn of(w: &Want) -> Settings {
+        Settings {
+            universe: w.universe,
+            fixtures: w.fixtures.clone(),
+            fps: w.fps,
+            delay_ms: w.delay_ms,
+        }
+    }
+
+    fn valid(&self) -> bool {
+        !self.fixtures.is_empty() && self.fixtures.iter().all(dmx::valid)
+    }
 }
 
 /// Resolves "host" / "host:port" to an IPv4 address; the port defaults to 6454.
@@ -73,6 +122,7 @@ pub fn parse_target(s: &str) -> Option<SocketAddr> {
 }
 
 /// Sends one frame (tight RGBA `w` x `h`) to `target`. Returns how many ArtDmx packets went out.
+#[cfg(test)]
 fn send_frame(
     sock: &UdpSocket,
     target: SocketAddr,
@@ -81,7 +131,7 @@ fn send_frame(
     size: (u32, u32),
     seq: u8,
 ) -> std::io::Result<usize> {
-    let packets = dmx::frame_packets(&set.fixture, set.universe, rgba, size, seq);
+    let packets = dmx::frame_packets(&set.fixtures, set.universe, rgba, size, seq, false);
     for p in &packets {
         sock.send_to(p, target)?;
     }
@@ -121,7 +171,7 @@ impl Pub {
                 let Some(target) = parse_target(&w.ip) else {
                     return fail(format!("cannot resolve '{}'", w.ip));
                 };
-                if !dmx::valid(&w.fixture) {
+                if !Settings::of(&w).valid() {
                     return fail("fixture is empty or too large".into());
                 }
                 let sock = match UdpSocket::bind(("0.0.0.0", 0)) {
@@ -130,14 +180,19 @@ impl Pub {
                 };
                 // Broadcast only if the user typed a broadcast address.
                 let _ = sock.set_broadcast(true);
-                let mut set = Settings {
-                    universe: w.universe,
-                    fixture: w.fixture,
-                };
+                let mut set = Settings::of(&w);
                 let mut seq = 0u8;
                 let mut scratch = Vec::new();
+                let mut pacer = Pacer::default();
+                let mut was_black = false;
+                // Packets waiting for their delay to pass.
+                let mut held: VecDeque<(Instant, Vec<Vec<u8>>)> = VecDeque::new();
                 loop {
-                    let got = rx.recv_timeout(Duration::from_millis(250));
+                    let wait = held.front().map_or(Duration::from_millis(250), |(due, _)| {
+                        due.saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(250))
+                    });
+                    let got = rx.recv_timeout(wait);
                     while let Ok(s) = upd_rx.try_recv() {
                         set = s;
                     }
@@ -164,13 +219,38 @@ impl Pub {
                                 (Src::Cpu(v), false) => v,
                                 _ => &scratch,
                             };
-                            if !dmx::valid(&set.fixture) {
+                            if !set.valid() {
                                 // Reported once; the sender restarts on the next change.
                                 fail("fixture is empty or too large".into());
                             } else if ready {
-                                seq = dmx::next_seq(seq);
-                                // UDP errors (unreachable host, link down) must not stop the show.
-                                let _ = send_frame(&sock, target, &set, rgba, (f.w, f.h), seq);
+                                let now = Instant::now();
+                                // Slightly under one period, so jitter does not eat frames.
+                                // A black-out change is never held back by the rate limit.
+                                let flip = f.black != was_black;
+                                was_black = f.black;
+                                // fps 0 (old projects): the app-side throttle already paces, as before.
+                                let paced = set.fps <= 0.0
+                                    || pacer.allow(now, period(set.fps).mul_f32(0.9));
+                                if paced || flip {
+                                    seq = dmx::next_seq(seq);
+                                    // The black-out zeroes the channels too (a fixture colour
+                                    // with contrast < 1 would lift black to grey).
+                                    let packets = dmx::frame_packets(
+                                        &set.fixtures,
+                                        set.universe,
+                                        rgba,
+                                        (f.w, f.h),
+                                        seq,
+                                        f.black,
+                                    );
+                                    // Black goes out at once and drops what was still waiting.
+                                    let delay = if f.black { 0 } else { set.delay_ms };
+                                    if f.black {
+                                        held.clear();
+                                    }
+                                    let due = now + Duration::from_millis(u64::from(delay));
+                                    held.push_back((due, packets));
+                                }
                             }
                             if let Src::Gpu(b) = f.src {
                                 b.unmap();
@@ -179,6 +259,15 @@ impl Pub {
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                    let now = Instant::now();
+                    while held.front().is_some_and(|(due, _)| *due <= now) {
+                        if let Some((_, packets)) = held.pop_front() {
+                            // UDP errors (unreachable host, link down) must not stop the show.
+                            for p in &packets {
+                                let _ = sock.send_to(p, target);
+                            }
+                        }
                     }
                 }
             })
@@ -200,13 +289,10 @@ impl Pub {
         }
     }
 
-    /// Universe / fixture changes reach the running worker; no new socket.
+    /// Universe, fixture, rate and delay changes reach the running worker; no new socket.
     fn update(&mut self, want: &Want) {
-        if self.want.universe != want.universe || self.want.fixture != want.fixture {
-            let _ = self.upd.send(Settings {
-                universe: want.universe,
-                fixture: want.fixture.clone(),
-            });
+        if self.want != *want {
+            let _ = self.upd.send(Settings::of(want));
             self.want = want.clone();
         }
     }
@@ -321,7 +407,7 @@ impl ArtNetOut {
         if now < p.next_due {
             return;
         }
-        let period = Duration::from_secs_f64(1.0 / f64::from(MAX_HZ));
+        let period = period(p.want.fps);
         p.next_due = (p.next_due + period).max(now);
         if p.inflight.len() >= MAX_INFLIGHT || (p.size != size && p.inflight.len() > 0) {
             return;
@@ -384,12 +470,19 @@ mod tests {
             id: Uuid::new_v4(),
             ip: addr.to_string(),
             universe,
-            fixture: f,
+            fixtures: vec![f],
+            fps: 0.0,
+            delay_ms: 0,
         }
     }
 
     fn settings(fixture: Fixture, universe: u16) -> Settings {
-        Settings { universe, fixture }
+        Settings {
+            universe,
+            fixtures: vec![fixture],
+            fps: 0.0,
+            delay_ms: 0,
+        }
     }
 
     fn fixture(w: u32, h: u32, format: PixelFormat) -> Fixture {
@@ -401,6 +494,7 @@ mod tests {
             order: ChannelOrder::Grb,
             gamma: 1.0,
             serpentine: false,
+            ..Fixture::default()
         }
     }
 
@@ -534,8 +628,8 @@ mod tests {
         out.sync(&[w.clone()]);
         let thread = out.pubs[&w.id].worker.as_ref().unwrap().thread().id();
         w.universe = 3;
-        w.fixture.name = "other".into();
-        w.fixture.gamma = 2.0;
+        w.fixtures[0].name = "other".into();
+        w.fixtures[0].gamma = 2.0;
         out.sync(&[w.clone()]);
         assert_eq!(out.len(), 1);
         assert_eq!(out.pubs[&w.id].want.universe, 3);
@@ -574,7 +668,7 @@ mod tests {
         let (_rx, addr) = local();
         let mut w = want(addr, fixture(1, 1, PixelFormat::Rgb), 0);
         let mut p = Pub::start(w.clone());
-        w.fixture.width = 0;
+        w.fixtures[0].width = 0;
         p.update(&w);
         p.tx.as_ref()
             .unwrap()
@@ -611,5 +705,139 @@ mod tests {
             .unwrap();
         recv_dmx(&rx);
         assert!(!p.failed());
+    }
+
+    fn frame(black: bool) -> Frame {
+        Frame {
+            w: 1,
+            h: 1,
+            src: Src::Cpu(vec![1, 2, 3, 255]),
+            black,
+        }
+    }
+
+    /// Packets that reach `rx` within `window`.
+    fn count_for(rx: &UdpSocket, window: Duration) -> usize {
+        rx.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let end = Instant::now() + window;
+        let mut n = 0;
+        let mut b = [0u8; 1024];
+        while Instant::now() < end {
+            if rx.recv(&mut b).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn pacer_lets_one_frame_through_per_period() {
+        let t0 = Instant::now();
+        let p = period(10.0);
+        assert_eq!(p, Duration::from_millis(100));
+        let mut pc = Pacer::default();
+        let got: Vec<bool> = (0..6)
+            .map(|i| pc.allow(t0 + Duration::from_millis(i * 30), p))
+            .collect();
+        assert_eq!(got, [true, false, false, false, true, false]);
+        // Negative control: a 30 ms period lets every one of those frames through.
+        let mut pc = Pacer::default();
+        assert!((0..6).all(|i| pc.allow(
+            t0 + Duration::from_millis(i * 30),
+            Duration::from_millis(30)
+        )));
+        assert_eq!(period(0.0), period(MAX_HZ));
+        assert_eq!(period(1000.0), period(TOP_HZ));
+    }
+
+    #[test]
+    fn worker_framerate_limits_the_sends() {
+        let (rx, addr) = local();
+        let mut w = want(addr, fixture(1, 1, PixelFormat::Rgb), 0);
+        w.fps = 10.0;
+        let p = Pub::start(w);
+        let tx = p.tx.as_ref().unwrap();
+        for _ in 0..5 {
+            tx.send(frame(false)).unwrap();
+        }
+        assert_eq!(count_for(&rx, Duration::from_millis(250)), 1);
+        // Control: the same frames spaced beyond the period all go out.
+        for _ in 0..3 {
+            tx.send(frame(false)).unwrap();
+            std::thread::sleep(Duration::from_millis(130));
+        }
+        assert_eq!(count_for(&rx, Duration::from_millis(100)), 3);
+    }
+
+    #[test]
+    fn worker_without_fps_forwards_every_frame_the_app_sends() {
+        // Old projects (fps 0): frames 17 ms apart (one 60 Hz tick) must all go out.
+        let (rx, addr) = local();
+        let w = want(addr, fixture(1, 1, PixelFormat::Rgb), 0);
+        assert_eq!(w.fps, 0.0);
+        let p = Pub::start(w);
+        let tx = p.tx.as_ref().unwrap();
+        for _ in 0..4 {
+            tx.send(frame(false)).unwrap();
+            std::thread::sleep(Duration::from_millis(17));
+        }
+        assert_eq!(count_for(&rx, Duration::from_millis(150)), 4);
+    }
+
+    #[test]
+    fn worker_delay_holds_the_frame_but_black_is_immediate() {
+        let (rx, addr) = local();
+        let mut w = want(addr, fixture(1, 1, PixelFormat::Rgb), 0);
+        w.delay_ms = 250;
+        let p = Pub::start(w);
+        let tx = p.tx.as_ref().unwrap();
+        let t = Instant::now();
+        tx.send(frame(false)).unwrap();
+        recv_dmx(&rx);
+        assert!(
+            t.elapsed() >= Duration::from_millis(240),
+            "{:?}",
+            t.elapsed()
+        );
+        // Black-out skips the delay (and the control: no delay configured is fast too).
+        let t = Instant::now();
+        tx.send(frame(true)).unwrap();
+        assert!(recv_dmx(&rx).data.iter().all(|&b| b == 0));
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn running_worker_applies_two_fixtures_and_colour_but_black_stays_black() {
+        let (rx, addr) = local();
+        let mut a = fixture(1, 1, PixelFormat::Rgb);
+        a.order = ChannelOrder::Rgb;
+        a.color.contrast = 0.5; // lifts black to grey
+        let mut b = a.clone();
+        b.start_channel = 4;
+        let mut w = want(addr, a, 0);
+        w.fixtures.push(b);
+        let p = Pub::start(w);
+        let tx = p.tx.as_ref().unwrap();
+        tx.send(Frame {
+            w: 1,
+            h: 1,
+            src: Src::Cpu(vec![0, 0, 0, 255]),
+            black: false,
+        })
+        .unwrap();
+        assert!(recv_dmx(&rx).data[..6].iter().all(|&v| v > 0));
+        tx.send(Frame {
+            w: 1,
+            h: 1,
+            src: Src::Cpu(vec![0, 0, 0, 255]),
+            black: true,
+        })
+        .unwrap();
+        assert!(recv_dmx(&rx).data.iter().all(|&v| v == 0));
     }
 }

@@ -950,15 +950,57 @@ fn output_setup_artnet_device_shows_fixture_editor() {
         device: vjc_model::OutputDevice::ArtNet {
             ip: "127.0.0.1".into(),
             universe: 2,
-            fixture: vjc_core::dmx::presets()[2].clone(),
+            fixtures: vec![vjc_core::dmx::presets()[2].clone()],
+            fps: 0.0,
+            delay_ms: 0,
         },
     });
     settle(&mut h);
     assert!(exists(&h, "Save to library"));
     assert!(exists(&h, "Serpentine (odd rows reversed)"));
+    // The taller panel scrolls: the button must be brought into view first.
+    h.get_by_label("Save to library").scroll_to_me();
+    h.run_steps(30); // the scroll is animated
     click(&mut h, "Save to library");
     assert_eq!(h.state().prefs.dmx.fixtures.len(), 1);
     assert_eq!(h.state().prefs.dmx.fixtures[0].name, "Matrix 8x8 RGB");
+}
+
+#[test]
+fn output_setup_artnet_add_fixture_and_flip() {
+    let mut h = app();
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    click(&mut h, "Add");
+    let id = h.state().project.output.screens[0].id;
+    h.state_mut().exec(Command::SetScreenDevice {
+        screen: id,
+        device: vjc_model::OutputDevice::ArtNet {
+            ip: "127.0.0.1".into(),
+            universe: 0x123,
+            fixtures: vec![vjc_core::dmx::presets()[0].clone()],
+            fps: 0.0,
+            delay_ms: 0,
+        },
+    });
+    settle(&mut h);
+    let fixtures = |h: &Harness<'_, State>| match &h.state().project.output.screens[0].device {
+        vjc_model::OutputDevice::ArtNet { fixtures, .. } => fixtures.clone(),
+        _ => panic!(),
+    };
+    assert!(exists(&h, "Net") && exists(&h, "Sub-net") && exists(&h, "Find nodes"));
+    h.get_by_label("Add fixture").scroll_to_me();
+    settle(&mut h);
+    click(&mut h, "Add fixture");
+    let f = fixtures(&h);
+    // Strip 1x16 RGB uses channels 1..=48: the new one starts after it.
+    assert_eq!((f.len(), f[1].start_channel), (2, 49));
+    h.get_all_by_label("Flip H").next().unwrap().scroll_to_me();
+    settle(&mut h);
+    h.get_all_by_label("Flip H").next().unwrap().click();
+    settle(&mut h);
+    let f = fixtures(&h);
+    assert!(f[0].flip_h && !f[1].flip_h);
 }
 
 #[test]
