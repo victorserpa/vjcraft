@@ -1833,6 +1833,10 @@ fn soak_render_and_decode_loop() {
         if let Some(mb) = ps {
             return mb;
         }
+        peak_rss_mb()
+    }
+    #[cfg(unix)]
+    fn peak_rss_mb() -> f64 {
         // SAFETY: getrusage only writes into the zeroed struct we pass.
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
@@ -1845,6 +1849,10 @@ fn soak_render_and_decode_loop() {
         let mb = ru.ru_maxrss as f64 / unit;
         assert!(mb > 0.0, "RSS reads as 0: the soak check would be vacuous");
         mb
+    }
+    #[cfg(not(unix))]
+    fn peak_rss_mb() -> f64 {
+        panic!("cannot read RSS: no `ps` and no getrusage on this platform")
     }
     let minutes = env_f64("VJC_SOAK_MINUTES", 1.0);
     let max_growth = env_f64("VJC_SOAK_MAX_RSS_MB", 300.0);
@@ -2595,4 +2603,20 @@ fn browser_grid_toggle_and_favorite_heart_persist_in_prefs() {
         favs.len() == 1 && favs[0].starts_with("fx:"),
         "heart click stored {favs:?}"
     );
+}
+
+#[test]
+fn stale_multi_selection_is_pruned_after_undo() {
+    let mut h = precise_slice_setup();
+    two_slices_selected(&mut h);
+    assert_eq!(h.state().sel_slices.len(), 2);
+    h.state_mut().undo(); // undoes the Duplicate: the copy is gone
+    assert!(h.state().sel_slices.is_empty(), "stale ids must be dropped");
+    // negative control: without pruning the ids stay
+    let mut h = precise_slice_setup();
+    two_slices_selected(&mut h);
+    let ghost = uuid::Uuid::new_v4();
+    h.state_mut().sel_slices = vec![ghost, ghost];
+    h.state_mut().prune_sel_slices();
+    assert!(h.state().sel_slices.is_empty());
 }

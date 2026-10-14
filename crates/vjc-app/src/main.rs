@@ -1633,7 +1633,37 @@ impl State {
         }
     }
 
+    /// Drops multi-selected slices that no longer exist on the selected screen (undo,
+    /// RemoveScreen, SetOutputSetup); a lone survivor is not a multi-selection.
+    pub(crate) fn prune_sel_slices(&mut self) {
+        if self.sel_slices.is_empty() {
+            return;
+        }
+        let live: Vec<Uuid> = match self.sel_screen {
+            Some(id) => self
+                .project
+                .output
+                .screens
+                .iter()
+                .filter(|s| s.id == id)
+                .flat_map(|s| s.slices.iter().map(|x| x.id))
+                .collect(),
+            None => self
+                .project
+                .output
+                .screens
+                .iter()
+                .flat_map(|s| s.slices.iter().map(|x| x.id))
+                .collect(),
+        };
+        self.sel_slices.retain(|i| live.contains(i));
+        if self.sel_slices.len() < 2 {
+            self.sel_slices.clear();
+        }
+    }
+
     fn handle(&mut self, events: Vec<Event>) {
+        self.prune_sel_slices();
         for e in events {
             match e {
                 Event::ClipStarted {
@@ -5803,6 +5833,17 @@ impl eframe::App for State {
 #[cfg(test)]
 mod ui_tests;
 
+/// VJC_AUTOPLAY paths: a value that exists as a file is one path (it may contain the
+/// PATH separator); otherwise it is split like PATH.
+fn autoplay_paths(v: &std::ffi::OsStr) -> Vec<PathBuf> {
+    let whole = PathBuf::from(v);
+    if whole.is_file() {
+        vec![whole]
+    } else {
+        std::env::split_paths(v).collect()
+    }
+}
+
 fn main() -> eframe::Result {
     let (prefs, warn) = match prefs_path() {
         Some(p) => Prefs::load(&p),
@@ -5848,7 +5889,7 @@ fn main() -> eframe::Result {
                     .rev()
                     .map(|l| l.id)
                     .collect();
-                for (l, path) in ids.into_iter().zip(std::env::split_paths(&p)) {
+                for (l, path) in ids.into_iter().zip(autoplay_paths(&p)) {
                     s.drop_file(l, 0, path);
                 }
             }
@@ -5939,6 +5980,19 @@ fn window_grew(prev: egui::Vec2, now: egui::Vec2) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autoplay_whole_value_is_one_path_when_it_is_a_file() {
+        let d = std::env::temp_dir().join(format!("vjc-ap-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join(format!("a{}b.mp4", if cfg!(windows) { ';' } else { ':' }));
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(super::autoplay_paths(f.as_os_str()), vec![f.clone()]);
+        // negative control: a non-existing value is still split
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let multi = std::ffi::OsString::from(format!("/no/a.mp4{sep}/no/b.mp4"));
+        assert_eq!(super::autoplay_paths(&multi).len(), 2);
+        std::fs::remove_dir_all(&d).ok();
+    }
     #[test]
     fn preview_warns_when_selected_layer_video_is_off() {
         assert_eq!(preview_note(true, false), "Selected layer");
