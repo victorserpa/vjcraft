@@ -84,15 +84,35 @@ pub fn section(ui: &mut egui::Ui, id: &'static str, title: &str) -> bool {
     open
 }
 
-/// Label column of a property row: right-aligned in a fixed width so values line up.
+/// Label column of a property row: right-aligned in a column as wide as the widest label seen
+/// so far (capped at `PARAM_LABEL_MAX`), so values line up. Longer labels are cut with "..."
+/// and show the full text on hover.
 pub fn row_label(ui: &mut egui::Ui, label: &str) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(crate::theme::PROP_LABEL_W, crate::theme::PROP_ROW_H),
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let text_w = ui.fonts_mut(|f| {
+        f.layout_no_wrap(label.to_owned(), font, crate::theme::TEXT)
+            .size()
+            .x
+    });
+    let key = egui::Id::new("param-label-w");
+    let seen: f32 = ui.data(|d| d.get_temp(key)).unwrap_or(0.0);
+    let want = text_w.ceil().min(crate::theme::PARAM_LABEL_MAX);
+    // Never more than 40% of the row: narrow panels keep room for the value and slider.
+    let room = (ui.available_width() * 0.4).max(crate::theme::PARAM_LABEL_MIN);
+    let w = seen.max(want).max(crate::theme::PARAM_LABEL_MIN).min(room);
+    if want > seen {
+        ui.data_mut(|d| d.insert_temp(key, want));
+        ui.ctx().request_repaint();
+    }
+    let r = ui.allocate_ui_with_layout(
+        egui::vec2(w, crate::theme::PROP_ROW_H),
         egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.add(egui::Label::new(label).truncate());
-        },
+        |ui| ui.add(egui::Label::new(label).truncate()),
     );
+    if text_w > w {
+        r.inner.on_hover_text(label);
+    }
+    ui.add_space(crate::theme::SP_2);
 }
 
 /// Slider with value label (double click to type, Enter commits, Esc cancels) and a reset
@@ -466,6 +486,7 @@ fn slider_inner(
     let mut out = None;
     let mut anim_out = None;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = crate::theme::SP_2.max(ui.spacing().item_spacing.x);
         row_label(ui, label);
         // Value | - | + | slider | reset | animation.
         let editing: Option<String> = ui.data(|d| d.get_temp(id));

@@ -4559,3 +4559,31 @@ fn prefs_window_snapshot() {
     assert!(exists(&h, "Close") && exists(&h, "Choose..."));
     snap(&mut h, "prefs");
 }
+
+/// Width of `text` in the body font, as the param label column measures it.
+fn body_text_w(h: &Harness<'_, State>, text: &str) -> f32 {
+    let font = egui::TextStyle::Body.resolve(&h.ctx.global_style());
+    h.ctx.fonts_mut(|f| {
+        f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+/// Param labels get the width of the widest label (up to PARAM_LABEL_MAX), not a fixed 110 px.
+#[test]
+fn composition_param_labels_are_not_truncated() {
+    let mut h = app();
+    settle(&mut h);
+    let full = body_text_w(&h, "Crossfader behaviour");
+    let node = h.get_by_label("Crossfader behaviour");
+    let shown = node.rect().width();
+    assert!(
+        shown + 1.0 >= full,
+        "label cut: shown {shown} < full {full}"
+    );
+    // Negative control: the old fixed 110 px column could not hold this label.
+    assert!(full > 110.0, "control: old width would fit ({full})");
+    assert!(full <= crate::theme::PARAM_LABEL_MAX);
+    snap(&mut h, "params");
+}

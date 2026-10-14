@@ -241,7 +241,9 @@ pub const MONITOR_BG: Color32 = Color32::BLACK;
 pub const PROP_VALUE_W: f32 = 56.0;
 pub const SECTION_ROW_H: f32 = 24.0;
 pub const PROP_ROW_H: f32 = 20.0;
-pub const PROP_LABEL_W: f32 = 110.0;
+/// Param label column: minimum width and the cap above which labels are truncated.
+pub const PARAM_LABEL_MIN: f32 = 60.0;
+pub const PARAM_LABEL_MAX: f32 = 180.0;
 pub const SECTION_HEAD: Color32 = Color32::from_rgb(150, 160, 178);
 
 /// Clip scrub bar: height, marker grab distance (px) and the shade over the part outside in..out.
