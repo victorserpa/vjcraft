@@ -295,6 +295,21 @@ mod tests {
         assert!(warns.iter().any(|w| w.contains("share")), "{warns:?}");
     }
 
+    #[test]
+    fn open_keeps_empty_group_from_file() {
+        let d = tmp("emptygroup");
+        let mut p = Project::new("T");
+        let mut g = vjc_model::LayerGroup::new("kept");
+        g.speed = 2.0;
+        let id = g.id;
+        p.composition.groups.push(g);
+        let f = d.join("p.vjc");
+        save(&p, &f).unwrap();
+        let (q, warns) = open(&f).unwrap();
+        assert_eq!(q.composition.groups.len(), 1, "{warns:?}");
+        assert_eq!(q.composition.group(id).unwrap().speed, 2.0);
+    }
+
     fn with_media(path: PathBuf) -> Project {
         let mut p = Project::new("T");
         let layer = uuid_layer();

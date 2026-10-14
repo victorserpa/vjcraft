@@ -231,13 +231,17 @@ mod tests {
         p.composition.layers[1].group = None;
         assert_eq!(p.normalize_groups(), 2);
         assert!(p.composition.layers.iter().all(|l| l.group.is_none()));
-        // The group left without members is dropped, and so is one empty in the file.
+        // The group left without members by the repair is dropped...
         assert!(p.composition.groups.is_empty());
-        p.composition
-            .groups
-            .push(vjc_model::LayerGroup::new("empty"));
+        // ...but one empty in the file is kept (it holds speed/opacity).
+        let mut e = vjc_model::LayerGroup::new("empty");
+        e.speed = 2.0;
+        let eid = e.id;
+        p.composition.groups.push(e);
         p.normalize_groups();
-        assert!(p.composition.groups.is_empty());
+        assert_eq!(p.composition.groups.len(), 1);
+        assert_eq!(p.composition.groups[0].id, eid);
+        assert_eq!(p.composition.groups[0].speed, 2.0);
     }
 
     #[test]

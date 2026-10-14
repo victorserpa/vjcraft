@@ -633,8 +633,10 @@ enum Target {
     Transform(EffectTarget, TransformField),
     Anim(AnimTarget),
     SliceMesh(Uuid),
-    /// Slice and point count (0 = cleared): create, drag, add point and clear are separate steps.
-    SliceMask(Uuid, usize),
+    /// Slice, point count (0 = cleared) and dragged point (first point that differs from the
+    /// current mask; 0 when there is none or the count changes): create, add point, clear and drags of
+    /// different points are separate steps.
+    SliceMask(Uuid, usize, usize),
     SliceSoftEdge(Uuid),
     SliceInput(Uuid, Uuid),
     ScreenSize(Uuid),
@@ -669,9 +671,11 @@ impl Command {
                 std::mem::discriminant(device),
             )),
             Command::SetSliceMesh { slice, .. } => Some(Target::SliceMesh(*slice)),
-            Command::SetSliceMask { slice, mask, .. } => {
-                Some(Target::SliceMask(*slice, mask.as_ref().map_or(0, Vec::len)))
-            }
+            Command::SetSliceMask { slice, mask, .. } => Some(Target::SliceMask(
+                *slice,
+                mask.as_ref().map_or(0, Vec::len),
+                0,
+            )),
             Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),
             Command::SetSliceInput { screen, slice, .. } => {
                 Some(Target::SliceInput(*screen, *slice))
@@ -2478,7 +2482,29 @@ impl History {
             },
             c => c,
         };
-        let target = cmd.target();
+        let mut target = cmd.target();
+        if let (
+            Some(Target::SliceMask(sl, n, _)),
+            Command::SetSliceMask {
+                mask: Some(new), ..
+            },
+        ) = (target, &cmd)
+        {
+            let cur = p
+                .output
+                .screens
+                .iter()
+                .flat_map(|s| &s.slices)
+                .find(|s| s.id == sl)
+                .and_then(|s| s.mask.as_ref());
+            let idx = match cur {
+                Some(old) if old.len() == new.len() => {
+                    old.iter().zip(new).position(|(a, b)| a != b).unwrap_or(0)
+                }
+                _ => 0,
+            };
+            target = Some(Target::SliceMask(sl, n, idx));
+        }
         let Applied { inverse, events } = apply(p, cmd.clone())?;
         let Some(undo) = inverse else {
             return Ok(events);
@@ -5637,6 +5663,36 @@ mod tests {
         assert_eq!(state(&p), Some(tri(0.1)));
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(state(&p), None);
+    }
+
+    #[test]
+    fn mask_drags_of_different_points_are_separate_undo_steps() {
+        let (mut p, sid, lid) = one_screen_slice();
+        let mut h = History::new();
+        let now = Instant::now();
+        let mask = |m: Vec<(f32, f32)>| Command::SetSliceMask {
+            screen: sid,
+            slice: lid,
+            mask: Some(m),
+        };
+        let state = |p: &Project| p.output.screens[0].slices[0].mask.clone().unwrap();
+        let base = vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)];
+        h.exec(&mut p, mask(base.clone()), now).unwrap();
+        // Two frames dragging point 1, then two dragging point 2.
+        let mut m = base.clone();
+        m[1] = (0.9, 0.0);
+        h.exec(&mut p, mask(m.clone()), now).unwrap();
+        m[1] = (0.8, 0.0);
+        h.exec(&mut p, mask(m.clone()), now).unwrap();
+        let after1 = m.clone();
+        m[2] = (0.0, 0.9);
+        h.exec(&mut p, mask(m.clone()), now).unwrap();
+        m[2] = (0.0, 0.8);
+        h.exec(&mut p, mask(m), now).unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(state(&p), after1);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(state(&p), base);
     }
 
     #[test]

@@ -921,6 +921,12 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
             "void main() { float a, amount; }",
             "void main() { float a = 1.0, amount = 2.0; }",
             "void main() { float a = mix(0.0, 1.0, 0.5), b, amount; }",
+            "void main() { float a = float(1.0), amount; }",
+            "void main() { float a = float(1.0), amount = 2.0; }",
+            "void main() { vec2 a = vec2(float(1.0), float(2.0)), amount; }",
+            "void main() { float a = float(float(1.0)), amount; }",
+            "void main() { float a = float (1.0), amount; }",
+            "void main() { float a = float(1.0) + float(2.0), amount; }",
         ] {
             assert_eq!(declared_input(b, &n).as_deref(), Some("amount"), "{b}");
         }

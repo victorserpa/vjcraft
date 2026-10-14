@@ -943,6 +943,14 @@ impl Project {
     pub fn normalize_groups(&mut self) -> usize {
         let c = &mut self.composition;
         let mut changed = 0;
+        // Groups already empty in the file keep their speed/opacity; only groups emptied
+        // by the repair below are dropped.
+        let empty_in_file: std::collections::HashSet<GroupId> = c
+            .groups
+            .iter()
+            .map(|g| g.id)
+            .filter(|id| !c.layers.iter().any(|l| l.group == Some(*id)))
+            .collect();
         for l in &mut c.layers {
             if l.group.is_some_and(|g| !c.groups.iter().any(|x| x.id == g)) {
                 l.group = None;
@@ -964,10 +972,11 @@ impl Project {
                 }
             }
         }
-        // A group left without members (all ungrouped above, or empty in the file) is dropped.
+        // A group left without members by the repair above is dropped.
         let used: std::collections::HashSet<GroupId> =
             c.layers.iter().filter_map(|l| l.group).collect();
-        c.groups.retain(|g| used.contains(&g.id));
+        c.groups
+            .retain(|g| used.contains(&g.id) || empty_in_file.contains(&g.id));
         changed
     }
 

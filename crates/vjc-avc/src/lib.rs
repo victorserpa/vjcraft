@@ -723,6 +723,10 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
             .map(|p| {
                 p.kids("point")
                     .filter_map(|pt| Some((pt.num("x")?, pt.num("y")?)))
+                    // Envelope space is the unit square (the owner's files stay inside it);
+                    // anything else would drive the param outside its range.
+                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    .map(|(x, y)| (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)))
                     .collect()
             })
             .unwrap_or_default();
@@ -814,6 +818,17 @@ mod tests {
             })
         );
         assert!(i.warning_counts.keys().all(|k| !k.contains("envelope")));
+    }
+
+    #[test]
+    fn envelope_points_are_clamped_to_unit_square() {
+        let (_, a) = anim_of(
+            r#"<BehaviourDouble><Modifier><ModifierEnvelope><points><point x="-0.5" y="3" curve="0"/><point x="2" y="-1" curve="0"/><point x="nan" y="0" curve="0"/></points></ModifierEnvelope></Modifier></BehaviourDouble>"#,
+        );
+        let Some(Animation::Envelope { points, .. }) = a else {
+            panic!("{a:?}")
+        };
+        assert_eq!(points, vec![(0.0, 1.0), (1.0, 0.0)]);
     }
 
     #[test]
@@ -944,6 +959,85 @@ mod tests {
             i.warnings
         );
         Some((c.layers.len(), c.columns.len(), clips, i.warnings))
+    }
+
+    /// Every Animation reachable in the serialized project.
+    fn animations(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(a) = m.get("animation").filter(|a| !a.is_null()) {
+                    out.push(a.clone());
+                }
+                m.values().for_each(|c| animations(c, out));
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|c| animations(c, out)),
+            _ => {}
+        }
+    }
+
+    fn check_animation(a: &serde_json::Value, what: &str) {
+        let pos = |v: &serde_json::Value| v.as_f64().is_some_and(|x| x.is_finite() && x > 0.0);
+        if let Some(e) = a.get("Envelope") {
+            assert!(pos(&e["beats"]), "{what}: beats {e}");
+            let pts = e["points"].as_array().unwrap();
+            assert!(!pts.is_empty(), "{what}");
+            let mut last = 0.0;
+            for p in pts {
+                let (x, y) = (p[0].as_f64().unwrap(), p[1].as_f64().unwrap());
+                assert!((0.0..=1.0).contains(&x), "{what}: x {x}");
+                assert!((0.0..=1.0).contains(&y), "{what}: y {y}");
+                assert!(x >= last, "{what}: unsorted");
+                last = x;
+            }
+        } else if let Some(t) = a.get("Timeline") {
+            assert!(pos(&t["duration_secs"]), "{what}: {t}");
+        } else if let Some(b) = a.get("Beats") {
+            assert!(pos(&b["beats"]), "{what}: {b}");
+        }
+    }
+
+    /// Imports every .avc in the owner's Resolume folders (read-only); skips when absent.
+    /// Ignored by default so a machine without them is not affected: run with `--ignored`.
+    #[test]
+    #[ignore = "reads the owner's Resolume compositions"]
+    fn imports_all_local_avc_with_sane_animation_and_transport() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dirs = [
+            format!("{home}/Documents/Resolume Arena/Compositions"),
+            "/Applications/Resolume Arena/default".to_string(),
+        ];
+        let mut n = 0;
+        for d in dirs {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                eprintln!("skip: {d} missing");
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_none_or(|x| x != "avc") {
+                    continue;
+                }
+                let i = import_file(&p).unwrap_or_else(|er| panic!("{}: {er}", p.display()));
+                n += 1;
+                let mut anims = vec![];
+                animations(&serde_json::to_value(&i.project).unwrap(), &mut anims);
+                eprintln!(
+                    "{}: {} animations; warnings {:#?}",
+                    p.display(),
+                    anims.len(),
+                    i.warnings
+                );
+                for a in &anims {
+                    check_animation(a, &p.display().to_string());
+                }
+                for c in i.project.composition.decks.iter().flat_map(|d| &d.clips) {
+                    if let Some(b) = c.clip.transport.beat_sync {
+                        assert!(b.is_finite() && b > 0.0, "{}: beat_sync {b}", p.display());
+                    }
+                }
+            }
+        }
+        eprintln!("imported {n} files");
     }
 
     #[test]
