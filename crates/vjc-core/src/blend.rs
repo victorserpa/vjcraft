@@ -25,7 +25,44 @@ pub const COMPOSITION_MODES: &[(BlendMode, &str)] = &[
     (BlendMode::LumaIsAlpha, "Luma Is Alpha"),
     (BlendMode::Rgb, "RGB"),
     (BlendMode::BlackWhite, "Black & White"),
+    // Appended after the original 19: shader ids are list positions, so order is stable.
+    (BlendMode::Divide, "Divide"),
+    (BlendMode::Hue, "Hue"),
+    (BlendMode::Saturation, "Saturation"),
+    (BlendMode::Color, "Color"),
+    (BlendMode::Luminosity, "Luminosity"),
+    (BlendMode::Displace, "Displace"),
+    (BlendMode::LoRez, "LoRez"),
+    (BlendMode::Add50, "50 Add"),
+    (BlendMode::Burn50, "50 Burn"),
+    (BlendMode::Difference50, "50 Difference"),
+    (BlendMode::Distance50, "50 Distance"),
+    (BlendMode::Dodge50, "50 Dodge"),
+    (BlendMode::Lighten50, "50 Lighten"),
+    (BlendMode::Mask50, "50 Mask"),
+    (BlendMode::Multiply50, "50 Multiply"),
+    (BlendMode::Overlay50, "50 Overlay"),
+    (BlendMode::Subtract50, "50 Subtract"),
 ];
+
+// Not offered as composition blends (they render as Normal):
+// - Cube: a two-picture transition (needs outgoing and incoming faces); it lives in
+//   `transition::Kind::Cube`.
+// - Depth, JitterBug, Meta Mix, Multi Task, Noise...: need depth maps, time or several
+//   inputs that a single source-over-base pass does not have.
+
+/// Reach in px of the Displace blend: red and green of the source push the base sample
+/// (0.5 = no shift).
+pub const DISPLACE_PX: f32 = 16.0;
+pub fn displace_offset(s: [f32; 4]) -> [i32; 2] {
+    [
+        ((s[0] - 0.5) * 2.0 * DISPLACE_PX).round() as i32,
+        ((s[1] - 0.5) * 2.0 * DISPLACE_PX).round() as i32,
+    ]
+}
+
+/// Block size in source texels of the LoRez blend (source sampled at each block's first texel).
+pub const LOREZ_BLOCK: usize = 8;
 
 /// Mode id used by the shader; modes without a composition formula map to 0 (Normal).
 /// Blend a clip is drawn with: its own override when set, else the layer's.
@@ -101,6 +138,93 @@ fn channel(id: u32, cb: f32, cs: f32) -> f32 {
     }
 }
 
+fn lum(c: [f32; 3]) -> f32 {
+    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+}
+
+fn clip_color(c: [f32; 3]) -> [f32; 3] {
+    let l = lum(c);
+    let n = c[0].min(c[1]).min(c[2]);
+    let x = c[0].max(c[1]).max(c[2]);
+    let mut o = c;
+    if n < 0.0 {
+        for v in &mut o {
+            *v = l + (*v - l) * l / (l - n);
+        }
+    }
+    if x > 1.0 {
+        for v in &mut o {
+            *v = l + (*v - l) * (1.0 - l) / (x - l);
+        }
+    }
+    o
+}
+
+fn set_lum(c: [f32; 3], l: f32) -> [f32; 3] {
+    let d = l - lum(c);
+    clip_color([c[0] + d, c[1] + d, c[2] + d])
+}
+
+fn sat(c: [f32; 3]) -> f32 {
+    c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+}
+
+fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
+    let n = c[0].min(c[1]).min(c[2]);
+    let x = c[0].max(c[1]).max(c[2]);
+    if x <= n {
+        return [0.0; 3];
+    }
+    c.map(|v| (v - n) * s / (x - n))
+}
+
+/// Full-colour result of a mode before the alpha mix (ids 0..=14, 19..=23 and 26..=35).
+fn color_mode(id: u32, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
+    let per = |id: u32| [0, 1, 2].map(|i| channel(id, b[i], s[i]));
+    match id {
+        19 => [0, 1, 2].map(|i| {
+            if s[i] <= 0.0 {
+                1.0
+            } else {
+                (b[i] / s[i]).min(1.0)
+            }
+        }),
+        20 => set_lum(set_sat(s, sat(b)), lum(b)),
+        21 => set_lum(set_sat(b, sat(s)), lum(b)),
+        22 => set_lum(s, lum(b)),
+        23 => set_lum(b, lum(s)),
+        26..=35 => {
+            // 50%: the mode's result mixed with the layer below at half strength.
+            let full = match id {
+                29 => {
+                    // Distance: grey level from the colour distance between the two layers.
+                    let d = ((b[0] - s[0]).powi(2) + (b[1] - s[1]).powi(2) + (b[2] - s[2]).powi(2))
+                        .sqrt()
+                        / 3f32.sqrt();
+                    [d; 3]
+                }
+                32 => {
+                    // Mask: the base kept where the source is bright.
+                    let m = luma(s);
+                    b.map(|v| v * m)
+                }
+                _ => per(match id {
+                    26 => 2,
+                    27 => 14,
+                    28 => 11,
+                    30 => 13,
+                    31 => 9,
+                    33 => 4,
+                    34 => 6,
+                    _ => 3,
+                }),
+            };
+            [0, 1, 2].map(|i| b[i] + (full[i] - b[i]) * 0.5)
+        }
+        _ => per(id),
+    }
+}
+
 /// Blends source `s` over base `b`. `opacity` scales the source alpha, so the result is
 /// `mix(base, blended, s.a * opacity)`. Output alpha is the union of both alphas.
 pub fn blend_pixel(mode: &BlendMode, b: [f32; 4], s: [f32; 4], opacity: f32) -> [f32; 4] {
@@ -133,11 +257,11 @@ pub fn blend_pixel(mode: &BlendMode, b: [f32; 4], s: [f32; 4], opacity: f32) -> 
         }
         // Black & White: grayscale source, normal blend.
         18 => rgb = [l; 3],
-        _ => {
-            for i in 0..3 {
-                rgb[i] = channel(id, b[i], s[i]);
-            }
-        }
+        // Displace and LoRez need neighbouring pixels (see `displace_offset` and
+        // `LOREZ_BLOCK`): per pixel the caller passes the displaced base / snapped source.
+        24 => rgb = [b[0], b[1], b[2]],
+        25 => rgb = [s[0], s[1], s[2]],
+        _ => rgb = color_mode(id, [b[0], b[1], b[2]], [s[0], s[1], s[2]]),
     }
     [
         b[0] + (rgb[0] - b[0]) * a,
@@ -258,6 +382,42 @@ mod tests {
             run(BlendMode::Cut, B, S, 1.0),
             run(BlendMode::Normal, B, S, 1.0)
         );
-        assert_eq!(COMPOSITION_MODES.len(), 19);
+        assert_eq!(COMPOSITION_MODES.len(), 36);
+    }
+
+    /// Old projects keep their blends: the first 19 keep their shader ids and the serialized
+    /// names of every old variant are unchanged.
+    #[test]
+    fn original_blends_keep_ids_and_names() {
+        let old = [
+            "Normal",
+            "Alpha",
+            "Add",
+            "Subtract",
+            "Multiply",
+            "Screen",
+            "Overlay",
+            "SoftLight",
+            "HardLight",
+            "Lighten",
+            "Darken",
+            "Difference",
+            "Exclusion",
+            "Dodge",
+            "Burn",
+            "LumaKey",
+            "LumaIsAlpha",
+            "Rgb",
+            "BlackWhite",
+        ];
+        for (i, name) in old.iter().enumerate() {
+            let m: BlendMode = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(COMPOSITION_MODES[i].0, m, "{name}");
+            assert_eq!(shader_id(&m), i as u32);
+            assert_eq!(serde_json::to_string(&m).unwrap(), format!("\"{name}\""));
+        }
+        // Control: a name that does not exist maps to Unknown, not to a shifted mode.
+        let u: BlendMode = serde_json::from_str("\"Nope\"").unwrap();
+        assert_eq!(u, BlendMode::Unknown);
     }
 }

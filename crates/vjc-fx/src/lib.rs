@@ -167,6 +167,11 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("wave", include_str!("../../../assets/effects/wave.fs")),
     ("trails", include_str!("../../../assets/effects/trails.fs")),
     ("echo", include_str!("../../../assets/effects/echo.fs")),
+    ("crop", include_str!("../../../assets/effects/crop.fs")),
+    (
+        "keystone",
+        include_str!("../../../assets/effects/keystone.fs"),
+    ),
     (
         "zoom_blur",
         include_str!("../../../assets/effects/zoom_blur.fs"),

@@ -751,8 +751,9 @@ mod tests {
         assert_eq!(nan_pixels(&px), 1, "negative control: one hole is counted");
     }
 
-    /// Effects that clear alpha on purpose (keyers; remove_bg without a mask).
-    const KEYERS: [&str; 3] = ["chroma_key", "luma_key", "remove_bg"];
+    /// Effects that clear alpha on purpose (keyers; remove_bg without a mask; crop at its
+    /// extremes cuts everything).
+    const KEYERS: [&str; 4] = ["chroma_key", "luma_key", "remove_bg", "crop"];
 
     /// Every bundled shader at default, minimum and maximum parameters and at several
     /// times: no transparent-black holes (NaN) outside the keyers; at defaults, not a fully

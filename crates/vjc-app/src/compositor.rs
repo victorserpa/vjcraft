@@ -122,6 +122,61 @@ fn channel(id: u32, cb: f32, cs: f32) -> f32 {
     }
 }
 
+fn lum3(c: vec3<f32>) -> f32 { return dot(c, vec3(0.3, 0.59, 0.11)); }
+
+fn clip_color(c: vec3<f32>) -> vec3<f32> {
+    let l = lum3(c);
+    let n = min(c.r, min(c.g, c.b));
+    let x = max(c.r, max(c.g, c.b));
+    var o = c;
+    if (n < 0.0) { o = vec3(l) + (o - vec3(l)) * l / (l - n); }
+    if (x > 1.0) { o = vec3(l) + (o - vec3(l)) * (1.0 - l) / (x - l); }
+    return o;
+}
+
+fn set_lum(c: vec3<f32>, l: f32) -> vec3<f32> { return clip_color(c + vec3(l - lum3(c))); }
+
+fn sat3(c: vec3<f32>) -> f32 {
+    return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+}
+
+fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
+    let n = min(c.r, min(c.g, c.b));
+    let x = max(c.r, max(c.g, c.b));
+    if (x <= n) { return vec3(0.0); }
+    return (c - vec3(n)) * s / (x - n);
+}
+
+fn per_channel(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
+    return vec3(channel(id, b.r, s.r), channel(id, b.g, s.g), channel(id, b.b, s.b));
+}
+
+// Full-colour modes appended after the original 19 (mirrors blend.rs `color_mode`).
+fn color_mode(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
+    if (id == 19u) {
+        return select(min(b / s, vec3(1.0)), vec3(1.0), s <= vec3(0.0));
+    }
+    if (id == 20u) { return set_lum(set_sat(s, sat3(b)), lum3(b)); }
+    if (id == 21u) { return set_lum(set_sat(b, sat3(s)), lum3(b)); }
+    if (id == 22u) { return set_lum(s, lum3(b)); }
+    if (id == 23u) { return set_lum(b, lum3(s)); }
+    // 26..35: the mode mixed 50% with the layer below.
+    var full: vec3<f32>;
+    switch id {
+        case 26u: { full = per_channel(2u, b, s); }
+        case 27u: { full = per_channel(14u, b, s); }
+        case 28u: { full = per_channel(11u, b, s); }
+        case 29u: { full = vec3(length(b - s) / 1.7320508); }
+        case 30u: { full = per_channel(13u, b, s); }
+        case 31u: { full = per_channel(9u, b, s); }
+        case 32u: { full = b * luma(s); }
+        case 33u: { full = per_channel(4u, b, s); }
+        case 34u: { full = per_channel(6u, b, s); }
+        default: { full = per_channel(3u, b, s); }
+    }
+    return b + (full - b) * 0.5;
+}
+
 // Output is the final composited pixel (no hardware blending): mix(base, blended, alpha).
 @fragment
 fn fs(in: VO) -> @location(0) vec4<f32> {
@@ -221,6 +276,11 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) {
         discard;
     }
+    if (u.mode == 25u) {
+        // LoRez: the source is read at the first texel of each 8x8 block.
+        let td = vec2<f32>(textureDimensions(tex));
+        q = (floor(q * td / 8.0) * 8.0 + vec2(0.5)) / td;
+    }
     var s = textureSample(tex, smp, q);
     // pad = channel mask: bit 0..3 set = R, G, B, A off (off alpha means opaque).
     if ((u.pad & 1u) != 0u) { s.r = 0.0; }
@@ -250,6 +310,17 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         rgb = luma(b.rgb) * s.rgb;
     } else if (id == 18u) {
         rgb = vec3(l);
+    } else if (id == 24u) {
+        // Displace: the source's red/green push where the base is read from.
+        let bs = vec2<i32>(textureDimensions(base_tex)) - vec2<i32>(1);
+        let off = vec2<i32>(round((s.rg - vec2(0.5)) * 32.0));
+        let bp = clamp(vec2<i32>(in.pos.xy) + off, vec2<i32>(0), bs);
+        rgb = textureLoad(base_tex, bp, 0).rgb;
+    } else if (id == 25u) {
+        rgb = s.rgb;
+    } else if (id >= 19u) {
+        rgb = color_mode(id, b.rgb, s.rgb);
+        rgb = mix(s.rgb, rgb, b.a);
     } else {
         rgb = vec3(channel(id, b.r, s.r), channel(id, b.g, s.g), channel(id, b.b, s.b));
         // Over a see-through base (a group's own buffer) the blend only applies where the
@@ -3251,6 +3322,258 @@ mod tests {
         assert_eq!(comp.fx.persist.len(), 2);
         comp.render_routed(&device, &queue, (&[], &[]), (&[], 1.0), &[]);
         assert_eq!(comp.fx.persist.len(), 0, "histories freed with the layer");
+    }
+
+    fn layer<'a>(
+        id: u128,
+        opacity: f32,
+        blend: BlendMode,
+        effects: Vec<EffectDraw>,
+        data: &'a [u8],
+        serial: u64,
+    ) -> LayerDraw<'a> {
+        LayerDraw {
+            id: uuid::Uuid::from_u128(id),
+            opacity,
+            blend,
+            fit: FitMode::Stretch,
+            effects,
+            frame: Some((16, 16, data, serial)),
+            generator: None,
+            transition: None,
+            transform: Affine::IDENTITY,
+            channels: Default::default(),
+            mask: Default::default(),
+        }
+    }
+
+    /// Whole 16x16 composition as RGBA bytes.
+    fn read16(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor) -> Vec<u8> {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(16),
+                },
+            },
+            wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let raw = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        (0..16)
+            .flat_map(|y| raw[y * 256..y * 256 + 64].to_vec())
+            .collect()
+    }
+
+    fn px_at(img: &[u8], x: usize, y: usize) -> [u8; 4] {
+        let i = (y * 16 + x) * 4;
+        [img[i], img[i + 1], img[i + 2], img[i + 3]]
+    }
+
+    /// One 16x16 frame through a bundled effect with the given param overrides.
+    #[allow(clippy::too_many_arguments)]
+    fn run_fx(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        comp: &mut Compositor,
+        kind: &str,
+        set: &[(&str, vjc_model::Value)],
+        time: f32,
+        persistent: Option<uuid::Uuid>,
+        data: &[u8],
+        serial: u64,
+    ) -> Vec<u8> {
+        let (isf, _) = vjc_fx::compile(vjc_fx::builtin_source(kind).unwrap()).unwrap();
+        let mut params = isf.default_params();
+        for (n, v) in set {
+            params.iter_mut().find(|p| p.name == *n).unwrap().value = v.clone();
+        }
+        let fx = EffectDraw {
+            kind: kind.into(),
+            uniforms: isf.pack(&params, time, (16, 16)),
+            dry_wet: 1.0,
+            ml: None,
+            persistent,
+        };
+        let l = [layer(1, 1.0, BlendMode::Normal, vec![fx], data, serial)];
+        comp.render(device, queue, &l, &[], 1.0);
+        read16(device, queue, comp)
+    }
+
+    fn fx_comp(device: &wgpu::Device, kind: &str) -> Compositor {
+        let (_, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(kind).unwrap()).unwrap();
+        let mut comp = Compositor::new(device, 16, 16);
+        comp.add_effect(device, kind, &wgsl).unwrap();
+        comp
+    }
+
+    /// Every blend added after the original 19 (except Displace/LoRez, tested apart)
+    /// against the CPU formula, for two colour pairs. Negative control: the CPU result of
+    /// Normal must differ from the GPU one, so a shader that fell back to Normal fails.
+    #[test]
+    fn gpu_new_blends_match_reference() {
+        let Some((device, queue)) = gpu() else { return };
+        let pairs = [
+            ([204u8, 128, 51, 255], [102u8, 128, 230, 255]),
+            ([30u8, 200, 120, 255], [220u8, 60, 90, 255]),
+        ];
+        let f = |c: [u8; 4]| c.map(|v| v as f32 / 255.0);
+        let mut comp = Compositor::new(&device, 16, 16);
+        for (mode, name) in &vjc_core::blend::COMPOSITION_MODES[19..] {
+            if matches!(mode, BlendMode::Displace | BlendMode::LoRez) {
+                continue;
+            }
+            for (n, (base, src)) in pairs.iter().enumerate() {
+                let (bd, sd) = (base.repeat(256), src.repeat(256));
+                let ls = [
+                    layer(1, 1.0, BlendMode::Normal, vec![], &bd, 1 + n as u64),
+                    layer(2, 0.7, mode.clone(), vec![], &sd, 1 + n as u64),
+                ];
+                comp.render(&device, &queue, &ls, &[], 1.0);
+                let got = px_at(&read16(&device, &queue, &comp), 5, 5);
+                let want = vjc_core::blend::blend_pixel(mode, f(*base), f(*src), 0.7);
+                let normal =
+                    vjc_core::blend::blend_pixel(&BlendMode::Normal, f(*base), f(*src), 0.7);
+                let mut differs = false;
+                for i in 0..3 {
+                    let g = got[i] as f32 / 255.0;
+                    assert!((g - want[i]).abs() < 0.02, "{name}: {got:?} vs {want:?}");
+                    differs |= (g - normal[i]).abs() > 0.02;
+                }
+                assert!(differs, "{name}: indistinguishable from Normal, weak case");
+            }
+        }
+    }
+
+    /// Displace reads the base shifted by the source; LoRez reads the source per 8x8 block.
+    /// Controls: a neutral source (no shift) and plain Normal give the unshifted pixel.
+    #[test]
+    fn gpu_displace_and_lorez() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = Compositor::new(&device, 16, 16);
+        // Base: left half red, right half blue.
+        let base: Vec<u8> = (0..256)
+            .flat_map(|i| {
+                if i % 16 < 8 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                }
+            })
+            .collect();
+        let shifted = [255u8, 128, 128, 255].repeat(256);
+        let neutral = [128u8, 128, 128, 255].repeat(256);
+        let draw = |comp: &mut Compositor, mode: BlendMode, src: &[u8], s: u64| {
+            let ls = [
+                layer(1, 1.0, BlendMode::Normal, vec![], &base, 1),
+                layer(2, 1.0, mode, vec![], src, s),
+            ];
+            comp.render(&device, &queue, &ls, &[], 1.0);
+            read16(&device, &queue, comp)
+        };
+        let off = vjc_core::blend::displace_offset([1.0, 0.5, 0.5, 1.0]);
+        assert!(off[0] > 8);
+        let img = draw(&mut comp, BlendMode::Displace, &shifted, 1);
+        assert_eq!(
+            px_at(&img, 3, 8)[2],
+            255,
+            "red side reads blue base: {img:?}"
+        );
+        let img = draw(&mut comp, BlendMode::Displace, &neutral, 2);
+        assert_eq!(px_at(&img, 3, 8)[0], 255);
+        assert_eq!(px_at(&img, 3, 8)[2], 0);
+        // LoRez: source red = 16 * x, so block 1 (x 8..16) repeats the value of x = 8.
+        let ramp: Vec<u8> = (0..256)
+            .flat_map(|i| [(i % 16 * 16) as u8, 0, 0, 255])
+            .collect();
+        let img = draw(&mut comp, BlendMode::LoRez, &ramp, 3);
+        assert_eq!(px_at(&img, 11, 4)[0], 128, "x=11 reads x=8");
+        assert_eq!(px_at(&img, 3, 4)[0], 0, "x=3 reads x=0");
+        let img = draw(&mut comp, BlendMode::Normal, &ramp, 4);
+        assert_eq!(px_at(&img, 11, 4)[0], 176, "control: Normal keeps x=11");
+    }
+
+    /// Crop clears everything outside the box. Control: zero crop leaves the picture.
+    #[test]
+    fn gpu_crop_zeroes_outside_area() {
+        use vjc_model::Value::Number;
+        let Some((device, queue)) = gpu() else { return };
+        let white = [255u8; 4].repeat(256);
+        let mut comp = fx_comp(&device, "crop");
+        let set = [("left", Number(0.25)), ("top", Number(0.5))];
+        let img = run_fx(
+            &device, &queue, &mut comp, "crop", &set, 0.0, None, &white, 1,
+        );
+        assert_eq!(px_at(&img, 1, 12)[..3], [0, 0, 0], "left strip");
+        assert_eq!(px_at(&img, 8, 2)[..3], [0, 0, 0], "top half");
+        assert_eq!(px_at(&img, 8, 12), [255; 4], "inside stays");
+        let img = run_fx(
+            &device,
+            &queue,
+            &mut comp,
+            "crop",
+            &[],
+            0.0,
+            None,
+            &white,
+            2,
+        );
+        assert_eq!(px_at(&img, 1, 2), [255; 4], "control: no crop");
+    }
+
+    /// Keystone with the corners on the pattern's own corners is identity. Control: moving
+    /// one corner changes the picture.
+    #[test]
+    fn gpu_keystone_default_is_identity() {
+        use vjc_model::Value::Color;
+        let Some((device, queue)) = gpu() else { return };
+        let ramp: Vec<u8> = (0..256)
+            .flat_map(|i| [(i % 16 * 16) as u8, (i / 16 * 16) as u8, 90, 255])
+            .collect();
+        let mut comp = fx_comp(&device, "keystone");
+        let img = run_fx(
+            &device,
+            &queue,
+            &mut comp,
+            "keystone",
+            &[],
+            0.0,
+            None,
+            &ramp,
+            1,
+        );
+        for (g, w) in img.iter().zip(&ramp) {
+            assert!(g.abs_diff(*w) <= 2, "identity broke: {g} vs {w}");
+        }
+        let set = [("top_right", Color([0.5, 1.0, 0.0, 1.0]))];
+        let img = run_fx(
+            &device, &queue, &mut comp, "keystone", &set, 0.0, None, &ramp, 2,
+        );
+        assert_ne!(px_at(&img, 14, 8), px_at(&ramp, 14, 8));
+        assert_eq!(
+            px_at(&img, 14, 1)[..3],
+            [0, 0, 0],
+            "right of the moved edge is empty"
+        );
     }
 
     fn read_px(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor) -> [u8; 4] {
