@@ -3789,3 +3789,346 @@ fn choosing_fullscreen_resets_rehearsal_windowed_output() {
     st.choose_fullscreen(7);
     assert!(!st.output_windowed);
 }
+
+// ---- Whole gig, end to end, through the real UI -------------------------------------------
+
+/// What reaches the output: per layer the (deck, column) that plays, sorted by layer order.
+fn on_air(h: &Harness<'_, State>) -> Vec<(LayerId, Option<(DeckId, u32)>)> {
+    let st = h.state();
+    st.project
+        .composition
+        .layers
+        .iter()
+        .map(|l| (l.id, active_of(&st.players, &st.gens, l.id)))
+        .collect()
+}
+
+fn playing_count(h: &Harness<'_, State>) -> usize {
+    on_air(h).iter().filter(|(_, a)| a.is_some()).count()
+}
+
+fn clip_name_at(h: &Harness<'_, State>, layer_idx: usize, col: u32) -> String {
+    let st = h.state();
+    let lid = st.project.composition.layers[layer_idx].id;
+    vjc_core::clip_in(&st.project, st.project.composition.current_deck, lid, col)
+        .unwrap_or_else(|| panic!("clip at {layer_idx},{col}"))
+        .name
+        .clone()
+}
+
+/// Waits (pumping the UI) until the player of `lid` has decoded a frame.
+fn wait_frame(h: &mut Harness<'_, State>, lid: LayerId) -> bool {
+    for _ in 0..100 {
+        h.step();
+        if h.state()
+            .players
+            .get(&lid)
+            .is_some_and(|p| p.2.latest_frame().is_some())
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+fn nth_label<'a>(h: &'a Harness<'_, State>, label: &'a str, n: usize) -> egui_kittest::Node<'a> {
+    h.query_all_by_label(label)
+        .nth(n)
+        .unwrap_or_else(|| panic!("{label} #{n}"))
+}
+
+/// Clicks the topmost node with this label (the menu bar one when a panel repeats it).
+fn click_top(h: &mut Harness<'_, State>, label: &str) {
+    h.query_all_by_label(label)
+        .min_by(|a, b| a.rect().min.y.total_cmp(&b.rect().min.y))
+        .unwrap_or_else(|| panic!("{label}"))
+        .click();
+    settle(h);
+}
+
+#[test]
+fn whole_gig_through_the_ui() {
+    let Some(base) = test_video("gig-base.mp4") else {
+        eprintln!("ffmpeg missing: skipped");
+        return;
+    };
+    // The data dir is a scratch one: nothing here may reach the user's own.
+    let dir = base.parent().unwrap().join("gig");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = app_with(State::headless(prefs()), egui::vec2(1600.0, 1000.0));
+    assert_eq!(layers_cols(&h), (3, 9));
+
+    // 1. Load 9 distinct clips into 3 layers x 3 columns.
+    for l in 0..3usize {
+        for c in 0..3u32 {
+            let p = dir.join(format!("gig-l{l}c{c}.mp4"));
+            std::fs::copy(&base, &p).unwrap();
+            drop_video_on_cell(&mut h, l, c, &p);
+        }
+    }
+    let deck = h.state().project.composition.current_deck;
+    let lids = layer_ids(&h);
+    for (l, lid) in lids.iter().enumerate() {
+        for c in 0..3u32 {
+            assert!(
+                clip_id_at(&h, *lid, c).is_some(),
+                "clip at layer {l} column {c}: {}",
+                h.state().status
+            );
+        }
+    }
+    // A drop plays the clip (by design): each layer ends on the last file dropped on it.
+    for (_, a) in on_air(&h) {
+        assert_eq!(a, Some((deck, 2)));
+    }
+
+    // 2. Name strip: only the Preview changes, the output stays as it was.
+    let before = on_air(&h);
+    let n = clip_name_at(&h, 0, 1);
+    click(&mut h, &format!("Select {n}"));
+    assert_eq!(h.state().selected, Some((lids[0], 1)));
+    assert_eq!(
+        h.state().preview_target,
+        PreviewTarget::Clip(deck, lids[0], 1)
+    );
+    assert_eq!(on_air(&h), before, "strip click leaves the output alone");
+
+    // 3. Thumbnail: plays on its layer, with a decoded frame.
+    let t = thumb_of(&h, 0, 1);
+    click_at(&mut h, t);
+    assert_eq!(on_air(&h)[0].1, Some((deck, 1)));
+    assert_eq!(on_air(&h)[1].1, Some((deck, 2)), "other layers stay");
+    assert_eq!(playing_count(&h), 3);
+    assert_eq!(h.state().preview_target, PreviewTarget::Layer(lids[0]));
+    assert!(wait_frame(&mut h, lids[0]), "layer 0 decoded a frame");
+
+    // 4. Column trigger: every layer plays column 2.
+    click(&mut h, "Trigger column 3");
+    for (_, a) in on_air(&h) {
+        assert_eq!(a, Some((deck, 2)));
+    }
+    for lid in &lids {
+        assert!(wait_frame(&mut h, *lid), "frame on every layer");
+    }
+
+    // 5. Crossfader: layer 0 on A, layer 1 on B, then slide.
+    click(&mut h, "Composition");
+    nth_label(&h, "Crossfader bus A", 0).click();
+    settle(&mut h);
+    nth_label(&h, "Crossfader bus B", 1).click();
+    settle(&mut h);
+    let layers = h.state().project.composition.layers.clone();
+    assert_eq!(layers[0].crossfader_bus, Some(vjc_model::Bus::A));
+    assert_eq!(layers[1].crossfader_bus, Some(vjc_model::Bus::B));
+    assert_eq!(layers[2].crossfader_bus, None);
+    let pos = |h: &Harness<'_, State>| {
+        h.state()
+            .project
+            .composition
+            .crossfader
+            .as_ref()
+            .map(|c| vjc_core::anim::effective_number(&c.position, &Default::default()))
+    };
+    let gains = |h: &Harness<'_, State>| {
+        let c = &h.state().project.composition;
+        let p = pos(h).unwrap_or(vjc_core::crossfader::CENTER);
+        (
+            vjc_core::crossfader::layer_gain(
+                c.crossfader.as_ref(),
+                c.layers[0].crossfader_bus.as_ref(),
+                p,
+            ),
+            vjc_core::crossfader::layer_gain(
+                c.crossfader.as_ref(),
+                c.layers[1].crossfader_bus.as_ref(),
+                p,
+            ),
+        )
+    };
+    let centre = gains(&h);
+    // The slider sits on the row of the "Crossfader A-B" text.
+    let row_y = h
+        .query_all_by_value("Crossfader A-B")
+        .next()
+        .expect("crossfader row")
+        .rect()
+        .center()
+        .y;
+    let r = slider_rects(&h)
+        .into_iter()
+        .min_by(|a, b| {
+            (a.center().y - row_y)
+                .abs()
+                .total_cmp(&(b.center().y - row_y).abs())
+        })
+        .unwrap();
+    assert!((r.center().y - row_y).abs() < 10.0, "slider on the row");
+    drag_to_slider_pct(&mut h, r, 0.02);
+    let left = gains(&h);
+    assert!(
+        left.0 > centre.0 - 1e-9 && left.1 < 0.1,
+        "A open, B shut: {left:?}"
+    );
+    drag_to_slider_pct(&mut h, r, 0.98);
+    let right = gains(&h);
+    assert!(right.1 > 0.9 && right.0 < 0.1, "B open, A shut: {right:?}");
+    assert_eq!(
+        playing_count(&h),
+        3,
+        "crossfading keeps every layer playing"
+    );
+    // A second click frees the bus.
+    nth_label(&h, "Crossfader bus B", 1).click();
+    settle(&mut h);
+    assert_eq!(h.state().project.composition.layers[1].crossfader_bus, None);
+
+    // 6. Effect on layer 1 through the header menu, then a param.
+    // The panels also carry "Add effect" buttons; the layer headers' come last.
+    let hdr = all(&h, "Add effect") - 3;
+    nth_label(&h, "Add effect", hdr + 1).click();
+    settle(&mut h);
+    let fx_id = vjc_fx::BUILTIN[0].0;
+    click(&mut h, &fx_label(fx_id));
+    let chain = |h: &Harness<'_, State>| {
+        h.state().project.composition.layers[1]
+            .track
+            .effects
+            .clone()
+    };
+    assert_eq!(chain(&h).len(), 1, "{}", h.state().status);
+    assert_eq!(chain(&h)[0].kind, fx_id);
+    let name_l1 = layer_name(&h, lids[1]);
+    click(&mut h, &name_l1);
+    click(&mut h, "Layer");
+    let before_params = chain(&h)[0].params.clone();
+    let mut changed = false;
+    for i in (0..slider_rects(&h).len()).rev() {
+        h.query_all_by_role(egui::accesskit::Role::Slider)
+            .nth(i)
+            .unwrap()
+            .scroll_to_me();
+        settle(&mut h);
+        let r = slider_rects(&h)[i];
+        drag_to_slider_pct(&mut h, r, 0.9);
+        if chain(&h)[0].params != before_params {
+            changed = true;
+            break;
+        }
+    }
+    assert!(changed, "effect param changed");
+
+    // 7. Bypass and solo on layer 2.
+    nth_label(&h, "Bypass layer", 2).click();
+    settle(&mut h);
+    assert!(h.state().project.composition.layers[2].bypass);
+    nth_label(&h, "Solo layer", 2).click();
+    settle(&mut h);
+    assert!(h.state().project.composition.layers[2].solo);
+    nth_label(&h, "Bypass layer", 2).click();
+    nth_label(&h, "Solo layer", 2).click();
+    settle(&mut h);
+    let l2 = &h.state().project.composition.layers[2];
+    assert!(!l2.bypass && !l2.solo, "toggles are reversible");
+
+    // 8. Add a layer, then remove a layer that has clips (modal), then undo.
+    click(&mut h, "Add layer");
+    assert_eq!(layers_cols(&h).0, 4);
+    h.state_mut().selected = Some((lids[0], 2));
+    settle(&mut h);
+    let id02 = clip_id_at(&h, lids[0], 2).unwrap();
+    open_layer_menu(&mut h);
+    click_menu(&mut h, "Remove layer");
+    assert!(exists(&h, "Remove layer?"), "playing layer asks first");
+    click(&mut h, "Yes");
+    assert_eq!(layers_cols(&h).0, 3);
+    assert!(!layer_ids(&h).contains(&lids[0]));
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(layers_cols(&h).0, 4);
+    assert_eq!(
+        clip_id_at(&h, lids[0], 2),
+        Some(id02),
+        "clips back after undo"
+    );
+
+    // 9. Add a deck and switch decks while playing: the output does not move.
+    let air = on_air(&h);
+    click(&mut h, "Add deck");
+    let deck_b = h.state().project.composition.current_deck;
+    assert_ne!(deck_b, deck);
+    assert_eq!(on_air(&h), air);
+    click(&mut h, "Previous deck");
+    assert_eq!(h.state().project.composition.current_deck, deck);
+    assert_eq!(on_air(&h), air, "output unchanged across deck switches");
+
+    // 10. Drag a clip to another cell (a free one).
+    let moved = clip_id_at(&h, lids[2], 0).unwrap();
+    // "Add layer" puts the new layer on top: find the row of the layer by id.
+    let row = layer_ids(&h).iter().position(|l| *l == lids[2]).unwrap();
+    let (a, b) = (thumb_of(&h, row, 0), thumb_of(&h, row, 4));
+    drag(&mut h, a, b);
+    assert_eq!(clip_id_at(&h, lids[2], 0), None);
+    assert_eq!(clip_id_at(&h, lids[2], 4), Some(moved));
+
+    // 11. BPM by tapping.
+    click(&mut h, "Tap");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    click(&mut h, "Tap");
+    let bpm = h.state().project.composition.tempo.bpm;
+    assert!((100.0..=200.0).contains(&bpm), "tapped bpm {bpm}");
+
+    // 12. Output screen with two slices and a test card.
+    click_top(&mut h, "Output");
+    click(&mut h, "Setup...");
+    click(&mut h, "Add");
+    click(&mut h, "Add slice");
+    click(&mut h, "Add slice");
+    let scr = h.state().project.output.screens[0].clone();
+    assert_eq!(scr.slices.len(), 2);
+    // The setup window opens over the menu bar: drag it down by its title, like a user.
+    let win = h.get_by_label("Output setup").rect();
+    let title = egui::pos2(win.center().x, win.min.y + 10.0);
+    drag(&mut h, title, egui::pos2(title.x + 300.0, title.y + 400.0));
+    click_top(&mut h, "Output");
+    click_menu(&mut h, "Show test card");
+    h.query_all_by_role(egui::accesskit::Role::CheckBox)
+        .find(|n| n.accesskit_node().label().as_deref() == Some(scr.name.as_str()))
+        .expect("test card checkbox")
+        .click();
+    settle(&mut h);
+    assert!(h.state().test_cards.contains(&scr.id));
+
+    // 13. Save, reopen in a fresh app, the structure survived.
+    let path = dir.join("gig.vjc");
+    assert!(h.state_mut().save_to(path.clone()), "{}", h.state().status);
+    let saved = h.state().project.clone();
+    let mut h2 = app_with(State::headless(prefs()), egui::vec2(1600.0, 1000.0));
+    assert!(h2.state_mut().load(path), "{}", h2.state().status);
+    settle(&mut h2);
+    let p = &h2.state().project;
+    assert_eq!(p, &saved);
+    assert_eq!(p.composition.layers.len(), 4);
+    assert_eq!(p.composition.decks.len(), 2);
+    assert_eq!(p.output.screens[0].slices.len(), 2);
+    let by_id = |id: LayerId| p.composition.layers.iter().find(|l| l.id == id).unwrap();
+    assert_eq!(by_id(lids[1]).track.effects.len(), 1);
+    assert_eq!(by_id(lids[0]).crossfader_bus, Some(vjc_model::Bus::A));
+    assert_eq!(by_id(lids[2]).crossfader_bus, None);
+    assert_eq!(playing_count(&h2), 0, "reopening does not play");
+    assert_eq!(on_air(&h2).len(), 4);
+    // The reopened show plays: its media was found again.
+    click(&mut h2, "Trigger column 2");
+    let lid_b = h2.state().project.composition.layers[1].id;
+    assert!(
+        h2.state().players.contains_key(&lid_b),
+        "reopened clip plays"
+    );
+    assert!(wait_frame(&mut h2, lid_b), "reopened clip decodes");
+
+    // 14. Clear all stops everything.
+    assert!(playing_count(&h) > 0);
+    click(&mut h, "Stop all layers");
+    assert_eq!(playing_count(&h), 0);
+    assert!(h.state().players.is_empty() && h.state().gens.is_empty());
+}

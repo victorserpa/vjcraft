@@ -178,6 +178,8 @@ impl State {
         egui::Window::new("Output setup")
             .open(&mut open)
             .default_width(820.0)
+            // Open below the menu bar: the default position covered "Output" and ate its clicks.
+            .default_pos(egui::pos2(60.0, 80.0))
             .show(ctx, |ui| {
                 self.presets_row(ui);
                 ui.horizontal_top(|ui| {
