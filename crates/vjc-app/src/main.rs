@@ -915,6 +915,33 @@ fn transform_ui_range(field: TransformField, (w, h): (f64, f64)) -> ((f64, f64),
     }
 }
 
+/// Transition types offered in the layer and clip panels: (stored name, label).
+fn transition_kinds() -> Vec<(String, String)> {
+    [
+        "Cut",
+        "Dissolve",
+        "ToBlack",
+        "PushLeft",
+        "PushRight",
+        "PushUp",
+        "PushDown",
+        "ZoomIn",
+        "ZoomOut",
+        "WipeEllipse",
+        "WipeLeft",
+        "WipeRight",
+        "WipeUp",
+        "WipeDown",
+        "Cube",
+        "Pixelate",
+        "LumaWipe",
+        "Random",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), k.to_string()))
+    .collect()
+}
+
 fn labeled<T: Copy>(v: &[(T, &str)]) -> Vec<(T, String)> {
     v.iter().map(|(a, n)| (*a, n.to_string())).collect()
 }
@@ -2539,7 +2566,7 @@ impl State {
                         self.flow.loops.remove(&layer);
                         self.flow.auto_time.remove(&layer);
                         self.flow.beat_loops.remove(&layer);
-                        self.cross_from_old(layer);
+                        self.cross_from_old(layer, deck, column);
                         let mut player = self
                             .preload
                             .take(deck, layer, column, &path)
@@ -2584,7 +2611,7 @@ impl State {
                     self.flow.loops.remove(&layer);
                     self.flow.auto_time.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
-                    self.cross_from_old(layer);
+                    self.cross_from_old(layer, deck, column);
                     self.flow.regions.remove(&layer);
                     self.flow.pos.remove(&layer);
                     self.players
@@ -2602,7 +2629,7 @@ impl State {
                     self.flow.loops.remove(&layer);
                     self.flow.auto_time.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
-                    self.cross_from_old(layer);
+                    self.cross_from_old(layer, deck, column);
                     self.flow.regions.remove(&layer);
                     self.flow.pos.remove(&layer);
                     match browser::net_backend(&protocol) {
@@ -2914,7 +2941,7 @@ impl State {
     /// Moves the playing clip of `layer` (if any) into `flow.outgoing` when the layer's
     /// transition asks for a crossing; otherwise drops it. Joins the old decode thread
     /// only in the second case.
-    fn cross_from_old(&mut self, layer: LayerId) {
+    fn cross_from_old(&mut self, layer: LayerId, deck: DeckId, column: u32) {
         self.flow.outgoing.remove(&layer);
         let old_clip = self
             .active(layer)
@@ -2931,7 +2958,17 @@ impl State {
             .iter()
             .find(|l| l.id == layer)
             .map_or(vjc_core::transition::State::Idle, |l| {
-                vjc_core::transition::State::start(&l.transition, self.clock.bpm())
+                // The incoming clip's own transition, when set, wins over the layer's.
+                let own = vjc_core::clip_in(&self.project, deck, layer, column)
+                    .and_then(|k| k.transition.as_ref());
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                vjc_core::transition::State::start_seeded(
+                    vjc_core::transition::effective(&l.transition, own),
+                    self.clock.bpm(),
+                    seed,
+                )
             });
         if state != vjc_core::transition::State::Idle {
             self.flow.outgoing.insert(
@@ -6947,18 +6984,7 @@ impl State {
             });
         }
         if params::section(ui, "sec-transition", "Transition") {
-            let kinds: Vec<(String, String)> = [
-                "Cut",
-                "Dissolve",
-                "ToBlack",
-                "PushLeft",
-                "PushRight",
-                "ZoomIn",
-                "WipeEllipse",
-            ]
-            .iter()
-            .map(|k| (k.to_string(), k.to_string()))
-            .collect();
+            let kinds = transition_kinds();
             let tr = l.transition.clone();
             if let Some(kind) = params::combo(ui, ("ltk", lid), "Transition", &tr.kind, &kinds) {
                 let transition = Transition { kind, ..tr.clone() };
@@ -7515,6 +7541,73 @@ impl State {
                     column,
                     blend,
                 });
+            }
+            if params::section(ui, "sec-clip-transition", "Transition") {
+                let layer_kinds = transition_kinds();
+                // None = "From layer": the layer's transition applies.
+                let mut kinds: Vec<(Option<String>, String)> =
+                    vec![(None, "From layer".to_string())];
+                kinds.extend(layer_kinds.into_iter().map(|(a, b)| (Some(a), b)));
+                let cur = k.transition.as_ref().map(|t| t.kind.clone());
+                if let Some(choice) = params::combo(ui, "ctk", "Type", &cur, &kinds) {
+                    let transition = choice.map(|kind| Transition {
+                        kind,
+                        ..k.transition.clone().unwrap_or(Transition {
+                            kind: String::new(),
+                            duration_beats: None,
+                            duration_secs: 1.0,
+                        })
+                    });
+                    cmds.push(Command::SetClipTransition {
+                        deck,
+                        layer,
+                        column,
+                        transition,
+                    });
+                }
+                if let Some(tr) = k.transition.clone() {
+                    if let Some(secs) = params::param_slider(
+                        ui,
+                        "ctd",
+                        "Duration (s)",
+                        tr.duration_secs,
+                        1.0,
+                        (0.0, 8.0),
+                    ) {
+                        cmds.push(Command::SetClipTransition {
+                            deck,
+                            layer,
+                            column,
+                            transition: Some(Transition {
+                                duration_secs: secs,
+                                ..tr.clone()
+                            }),
+                        });
+                    }
+                    let beats: Vec<(Option<f64>, String)> =
+                        [None, Some(1.0), Some(2.0), Some(4.0), Some(8.0)]
+                            .into_iter()
+                            .map(|b| {
+                                (
+                                    b,
+                                    b.map_or("off (use seconds)".into(), |n| format!("{n} beats")),
+                                )
+                            })
+                            .collect();
+                    if let Some(duration_beats) =
+                        params::combo(ui, "ctb", "Duration (beats)", &tr.duration_beats, &beats)
+                    {
+                        cmds.push(Command::SetClipTransition {
+                            deck,
+                            layer,
+                            column,
+                            transition: Some(Transition {
+                                duration_beats,
+                                ..tr
+                            }),
+                        });
+                    }
+                }
             }
             ui.horizontal(|ui| {
                 let mut ch = k.channels;
@@ -8754,6 +8847,7 @@ mod tests {
             transport: Default::default(),
             track: vjc_model::Track::new(vjc_model::BlendMode::Normal),
             blend_override: None,
+            transition: None,
             trigger_style: Default::default(),
             fit: Default::default(),
             channels: Default::default(),

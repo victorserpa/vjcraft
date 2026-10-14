@@ -14,9 +14,55 @@ pub enum Kind {
     PushRight,
     ZoomIn,
     WipeEllipse,
+    WipeLeft,
+    WipeRight,
+    WipeUp,
+    WipeDown,
+    PushUp,
+    PushDown,
+    ZoomOut,
+    Cube,
+    Pixelate,
+    LumaWipe,
+    /// Resolved to one of `Kind::RANDOM_POOL` at each trigger; never reaches the shader.
+    Random,
 }
 
 impl Kind {
+    /// What `Random` draws from: every visible transition except itself and Cut.
+    pub const RANDOM_POOL: [Kind; 16] = [
+        Kind::Dissolve,
+        Kind::ToBlack,
+        Kind::PushLeft,
+        Kind::PushRight,
+        Kind::PushUp,
+        Kind::PushDown,
+        Kind::ZoomIn,
+        Kind::ZoomOut,
+        Kind::WipeEllipse,
+        Kind::WipeLeft,
+        Kind::WipeRight,
+        Kind::WipeUp,
+        Kind::WipeDown,
+        Kind::Cube,
+        Kind::Pixelate,
+        Kind::LumaWipe,
+    ];
+
+    /// Concrete kind for a `Random` pick: deterministic in `seed`, never `Random`/`Cut`.
+    /// Other kinds come back unchanged.
+    pub fn resolve(self, seed: u64) -> Kind {
+        if self != Kind::Random {
+            return self;
+        }
+        // splitmix64 finalizer: close seeds (consecutive triggers) spread out.
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        Kind::RANDOM_POOL[(z % Kind::RANDOM_POOL.len() as u64) as usize]
+    }
+
     pub fn parse(name: &str) -> Kind {
         match name {
             // "Alpha" is the default kind written by the .avc importer: no transition.
@@ -26,6 +72,17 @@ impl Kind {
             "PushRight" => Kind::PushRight,
             "ZoomIn" => Kind::ZoomIn,
             "WipeEllipse" => Kind::WipeEllipse,
+            "WipeLeft" => Kind::WipeLeft,
+            "WipeRight" => Kind::WipeRight,
+            "WipeUp" => Kind::WipeUp,
+            "WipeDown" => Kind::WipeDown,
+            "PushUp" => Kind::PushUp,
+            "PushDown" => Kind::PushDown,
+            "ZoomOut" => Kind::ZoomOut,
+            "Cube" => Kind::Cube,
+            "Pixelate" => Kind::Pixelate,
+            "LumaWipe" => Kind::LumaWipe,
+            "Random" => Kind::Random,
             _ => Kind::Dissolve,
         }
     }
@@ -40,8 +97,25 @@ impl Kind {
             Kind::PushRight => 4,
             Kind::ZoomIn => 5,
             Kind::WipeEllipse => 6,
+            Kind::WipeLeft => 7,
+            Kind::WipeRight => 8,
+            Kind::WipeUp => 9,
+            Kind::WipeDown => 10,
+            Kind::PushUp => 11,
+            Kind::PushDown => 12,
+            Kind::ZoomOut => 13,
+            Kind::Cube => 14,
+            Kind::Pixelate => 15,
+            Kind::LumaWipe => 16,
+            // Unresolved Random: a plain dissolve is the safe picture.
+            Kind::Random => 1,
         }
     }
+}
+
+/// The transition a trigger uses: the clip's own override when set, else the layer's.
+pub fn effective<'a>(layer: &'a Transition, clip: Option<&'a Transition>) -> &'a Transition {
+    clip.unwrap_or(layer)
 }
 
 /// Crossing time in seconds: beats (at `bpm`) win over seconds when set.
@@ -75,8 +149,19 @@ pub fn weights(kind: Kind, progress: f32) -> Option<(f32, f32)> {
         } else {
             (0.0, 2.0 * p - 1.0)
         }),
-        Kind::ZoomIn => Some((1.0 - p, p)),
-        Kind::PushLeft | Kind::PushRight | Kind::WipeEllipse => None,
+        Kind::ZoomIn | Kind::ZoomOut => Some((1.0 - p, p)),
+        Kind::Pixelate | Kind::Random => Some((1.0, p)),
+        Kind::PushLeft
+        | Kind::PushRight
+        | Kind::PushUp
+        | Kind::PushDown
+        | Kind::WipeEllipse
+        | Kind::WipeLeft
+        | Kind::WipeRight
+        | Kind::WipeUp
+        | Kind::WipeDown
+        | Kind::Cube
+        | Kind::LumaWipe => None,
     }
 }
 
@@ -94,7 +179,12 @@ pub enum State {
 impl State {
     /// Starts a crossing. Cut or a zero duration stays idle (instant switch).
     pub fn start(t: &Transition, bpm: f64) -> State {
-        let kind = Kind::parse(&t.kind);
+        Self::start_seeded(t, bpm, 0)
+    }
+
+    /// Like `start`; `seed` picks the concrete kind when the transition is `Random`.
+    pub fn start_seeded(t: &Transition, bpm: f64, seed: u64) -> State {
+        let kind = Kind::parse(&t.kind).resolve(seed);
         let duration = duration_secs(t, bpm);
         if kind == Kind::Cut || duration <= 0.0 {
             State::Idle
@@ -207,10 +297,59 @@ mod tests {
     }
 
     #[test]
+    fn random_never_stays_random_and_is_deterministic() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..2000u64 {
+            let k = Kind::Random.resolve(seed);
+            assert_ne!(k, Kind::Random);
+            assert_ne!(k, Kind::Cut);
+            assert_eq!(k, Kind::Random.resolve(seed), "same seed, same kind");
+            seen.insert(k.shader_id());
+            // A running crossing never carries Random either.
+            let s = State::start_seeded(&tr("Random", None, 1.0), 120.0, seed);
+            assert_ne!(s.current().unwrap().0, Kind::Random);
+        }
+        assert_eq!(
+            seen.len(),
+            Kind::RANDOM_POOL.len(),
+            "every kind is reachable"
+        );
+        // Negative control: a concrete kind ignores the seed.
+        assert_eq!(Kind::Cube.resolve(5), Kind::Cube);
+        assert_eq!(Kind::parse("Random"), Kind::Random);
+    }
+
+    #[test]
+    fn clip_override_wins_over_layer() {
+        let layer = tr("Dissolve", None, 1.0);
+        let clip = tr("Cube", Some(2.0), 0.0);
+        assert_eq!(effective(&layer, Some(&clip)), &clip);
+        // Negative control: no override falls back to the layer.
+        assert_eq!(effective(&layer, None), &layer);
+        let run = |t: &Transition| State::start(t, 120.0).current().unwrap().0;
+        assert_eq!(run(effective(&layer, Some(&clip))), Kind::Cube);
+        assert_eq!(run(effective(&layer, None)), Kind::Dissolve);
+        // A clip override of Cut beats a dissolving layer: instant switch.
+        let cut = tr("Cut", None, 1.0);
+        assert_eq!(
+            State::start(effective(&layer, Some(&cut)), 120.0),
+            State::Idle
+        );
+    }
+
+    #[test]
+    fn shader_ids_are_unique() {
+        let mut ids: Vec<u32> = Kind::RANDOM_POOL.iter().map(|k| k.shader_id()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), Kind::RANDOM_POOL.len());
+    }
+
+    #[test]
     fn cut_and_zero_are_instant_unknown_dissolves() {
         assert_eq!(State::start(&tr("Cut", None, 1.0), 120.0), State::Idle);
         assert_eq!(State::start(&tr("Dissolve", None, 0.0), 120.0), State::Idle);
-        assert_eq!(Kind::parse("PushUp"), Kind::Dissolve);
+        assert_eq!(Kind::parse("ToWhite"), Kind::Dissolve);
         assert_eq!(Kind::parse("WipeEllipse"), Kind::WipeEllipse);
     }
 }

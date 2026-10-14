@@ -478,6 +478,13 @@ pub enum Command {
         column: ColumnIdx,
         blend: Option<BlendMode>,
     },
+    /// Transition a clip uses when triggered (None = the layer's). Undoable.
+    SetClipTransition {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        transition: Option<vjc_model::Transition>,
+    },
     /// Groups adjacent, ungrouped layers under `group` (any order; at least one).
     CreateGroup {
         group: vjc_model::LayerGroup,
@@ -1209,6 +1216,7 @@ pub fn clip_from_path(path: PathBuf) -> Clip {
         transport: Transport::default(),
         track: Track::new(BlendMode::Normal),
         blend_override: None,
+        transition: None,
         trigger_style: Default::default(),
         channels: Default::default(),
         fit: FitMode::default(),
@@ -2722,6 +2730,35 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetClipTransition {
+            deck,
+            layer,
+            column,
+            transition,
+        } => {
+            if transition.as_ref().is_some_and(|t| {
+                !t.duration_secs.is_finite()
+                    || t.duration_beats.is_some_and(|b| !b.is_finite() || b < 0.0)
+            }) {
+                return Err(Error::InvalidValue);
+            }
+            check_cell(p, layer, column)?;
+            let k = deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .ok_or(Error::NoClip)?;
+            let prev = std::mem::replace(&mut k.clip.transition, transition);
+            undoable(
+                Command::SetClipTransition {
+                    deck,
+                    layer,
+                    column,
+                    transition: prev,
+                },
+                vec![],
+            )
+        }
         Command::AddLayer { layer, index } => {
             let id = layer.id;
             let ls = &mut p.composition.layers;
@@ -4122,6 +4159,48 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn clip_transition_command_roundtrips_and_rejects_bad_input() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let t = vjc_model::Transition {
+            kind: "Cube".into(),
+            duration_beats: None,
+            duration_secs: 0.5,
+        };
+        roundtrip(
+            &mut p,
+            Command::SetClipTransition {
+                deck: A,
+                layer: l,
+                column: 0,
+                transition: Some(t.clone()),
+            },
+        );
+        assert_eq!(p.composition.decks[0].clips[0].clip.transition, Some(t));
+        let bad = |deck_col: u32, secs: f64| {
+            let mut q = p.clone();
+            apply(
+                &mut q,
+                Command::SetClipTransition {
+                    deck: A,
+                    layer: l,
+                    column: deck_col,
+                    transition: Some(vjc_model::Transition {
+                        kind: "Cube".into(),
+                        duration_beats: None,
+                        duration_secs: secs,
+                    }),
+                },
+            )
+            .is_err()
+        };
+        assert!(bad(5, 1.0), "missing clip");
+        assert!(bad(0, f64::NAN), "non-finite duration");
+        assert!(!bad(0, 1.0), "control: valid input passes");
     }
 
     #[test]

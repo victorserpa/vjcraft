@@ -161,6 +161,62 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
             let e = length((in.uv - vec2(0.5)) * 2.0) / 1.41421356;
             tmix = 1.0 - smoothstep(p * 1.1 - 0.1, p * 1.1, e);
         }
+    } else if (u.tkind >= 7u && u.tkind <= 10u) {
+        // Wipes: a soft edge sweeps the frame; d = 0 at the side it starts from.
+        // 7 left (edge moves toward the left), 8 right, 9 up, 10 down.
+        if (u.out == 0u) {
+            var d = in.uv.x;
+            if (u.tkind == 7u) { d = 1.0 - in.uv.x; }
+            if (u.tkind == 9u) { d = 1.0 - in.uv.y; }
+            if (u.tkind == 10u) { d = in.uv.y; }
+            tmix = 1.0 - smoothstep(p * 1.05 - 0.05, p * 1.05, d);
+        }
+    } else if (u.tkind == 11u || u.tkind == 12u) {
+        let dir = select(-1.0, 1.0, u.tkind == 11u);
+        let shift = select(p - 1.0, p, u.out == 1u);
+        q.y = q.y + dir * shift;
+    } else if (u.tkind == 13u) {
+        // Zoom out: the old picture shrinks away while fading, the new one fades in.
+        if (u.out == 1u) {
+            q = (q - vec2(0.5)) * (1.0 + p) + vec2(0.5);
+            tmix = 1.0 - p;
+        } else {
+            tmix = p;
+        }
+    } else if (u.tkind == 14u) {
+        // Cube: the edge shared by both faces runs from the right side to the left one;
+        // each face is squeezed into its part of the frame and shrinks towards its far
+        // edge (cheap perspective).
+        let x = in.uv.x * 2.0 - 1.0;
+        let e = 1.0 - 2.0 * p;
+        var fu: f32;
+        var depth: f32;
+        if (u.out == 1u) {
+            if (x > e) { discard; }
+            fu = (x + 1.0) / max(e + 1.0, 0.0001);
+            depth = p * (1.0 - fu);
+        } else {
+            if (x < e) { discard; }
+            fu = (x - e) / max(1.0 - e, 0.0001);
+            depth = (1.0 - p) * fu;
+        }
+        let k = 1.0 - 0.3 * depth;
+        q = vec2(fu, (in.uv.y - 0.5) / k + 0.5);
+    } else if (u.tkind == 15u) {
+        // Pixelate: blocks grow then shrink while the new picture fades in.
+        let sn = sin(p * 3.14159265);
+        let cells = 8.0 + pow(1.0 - sn, 4.0) * 2000.0;
+        q = (floor(q * cells) + vec2(0.5)) / cells;
+        if (u.out == 0u) { tmix = p; }
+    } else if (u.tkind == 16u) {
+        // Luma wipe: a procedural luma pattern (gradient plus blocky noise) decides the
+        // order in which the new picture appears.
+        if (u.out == 0u) {
+            let g = floor(in.uv * 14.0);
+            let n = fract(sin(dot(g, vec2(12.9898, 78.233))) * 43758.5453);
+            let l = 0.6 * in.uv.x + 0.4 * n;
+            tmix = smoothstep(0.0, 0.2, p * 1.2 - l);
+        }
     }
     if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) {
         discard;
@@ -2515,6 +2571,80 @@ mod tests {
         // Negative control: at progress 0 the centre is still the old clip.
         let w0 = render_transition(WipeEllipse, 0.0, (5, 5), PX_BLACK, PX_WHITE).unwrap();
         assert!(px_near(w0[12], 0), "{:?}", w0[12]);
+    }
+
+    /// New transition kinds: at progress 0 every pixel is the old clip, at 1 the new one,
+    /// and halfway the frame is neither. Old is black and new is white.
+    fn check_new_kind(kind: vjc_core::transition::Kind) {
+        let size = (16, 4);
+        let Some(start) = render_transition(kind, 0.0, size, PX_BLACK, PX_WHITE) else {
+            return;
+        };
+        let end = render_transition(kind, 1.0, size, PX_BLACK, PX_WHITE).unwrap();
+        let mid = render_transition(kind, 0.5, size, PX_BLACK, PX_WHITE).unwrap();
+        assert!(
+            start.iter().all(|p| px_near(*p, 0)),
+            "{kind:?} t=0: {start:?}"
+        );
+        assert!(
+            end.iter().all(|p| px_near(*p, 255)),
+            "{kind:?} t=1: {end:?}"
+        );
+        assert_ne!(mid, start, "{kind:?} t=.5 still the old clip");
+        assert_ne!(mid, end, "{kind:?} t=.5 already the new clip");
+    }
+
+    #[test]
+    fn gpu_wipe_left() {
+        check_new_kind(vjc_core::transition::Kind::WipeLeft);
+    }
+    #[test]
+    fn gpu_wipe_right() {
+        check_new_kind(vjc_core::transition::Kind::WipeRight);
+    }
+    #[test]
+    fn gpu_wipe_up() {
+        check_new_kind(vjc_core::transition::Kind::WipeUp);
+    }
+    #[test]
+    fn gpu_wipe_down() {
+        check_new_kind(vjc_core::transition::Kind::WipeDown);
+    }
+    #[test]
+    fn gpu_push_up() {
+        check_new_kind(vjc_core::transition::Kind::PushUp);
+    }
+    #[test]
+    fn gpu_push_down() {
+        check_new_kind(vjc_core::transition::Kind::PushDown);
+    }
+    #[test]
+    fn gpu_zoom_out() {
+        check_new_kind(vjc_core::transition::Kind::ZoomOut);
+    }
+    #[test]
+    fn gpu_cube() {
+        check_new_kind(vjc_core::transition::Kind::Cube);
+    }
+    #[test]
+    fn gpu_pixelate() {
+        check_new_kind(vjc_core::transition::Kind::Pixelate);
+    }
+    #[test]
+    fn gpu_luma_wipe() {
+        check_new_kind(vjc_core::transition::Kind::LumaWipe);
+    }
+
+    /// Wipes sweep in the named direction: the new clip shows on the side it comes from.
+    #[test]
+    fn gpu_wipe_directions_are_opposite() {
+        use vjc_core::transition::Kind::{WipeLeft, WipeRight};
+        let Some(l) = render_transition(WipeLeft, 0.5, (8, 1), PX_BLACK, PX_WHITE) else {
+            return;
+        };
+        let r = render_transition(WipeRight, 0.5, (8, 1), PX_BLACK, PX_WHITE).unwrap();
+        assert!(px_near(l[7], 255) && px_near(l[0], 0), "{l:?}");
+        assert!(px_near(r[0], 255) && px_near(r[7], 0), "{r:?}");
     }
 
     /// Invert on one pixel through the full chain (translate, pipeline, ping-pong), for a

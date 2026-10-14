@@ -604,6 +604,7 @@ fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
         transport,
         track,
         blend_override: None,
+        transition: None,
         trigger_style: Default::default(),
         channels: Default::default(),
         fit: Default::default(),

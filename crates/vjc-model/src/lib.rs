@@ -292,6 +292,9 @@ pub struct Clip {
     /// Overrides the layer blend when set (None = layer determined).
     #[serde(default)]
     pub blend_override: Option<BlendMode>,
+    /// Transition used when this clip is triggered; wins over the layer's (None = layer's).
+    #[serde(default)]
+    pub transition: Option<Transition>,
     /// How the video is fitted to the composition frame.
     #[serde(default)]
     pub fit: FitMode,
@@ -1839,6 +1842,7 @@ mod tests {
                 track: Track::new(BlendMode::Normal),
                 fit: FitMode::default(),
                 blend_override: None,
+                transition: None,
                 trigger_style: Default::default(),
                 channels: Default::default(),
             },
@@ -1987,6 +1991,7 @@ mod tests {
             transport: Transport::default(),
             track: Track::new(BlendMode::Normal),
             blend_override: None,
+            transition: None,
             trigger_style: Default::default(),
             fit: FitMode::Fit,
             channels: Channels::default(),
@@ -2088,6 +2093,37 @@ mod tests {
         assert_eq!(s.slices[0].color.brightness, 0.5);
         let back: Screen = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn clip_transition_roundtrips_and_old_clips_default_to_layer() {
+        let mut clip = Clip {
+            id: Uuid::new_v4(),
+            name: "c".into(),
+            source: Source::Generator {
+                kind: "g".into(),
+                params: vec![],
+            },
+            transport: Transport::default(),
+            track: Track::new(BlendMode::Normal),
+            blend_override: None,
+            transition: Some(Transition {
+                kind: "Cube".into(),
+                duration_beats: Some(2.0),
+                duration_secs: 0.5,
+            }),
+            trigger_style: Default::default(),
+            fit: FitMode::Fit,
+            channels: Channels::default(),
+        };
+        let json = serde_json::to_string(&clip).unwrap();
+        assert_eq!(serde_json::from_str::<Clip>(&json).unwrap(), clip);
+        // An old file has no such key: the layer's transition applies.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("transition");
+        let old: Clip = serde_json::from_value(v).unwrap();
+        clip.transition = None;
+        assert_eq!(old, clip);
     }
 
     #[test]
