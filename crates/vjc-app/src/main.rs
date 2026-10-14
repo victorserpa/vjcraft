@@ -285,6 +285,7 @@ struct State {
     /// Presented-frame rate per output window.
     out_fps: HashMap<Uuid, output_overlay::FpsMeter>,
     slice_r: Option<slice_render::SliceRenderer>,
+    stamper: Option<slice_render::Stamper>,
     /// Per-screen render target and its egui texture id.
     screen_rt: HashMap<Uuid, ScreenRt>,
     prefs_tab: PrefsTab,
@@ -1445,6 +1446,7 @@ impl State {
             display_info_open: false,
             out_fps: HashMap::new(),
             slice_r: None,
+            stamper: None,
             screen_rt: HashMap::new(),
             prefs_tab: PrefsTab::General,
             prefs_dirty: false,
@@ -4124,6 +4126,14 @@ impl State {
                 (view, comp.size)
             };
             r.render(&rs.device, &rs.queue, scr, &source, &t.view);
+            // The test card goes into the screen target itself, so Art-Net, Syphon and NDI
+            // see it too. Black-out and a disabled screen stay black.
+            if self.test_cards.contains(&id) && !self.blackouts.contains(&id) && scr.enabled {
+                let px = output_overlay::rasterize(&output_overlay::test_card(scr), size.0, size.1);
+                self.stamper
+                    .get_or_insert_with(|| slice_render::Stamper::new(&rs.device))
+                    .stamp(&rs.device, &rs.queue, &t.view, size, &px);
+            }
         }
         // Publish: the screen's own target when it has slices, else the composition.
         let fps = self.project.composition.fps;

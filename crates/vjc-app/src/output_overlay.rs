@@ -54,6 +54,45 @@ pub fn test_card(screen: &Screen) -> Vec<Item> {
     v
 }
 
+/// Rasterizes test card items into straight-alpha RGBA (`w` x `h`, transparent where
+/// nothing is drawn). Later items win. Twin of what `draw` paints over the output window,
+/// minus the text, so the card can also be stamped on the GPU screen target.
+pub fn rasterize(items: &[Item], w: u32, h: u32) -> Vec<u8> {
+    let mut img = vec![0u8; (w as usize) * (h as usize) * 4];
+    let mut put = |x: i64, y: i64, c: Color32| {
+        if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+            let i = ((y as usize) * (w as usize) + x as usize) * 4;
+            img[i..i + 4].copy_from_slice(&c.to_srgba_unmultiplied());
+        }
+    };
+    for it in items {
+        match it {
+            Item::Fill([x0, y0, x1, y1], c) => {
+                for y in (y0.round() as i64)..(y1.round() as i64) {
+                    for x in (x0.round() as i64)..(x1.round() as i64) {
+                        put(x, y, *c);
+                    }
+                }
+            }
+            Item::Outline(pts, c) => {
+                for i in 0..pts.len() {
+                    let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                    let n = (b.0 - a.0).abs().max((b.1 - a.1).abs()).ceil().max(1.0) as i64;
+                    for k in 0..=n {
+                        let t = k as f32 / n as f32;
+                        put(
+                            (a.0 + (b.0 - a.0) * t).floor() as i64,
+                            (a.1 + (b.1 - a.1) * t).floor() as i64,
+                            *c,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    img
+}
+
 /// Smallest tile the pixel-map grid draws (finer would be thousands of lines).
 pub const MIN_TILE: u32 = 4;
 

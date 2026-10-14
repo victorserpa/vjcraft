@@ -323,6 +323,157 @@ impl SliceRenderer {
     }
 }
 
+const STAMP_SHADER: &str = r#"
+@group(0) @binding(0) var ov: texture_2d<f32>;
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(ov, vec2<i32>(pos.xy), 0);
+}
+"#;
+
+/// Alpha-blends a straight-alpha RGBA image over a screen target, on the GPU, so what is
+/// stamped (the test card) is part of the frame that Art-Net, Syphon and NDI read back.
+pub struct Stamper {
+    pipe: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    /// Uploaded overlay and the pixels it holds, to skip re-uploading an unchanged card.
+    cache: Option<((u32, u32), Vec<u8>, wgpu::TextureView)>,
+}
+
+impl Stamper {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("stamp"),
+            source: wgpu::ShaderSource::Wgsl(STAMP_SHADER.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("stamp_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("stamp_pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("stamp_pipe"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        Self {
+            pipe,
+            bgl,
+            cache: None,
+        }
+    }
+
+    /// Draws `rgba` (`size` = target size, straight alpha) over `target`.
+    pub fn stamp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        size: (u32, u32),
+        rgba: &[u8],
+    ) {
+        use wgpu::util::DeviceExt;
+        if self
+            .cache
+            .as_ref()
+            .is_none_or(|(s, px, _)| *s != size || px != rgba)
+        {
+            let t = device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("stamp_tex"),
+                    size: wgpu::Extent3d {
+                        width: size.0,
+                        height: size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                rgba,
+            );
+            self.cache = Some((size, rgba.to_vec(), t.create_view(&Default::default())));
+        }
+        let Some((_, _, view)) = &self.cache else {
+            return;
+        };
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stamp_bg"),
+            layout: &self.bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            }],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("stamp"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit(Some(enc.finish()));
+    }
+}
+
 /// Render target for a screen.
 pub fn make_screen_target(
     device: &wgpu::Device,
@@ -356,6 +507,11 @@ mod tests {
 
     /// Renders `screen` (w x h) from a 1x1 `src` pixel; None without an adapter.
     fn render_rgba(screen: &Screen, src_px: [u8; 4]) -> Option<Vec<u8>> {
+        render_rgba_card(screen, src_px, false)
+    }
+
+    /// Same, optionally stamping the test card on the target like the app does.
+    fn render_rgba_card(screen: &Screen, src_px: [u8; 4], card: bool) -> Option<Vec<u8>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no wgpu adapter: skipped");
@@ -386,6 +542,11 @@ mod tests {
         let (w, h) = (screen.width, screen.height);
         let (dst, dst_v) = make_screen_target(&device, w, h);
         SliceRenderer::new(&device).render(&device, &queue, screen, &|_| (&src_v, (1, 1)), &dst_v);
+        if card {
+            let px =
+                crate::output_overlay::rasterize(&crate::output_overlay::test_card(screen), w, h);
+            Stamper::new(&device).stamp(&device, &queue, &dst_v, (w, h), &px);
+        }
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 256 * h as u64,
@@ -426,6 +587,42 @@ mod tests {
     fn px(img: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
         let i = (y * w + x) * 4;
         [img[i], img[i + 1], img[i + 2], img[i + 3]]
+    }
+
+    /// The frame Art-Net / NDI / Syphon read back carries the test card; without it, an
+    /// empty screen is black (negative control); black-out wins over the card.
+    #[test]
+    fn gpu_test_card_reaches_sampled_frame() {
+        let screen = mapping::new_screen("t", 64, 64);
+        let (Some(on), Some(off)) = (
+            render_rgba_card(&screen, [0, 0, 0, 255], true),
+            render_rgba_card(&screen, [0, 0, 0, 255], false),
+        ) else {
+            return;
+        };
+        assert!(on.chunks(4).any(|p| p[..3] != [0, 0, 0]), "card is visible");
+        assert_eq!(px(&on, 64, 0, 0), [255, 255, 255, 255], "border pixel");
+        assert!(
+            off.chunks(4).all(|p| p == [0, 0, 0, 255]),
+            "no card, no content: black"
+        );
+        let mut black = on.clone();
+        crate::capture::blacken(&mut black);
+        assert!(
+            black.chunks(4).all(|p| p == [0, 0, 0, 255]),
+            "black-out + card: black"
+        );
+    }
+
+    /// A disabled screen renders black even with the card requested.
+    #[test]
+    fn gpu_disabled_screen_stays_black_without_card_stamp() {
+        let mut screen = mapping::new_screen("t", 8, 8);
+        screen.slices.push(mapping::new_slice(8, 8));
+        screen.enabled = false;
+        if let Some(img) = render_rgba(&screen, [255, 255, 255, 255]) {
+            assert!(img.chunks(4).all(|p| p == [0, 0, 0, 255]));
+        }
     }
 
     /// An identity slice reproduces the composition pixel. Skipped without an adapter.
