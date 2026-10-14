@@ -376,8 +376,8 @@ fn effect_dropped_on_clip_and_param_edit() {
     let mut h = app();
     let lid = drop_video_on_cell(&mut h, 1, 0, &video);
     let (_, pos) = cell_center(&h, 1, 0);
-    let (fx_id, _) = vjc_fx::BUILTIN[0];
-    let label = fx_label(fx_id);
+    let (fx_id, fx_src) = vjc_fx::BUILTIN[0];
+    let label = browser_label(fx_id, fx_src);
     browser_drag(&mut h, "Effects", &label, pos);
     let deck = h.state().project.composition.current_deck;
     let effects = |h: &Harness<'_, State>| {
@@ -430,8 +430,8 @@ fn effect_dry_wet_slider_changes_chain() {
     let mut h = app();
     let lid = drop_video_on_cell(&mut h, 1, 0, &video);
     let (_, pos) = cell_center(&h, 1, 0);
-    let (fx_id, _) = vjc_fx::BUILTIN[0];
-    browser_drag(&mut h, "Effects", &fx_label(fx_id), pos);
+    let (fx_id, fx_src) = vjc_fx::BUILTIN[0];
+    browser_drag(&mut h, "Effects", &browser_label(fx_id, fx_src), pos);
     let deck = h.state().project.composition.current_deck;
     let dry_wet = |h: &Harness<'_, State>| {
         vjc_core::clip_in(&h.state().project, deck, lid, 0)

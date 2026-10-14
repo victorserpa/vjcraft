@@ -48,6 +48,127 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "brightness_contrast",
         include_str!("../../../assets/effects/brightness_contrast.fs"),
     ),
+    ("barrel", include_str!("../../../assets/effects/barrel.fs")),
+    ("bulge", include_str!("../../../assets/effects/bulge.fs")),
+    (
+        "channel_mixer",
+        include_str!("../../../assets/effects/channel_mixer.fs"),
+    ),
+    (
+        "chroma_key",
+        include_str!("../../../assets/effects/chroma_key.fs"),
+    ),
+    (
+        "chromatic_aberration",
+        include_str!("../../../assets/effects/chromatic_aberration.fs"),
+    ),
+    (
+        "color_temperature",
+        include_str!("../../../assets/effects/color_temperature.fs"),
+    ),
+    ("crt", include_str!("../../../assets/effects/crt.fs")),
+    (
+        "directional_blur",
+        include_str!("../../../assets/effects/directional_blur.fs"),
+    ),
+    (
+        "dot_screen",
+        include_str!("../../../assets/effects/dot_screen.fs"),
+    ),
+    (
+        "duotone",
+        include_str!("../../../assets/effects/duotone.fs"),
+    ),
+    (
+        "edge_detect",
+        include_str!("../../../assets/effects/edge_detect.fs"),
+    ),
+    ("emboss", include_str!("../../../assets/effects/emboss.fs")),
+    (
+        "film_grain",
+        include_str!("../../../assets/effects/film_grain.fs"),
+    ),
+    (
+        "gaussian_blur",
+        include_str!("../../../assets/effects/gaussian_blur.fs"),
+    ),
+    (
+        "glitch_slices",
+        include_str!("../../../assets/effects/glitch_slices.fs"),
+    ),
+    ("glow", include_str!("../../../assets/effects/glow.fs")),
+    (
+        "gradient_map",
+        include_str!("../../../assets/effects/gradient_map.fs"),
+    ),
+    (
+        "halftone",
+        include_str!("../../../assets/effects/halftone.fs"),
+    ),
+    ("jitter", include_str!("../../../assets/effects/jitter.fs")),
+    ("levels", include_str!("../../../assets/effects/levels.fs")),
+    (
+        "luma_key",
+        include_str!("../../../assets/effects/luma_key.fs"),
+    ),
+    ("mosaic", include_str!("../../../assets/effects/mosaic.fs")),
+    (
+        "neon_edges",
+        include_str!("../../../assets/effects/neon_edges.fs"),
+    ),
+    (
+        "noise_displace",
+        include_str!("../../../assets/effects/noise_displace.fs"),
+    ),
+    ("polar", include_str!("../../../assets/effects/polar.fs")),
+    (
+        "posterize",
+        include_str!("../../../assets/effects/posterize.fs"),
+    ),
+    (
+        "radial_blur",
+        include_str!("../../../assets/effects/radial_blur.fs"),
+    ),
+    ("ripple", include_str!("../../../assets/effects/ripple.fs")),
+    (
+        "saturation",
+        include_str!("../../../assets/effects/saturation.fs"),
+    ),
+    (
+        "scanlines",
+        include_str!("../../../assets/effects/scanlines.fs"),
+    ),
+    (
+        "sharpen",
+        include_str!("../../../assets/effects/sharpen.fs"),
+    ),
+    (
+        "solarize",
+        include_str!("../../../assets/effects/solarize.fs"),
+    ),
+    (
+        "split_tone",
+        include_str!("../../../assets/effects/split_tone.fs"),
+    ),
+    ("strobe", include_str!("../../../assets/effects/strobe.fs")),
+    (
+        "threshold",
+        include_str!("../../../assets/effects/threshold.fs"),
+    ),
+    (
+        "tilt_shift",
+        include_str!("../../../assets/effects/tilt_shift.fs"),
+    ),
+    ("twirl", include_str!("../../../assets/effects/twirl.fs")),
+    (
+        "vhs_noise",
+        include_str!("../../../assets/effects/vhs_noise.fs"),
+    ),
+    ("wave", include_str!("../../../assets/effects/wave.fs")),
+    (
+        "zoom_blur",
+        include_str!("../../../assets/effects/zoom_blur.fs"),
+    ),
 ];
 
 /// Bundled generators: ISF without an image input, rendered at composition size.
@@ -70,6 +191,24 @@ pub const GENERATORS: &[(&str, &str)] = &[
     ),
     ("noise", include_str!("../../../assets/generators/noise.fs")),
     ("bars", include_str!("../../../assets/generators/bars.fs")),
+    (
+        "digits",
+        include_str!("../../../assets/generators/digits.fs"),
+    ),
+    (
+        "plasma",
+        include_str!("../../../assets/generators/plasma.fs"),
+    ),
+    ("rings", include_str!("../../../assets/generators/rings.fs")),
+    (
+        "starfield",
+        include_str!("../../../assets/generators/starfield.fs"),
+    ),
+    (
+        "voronoi",
+        include_str!("../../../assets/generators/voronoi.fs"),
+    ),
+    ("waves", include_str!("../../../assets/generators/waves.fs")),
 ];
 
 /// Source of a bundled effect or generator.
@@ -733,7 +872,7 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
 
     #[test]
     fn all_builtin_effects_translate() {
-        assert_eq!(BUILTIN.len(), 12);
+        assert!(BUILTIN.len() >= 50);
         for (id, src) in BUILTIN {
             let (isf, wgsl) = compile(src).unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(wgsl.contains("fn main"), "{id}");
@@ -752,7 +891,7 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
 
     #[test]
     fn all_generators_compile() {
-        assert_eq!(GENERATORS.len(), 6);
+        assert!(GENERATORS.len() >= 12);
         for (id, src) in GENERATORS {
             let (isf, wgsl) = compile(src).unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(wgsl.contains("fn main"), "{id}");
@@ -766,6 +905,63 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
             .unwrap_or_else(|e| panic!("{id}: {e:?}"));
         }
         assert!(generator_params("invert").is_none());
+    }
+
+    /// Every .fs under assets/ (registered or not) must go ISF -> WGSL -> naga validate,
+    /// be registered, and carry a category, a description and sane ranges. All failures
+    /// are listed by name in one message.
+    #[test]
+    fn every_fs_file_compiles_and_is_registered() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let mut failures = vec![];
+        let mut seen = 0;
+        for dir in ["effects", "generators"] {
+            let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == "fs"))
+                .collect();
+            files.sort();
+            for path in files {
+                seen += 1;
+                let id = path.file_stem().unwrap().to_string_lossy().to_string();
+                let src = std::fs::read_to_string(&path).unwrap();
+                let check = || -> Result<(), String> {
+                    let (isf, wgsl) = compile(&src).map_err(|e| e.to_string())?;
+                    let m = naga::front::wgsl::parse_str(&wgsl).map_err(|e| format!("{e:?}"))?;
+                    naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        naga::valid::Capabilities::all(),
+                    )
+                    .validate(&m)
+                    .map_err(|e| format!("{e:?}"))?;
+                    if isf.categories.is_empty() || isf.description.is_empty() {
+                        return Err("missing category or description".into());
+                    }
+                    for i in &isf.inputs {
+                        if let InputKind::Float { min, max, default } = i.kind
+                            && (min >= max || default < min || default > max)
+                        {
+                            return Err(format!("bad range on {}", i.name));
+                        }
+                    }
+                    let list = if dir == "effects" {
+                        BUILTIN
+                    } else {
+                        GENERATORS
+                    };
+                    if !list.iter().any(|(k, _)| *k == id) {
+                        return Err("not registered in lib.rs".into());
+                    }
+                    Ok(())
+                };
+                if let Err(e) = check() {
+                    failures.push(format!("{dir}/{id}.fs: {e}"));
+                }
+            }
+        }
+        assert_eq!(seen, BUILTIN.len() + GENERATORS.len(), "registry vs files");
+        assert!(failures.is_empty(), "failed:\n{}", failures.join("\n"));
     }
 
     #[test]

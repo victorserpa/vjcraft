@@ -2205,6 +2205,137 @@ mod tests {
         }
     }
 
+    /// Renders `layer` on `comp` and returns the 64 x 36 RGBA target.
+    fn read_target(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor) -> Vec<u8> {
+        let (w, h) = (64u32, 36u32);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (256 * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        data
+    }
+
+    /// Every bundled effect and generator renders with default params to something that is
+    /// not entirely black (a NaN/inf in the shader ends up black in the Unorm target).
+    /// `MAY_BE_DARK` lists the ones where black is a legitimate result. Skipped without
+    /// an adapter.
+    #[test]
+    fn gpu_every_bundled_effect_and_generator_renders_visible_output() {
+        const MAY_BE_DARK: &[&str] = &[];
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let (w, h) = (64u32, 36u32);
+        // Test frame: colour ramps, a bright and a dark block, a green patch (for keying).
+        let mut frame = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+                let mut rgb = [fx, fy, 1.0 - fx];
+                if x < 8 && y < 8 {
+                    rgb = [0.02; 3];
+                }
+                if x >= w - 10 && y < 10 {
+                    rgb = [0.95; 3];
+                }
+                if (24..40).contains(&x) && (14..24).contains(&y) {
+                    rgb = [0.1, 0.9, 0.15];
+                }
+                for c in 0..3 {
+                    frame[i + c] = (rgb[c] * 255.0) as u8;
+                }
+            }
+        }
+        let mut comp = Compositor::new(&device, w, h);
+        let mut bad = vec![];
+        let mut count = 0;
+        for (generator, list) in [(false, vjc_fx::BUILTIN), (true, vjc_fx::GENERATORS)] {
+            for (id, _) in list {
+                count += 1;
+                let (isf, wgsl) = match vjc_fx::compile(vjc_fx::builtin_source(id).unwrap()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        bad.push(format!("{id}: translate: {e}"));
+                        continue;
+                    }
+                };
+                if let Err(e) = comp.add_effect(&device, id, &wgsl) {
+                    bad.push(format!("{id}: GPU compile: {e}"));
+                    continue;
+                }
+                let draw = EffectDraw {
+                    kind: id.to_string(),
+                    uniforms: isf.pack(&isf.default_params(), 0.1, (w, h)),
+                    dry_wet: 1.0,
+                    ml: None,
+                };
+                let (effects, gen_draw, fr) = if generator {
+                    (vec![], Some(draw), None)
+                } else {
+                    (vec![draw], None, Some((w, h, &frame[..], 1)))
+                };
+                let layer = [LayerDraw {
+                    id: uuid::Uuid::from_u128(2),
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    fit: FitMode::Stretch,
+                    effects,
+                    frame: fr,
+                    generator: gen_draw,
+                    transition: None,
+                    transform: Affine::IDENTITY,
+                    channels: Default::default(),
+                }];
+                comp.render(&device, &queue, &layer, &[], 1.0);
+                let data = read_target(&device, &queue, &comp);
+                let lit = data
+                    .chunks(4)
+                    .filter(|p| p[..3].iter().any(|v| *v > 2))
+                    .count();
+                if lit == 0 && !MAY_BE_DARK.contains(id) {
+                    bad.push(format!("{id}: output is entirely black"));
+                }
+            }
+        }
+        assert_eq!(count, vjc_fx::BUILTIN.len() + vjc_fx::GENERATORS.len());
+        assert!(bad.is_empty(), "failed:\n{}", bad.join("\n"));
+    }
+
     #[test]
     fn mix_plan_cases() {
         assert_eq!(mix_plan(0.0), MixPlan::Skip);

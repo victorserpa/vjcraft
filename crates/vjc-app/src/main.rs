@@ -721,11 +721,27 @@ fn open_network(protocol: vjc_net::Protocol, name: String) -> Player {
     Player::open_external(&label, move |sink| vjc_net::receive(protocol, &name, sink))
 }
 
+/// Browser label: the browser list is flat, so the category goes in front of the name
+/// ("Color / Posterize"). Sorting by label then groups the categories.
+fn browser_label(id: &str, src: &str) -> String {
+    match vjc_fx::parse(src)
+        .ok()
+        .and_then(|i| i.categories.first().cloned())
+    {
+        Some(cat) => format!("{cat} / {}", fx_label(id)),
+        None => fx_label(id),
+    }
+}
+
 /// Effects and generators offered by the browser.
 fn browser_fx() -> Vec<(String, browser::Item)> {
-    let fx = vjc_fx::BUILTIN
-        .iter()
-        .map(|(id, _)| (fx_label(id), browser::Item::Effect(id.to_string())));
+    let fx = vjc_fx::BUILTIN.iter().map(|(id, src)| {
+        (
+            browser_label(id, src),
+            browser::Item::Effect(id.to_string()),
+        )
+    });
+    // Generators are already their own group in the browser; no prefix.
     let gens = vjc_fx::GENERATORS
         .iter()
         .map(|(id, _)| (fx_label(id), browser::Item::Generator(id.to_string())));
