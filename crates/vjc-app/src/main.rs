@@ -4790,10 +4790,16 @@ impl State {
                 self.preview_target = PreviewTarget::Composition;
             }
             let ui = &mut gui;
+            let mut ghost_hit = false;
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .max_height(area.height().max(0.0))
                 .show(ui, |ui| {
+                    let ghost_cols = (((area.width() - theme::LAYER_HEAD_W - 1.0)
+                        / (theme::CELL_W + 1.0))
+                        .floor() as i64
+                        - i64::from(ncols))
+                    .clamp(0, 64);
                     egui::Grid::new("grid").spacing([1.0, 1.0]).show(ui, |ui| {
                         ui.scope(|ui| {
                             let (hrect, _) = ui.allocate_exact_size(
@@ -4970,6 +4976,30 @@ impl State {
                                 }
                             });
                         }
+
+                        for _ in 0..ghost_cols {
+                            let (r, resp) = ui.allocate_exact_size(
+                                egui::vec2(theme::CELL_W, 2.0 * theme::COLUMN_HEAD_H),
+                                egui::Sense::click(),
+                            );
+                            ui.painter().rect_filled(
+                                r,
+                                theme::CELL_ROUNDING,
+                                theme::COLUMN_HEAD_BG,
+                            );
+                            ghost_hit |= resp.clicked();
+                            egui::Popup::menu(&resp).show(|ui| {
+                                if ui.button("Add column").clicked() {
+                                    cmds.push(Command::AddColumn {
+                                        column: vjc_model::Column {
+                                            id: Uuid::new_v4(),
+                                            name: (ncols + 1).to_string(),
+                                        },
+                                    });
+                                    ui.close();
+                                }
+                            });
+                        }
                         ui.end_row();
                         for li in 0..comp.layers.len() {
                             let lid = comp.layers[li].id;
@@ -5013,24 +5043,33 @@ impl State {
                                         .font(theme::bold_font(&lctx, theme::FS_XS))
                                 };
                                 // Name + select
-                                let name = ui.put(
-                                    at(
-                                        theme::lh::X0,
-                                        theme::lh::NAME_Y,
-                                        theme::lh::NAME_W,
-                                        theme::lh::BUS_H,
-                                    ),
-                                    egui::Label::new(
-                                        egui::RichText::new(if in_group {
-                                            format!("\u{2502} {}", layer.name)
-                                        } else {
-                                            layer.name.clone()
-                                        })
-                                        .size(theme::FS_XS),
-                                    )
-                                    .truncate()
-                                    .sense(egui::Sense::click_and_drag()),
+                                let name_rect = at(
+                                    theme::lh::X0,
+                                    theme::lh::NAME_Y,
+                                    theme::lh::NAME_W,
+                                    theme::lh::BUS_H,
                                 );
+                                let name = ui
+                                    .scope_builder(
+                                        egui::UiBuilder::new().max_rect(name_rect).layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                        ),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(if in_group {
+                                                        format!("\u{2502} {}", layer.name)
+                                                    } else {
+                                                        layer.name.clone()
+                                                    })
+                                                    .size(theme::FS_XS),
+                                                )
+                                                .truncate()
+                                                .sense(egui::Sense::click_and_drag()),
+                                            )
+                                        },
+                                    )
+                                    .inner;
                                 if name.drag_started() && !in_group {
                                     self.layer_drag = Some(lid);
                                 }
@@ -5477,10 +5516,37 @@ impl State {
                                     pick = Some((lid, ci));
                                 }
                             }
+
+                            for _ in 0..ghost_cols {
+                                let (r, resp) = ui.allocate_exact_size(
+                                    egui::vec2(theme::CELL_W, theme::THUMB_H + theme::NAME_H),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().rect_filled(
+                                    r,
+                                    theme::CELL_ROUNDING,
+                                    theme::CELL_EMPTY,
+                                );
+                                ghost_hit |= resp.clicked();
+                                egui::Popup::menu(&resp).show(|ui| {
+                                    if ui.button("Add column").clicked() {
+                                        cmds.push(Command::AddColumn {
+                                            column: vjc_model::Column {
+                                                id: Uuid::new_v4(),
+                                                name: (ncols + 1).to_string(),
+                                            },
+                                        });
+                                        ui.close();
+                                    }
+                                });
+                            }
                             ui.end_row();
                         }
                     });
                 });
+            if ghost_hit {
+                self.preview_target = PreviewTarget::Composition;
+            }
             let mut tabs_ui = parent_ui.new_child(egui::UiBuilder::new().max_rect(tabs_area));
             tabs_ui.set_clip_rect(tabs_area.intersect(parent_ui.clip_rect()));
             self.tabs_clip = tabs_ui.clip_rect();
@@ -6283,10 +6349,19 @@ impl State {
         let Some((layer, column, k)) =
             sel.and_then(|(l, c)| Some((l, c, vjc_core::clip_in(&self.project, deck, l, c)?)))
         else {
-            ui.label("No clip selected.");
-            ui.weak("Click a filled cell to edit its transport, opacity and effects.");
-            ui.add_space(theme::SP_2);
-            ui.weak("Drop a video file on a cell, or right-click it to import a file or add a generator.");
+            let avail = ui.available_height();
+            ui.add_space((avail * 0.5 - 70.0).max(0.0));
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    icons::glyph(icons::i::FILM_SLATE)
+                        .size(theme::FS_BASE * 2.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.label("No clip selected.");
+                ui.weak("Click a filled cell to edit its transport, opacity and effects.");
+                ui.add_space(theme::SP_2);
+                ui.weak("Drop a video file on a cell, or right-click it to import a file or add a generator.");
+            });
             return;
         };
         let k = k.clone();

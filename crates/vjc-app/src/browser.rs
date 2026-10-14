@@ -574,46 +574,63 @@ impl Browser {
         self.thumbs.poll();
         self.fx_thumbs.step(&ctx);
         let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            for (tab, label, key) in [
-                (Tab::Files, "Files", "browser-files"),
-                (Tab::Compositions, "Compositions", "browser-compositions"),
-                (Tab::Effects, "Effects", "browser-effects"),
-                (Tab::Generators, "Generators", "browser-generators"),
-                (Tab::Network, "Network", "browser-network"),
-                (Tab::Record, "Record", "browser-record"),
-            ] {
-                let on = self.tab == tab;
-                let text = egui::RichText::new(label)
-                    .font(if on {
-                        crate::theme::bold_font(&ctx, crate::theme::FS_SM)
-                    } else {
-                        egui::FontId::proportional(crate::theme::FS_SM)
-                    })
-                    .color(if on {
-                        crate::theme::TEXT
-                    } else {
-                        crate::theme::TEXT_MUTED
-                    });
-                let r = ui.add(
-                    egui::Button::new(text)
-                        .corner_radius(0.0)
-                        .fill(if on {
-                            crate::theme::BG
+        // One row; a narrow panel scrolls the tabs instead of clipping the last ones.
+        egui::ScrollArea::horizontal()
+            .id_salt("browser_tabs")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    ui.spacing_mut().button_padding.x = crate::theme::SP_2;
+                    for (tab, label, key) in [
+                        (Tab::Files, "Files", "browser-files"),
+                        (Tab::Compositions, "Compositions", "browser-compositions"),
+                        (Tab::Effects, "Effects", "browser-effects"),
+                        (Tab::Generators, "Generators", "browser-generators"),
+                        (Tab::Network, "Network", "browser-network"),
+                        (Tab::Record, "Record", "browser-record"),
+                    ] {
+                        let on = self.tab == tab;
+                        let shown = match tab {
+                            Tab::Compositions => "Comps",
+                            Tab::Generators => "Gens",
+                            Tab::Network => "Net",
+                            _ => label,
+                        };
+                        let text = egui::RichText::new(shown)
+                            .font(if on {
+                                crate::theme::bold_font(&ctx, crate::theme::FS_SM)
+                            } else {
+                                egui::FontId::proportional(crate::theme::FS_SM)
+                            })
+                            .color(if on {
+                                crate::theme::TEXT
+                            } else {
+                                crate::theme::TEXT_MUTED
+                            });
+                        let r = ui.add(
+                            egui::Button::new(text)
+                                .corner_radius(0.0)
+                                .fill(if on {
+                                    crate::theme::BG
+                                } else {
+                                    crate::theme::HEADER_BG
+                                })
+                                .min_size(egui::vec2(0.0, crate::theme::PANEL_HEAD_H)),
+                        );
+                        let r = if shown == label {
+                            r
                         } else {
-                            crate::theme::HEADER_BG
-                        })
-                        .min_size(egui::vec2(0.0, crate::theme::PANEL_HEAD_H)),
-                );
-                r.widget_info(|| {
-                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, label)
-                });
-                if crate::help::help(r, key).clicked() {
-                    self.tab = tab;
-                }
-            }
-        });
+                            r.on_hover_text(label)
+                        };
+                        r.widget_info(|| {
+                            egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, label)
+                        });
+                        if crate::help::help(r, key).clicked() {
+                            self.tab = tab;
+                        }
+                    }
+                })
+            });
         if let Some(rx) = &self.net_rx {
             match poll_net(rx) {
                 NetPoll::Pending => {}

@@ -293,11 +293,11 @@ pub mod lh {
     pub const OP_W: f32 = 16.0;
     pub const BUS_W: f32 = 15.0;
     pub const BUS_H: f32 = 14.0;
-    pub const NAME_Y: f32 = 78.0;
+    pub const NAME_Y: f32 = 79.0;
     /// Bus A / B sit at the right edge of the header; the name fills the rest of the row.
     pub const BUS_B_X: f32 = LAYER_HEAD_W - GAP - BUS_W;
     pub const BUS_A_X: f32 = BUS_B_X - 1.0 - BUS_W;
-    pub const NAME_W: f32 = OP_X - GAP - X0;
+    pub const NAME_W: f32 = BUS_A_X - GAP - X0;
 }
 pub const PILL_ROUNDING: f32 = 3.0;
 pub const DECK_BAR_BG: Color32 = Color32::from_rgb(0x1c, 0x1e, 0x23);
