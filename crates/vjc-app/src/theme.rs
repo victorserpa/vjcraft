@@ -173,10 +173,10 @@ fn style_dark(s: &mut egui::Style) {
 }
 
 /// Clip cell: thumbnail area plus a name strip below it.
-pub const CELL_W: f32 = 92.0;
-pub const THUMB_H: f32 = 52.0;
-pub const NAME_H: f32 = 14.0;
-pub const CELL_ROUNDING: f32 = 3.0;
+pub const CELL_W: f32 = 104.0;
+pub const THUMB_H: f32 = 80.0;
+pub const NAME_H: f32 = 16.0;
+pub const CELL_ROUNDING: f32 = 0.0;
 pub const THUMB_MAX_SIDE: u32 = 160;
 
 pub const CELL_EMPTY: Color32 = Color32::from_rgb(24, 26, 30);
@@ -191,9 +191,10 @@ pub const CELL_PENDING: Color32 = Color32::from_rgb(44, 48, 56);
 pub const ACCENT: Color32 = Color32::from_rgb(169, 139, 255);
 
 /// Layer header block (left of the cells).
-pub const LAYER_HEAD_W: f32 = 150.0;
-pub const LAYER_FADER_W: f32 = 130.0;
-pub const LAYER_BTN: f32 = 20.0;
+pub const LAYER_HEAD_W: f32 = 244.0;
+
+/// Deck tab strip under the grid.
+pub const DECK_TABS_H: f32 = 26.0;
 
 /// Column header trigger.
 pub const COLUMN_HEAD_H: f32 = 22.0;
@@ -225,7 +226,7 @@ pub const FX_SLIDER_W: f32 = 120.0;
 pub const FX_BTN: Vec2 = vec2(22.0, 20.0);
 
 /// Transport bar height assumed until the first frame measures it.
-pub const TRANSPORT_H: f32 = 30.0;
+pub const TRANSPORT_H: f32 = 40.0;
 
 /// Status bar.
 pub const STATUS_H: f32 = 22.0;
@@ -267,6 +268,40 @@ pub const TESTCARD_BARS: [Color32; 8] = [
 pub const IDENTIFY_BG: Color32 = Color32::from_black_alpha(170);
 pub const IDENTIFY_TEXT: Color32 = ACCENT;
 pub const FPS_TEXT: Color32 = CELL_PLAYING;
+
+/// Mock-v2 look: panel header rows, per-layer strip buttons, column header states.
+pub const HEADER_BG: Color32 = Color32::from_rgb(0x20, 0x22, 0x28);
+pub const SECTION_BG: Color32 = Color32::from_rgb(0x2a, 0x2d, 0x34);
+pub const EFFECT_BG: Color32 = Color32::from_rgb(0x2e, 0x2a, 0x45);
+pub const LAYER_AUDIO_ON: Color32 = Color32::from_rgb(0xc8, 0x4b, 0x8c);
+pub const LAYER_VIDEO_ON: Color32 = CELL_PLAYING;
+pub const COLUMN_SELECTED: Color32 = ACCENT;
+pub const COLUMN_HEAD_BG: Color32 = Color32::from_rgb(0x2a, 0x2d, 0x34);
+pub const LAYER_ROW_H: f32 = THUMB_H + NAME_H;
+/// Layer header geometry (x offsets inside `LAYER_HEAD_W`), all derived from a few widths.
+pub mod lh {
+    use super::LAYER_HEAD_W;
+    pub const GAP: f32 = 4.0;
+    pub const CLEAR_W: f32 = 38.0;
+    pub const X0: f32 = CLEAR_W + GAP;
+    pub const BTN_W: f32 = 44.0;
+    pub const BTN_X2: f32 = X0 + BTN_W + GAP - 2.0;
+    pub const BLEND_W: f32 = 2.0 * BTN_W + GAP - 2.0;
+    pub const FLAG_X: f32 = X0 + BLEND_W + GAP + 2.0;
+    pub const FLAG_W: f32 = 20.0;
+    pub const OP_X: f32 = FLAG_X + FLAG_W + 10.0;
+    pub const OP_W: f32 = 16.0;
+    pub const BUS_W: f32 = 15.0;
+    pub const BUS_H: f32 = 14.0;
+    pub const NAME_Y: f32 = 78.0;
+    /// Bus A / B sit at the right edge of the header; the name fills the rest of the row.
+    pub const BUS_B_X: f32 = LAYER_HEAD_W - GAP - BUS_W;
+    pub const BUS_A_X: f32 = BUS_B_X - 1.0 - BUS_W;
+    pub const NAME_W: f32 = OP_X - GAP - X0;
+}
+pub const PILL_ROUNDING: f32 = 3.0;
+pub const DECK_BAR_BG: Color32 = Color32::from_rgb(0x1c, 0x1e, 0x23);
+pub const PANEL_HEAD_H: f32 = 24.0;
 
 #[cfg(test)]
 mod tests {

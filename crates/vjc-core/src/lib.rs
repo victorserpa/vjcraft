@@ -427,6 +427,10 @@ pub enum Command {
     AddColumn {
         column: Column,
     },
+    RenameColumn {
+        column: Uuid,
+        name: String,
+    },
     /// Removes the last column, which must be empty.
     RemoveColumn {
         column: Uuid,
@@ -1111,6 +1115,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
     if let Command::RenameLayer { name, .. }
     | Command::RenameClip { name, .. }
     | Command::RenameDeck { name, .. }
+    | Command::RenameColumn { name, .. }
     | Command::RenameGroup { name, .. } = &cmd
         && name.trim().is_empty()
     {
@@ -2048,6 +2053,16 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             p.composition.columns.push(column);
             undoable(Command::RemoveColumn { column: id }, vec![])
         }
+        Command::RenameColumn { column, name } => {
+            let c = p
+                .composition
+                .columns
+                .iter_mut()
+                .find(|c| c.id == column)
+                .ok_or(Error::NoColumn)?;
+            let prev = std::mem::replace(&mut c.name, name);
+            undoable(Command::RenameColumn { column, name: prev }, vec![])
+        }
         Command::RemoveColumn { column } => {
             let i = p
                 .composition
@@ -2816,6 +2831,36 @@ mod tests {
         );
         assert_eq!(r, Err(Error::InvalidValue));
         assert_eq!(p.composition.decks[0].name, "Deck");
+    }
+
+    #[test]
+    fn rename_column_is_undoable_and_rejects_empty() {
+        let mut p = Project::new("t");
+        let mut h = History::new();
+        let id = Uuid::new_v4();
+        p.composition.columns.push(Column {
+            id,
+            name: "1".into(),
+        });
+        let rename = |name: &str| Command::RenameColumn {
+            column: id,
+            name: name.into(),
+        };
+        h.exec(&mut p, rename("Drop"), Instant::now()).unwrap();
+        assert_eq!(p.composition.columns.last().unwrap().name, "Drop");
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p.composition.columns.last().unwrap().name, "1");
+        // negative control: blank and unknown ids change nothing
+        assert_eq!(
+            h.exec(&mut p, rename("  "), Instant::now()),
+            Err(Error::InvalidValue)
+        );
+        let bad = Command::RenameColumn {
+            column: Uuid::new_v4(),
+            name: "x".into(),
+        };
+        assert_eq!(apply(&mut p, bad), Err(Error::NoColumn));
+        assert_eq!(p.composition.columns.last().unwrap().name, "1");
     }
 
     #[test]

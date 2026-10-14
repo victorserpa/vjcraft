@@ -226,7 +226,7 @@ fn tmp_vjc(name: &str) -> PathBuf {
 #[test]
 fn opens_empty_app_with_bar_grid_and_browser() {
     let mut h = app_with(State::headless(prefs()), egui::vec2(1280.0, 800.0));
-    for l in ["BPM", "Tap", "Resync", "Master", "Add layer", "Add column"] {
+    for l in ["BPM", "Tap", "Resync", "Bypass", "Add layer", "Add column"] {
         assert!(exists(&h, l) || has_text(&h, l), "missing {l}");
     }
     for l in ["Files", "Effects", "Generators", "Network"] {
@@ -356,16 +356,26 @@ fn layer_opacity_slider_and_blend_combo() {
     };
     assert_eq!(opacity(&h), 1.0);
     // Sliders in tree order: master opacity (panel) comes first, then the grid ones.
-    let n = slider_rects(&h).len();
-    let grid_top = slider_rects(&h).into_iter().nth(n - 2).unwrap();
-    drag_to_slider_pct(&mut h, grid_top, 0.25);
+    let grid = h.state().grid_rect;
+    let grid_top = slider_rects(&h)
+        .into_iter()
+        .filter(|r| r.height() > r.width() && grid.contains_rect(*r))
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .expect("vertical layer fader in the grid");
+    // The layer fader is vertical: 1.0 at the top, drag to a quarter from the bottom.
+    let x = grid_top.center().x;
+    drag(
+        &mut h,
+        egui::pos2(x, grid_top.center().y),
+        egui::pos2(x, grid_top.bottom() - grid_top.height() * 0.25),
+    );
     let v = opacity(&h);
     assert!(v < 0.6, "opacity dragged down, got {v}");
     assert!(h.state().dirty);
-    // Blend combo of the top layer (first ComboBox showing "Normal").
+    // Blend dropdown of the top layer: an icon, named by the current mode.
     let combo = h
-        .query_all_by_role(egui::accesskit::Role::ComboBox)
-        .find(|n| n.value().as_deref() == Some("Normal"))
+        .query_all_by_label("Blend mode: Normal")
+        .next()
         .expect("blend combo");
     combo.click();
     settle(&mut h);
@@ -2619,4 +2629,193 @@ fn stale_multi_selection_is_pruned_after_undo() {
     h.state_mut().sel_slices = vec![ghost, ghost];
     h.state_mut().prune_sel_slices();
     assert!(h.state().sel_slices.is_empty());
+}
+
+fn first_column_name(h: &Harness<'_, State>) -> String {
+    h.state().project.composition.columns[0].name.clone()
+}
+
+#[test]
+fn column_header_double_click_renames_enter_commits_esc_cancels() {
+    // Fast frames, so two clicks land inside egui's double-click delay.
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_step_dt(0.02)
+        .build_ui_state(styled_ui(), small_grid(State::headless(prefs())));
+    settle(&mut h);
+    let p = h.get_by_label("Select column 1").rect().center();
+    let before = first_column_name(&h);
+    double_click_at(&mut h, p);
+    assert!(h.state().col_renaming.is_some(), "rename mode");
+    h.get_by_label("Column name").type_text("x");
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(first_column_name(&h), format!("{before}x"));
+    assert!(h.state().dirty);
+    let name = first_column_name(&h);
+    assert_ne!(name, before);
+    // negative control: Esc leaves the name alone
+    let p = h
+        .get_by_label(&format!("Select column {name}"))
+        .rect()
+        .center();
+    double_click_at(&mut h, p);
+    h.get_by_label("Column name").type_text("zzz");
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(first_column_name(&h), name);
+}
+
+#[test]
+fn stop_column_button_stops_only_layers_playing_that_column() {
+    let mut h = app();
+    let (deck, layer) = {
+        let c = &h.state().project.composition;
+        (c.current_deck, c.layers[0].id)
+    };
+    h.state_mut().gens.insert(layer, (deck, 0, 0.0));
+    settle(&mut h);
+    // negative control: another column's stop does nothing (and is disabled)
+    h.get_by_label("Stop column 2").click();
+    settle(&mut h);
+    assert!(h.state().gens.contains_key(&layer));
+    click(&mut h, "Stop column 1");
+    assert!(!h.state().gens.contains_key(&layer));
+}
+
+#[test]
+fn deck_tabs_sit_under_the_grid_not_above_it() {
+    let h = app();
+    let grid = h.state().grid_rect;
+    let tab = h.get_by_label("Deck").rect();
+    assert!(tab.min.y >= grid.max.y - 0.5, "tab {tab:?} grid {grid:?}");
+    // negative control: the first column header is inside the grid, above the tab
+    let head = h.get_by_label("Trigger column 1").rect();
+    assert!(head.max.y <= grid.max.y && head.max.y < tab.min.y);
+    // the strip must really be visible: its clip rect is non-empty and holds the tab
+    // (accesskit nodes exist even when everything is clipped away)
+    let clip = h.state().tabs_clip;
+    assert!(
+        clip.width() > 1.0 && clip.height() > 1.0,
+        "strip clipped away: {clip:?}"
+    );
+    assert!(
+        clip.contains_rect(tab.shrink(0.5)),
+        "tab {tab:?} outside clip {clip:?}"
+    );
+    // negative control: the grid area does not contain the tab
+    assert!(!grid.contains_rect(tab));
+}
+
+#[test]
+fn layer_header_main_controls_share_one_row() {
+    let h = app();
+    let y = |label: &str| {
+        h.query_all_by_label(label)
+            .next()
+            .unwrap()
+            .rect()
+            .center()
+            .y
+    };
+    let row = y("Bypass layer");
+    assert!((y("Solo layer") - row).abs() < 1.0, "Solo on the first row");
+    // negative control: secondary toggles sit on their own row below
+    assert!(y("Layer video on/off") > row + 10.0);
+}
+
+#[test]
+fn layer_header_blend_is_an_icon_with_the_mode_in_its_name() {
+    let mut h = app();
+    assert!(exists(&h, "Blend mode: Normal"));
+    // negative control: the name follows the real mode
+    let (mode, name) = vjc_core::blend::COMPOSITION_MODES[1].clone();
+    let lid = h.state().project.composition.layers[0].id;
+    h.state_mut().exec(Command::SetBlend {
+        layer: lid,
+        blend: mode,
+    });
+    settle(&mut h);
+    assert!(exists(&h, &format!("Blend mode: {name}")));
+    assert!(!exists(&h, "Blend mode: Normal") || all(&h, "Blend mode: Normal") == 1);
+}
+
+/// The toolbar Record button (the browser also has a "Record" tab, further right).
+fn rec_btn<'a>(h: &'a Harness<'_, State>) -> egui_kittest::Node<'a> {
+    h.query_all_by_label("Record")
+        .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .unwrap()
+}
+
+#[test]
+fn record_button_shows_real_capture_state_without_flashing() {
+    // The toolbar button; the browser also has a "Record" tab.
+    let rec_toggled = |h: &Harness<'_, State>| rec_btn(h).accesskit_node().toggled();
+    let mut h = app();
+    assert_eq!(rec_toggled(&h), Some(egui::accesskit::Toggled::False));
+    // Click: the command is accepted, but no capture exists (it starts in the GPU pass),
+    // so the very next frame must still show "off", not a local flip.
+    rec_btn(&h).click();
+    // Every frame of the click (press, release, command) must keep showing "off".
+    for _ in 0..4 {
+        h.step();
+        assert!(h.state().capture.is_none());
+        assert_eq!(rec_toggled(&h), Some(egui::accesskit::Toggled::False));
+    }
+}
+
+fn fast_app() -> Harness<'static, State> {
+    // Fast frames, so two clicks land inside egui's double-click delay.
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_step_dt(0.02)
+        .build_ui_state(styled_ui(), small_grid(State::headless(prefs())));
+    settle(&mut h);
+    h
+}
+
+#[test]
+fn column_name_row_double_click_renames_without_triggering_arrow_row_triggers() {
+    let mut h = fast_app();
+    let (lid, pos) = cell_center(&h, 0, 1);
+    let (gen_id, _) = vjc_fx::GENERATORS[0];
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    h.state_mut().gens.clear();
+    settle(&mut h);
+    assert!(!h.state().gens.contains_key(&lid));
+    let p = h.get_by_label("Select column 2").rect().center();
+    double_click_at(&mut h, p);
+    assert!(h.state().col_renaming.is_some(), "rename editor opens");
+    assert!(!h.state().gens.contains_key(&lid), "no player started");
+    assert_eq!(h.state().col_sel, Some(1), "name row selects the column");
+    // negative control: the arrow row does trigger the column
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    click(&mut h, "Trigger column 2");
+    assert!(h.state().gens.contains_key(&lid), "arrow row triggers");
+}
+
+#[test]
+fn master_controls_and_crossfader_survive_a_hidden_grid() {
+    let mut h = app();
+    assert!(exists(&h, "Bypass") && exists(&h, "Record"));
+    h.state_mut().prefs.layouts.current.grid = false;
+    settle(&mut h);
+    assert!(exists(&h, "Bypass"), "master Bypass");
+    assert!(exists(&h, "Record"), "master Record");
+    assert!(exists(&h, "Clear All"));
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::Slider).count() > 0,
+        "crossfader slider"
+    );
+    assert!(h.state().topbars_h > 0.0, "topbars_h tracks the strip");
+}
+
+#[test]
+fn column_rename_is_dropped_when_the_column_is_gone() {
+    let mut h = app();
+    h.state_mut().col_renaming = Some((Uuid::new_v4(), "x".into()));
+    settle(&mut h);
+    assert!(h.state().col_renaming.is_none());
 }

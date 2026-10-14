@@ -45,10 +45,10 @@ pub fn section(ui: &mut egui::Ui, id: &'static str, title: &str) -> bool {
     let fill = if r.hovered() {
         theme::SURFACE_RAISED
     } else {
-        theme::SURFACE
+        theme::SECTION_BG
     };
     let p = ui.painter();
-    p.rect_filled(rect, theme::CELL_ROUNDING, fill);
+    p.rect_filled(rect, 0.0, fill);
     let arrow = if open {
         crate::icons::i::CARET_DOWN
     } else {
@@ -66,7 +66,7 @@ pub fn section(ui: &mut egui::Ui, id: &'static str, title: &str) -> bool {
         mid + egui::vec2(theme::SP_3 + 16.0, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
-        theme::bold_font(ui.ctx(), theme::FS_BASE),
+        egui::FontId::proportional(theme::FS_SM),
         theme::TEXT,
     );
     if r.has_focus() {

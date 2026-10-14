@@ -115,6 +115,8 @@ impl LayerGroup {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub id: Uuid,
+    /// Header label; older projects may lack it.
+    #[serde(default)]
     pub name: String,
 }
 
@@ -1148,6 +1150,19 @@ impl std::fmt::Display for Timecode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn column_name_roundtrips_and_defaults_when_absent() {
+        let c = Column {
+            id: Uuid::new_v4(),
+            name: "Drop".into(),
+        };
+        let back: Column = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        // negative control: an old file without the field still loads
+        let old = format!("{{\"id\":\"{}\"}}", c.id);
+        assert_eq!(serde_json::from_str::<Column>(&old).unwrap().name, "");
+    }
+
     use super::*;
 
     #[test]
