@@ -1068,7 +1068,7 @@ impl State {
             return;
         };
         let mut restore = None;
-        widgets::dialog(ctx, "Recover project", |ui| {
+        widgets::dialog(ctx, "Recover project", false, |ui| {
             ui.label("VJCraft found an autosaved project from a previous session. Restore it?");
             ui.add_space(theme::SP_4);
             ui.horizontal(|ui| {
@@ -1115,7 +1115,7 @@ impl State {
         let n = vjc_io::media::missing(&self.project).len();
         let mut go = false;
         let mut cancel = false;
-        widgets::dialog(ctx, "Relink missing media", |ui| {
+        let esc = widgets::dialog(ctx, "Relink missing media", true, |ui| {
             ui.label(format!(
                 "{n} file(s) are missing. Pick a folder to search for them by name."
             ));
@@ -1125,7 +1125,7 @@ impl State {
                 cancel = widgets::btn(ui, "Cancel", widgets::Kind::Secondary).clicked();
             });
         });
-        if go || cancel {
+        if go || cancel || esc {
             self.relink_open = false;
         }
         if go

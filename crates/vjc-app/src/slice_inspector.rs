@@ -5,45 +5,25 @@
 //! The maths lives in `vjc_core::slice_geom`; every edit is one undoable Command.
 
 use crate::State;
+use crate::theme::SP_4;
+use crate::widgets::{self, Kind};
 use eframe::egui;
 use vjc_core::Command;
 use vjc_core::slice_geom::{self, Field, Op, Side};
 use vjc_model::{Screen, Slice, SliceSource};
 
 /// Distance, in canvas pixels, at which a dragged point jumps to a guide.
-pub(crate) const GUIDE_PX: f32 = 8.0;
+pub(crate) const GUIDE_PX: f32 = SP_4;
 
-/// Text of a pixel value: whole numbers without decimals.
-fn show(v: f32) -> String {
-    if (v - v.round()).abs() < 0.005 {
-        format!("{:.0}", v.round())
-    } else {
-        format!("{v:.2}")
-    }
-}
+/// Range the pixel fields accept (far beyond any real screen).
+const PX_RANGE: std::ops::RangeInclusive<f32> = -1.0e6..=1.0e6;
 
-/// A text field that evaluates simple math (`/3`, `*2`, `+10`, `-10`, `1920/4`) against its
-/// current value when it loses focus. Returns the new value when it changed.
-fn math_field(ui: &mut egui::Ui, id: egui::Id, value: f32) -> Option<f32> {
-    let mut text = ui
-        .data_mut(|d| d.get_temp::<String>(id))
-        .unwrap_or_else(|| show(value));
-    let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(58.0));
-    let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    let mut out = None;
-    // An untouched field shows a rounded value; leaving it must not write that back.
-    if r.lost_focus() && !escaped && text != show(value) {
-        match slice_geom::eval_field(&text, value) {
-            Some(v) if (v - value).abs() > 1e-4 => out = Some(v),
-            _ => {}
-        }
-    }
-    if r.has_focus() {
-        ui.data_mut(|d| d.insert_temp(id, text));
-    } else {
-        ui.data_mut(|d| d.remove_temp::<String>(id));
-    }
-    out
+/// A numeric field that evaluates simple math (`/3`, `*2`, `+10`, `-10`, `1920/4`) against
+/// its current value when typed into. Returns the new value when it changed.
+fn math_field(ui: &mut egui::Ui, value: f32) -> Option<f32> {
+    let mut v = value;
+    let r = widgets::field_num(ui, &mut v, PX_RANGE, 0.0); // typed only: one undo step per edit
+    (r.changed() && (v - value).abs() > 1e-4).then_some(v)
 }
 
 /// Arrow keys over `rect` as a move in pixels: 1 px, 10 px with Shift. `None` when the
@@ -264,114 +244,112 @@ impl State {
         let c = &self.project.composition;
         let comp = (c.width, c.height);
         let side = self.geom_side;
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("Slice (px)");
-            ui.selectable_value(&mut self.geom_side, Side::Input, "Input");
-            ui.selectable_value(&mut self.geom_side, Side::Output, "Output");
-            ui.weak("fields take math: /3  *2  +10  -10");
-        });
-        if let Some(v) = slice_geom::readout(sl, side, comp) {
+        widgets::section(ui, "Slice (px)", |ui| {
             ui.horizontal(|ui| {
-                for (n, (label, f)) in [
-                    ("X", Field::X),
-                    ("Y", Field::Y),
-                    ("W", Field::W),
-                    ("H", Field::H),
-                    ("Rot", Field::Rot),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    ui.label(label);
-                    let id = egui::Id::new(("slice-field", sl.id, side == Side::Input, n));
-                    if let Some(new) = math_field(ui, id, v[n])
-                        && let Some(cmd) = slice_geom::edit(scr, sl, side, comp, Op::Set(f, new))
+                ui.selectable_value(&mut self.geom_side, Side::Input, "Input");
+                ui.selectable_value(&mut self.geom_side, Side::Output, "Output");
+                ui.weak("fields take math: /3  *2  +10  -10");
+            });
+            if let Some(v) = slice_geom::readout(sl, side, comp) {
+                ui.horizontal(|ui| {
+                    for (n, (label, f)) in [
+                        ("X", Field::X),
+                        ("Y", Field::Y),
+                        ("W", Field::W),
+                        ("H", Field::H),
+                        ("Rot", Field::Rot),
+                    ]
+                    .into_iter()
+                    .enumerate()
                     {
+                        ui.label(label);
+                        if let Some(new) = math_field(ui, v[n])
+                            && let Some(cmd) =
+                                slice_geom::edit(scr, sl, side, comp, Op::Set(f, new))
+                        {
+                            cmds.push(cmd);
+                        }
+                    }
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                let mut ops = vec![];
+                for (label, op) in [
+                    ("Rotate 90", Op::Rotate(1)),
+                    ("Rotate 180", Op::Rotate(2)),
+                    ("Rotate 270", Op::Rotate(3)),
+                    ("Flip H", Op::FlipH),
+                    ("Flip V", Op::FlipV),
+                ] {
+                    if widgets::btn(ui, label, Kind::Secondary).clicked() {
+                        ops.push(op);
+                    }
+                }
+                if widgets::btn(ui, "Match output shape", Kind::Secondary)
+                    .on_hover_text("Copy the output rectangle to the input: 1:1 pixel map")
+                    .clicked()
+                    && let Some(cmd) = slice_geom::edit(scr, sl, Side::Input, comp, Op::MatchOutput)
+                {
+                    cmds.push(cmd);
+                }
+                for op in ops {
+                    if let Some(cmd) = slice_geom::edit(scr, sl, side, comp, op) {
                         cmds.push(cmd);
                     }
                 }
             });
-        }
-        ui.horizontal_wrapped(|ui| {
-            let mut ops = vec![];
-            for (label, op) in [
-                ("Rotate 90", Op::Rotate(1)),
-                ("Rotate 180", Op::Rotate(2)),
-                ("Rotate 270", Op::Rotate(3)),
-                ("Flip H", Op::FlipH),
-                ("Flip V", Op::FlipV),
-            ] {
-                if ui.button(label).clicked() {
-                    ops.push(op);
-                }
-            }
-            if ui
-                .button("Match output shape")
-                .on_hover_text("Copy the output rectangle to the input: 1:1 pixel map")
-                .clicked()
-                && let Some(cmd) = slice_geom::edit(scr, sl, Side::Input, comp, Op::MatchOutput)
-            {
-                cmds.push(cmd);
-            }
-            for op in ops {
-                if let Some(cmd) = slice_geom::edit(scr, sl, side, comp, op) {
-                    cmds.push(cmd);
-                }
-            }
-        });
-        self.source_picker(ui, scr, sl, cmds);
-        ui.horizontal(|ui| {
-            if ui.button("Duplicate slice").clicked() {
-                let mut copy = sl.clone();
-                copy.id = uuid::Uuid::new_v4();
-                let at = scr
-                    .slices
-                    .iter()
-                    .position(|s| s.id == sl.id)
-                    .map_or(scr.slices.len(), |i| i + 1);
-                cmds.push(Command::AddSlice {
-                    screen: scr.id,
-                    slice: copy,
-                    index: at,
-                });
-            }
-            if ui
-                .button("Mirror")
-                .on_hover_text("Duplicate and flip the copy horizontally (one undo step)")
-                .clicked()
-            {
-                cmds.push(slice_geom::mirror(
-                    scr,
-                    sl,
-                    side,
-                    comp,
-                    uuid::Uuid::new_v4(),
-                ));
-            }
-            let others: Vec<(uuid::Uuid, String, usize)> = self
-                .project
-                .output
-                .screens
-                .iter()
-                .filter(|s| s.id != scr.id)
-                .map(|s| (s.id, s.name.clone(), s.slices.len()))
-                .collect();
-            ui.add_enabled_ui(!others.is_empty(), |ui| {
-                egui::ComboBox::from_label("Move to screen")
-                    .selected_text("Choose")
-                    .show_ui(ui, |ui| {
-                        for (id, name, n) in &others {
-                            if ui.selectable_label(false, name).clicked() {
-                                cmds.push(Command::MoveSlice {
-                                    from: scr.id,
-                                    to: *id,
-                                    slice: sl.id,
-                                    index: *n,
-                                });
-                            }
-                        }
+            self.source_picker(ui, scr, sl, cmds);
+            ui.horizontal(|ui| {
+                if widgets::btn(ui, "Duplicate slice", Kind::Secondary).clicked() {
+                    let mut copy = sl.clone();
+                    copy.id = uuid::Uuid::new_v4();
+                    let at = scr
+                        .slices
+                        .iter()
+                        .position(|s| s.id == sl.id)
+                        .map_or(scr.slices.len(), |i| i + 1);
+                    cmds.push(Command::AddSlice {
+                        screen: scr.id,
+                        slice: copy,
+                        index: at,
                     });
+                }
+                if widgets::btn(ui, "Mirror", Kind::Secondary)
+                    .on_hover_text("Duplicate and flip the copy horizontally (one undo step)")
+                    .clicked()
+                {
+                    cmds.push(slice_geom::mirror(
+                        scr,
+                        sl,
+                        side,
+                        comp,
+                        uuid::Uuid::new_v4(),
+                    ));
+                }
+                let others: Vec<(uuid::Uuid, String, usize)> = self
+                    .project
+                    .output
+                    .screens
+                    .iter()
+                    .filter(|s| s.id != scr.id)
+                    .map(|s| (s.id, s.name.clone(), s.slices.len()))
+                    .collect();
+                ui.add_enabled_ui(!others.is_empty(), |ui| {
+                    egui::ComboBox::from_label("Move to screen")
+                        .selected_text("Choose")
+                        .show_ui(ui, |ui| {
+                            for (id, name, n) in &others {
+                                if ui.selectable_label(false, name).clicked() {
+                                    cmds.push(Command::MoveSlice {
+                                        from: scr.id,
+                                        to: *id,
+                                        slice: sl.id,
+                                        index: *n,
+                                    });
+                                }
+                            }
+                        });
+                });
             });
         });
     }

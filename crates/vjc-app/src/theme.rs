@@ -32,7 +32,26 @@ pub const RADIUS_SM: u8 = 3;
 pub const FIELD_W_SM: f32 = 60.0;
 pub const FIELD_W_MD: f32 = 110.0;
 pub const FIELD_W_LG: f32 = 240.0;
+pub const FIELD_W_NAME: f32 = 140.0;
 pub const DIALOG_W: f32 = 360.0;
+pub const COMBO_W_SM: f32 = 40.0;
+
+/// Stroke widths: hairline (borders), handle outline, canvas outline.
+pub const STROKE_W: f32 = 1.0;
+pub const STROKE_HANDLE: f32 = 1.5;
+pub const STROKE_CANVAS: f32 = 2.0;
+
+/// Output setup window: size, first position, screen list column, canvas width.
+pub const OUTPUT_WIN_W: f32 = 820.0;
+pub const OUTPUT_WIN_X: f32 = 60.0;
+pub const OUTPUT_WIN_Y: f32 = 80.0;
+pub const OUTPUT_LIST_W: f32 = 190.0;
+pub const OUTPUT_CANVAS_W: f32 = 340.0;
+
+/// Canvas handles: radius, grab radius as a multiple of it, grid snap step.
+pub const HANDLE_R: f32 = 6.0;
+pub const HANDLE_GRAB_K: f32 = 1.5;
+pub const SNAP_PX: f32 = 10.0;
 
 /// Type scale (token `type`): xs 10, sm 12, base 13, lg 16.
 pub const FS_XS: f32 = 10.0;

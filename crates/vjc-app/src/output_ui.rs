@@ -8,8 +8,19 @@ use vjc_core::slice_geom::{self, Side};
 use vjc_core::{Command, dmx, mapping};
 use vjc_model::{ChannelOrder, Fixture, OutputDevice, PixelFormat, Screen};
 
-const HANDLE_R: f32 = 6.0;
-const SNAP_PX: f32 = 10.0;
+use crate::theme::{
+    COMBO_W_SM, FIELD_W_MD, FIELD_W_NAME, HANDLE_GRAB_K, HANDLE_R, OUTPUT_CANVAS_W, OUTPUT_LIST_W,
+    OUTPUT_WIN_W, OUTPUT_WIN_X, OUTPUT_WIN_Y, SNAP_PX, STROKE_CANVAS, STROKE_HANDLE,
+};
+use crate::widgets::{self, Kind};
+
+/// Largest screen size, fixture grid side and Art-Net universe the fields accept.
+const MAX_SCREEN_PX: u32 = 16384;
+const MAX_FIXTURE_SIDE: u32 = 1024;
+const MAX_UNIVERSE: i32 = 32767;
+/// A new mask is an inset square; a new soft edge starts 10% wide on the sides.
+const MASK_INSET: f32 = 0.1;
+const SOFT_EDGE_DEFAULT: f32 = 0.1;
 
 /// Behaviour switches of `handles`: grid `snap` (0 = off), arrow-key nudging of the
 /// selected point, and the slice rectangle that a drag off every handle moves.
@@ -54,7 +65,7 @@ fn handles(
             (q.y - rect.min.y) / rect.height() * space.1,
         )
     };
-    let radius = HANDLE_R * 1.5 * space.0 / rect.width();
+    let radius = HANDLE_R * HANDLE_GRAB_K * space.0 / rect.width();
     let drag_id = id.with("drag");
     let body_id = id.with("body");
     let mut moved = None;
@@ -145,7 +156,10 @@ fn handles(
             } else {
                 egui::Color32::TRANSPARENT
             },
-            egui::Stroke::new(1.5, if on_it { v.selection.stroke.color } else { off }),
+            egui::Stroke::new(
+                STROKE_HANDLE,
+                if on_it { v.selection.stroke.color } else { off },
+            ),
         );
     }
     Drag {
@@ -177,14 +191,14 @@ impl State {
             .cloned();
         egui::Window::new("Output setup")
             .open(&mut open)
-            .default_width(820.0)
+            .default_width(OUTPUT_WIN_W)
             // Open below the menu bar: the default position covered "Output" and ate its clicks.
-            .default_pos(egui::pos2(60.0, 80.0))
+            .default_pos(egui::pos2(OUTPUT_WIN_X, OUTPUT_WIN_Y))
             .show(ctx, |ui| {
                 self.presets_row(ui);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
-                        ui.set_width(190.0);
+                        ui.set_width(OUTPUT_LIST_W);
                         self.screen_list(ui, &screens, sel_screen.as_ref(), (cw, ch), &mut cmds);
                     });
                     ui.separator();
@@ -304,7 +318,9 @@ impl State {
             }
         }
         ui.horizontal(|ui| {
-            if crate::help::help(ui.button("Add"), "out-add-screen").clicked() {
+            if crate::help::help(widgets::btn(ui, "Add", Kind::Secondary), "out-add-screen")
+                .clicked()
+            {
                 let s = mapping::new_screen(&format!("Screen {}", screens.len() + 1), cw, ch);
                 self.sel_screen = Some(s.id);
                 cmds.push(Command::AddScreen {
@@ -313,7 +329,10 @@ impl State {
                 });
             }
             if ui
-                .add_enabled(cur.is_some(), egui::Button::new("Remove"))
+                .add_enabled_ui(cur.is_some(), |ui| {
+                    widgets::btn(ui, "Remove", Kind::Secondary)
+                })
+                .inner
                 .clicked()
                 && let Some(c) = cur
             {
@@ -386,8 +405,16 @@ impl State {
                 }
             });
         let (mut w, mut h) = (c.width, c.height);
-        let a = ui.add(egui::DragValue::new(&mut w).range(1..=16384).prefix("W "));
-        let b = ui.add(egui::DragValue::new(&mut h).range(1..=16384).prefix("H "));
+        let a = ui.add(
+            egui::DragValue::new(&mut w)
+                .range(1..=MAX_SCREEN_PX)
+                .prefix("W "),
+        );
+        let b = ui.add(
+            egui::DragValue::new(&mut h)
+                .range(1..=MAX_SCREEN_PX)
+                .prefix("H "),
+        );
         if a.changed() || b.changed() {
             cmds.push(Command::SetScreenSize {
                 screen: c.id,
@@ -438,7 +465,7 @@ impl State {
             .unwrap_or_else(|| ip.clone());
         ui.horizontal(|ui| {
             ui.label("IP");
-            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(110.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(FIELD_W_MD));
             if r.lost_focus() && text.trim() != ip {
                 cmds.push(set(text.trim().to_owned(), *universe, fixture.clone()));
             }
@@ -453,7 +480,7 @@ impl State {
         if ui
             .add(
                 egui::DragValue::new(&mut u)
-                    .range(0..=32767)
+                    .range(0..=MAX_UNIVERSE)
                     .prefix("Universe "),
             )
             .changed()
@@ -494,7 +521,7 @@ impl State {
                 .fixtures
                 .iter()
                 .position(|l| l.name == fixture.name);
-            if ui.button("Save to library").clicked() {
+            if widgets::btn(ui, "Save to library", Kind::Secondary).clicked() {
                 match saved {
                     Some(i) => self.prefs.dmx.fixtures[i] = fixture.clone(),
                     None => self.prefs.dmx.fixtures.push(fixture.clone()),
@@ -502,7 +529,10 @@ impl State {
                 self.save_prefs();
             }
             if ui
-                .add_enabled(saved.is_some(), egui::Button::new("Remove from library"))
+                .add_enabled_ui(saved.is_some(), |ui| {
+                    widgets::btn(ui, "Remove from library", Kind::Secondary)
+                })
+                .inner
                 .clicked()
                 && let Some(i) = saved
             {
@@ -521,7 +551,7 @@ impl State {
             let mut text = ui
                 .data_mut(|d| d.get_temp::<String>(name_id))
                 .unwrap_or_else(|| f.name.clone());
-            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(140.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(FIELD_W_NAME));
             if r.lost_focus() && !text.trim().is_empty() {
                 f.name = text.trim().to_owned();
             }
@@ -534,12 +564,12 @@ impl State {
         ui.horizontal(|ui| {
             ui.add(
                 egui::DragValue::new(&mut f.width)
-                    .range(1..=1024)
+                    .range(1..=MAX_FIXTURE_SIDE)
                     .prefix("W "),
             );
             ui.add(
                 egui::DragValue::new(&mut f.height)
-                    .range(1..=1024)
+                    .range(1..=MAX_FIXTURE_SIDE)
                     .prefix("H "),
             );
             while !dmx::valid(f) {
@@ -571,7 +601,7 @@ impl State {
                     }
                 });
         });
-        ui.add(egui::Slider::new(&mut f.gamma, 0.5..=3.0).text("Gamma"));
+        widgets::slider(ui, &mut f.gamma, 0.5..=3.0, "Gamma");
         ui.checkbox(&mut f.serpentine, "Serpentine (odd rows reversed)");
     }
 
@@ -620,7 +650,12 @@ impl State {
                         self.sel_pt_out = None;
                     }
                 }
-                if crate::help::help(ui.button("Add slice"), "out-add-slice").clicked() {
+                if crate::help::help(
+                    widgets::btn(ui, "Add slice", Kind::Secondary),
+                    "out-add-slice",
+                )
+                .clicked()
+                {
                     let s = mapping::new_slice(scr.width, scr.height);
                     cmds.push(Command::AddSlice {
                         screen: scr.id,
@@ -644,7 +679,9 @@ impl State {
                 } else {
                     "Remove slice"
                 };
-                if crate::help::help(ui.button(label), "out-remove-slice").clicked() {
+                if crate::help::help(widgets::btn(ui, label, Kind::Secondary), "out-remove-slice")
+                    .clicked()
+                {
                     let mut rm: Vec<Command> = self
                         .selected_slices(scr, sl)
                         .into_iter()
@@ -664,7 +701,7 @@ impl State {
                 let mut grid = (sl.mesh_cols, rows);
                 for (n, v) in [("Cols", &mut grid.0), ("Rows", &mut grid.1)] {
                     egui::ComboBox::from_label(n)
-                        .width(40.0)
+                        .width(COMBO_W_SM)
                         .selected_text(v.to_string())
                         .show_ui(ui, |ui| {
                             for k in mapping::MIN_GRID..=mapping::MAX_GRID {
@@ -711,74 +748,89 @@ impl State {
             slice: sl.id,
             mask: m,
         };
-        ui.horizontal(|ui| {
-            ui.strong("Mask");
-            if sl.mask.is_none() {
-                self.edit_mask = false;
-                if crate::help::help(ui.button("Create mask"), "out-create-mask").clicked() {
-                    self.edit_mask = true;
-                    self.sel_mask_pt = None;
-                    cmds.push(set_mask(Some(vec![
-                        (0.1, 0.1),
-                        (0.9, 0.1),
-                        (0.9, 0.9),
-                        (0.1, 0.9),
-                    ])));
-                }
-            } else if let Some(m) = &sl.mask {
-                ui.checkbox(&mut self.edit_mask, "Edit points");
-                let can_rm = m.len() > 3 && self.sel_mask_pt.is_some_and(|i| i < m.len());
-                if ui
-                    .add_enabled(can_rm, egui::Button::new("Remove point"))
-                    .clicked()
-                    && let Some(i) = self.sel_mask_pt.take()
-                {
-                    let mut m = m.clone();
-                    m.remove(i);
-                    cmds.push(set_mask(Some(m)));
-                }
-                if crate::help::help(ui.button("Clear mask"), "out-clear-mask").clicked() {
+        widgets::section(ui, "Mask", |ui| {
+            ui.horizontal(|ui| {
+                if sl.mask.is_none() {
                     self.edit_mask = false;
-                    self.sel_mask_pt = None;
-                    cmds.push(set_mask(None));
+                    if crate::help::help(
+                        widgets::btn(ui, "Create mask", Kind::Secondary),
+                        "out-create-mask",
+                    )
+                    .clicked()
+                    {
+                        self.edit_mask = true;
+                        self.sel_mask_pt = None;
+                        cmds.push(set_mask(Some(vec![
+                            (MASK_INSET, MASK_INSET),
+                            (1.0 - MASK_INSET, MASK_INSET),
+                            (1.0 - MASK_INSET, 1.0 - MASK_INSET),
+                            (MASK_INSET, 1.0 - MASK_INSET),
+                        ])));
+                    }
+                } else if let Some(m) = &sl.mask {
+                    ui.checkbox(&mut self.edit_mask, "Edit points");
+                    let can_rm = m.len() > 3 && self.sel_mask_pt.is_some_and(|i| i < m.len());
+                    if ui
+                        .add_enabled_ui(can_rm, |ui| {
+                            widgets::btn(ui, "Remove point", Kind::Secondary)
+                        })
+                        .inner
+                        .clicked()
+                        && let Some(i) = self.sel_mask_pt.take()
+                    {
+                        let mut m = m.clone();
+                        m.remove(i);
+                        cmds.push(set_mask(Some(m)));
+                    }
+                    if crate::help::help(
+                        widgets::btn(ui, "Clear mask", Kind::Secondary),
+                        "out-clear-mask",
+                    )
+                    .clicked()
+                    {
+                        self.edit_mask = false;
+                        self.sel_mask_pt = None;
+                        cmds.push(set_mask(None));
+                    }
+                    if self.edit_mask {
+                        ui.weak("click empty space to add a point");
+                    }
                 }
-                if self.edit_mask {
-                    ui.weak("click empty space to add a point");
-                }
-            }
+            });
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("Soft edge");
-            let mut on = sl.soft_edge.is_some();
-            if ui.checkbox(&mut on, "Enabled").changed() {
-                cmds.push(Command::SetSliceSoftEdge {
-                    screen: scr.id,
-                    slice: sl.id,
-                    soft_edge: on.then_some(vjc_model::SoftEdge {
-                        left: 0.1,
-                        right: 0.1,
-                        top: 0.0,
-                        bottom: 0.0,
-                        gamma: 1.0,
-                    }),
-                });
-            }
-            let Some(e) = &sl.soft_edge else { return };
-            let mut n = e.clone();
-            let w = 0.0..=mapping::MAX_SOFT_WIDTH;
-            ui.add(egui::Slider::new(&mut n.left, w.clone()).text("Edge left"));
-            ui.add(egui::Slider::new(&mut n.right, w.clone()).text("Edge right"));
-            ui.add(egui::Slider::new(&mut n.top, w.clone()).text("Edge top"));
-            ui.add(egui::Slider::new(&mut n.bottom, w).text("Edge bottom"));
-            let g = mapping::GAMMA_RANGE.0..=mapping::GAMMA_RANGE.1;
-            ui.add(egui::Slider::new(&mut n.gamma, g).text("Edge gamma"));
-            if n != *e {
-                cmds.push(Command::SetSliceSoftEdge {
-                    screen: scr.id,
-                    slice: sl.id,
-                    soft_edge: Some(n),
-                });
-            }
+        widgets::section(ui, "Soft edge", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let mut on = sl.soft_edge.is_some();
+                if ui.checkbox(&mut on, "Enabled").changed() {
+                    cmds.push(Command::SetSliceSoftEdge {
+                        screen: scr.id,
+                        slice: sl.id,
+                        soft_edge: on.then_some(vjc_model::SoftEdge {
+                            left: SOFT_EDGE_DEFAULT,
+                            right: SOFT_EDGE_DEFAULT,
+                            top: 0.0,
+                            bottom: 0.0,
+                            gamma: 1.0,
+                        }),
+                    });
+                }
+                let Some(e) = &sl.soft_edge else { return };
+                let mut n = e.clone();
+                let w = 0.0..=mapping::MAX_SOFT_WIDTH;
+                ui.add(egui::Slider::new(&mut n.left, w.clone()).text("Edge left"));
+                ui.add(egui::Slider::new(&mut n.right, w.clone()).text("Edge right"));
+                ui.add(egui::Slider::new(&mut n.top, w.clone()).text("Edge top"));
+                widgets::slider(ui, &mut n.bottom, w, "Edge bottom");
+                let g = mapping::GAMMA_RANGE.0..=mapping::GAMMA_RANGE.1;
+                widgets::slider(ui, &mut n.gamma, g, "Edge gamma");
+                if n != *e {
+                    cmds.push(Command::SetSliceSoftEdge {
+                        screen: scr.id,
+                        slice: sl.id,
+                        soft_edge: Some(n),
+                    });
+                }
+            });
         });
     }
 
@@ -790,24 +842,25 @@ impl State {
         sl: &vjc_model::Slice,
         cmds: &mut Vec<Command>,
     ) {
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("Colour");
-            let mut n = sl.color;
-            let r = 0.0..=mapping::MAX_GAIN;
-            ui.add(egui::Slider::new(&mut n.brightness, r.clone()).text("Brightness"));
-            ui.add(egui::Slider::new(&mut n.r, r.clone()).text("R"));
-            ui.add(egui::Slider::new(&mut n.g, r.clone()).text("G"));
-            ui.add(egui::Slider::new(&mut n.b, r).text("B"));
-            if ui.button("Reset").clicked() {
-                n = Default::default();
-            }
-            if n != sl.color {
-                cmds.push(Command::SetSliceColor {
-                    screen: scr.id,
-                    slice: sl.id,
-                    color: n,
-                });
-            }
+        widgets::section(ui, "Colour", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let mut n = sl.color;
+                let r = 0.0..=mapping::MAX_GAIN;
+                ui.add(egui::Slider::new(&mut n.brightness, r.clone()).text("Brightness"));
+                ui.add(egui::Slider::new(&mut n.r, r.clone()).text("R"));
+                ui.add(egui::Slider::new(&mut n.g, r.clone()).text("G"));
+                widgets::slider(ui, &mut n.b, r, "B");
+                if widgets::btn(ui, "Reset", Kind::Secondary).clicked() {
+                    n = Default::default();
+                }
+                if n != sl.color {
+                    cmds.push(Command::SetSliceColor {
+                        screen: scr.id,
+                        slice: sl.id,
+                        color: n,
+                    });
+                }
+            });
         });
     }
 
@@ -819,7 +872,7 @@ impl State {
         cmds: &mut Vec<Command>,
     ) {
         let c = &self.project.composition;
-        let rect = canvas_rect(ui, 340.0, c.width as f32 / c.height.max(1) as f32);
+        let rect = canvas_rect(ui, OUTPUT_CANVAS_W, c.width as f32 / c.height.max(1) as f32);
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
         if let Some(id) = self.comp_tex {
@@ -844,7 +897,10 @@ impl State {
                 ui.visuals().widgets.noninteractive.fg_stroke.color
             };
             let pts: Vec<egui::Pos2> = s.input.iter().map(|q| px(*q)).collect();
-            p.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.5, col)));
+            p.add(egui::Shape::closed_line(
+                pts,
+                egui::Stroke::new(STROKE_HANDLE, col),
+            ));
         }
         let id = egui::Id::new(("slice-in", sl.id));
         let snap = 0.0;
@@ -908,7 +964,11 @@ impl State {
         sl: &vjc_model::Slice,
         cmds: &mut Vec<Command>,
     ) {
-        let rect = canvas_rect(ui, 340.0, scr.width as f32 / scr.height.max(1) as f32);
+        let rect = canvas_rect(
+            ui,
+            OUTPUT_CANVAS_W,
+            scr.width as f32 / scr.height.max(1) as f32,
+        );
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
         let (cols, rows) = (
@@ -1008,8 +1068,10 @@ impl State {
         };
         let col = ui.visuals().selection.stroke.color;
         let pts: Vec<egui::Pos2> = m.iter().map(|q| px(*q)).collect();
-        ui.painter_at(rect)
-            .add(egui::Shape::closed_line(pts, egui::Stroke::new(2.0, col)));
+        ui.painter_at(rect).add(egui::Shape::closed_line(
+            pts,
+            egui::Stroke::new(STROKE_CANVAS, col),
+        ));
         let id = egui::Id::new(("slice-mask", sl.id));
         // The selection may come from another slice's mask: drop it if out of range.
         let mut sel = self.sel_mask_pt.filter(|&i| i < m.len());
@@ -1044,7 +1106,7 @@ impl State {
                 (at.x - rect.min.x) / rect.width(),
                 (at.y - rect.min.y) / rect.height(),
             );
-            let radius = HANDLE_R * 1.5 / rect.width();
+            let radius = HANDLE_R * HANDLE_GRAB_K / rect.width();
             if mapping::hit_test(m, q, radius).is_none() && m.len() < mapping::MAX_MASK_POINTS {
                 let i = mapping::nearest_edge_insert(m, q);
                 let mut mask = m.to_vec();
