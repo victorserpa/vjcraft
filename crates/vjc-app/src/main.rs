@@ -33,6 +33,7 @@ mod slice_render;
 mod source_info;
 mod theme;
 mod timecode_io;
+mod vram;
 mod wake;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
@@ -93,6 +94,11 @@ struct State {
     history: History,
     warnings: Vec<String>,
     status: String,
+    /// Texture-memory warning (see vram.rs), shown in the status bar while it holds.
+    vram_warn: Option<String>,
+    vram_dog: vram::Watchdog,
+    /// Texture-memory limit in bytes (`VJC_VRAM_LIMIT_MB`).
+    vram_limit: u64,
     frame_ms: frame_stats::FrameStats,
     /// Decoders opened ahead for the deck the user is about to switch to.
     preload: preload::Preload,
@@ -1130,6 +1136,9 @@ impl State {
             history: History::new(),
             warnings: vec![],
             status: "Drop video files on the grid cells.".into(),
+            vram_warn: None,
+            vram_dog: vram::Watchdog::default(),
+            vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
             preload: preload::Preload::default(),
             frames: 0,
@@ -3585,10 +3594,21 @@ impl State {
         match self.rec_request.take() {
             Some(true) if self.capture.is_none() => {
                 let size = comp.size;
+                // Master audio goes in when the output device is already open (clips with
+                // sound played); recording never opens a device by itself.
+                let feed = self
+                    .audio
+                    .as_ref()
+                    .filter(|a| a.sample_rate() > 0)
+                    .map(|a| vjc_media::record::AudioFeed {
+                        tap: a.tap(),
+                        rate: a.sample_rate(),
+                    });
                 match capture::Capture::start(
                     capture::default_path(self.prefs.general.record_folder.as_deref()),
                     size,
                     c.fps,
+                    feed,
                 ) {
                     Ok(cap) => {
                         self.status = format!("Recording to {}", cap.path().display());
@@ -3601,11 +3621,12 @@ impl State {
                 if let Some(cap) = self.capture.take() {
                     self.status = match cap.stop(&rs.device) {
                         Ok(s) => format!(
-                            "Saved {} ({} frames, {} dropped, {})",
+                            "Saved {} ({} frames, {} dropped, {}{})",
                             s.path.display(),
                             s.encoded,
                             s.dropped,
-                            s.codec
+                            s.codec,
+                            if s.audio { ", with audio" } else { "" }
                         ),
                         Err(e) => format!("Record failed: {e}"),
                     };
@@ -4598,6 +4619,10 @@ impl State {
                     ui.weak(format!("VJCraft {}", env!("CARGO_PKG_VERSION")));
                     ui.separator();
                     ui.label(&self.status);
+                    if let Some(w) = &self.vram_warn {
+                        ui.separator();
+                        ui.label(egui::RichText::new(w).color(theme::DANGER));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(local_clock())
@@ -7416,6 +7441,30 @@ impl State {
         }
     }
 
+    /// Texture-memory watchdog (see vram.rs): drops thumbnails over the limit, else warns (never the scratch pool).
+    fn vram_watch(&mut self) {
+        let Some(comp) = self.comp.as_mut() else {
+            self.vram_warn = None;
+            self.vram_dog.clear();
+            return;
+        };
+        let thumbs = std::cell::RefCell::new(&mut self.browser.fx_thumbs);
+        let comp = std::cell::RefCell::new(comp);
+        self.vram_warn = self.vram_dog.step(
+            self.vram_limit,
+            || {
+                let mut u = comp.borrow().vram();
+                u.thumbs = thumbs.borrow().bytes();
+                u
+            },
+            |c| match c {
+                vram::Cache::Thumbs => {
+                    thumbs.borrow_mut().evict_all();
+                }
+            },
+        );
+    }
+
     /// Tabs above the grid: click selects, double click renames, "+" adds, menu removes.
     fn deck_tabs(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, cf_pos: f64) {
         let cur = self.project.composition.current_deck;
@@ -7505,6 +7554,18 @@ impl State {
                 r.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
                         self.renaming = Some((*id, name.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Duplicate").clicked() {
+                        if let Some(deck) = vjc_core::duplicate_deck(&self.project, *id) {
+                            let new = deck.id;
+                            cmds.push(Command::AddDeck {
+                                deck,
+                                index: i + 1,
+                                select: None,
+                            });
+                            cmds.push(Command::SelectDeck { deck: new });
+                        }
                         ui.close();
                     }
                     if ui
@@ -7769,6 +7830,9 @@ impl eframe::App for State {
         self.tick_clock();
         self.audio_react.refresh(&self.project.composition);
         self.compose(frame);
+        if self.frames.is_multiple_of(30) {
+            self.vram_watch();
+        }
         if let Some(rs) = frame.wgpu_render_state() {
             self.browser
                 .fx_thumbs

@@ -228,6 +228,69 @@ impl EnvPreset {
     }
 }
 
+/// One cycle of a Timeline, Beats or Envelope animation as `n` samples in 0..=1 (sample `i`
+/// is at `i / n` of the cycle), for drawing the curve. Other kinds have no cycle: empty.
+pub fn preview(anim: &Animation, n: usize) -> Vec<f64> {
+    let cycle = match anim {
+        Animation::Timeline { duration_secs, .. } => *duration_secs,
+        Animation::Beats { beats, .. } | Animation::Envelope { beats, .. } => *beats,
+        _ => return Vec::new(),
+    };
+    (0..n)
+        .map(|i| {
+            let at = cycle * i as f64 / n as f64;
+            let ctx = match anim {
+                Animation::Timeline { .. } => AnimCtx {
+                    time_secs: at,
+                    ..Default::default()
+                },
+                _ => AnimCtx {
+                    beat_phase: at,
+                    ..Default::default()
+                },
+            };
+            unit(anim, &ctx)
+        })
+        .collect()
+}
+
+/// Index of the envelope point closest to (x, y) within `radius` (in the same 0..1 units,
+/// x and y weighted equally), or `None` when every point is farther.
+pub fn env_nearest(points: &[(f64, f64)], x: f64, y: f64, radius: f64) -> Option<usize> {
+    points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, (p.0 - x).hypot(p.1 - y)))
+        .filter(|(_, d)| *d <= radius)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// Moves point `i` to (x, y) clamped to 0..=1, and in x also between its neighbours so the
+/// points stay sorted by x. False when `i` is out of range or the position is not finite
+/// (nothing changes).
+pub fn env_move(points: &mut [(f64, f64)], i: usize, x: f64, y: f64) -> bool {
+    if i >= points.len() || !x.is_finite() || !y.is_finite() {
+        return false;
+    }
+    let lo = if i > 0 { points[i - 1].0 } else { 0.0 };
+    let hi = points.get(i + 1).map_or(1.0, |p| p.0);
+    points[i] = (x.clamp(lo.min(hi), hi.max(lo)), y.clamp(0.0, 1.0));
+    true
+}
+
+/// Inserts a point at (x, y) clamped to 0..=1, keeping the points sorted by x. Returns its
+/// index, or `None` when the position is not finite.
+pub fn env_insert(points: &mut Vec<(f64, f64)>, x: f64, y: f64) -> Option<usize> {
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    let at = points.partition_point(|p| p.0 <= x);
+    points.insert(at, (x, y));
+    Some(at)
+}
+
 /// Normalised 0..=1 output of the animation.
 fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
     let t = match anim {
@@ -427,6 +490,94 @@ mod tests {
         assert_eq!(a, at(Curve::Random, 6.5));
         assert_ne!(a, at(Curve::Random, 9.0));
         assert!((0.0..=10.0).contains(&a));
+    }
+
+    #[test]
+    fn preview_samples_one_cycle_of_each_curve() {
+        let tl = |curve| Animation::Timeline {
+            duration_secs: 3.0,
+            curve,
+        };
+        let saw = preview(&tl(Curve::Saw), 4);
+        assert_eq!(saw, vec![0.0, 0.25, 0.5, 0.75]);
+        let sq = preview(&tl(Curve::Square), 4);
+        assert_eq!(sq, vec![1.0, 1.0, 0.0, 0.0]);
+        let b = Animation::Beats {
+            beats: 4.0,
+            curve: Curve::Saw,
+        };
+        assert_eq!(
+            preview(&b, 4),
+            saw,
+            "cycle length does not change the shape"
+        );
+        let env = Animation::Envelope {
+            points: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
+            beats: 8.0,
+        };
+        assert_eq!(preview(&env, 4), vec![0.0, 0.5, 1.0, 0.5]);
+        // Negative controls: no cycle, no samples.
+        assert!(
+            preview(
+                &Animation::Dashboard {
+                    dial: 0,
+                    scope: Default::default()
+                },
+                4
+            )
+            .is_empty()
+        );
+        assert!(preview(&tl(Curve::Saw), 0).is_empty());
+    }
+
+    #[test]
+    fn envelope_points_pick_and_drag() {
+        let mut pts = vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)];
+        assert_eq!(env_nearest(&pts, 0.52, 0.9, 0.2), Some(1));
+        // Negative control: nothing within the radius.
+        assert_eq!(env_nearest(&pts, 0.25, 0.5, 0.1), None);
+        assert_eq!(env_nearest(&[], 0.5, 0.5, 1.0), None);
+        assert!(env_move(&mut pts, 1, 0.75, 0.25));
+        assert_eq!(pts[1], (0.75, 0.25));
+        // Clamped to the unit square.
+        assert!(env_move(&mut pts, 1, 3.0, -2.0));
+        assert_eq!(pts[1], (1.0, 0.0));
+        // Rejected moves leave the points alone.
+        let before = pts.clone();
+        assert!(!env_move(&mut pts, 9, 0.5, 0.5));
+        assert!(!env_move(&mut pts, 0, f64::NAN, 0.5));
+        assert_eq!(pts, before);
+        // The dragged envelope changes the evaluated value.
+        let mut a = Animation::Envelope {
+            points: vec![(0.0, 0.0), (1.0, 1.0)],
+            beats: 2.0,
+        };
+        let v = |a: &Animation| evaluate(&p((0.0, 1.0)), a, &ctx(1.0, 0.0, &[], &[]));
+        assert_eq!(v(&a), 0.5);
+        if let Animation::Envelope { points, .. } = &mut a {
+            env_move(points, 1, 1.0, 0.0);
+        }
+        assert_eq!(v(&a), 0.0);
+    }
+
+    #[test]
+    fn envelope_edits_keep_points_sorted() {
+        let mut pts = vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)];
+        // Dragging past a neighbour stops at it.
+        assert!(env_move(&mut pts, 1, 0.95, 0.5));
+        assert_eq!(pts[1], (0.95, 0.5));
+        assert!(env_move(&mut pts, 1, 1.0, 0.5));
+        assert!(env_move(&mut pts, 2, 0.2, 0.0));
+        assert_eq!(pts[2].0, 1.0, "last point cannot cross the previous one");
+        assert!(env_move(&mut pts, 0, 0.9, 0.0));
+        assert_eq!(pts[0].0, 0.9);
+        assert!(pts.windows(2).all(|w| w[0].0 <= w[1].0));
+        // Inserting in the middle lands in order, not at the end.
+        let mut pts = vec![(0.0, 0.0), (1.0, 1.0)];
+        assert_eq!(env_insert(&mut pts, 0.4, 0.7), Some(1));
+        assert_eq!(pts, [(0.0, 0.0), (0.4, 0.7), (1.0, 1.0)]);
+        assert_eq!(env_insert(&mut pts, f64::NAN, 0.0), None);
+        assert!(pts.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 
     #[test]

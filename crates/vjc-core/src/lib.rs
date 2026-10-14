@@ -1187,6 +1187,18 @@ pub fn clone_with_fresh_ids(clip: &Clip) -> Clip {
     c
 }
 
+/// A copy of the deck under a new id and name, sharing no clip or effect id with it.
+pub fn duplicate_deck(p: &Project, deck: DeckId) -> Option<Deck> {
+    let d = p.composition.decks.iter().find(|d| d.id == deck)?;
+    let mut c = d.clone();
+    c.id = Uuid::new_v4();
+    c.name = format!("{} copy", d.name);
+    for cc in &mut c.clips {
+        cc.clip = clone_with_fresh_ids(&cc.clip);
+    }
+    Some(c)
+}
+
 fn move_clip(
     p: &mut Project,
     deck: DeckId,
@@ -5596,6 +5608,48 @@ mod tests {
             .effects
             .push(c);
         (p, ids.0, ids.1, ids.2)
+    }
+
+    #[test]
+    fn deck_addresses_select_and_step() {
+        let (mut p, _, _, _) = fx_project();
+        let first = p.composition.decks[0].id;
+        for n in ["B", "C"] {
+            p.composition.decks.push(Deck {
+                id: Uuid::new_v4(),
+                name: n.into(),
+                clips: vec![],
+            });
+        }
+        let ids: Vec<_> = p.composition.decks.iter().map(|d| d.id).collect();
+        let sel = |id| Some(Command::SelectDeck { deck: id });
+        assert_eq!(sc::resolve(&p, "/comp/deck/2/select", 1.0), sel(ids[1]));
+        // Negative controls: released button, out of range, zero.
+        assert_eq!(sc::resolve(&p, "/comp/deck/2/select", 0.0), None);
+        assert_eq!(sc::resolve(&p, "/comp/deck/4/select", 1.0), None);
+        assert_eq!(sc::resolve(&p, "/comp/deck/0/select", 1.0), None);
+        assert_eq!(p.composition.current_deck, first);
+        assert_eq!(sc::resolve(&p, "/comp/deck/next", 1.0), sel(ids[1]));
+        assert_eq!(sc::resolve(&p, "/comp/deck/prev", 1.0), None);
+        p.composition.current_deck = ids[2];
+        assert_eq!(sc::resolve(&p, "/comp/deck/next", 1.0), None);
+        assert_eq!(sc::resolve(&p, "/comp/deck/prev", 1.0), sel(ids[1]));
+    }
+
+    #[test]
+    fn duplicate_deck_has_fresh_ids_and_same_content() {
+        let (p, _, _, _) = fx_project();
+        let src = p.composition.decks[0].clone();
+        assert!(!src.clips.is_empty());
+        let d = duplicate_deck(&p, src.id).unwrap();
+        assert_ne!(d.id, src.id);
+        assert_eq!(d.clips.len(), src.clips.len());
+        for (a, b) in d.clips.iter().zip(&src.clips) {
+            assert_ne!(a.clip.id, b.clip.id);
+            assert_eq!((a.layer, a.column), (b.layer, b.column));
+            assert_eq!(a.clip.source, b.clip.source);
+        }
+        assert!(duplicate_deck(&p, Uuid::new_v4()).is_none());
     }
 
     #[test]

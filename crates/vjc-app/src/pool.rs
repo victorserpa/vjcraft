@@ -42,6 +42,18 @@ impl<K: Hash + Eq + Clone, V> Pool<K, V> {
         self.map.retain(|k, _| used.contains(k));
     }
 
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.map.values()
+    }
+
+    /// Drops every entry (rebuilt on the next `acquire`). Returns how many.
+    #[cfg(test)]
+    pub fn clear(&mut self) -> usize {
+        let n = self.map.len();
+        self.map.clear();
+        n
+    }
+
     /// Marks the start of a frame (forgets what the previous one used).
     pub fn begin_frame(&mut self) {
         self.used.clear();
@@ -66,6 +78,17 @@ mod tests {
     use super::*;
 
     type Key = (u32, u32, &'static str);
+
+    #[test]
+    fn clear_drops_entries_and_they_rebuild_on_demand() {
+        let mut p: Pool<u32, u32> = Pool::new();
+        p.acquire(1, || 10);
+        p.acquire(2, || 20);
+        assert_eq!(p.values().sum::<u32>(), 30);
+        assert_eq!(p.clear(), 2);
+        assert_eq!(p.values().count(), 0);
+        assert_eq!(*p.acquire(1, || 11), 11);
+    }
 
     #[test]
     fn same_key_returns_same_entry_new_on_resize_or_format() {

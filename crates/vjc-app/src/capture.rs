@@ -193,12 +193,20 @@ pub(crate) fn unpad_into(src: &[u8], w: u32, h: u32, out: &mut Vec<u8>) {
 }
 
 impl Capture {
-    pub fn start(path: PathBuf, size: (u32, u32), fps: f32) -> Result<Self, String> {
+    pub fn start(
+        path: PathBuf,
+        size: (u32, u32),
+        fps: f32,
+        audio: Option<vjc_media::record::AudioFeed>,
+    ) -> Result<Self, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let fps = fps.round().clamp(1.0, 240.0) as u32;
-        let rec = Recorder::start(&path, size.0, size.1, fps)?;
+        let rec = match audio {
+            Some(feed) => Recorder::start_with_audio(&path, size.0, size.1, fps, feed)?,
+            None => Recorder::start(&path, size.0, size.1, fps)?,
+        };
         Ok(Self {
             rec,
             inflight: Inflight::new(),
@@ -503,7 +511,7 @@ mod tests {
     #[test]
     fn shutdown_leaves_a_playable_file() {
         let path = std::env::temp_dir().join(format!("vjc-sd-{}.mp4", std::process::id()));
-        let mut cap = Capture::start(path.clone(), (64, 48), 30.0).unwrap();
+        let mut cap = Capture::start(path.clone(), (64, 48), 30.0, None).unwrap();
         for pts in 0..5 {
             assert!(cap.rec.push_at(pts, vec![90; 64 * 48 * 4]));
         }

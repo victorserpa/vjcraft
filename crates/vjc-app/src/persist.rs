@@ -62,6 +62,10 @@ impl<T> PersistStore<T> {
         before - self.slots.len()
     }
 
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.slots.values().map(|(_, v)| v)
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.slots.len()
@@ -84,6 +88,19 @@ mod tests {
         assert_eq!(*s.acquire(b, (8, 8), || 9).0, 2);
         // Negative control: a new id never reuses another instance's buffer.
         assert_eq!(*s.acquire(Uuid::new_v4(), (8, 8), || 3).0, 3);
+    }
+
+    #[test]
+    fn values_follow_live_instances() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut s = PersistStore::<u32>::default();
+        s.acquire(a, (8, 8), || 1);
+        s.acquire(b, (8, 8), || 2);
+        assert_eq!(s.values().sum::<u32>(), 3);
+        s.sweep();
+        s.acquire(a, (8, 8), || 9);
+        s.sweep();
+        assert_eq!(s.values().sum::<u32>(), 1);
     }
 
     #[test]

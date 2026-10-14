@@ -618,6 +618,13 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
             let column = ColumnIdx::try_from(number_of(m)?.checked_sub(1)?).ok()?;
             fire.then_some(Command::TriggerColumn { deck, column })
         }
+        ["comp", "deck", "next"] => fire.then(|| step_deck(p, 1))?,
+        ["comp", "deck", "prev"] => fire.then(|| step_deck(p, -1))?,
+        ["comp", "deck", n, "select"] => {
+            let i = number_of(n)?.checked_sub(1)?;
+            let d = p.composition.decks.get(i)?;
+            fire.then_some(Command::SelectDeck { deck: d.id })
+        }
         ["comp", "tempo", "tap"] => fire.then_some(Command::Tap { at: ctx.now }),
         ["comp", "tempo", "bpm"] => Some(Command::SetBpm {
             bpm: value.clamp(super::clock::MIN_BPM, super::clock::MAX_BPM),
@@ -992,4 +999,14 @@ mod effect_id_tests {
             value,
         }
     }
+}
+
+/// Select the deck `delta` tabs away from the current one; `None` at either end.
+fn step_deck(p: &Project, delta: isize) -> Option<Command> {
+    let ds = &p.composition.decks;
+    let at = ds.iter().position(|d| d.id == p.composition.current_deck)?;
+    let to = at.checked_add_signed(delta)?;
+    Some(Command::SelectDeck {
+        deck: ds.get(to)?.id,
+    })
 }

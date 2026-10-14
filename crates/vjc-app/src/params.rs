@@ -45,7 +45,7 @@ pub fn section(ui: &mut egui::Ui, id: &'static str, title: &str) -> bool {
     let fill = if r.hovered() {
         theme::SURFACE_RAISED
     } else {
-        theme::SECTION_BG
+        crate::theme::SECTION_BG
     };
     let p = ui.painter();
     p.rect_filled(rect, 0.0, fill);
@@ -209,6 +209,91 @@ fn curve_combo(ui: &mut egui::Ui, id: egui::Id, curve: &mut Curve) {
         });
 }
 
+/// Draws one cycle of a Timeline/Beats/Envelope animation as a curve; nothing for other kinds.
+fn curve_graph(ui: &mut egui::Ui, a: &Animation) -> egui::Rect {
+    let size = egui::vec2(GRAPH_W, GRAPH_H);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let samples = vjc_core::anim::preview(a, GRAPH_W as usize);
+    if samples.len() > 1 {
+        let pts: Vec<egui::Pos2> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, v)| graph_pos(rect, i as f64 / samples.len() as f64, *v))
+            .collect();
+        ui.painter()
+            .rect_filled(rect, crate::theme::PILL_ROUNDING, crate::theme::SECTION_BG);
+        ui.painter().add(egui::Shape::line(
+            pts,
+            egui::Stroke::new(1.5, crate::theme::ACCENT),
+        ));
+    }
+    rect
+}
+
+/// The envelope curve with draggable points: drag a point to move it, double click on empty
+/// space to add one. Returns true when the points changed.
+fn envelope_editor(ui: &mut egui::Ui, points: &mut Vec<(f64, f64)>, beats: f64) -> bool {
+    let a = Animation::Envelope {
+        points: points.clone(),
+        beats,
+    };
+    let rect = curve_graph(ui, &a);
+    let r = ui.interact(
+        rect,
+        ui.id().with("env-graph"),
+        egui::Sense::click_and_drag(),
+    );
+    let to_unit = |p: egui::Pos2| {
+        (
+            f64::from((p.x - rect.left()) / rect.width()),
+            f64::from((rect.bottom() - p.y) / rect.height()),
+        )
+    };
+    let drag_id = ui.id().with("env-drag");
+    let mut changed = false;
+    if r.drag_started()
+        && let Some(p) = r.interact_pointer_pos()
+    {
+        let (x, y) = to_unit(p);
+        let hit = vjc_core::anim::env_nearest(points, x, y, ENV_PICK);
+        ui.data_mut(|d| d.insert_temp(drag_id, hit));
+    }
+    if r.dragged()
+        && let Some(p) = r.interact_pointer_pos()
+        && let Some(Some(i)) = ui.data(|d| d.get_temp::<Option<usize>>(drag_id))
+    {
+        let (x, y) = to_unit(p);
+        changed |= vjc_core::anim::env_move(points, i, x, y);
+    }
+    if r.double_clicked()
+        && let Some(p) = r.interact_pointer_pos()
+    {
+        let (x, y) = to_unit(p);
+        if vjc_core::anim::env_nearest(points, x, y, ENV_PICK).is_none() {
+            changed |= vjc_core::anim::env_insert(points, x, y).is_some();
+        }
+    }
+    for p in points.iter() {
+        ui.painter()
+            .circle_filled(graph_pos(rect, p.0, p.1), 3.0, crate::theme::TEXT);
+    }
+    changed
+}
+
+/// Pick radius for envelope points, in 0..1 graph units.
+const ENV_PICK: f64 = 0.08;
+
+const GRAPH_W: f32 = 160.0;
+const GRAPH_H: f32 = 48.0;
+
+/// Screen position of curve point (x, y), both 0..=1, y up.
+fn graph_pos(rect: egui::Rect, x: f64, y: f64) -> egui::Pos2 {
+    egui::pos2(
+        rect.left() + rect.width() * x as f32,
+        rect.bottom() - rect.height() * y as f32,
+    )
+}
+
 /// Popup body: kind selector and the fields of the current kind. Returns the edited animation.
 fn anim_menu(
     ui: &mut egui::Ui,
@@ -239,6 +324,13 @@ fn anim_menu(
             let before = curve.clone();
             curve_combo(ui, id.with("c"), curve);
             changed |= *curve != before;
+            curve_graph(
+                ui,
+                &Animation::Timeline {
+                    duration_secs: *duration_secs,
+                    curve: curve.clone(),
+                },
+            );
         }
         Some(Animation::Beats { beats, curve }) => {
             changed |= ui
@@ -251,6 +343,13 @@ fn anim_menu(
             let before = curve.clone();
             curve_combo(ui, id.with("c"), curve);
             changed |= *curve != before;
+            curve_graph(
+                ui,
+                &Animation::Beats {
+                    beats: *beats,
+                    curve: curve.clone(),
+                },
+            );
         }
         Some(Animation::Envelope { points, beats }) => {
             changed |= ui
@@ -260,6 +359,7 @@ fn anim_menu(
                         .suffix(" beats"),
                 )
                 .changed();
+            changed |= envelope_editor(ui, points, *beats);
             ui.menu_button("Preset", |ui| {
                 for pre in vjc_core::anim::EnvPreset::ALL {
                     if ui.button(pre.label()).clicked() {

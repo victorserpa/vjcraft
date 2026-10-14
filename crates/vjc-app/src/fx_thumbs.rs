@@ -138,6 +138,28 @@ impl FxThumbs {
         }
     }
 
+    /// Bytes of the ready thumbnails.
+    pub fn bytes(&self) -> u64 {
+        let ready = self
+            .slots
+            .values()
+            .filter(|s| matches!(s, Slot::Ready(..)))
+            .count() as u64;
+        ready * crate::vram::tex_bytes(W, H)
+    }
+
+    /// Drops every ready thumbnail not shown in the current frame; they render again on
+    /// demand. Returns how many were dropped.
+    pub fn evict_all(&mut self) -> usize {
+        let floor = self.frame_floor;
+        let before = self.slots.len();
+        self.slots.retain(|_, s| match s {
+            Slot::Ready(_, used) => !floor.is_none_or(|f| *used <= f),
+            _ => true,
+        });
+        before - self.slots.len()
+    }
+
     fn evict(&mut self) {
         loop {
             let ready = self
@@ -445,6 +467,23 @@ mod tests {
             t.texture(i);
         }
         t.take_batch(PER_FRAME)
+    }
+
+    #[test]
+    fn bytes_count_ready_only_and_evict_all_frees_them() {
+        let ctx = egui::Context::default();
+        let mut t = FxThumbs::new();
+        assert_eq!(t.bytes(), 0);
+        pending(&mut t, &["a", "b"]);
+        assert_eq!(t.bytes(), 0, "pending thumbnails hold no texture");
+        t.finish(&ctx, "a", Ok(rgba(1)));
+        t.finish(&ctx, "b", Ok(rgba(2)));
+        assert_eq!(t.bytes(), 2 * crate::vram::tex_bytes(W, H));
+        assert_eq!(t.evict_all(), 2);
+        assert_eq!(t.bytes(), 0);
+        // They come back on demand.
+        assert!(t.texture("a").is_none());
+        assert_eq!(t.take_batch(5), ["a"]);
     }
 
     #[test]

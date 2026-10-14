@@ -1056,6 +1056,34 @@ impl Compositor {
 
     /// Recreates the target if the composition resolution changed. Returns true when recreated
     /// (the caller must re-register the egui texture).
+    /// Estimated bytes of live textures (thumbnails are the caller's).
+    pub fn vram(&self) -> crate::vram::Usage {
+        use crate::vram::gpu_bytes as b;
+        let mut fixed = b(&self.base) + b(&self.target) + b(&self.fade.0);
+        fixed += self.xf.as_ref().map_or(0, |x| b(&x.0));
+        fixed += self.group.as_ref().map_or(0, |g| b(&g.tex) + b(&g.base));
+        fixed += self.routed.values().map(|r| b(&r.0)).sum::<u64>();
+        crate::vram::Usage {
+            fixed,
+            players: self.slots.values().map(|s| b(&s.tex)).sum(),
+            pool: self
+                .fx
+                .scratch
+                .values()
+                .flat_map(|s| s.iter())
+                .map(|t| b(&t.0))
+                .sum(),
+            persist: self.fx.persist.values().map(|t| b(&t.0)).sum(),
+            thumbs: 0,
+        }
+    }
+
+    /// Drops the effect scratch pool; it is rebuilt on demand.
+    #[cfg(test)]
+    pub fn evict_scratch(&mut self) -> usize {
+        self.fx.scratch.clear()
+    }
+
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) -> bool {
         if self.size == (w, h) {
             return false;
@@ -2033,6 +2061,195 @@ mod tests {
         for g in &got[..3] {
             assert!(g.abs_diff(128) <= 2, "{got:?}");
         }
+    }
+
+    /// Renders `old` (outgoing) and `new` (incoming) flat colours of a transition at
+    /// `progress` on a `w` x `h` frame; returns the RGBA of every pixel, row by row.
+    /// `None` when there is no adapter.
+    fn render_transition(
+        kind: vjc_core::transition::Kind,
+        progress: f32,
+        (w, h): (u32, u32),
+        old: &'static [u8; 4],
+        new: &'static [u8; 4],
+    ) -> Option<Vec<[u8; 4]>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        let draw = |n: u128, px: &'static [u8; 4], out: bool| LayerDraw {
+            id: uuid::Uuid::from_u128(n),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![],
+            frame: Some((1, 1, px, 1)),
+            generator: None,
+            transition: Some((kind.shader_id(), progress, out)),
+            transform: Affine::IDENTITY,
+            channels: Default::default(),
+        };
+        let layers = [draw(1, old, true), draw(2, new, false)];
+        let mut comp = Compositor::new(&device, w, h);
+        comp.render(&device, &queue, &layers, &[], 1.0);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        let mut out = vec![];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = y * 256 + x * 4;
+                out.push([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            }
+        }
+        Some(out)
+    }
+
+    /// The texture estimate follows the live layers and persistent buffers, and the scratch
+    /// pool can be dropped without touching them. Skipped when there is no adapter.
+    #[test]
+    fn gpu_vram_estimate_tracks_live_textures_and_evicts_scratch() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            return;
+        };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("invert").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 8, 8);
+        comp.add_effect(&device, "invert", &wgsl).unwrap();
+        let idle = comp.vram();
+        assert_eq!(idle.players, 0);
+        assert_eq!(idle.pool, 0);
+        assert!(idle.fixed >= 2 * 8 * 8 * 4, "target and base: {idle:?}");
+        let fx = EffectDraw {
+            kind: "invert".into(),
+            uniforms: isf.pack(&isf.default_params(), 0.0, (8, 8)),
+            dry_wet: 1.0,
+            ml: None,
+            persistent: Some(uuid::Uuid::from_u128(99)),
+        };
+        let layer = LayerDraw {
+            id: uuid::Uuid::from_u128(7),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![fx],
+            frame: Some((4, 4, &[9; 64], 1)),
+            generator: None,
+            transition: None,
+            transform: Affine::IDENTITY,
+            channels: Default::default(),
+        };
+        comp.render(&device, &queue, &[layer], &[], 1.0);
+        let busy = comp.vram();
+        assert_eq!(busy.players, 4 * 4 * 4, "one 4x4 player texture");
+        assert_eq!(
+            busy.pool,
+            3 * 4 * 4 * 4,
+            "scratch trio at the layer size: {busy:?}"
+        );
+        assert_eq!(busy.persist, 4 * 4 * 4, "one history buffer");
+        assert_eq!(comp.evict_scratch(), 1);
+        let after = comp.vram();
+        assert_eq!(after.pool, 0);
+        // Negative control: live textures are not caches and stay.
+        assert_eq!(after.players, busy.players);
+        assert_eq!(after.persist, busy.persist);
+        assert_eq!(after.fixed, busy.fixed);
+    }
+
+    fn px_near(px: [u8; 4], v: u8) -> bool {
+        px[..3].iter().all(|c| c.abs_diff(v) <= 3)
+    }
+
+    const PX_BLACK: &[u8; 4] = &[0, 0, 0, 255];
+    const PX_WHITE: &[u8; 4] = &[255, 255, 255, 255];
+
+    /// ToBlack dips through black: outgoing darkens, incoming rises from black.
+    #[test]
+    fn gpu_to_black_dips_through_black() {
+        use vjc_core::transition::Kind::ToBlack;
+        let at = |p| render_transition(ToBlack, p, (1, 1), PX_WHITE, PX_WHITE).map(|v| v[0]);
+        let Some(q) = at(0.25) else { return };
+        assert!(px_near(q, 128), "{q:?}");
+        assert!(px_near(at(0.5).unwrap(), 0), "midpoint is black");
+        assert!(px_near(at(1.0).unwrap(), 255), "ends on the incoming clip");
+        // Negative control: a plain cross would not be black at the midpoint.
+        let d = render_transition(
+            vjc_core::transition::Kind::Dissolve,
+            0.5,
+            (1, 1),
+            PX_WHITE,
+            PX_WHITE,
+        )
+        .unwrap();
+        assert!(px_near(d[0], 255), "{d:?}");
+    }
+
+    /// Push slides the incoming clip in; left and right are mirror images.
+    #[test]
+    fn gpu_push_left_and_right_are_mirrored() {
+        use vjc_core::transition::Kind::{PushLeft, PushRight};
+        let Some(l) = render_transition(PushLeft, 0.5, (4, 1), PX_BLACK, PX_WHITE) else {
+            return;
+        };
+        let r = render_transition(PushRight, 0.5, (4, 1), PX_BLACK, PX_WHITE).unwrap();
+        let v = |px: &[[u8; 4]]| px.iter().map(|p| p[0] > 128).collect::<Vec<_>>();
+        assert_eq!(v(&l), [false, false, true, true]);
+        assert_eq!(v(&r), [true, true, false, false]);
+        // Start shows only the old clip, end only the new one.
+        let s = render_transition(PushLeft, 0.0, (4, 1), PX_BLACK, PX_WHITE).unwrap();
+        assert!(s.iter().all(|p| px_near(*p, 0)), "{s:?}");
+        let e = render_transition(PushLeft, 1.0, (4, 1), PX_BLACK, PX_WHITE).unwrap();
+        assert!(e.iter().all(|p| px_near(*p, 255)), "{e:?}");
+    }
+
+    /// ZoomIn cross-fades like the pure weights say; WipeEllipse opens from the centre.
+    #[test]
+    fn gpu_zoom_in_and_wipe_ellipse() {
+        use vjc_core::transition::Kind::{WipeEllipse, ZoomIn};
+        let Some(z) = render_transition(ZoomIn, 0.5, (1, 1), PX_BLACK, PX_WHITE) else {
+            return;
+        };
+        let (_, wn) = vjc_core::transition::weights(ZoomIn, 0.5).unwrap();
+        assert!(px_near(z[0], (wn * 255.0) as u8), "{z:?}");
+        let w = render_transition(WipeEllipse, 0.5, (5, 5), PX_BLACK, PX_WHITE).unwrap();
+        assert!(px_near(w[12], 255), "centre already new: {:?}", w[12]);
+        assert!(px_near(w[0], 0), "corner still old: {:?}", w[0]);
+        // Negative control: at progress 0 the centre is still the old clip.
+        let w0 = render_transition(WipeEllipse, 0.0, (5, 5), PX_BLACK, PX_WHITE).unwrap();
+        assert!(px_near(w0[12], 0), "{:?}", w0[12]);
     }
 
     /// Invert on one pixel through the full chain (translate, pipeline, ping-pong), for a

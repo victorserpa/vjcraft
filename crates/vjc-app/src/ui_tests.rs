@@ -1592,6 +1592,20 @@ fn layout_has_monitor_column_status_bar_and_transport() {
 }
 
 #[test]
+fn status_bar_shows_the_vram_warning_only_while_it_holds() {
+    let mut h = app();
+    settle(&mut h);
+    let msg = "GPU memory ~9 MB over the 1 MB limit";
+    assert!(!has_text(&h, msg) && !exists(&h, msg));
+    h.state_mut().vram_warn = Some(msg.into());
+    settle(&mut h);
+    assert!(has_text(&h, msg) || exists(&h, msg));
+    h.state_mut().vram_warn = None;
+    settle(&mut h);
+    assert!(!has_text(&h, msg) && !exists(&h, msg));
+}
+
+#[test]
 fn transport_stop_and_undo_redo_buttons_work() {
     let mut h = app();
     let lid = h.state().project.composition.layers[0].id;
