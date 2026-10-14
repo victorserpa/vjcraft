@@ -31,6 +31,12 @@ pub struct FxThumbs {
     slots: HashMap<String, Slot>,
     tick: u64,
     cap: usize,
+    /// Thumbnails shown since this tick (the previous frame on) are not evicted: with more
+    /// visible than `cap` they would be rendered again every frame. None until the first
+    /// `step`.
+    frame_floor: Option<u64>,
+    /// `tick` when the current frame's `step` ran.
+    frame_start: u64,
     /// Ids seen on screen this frame that have no slot yet.
     wanted: Vec<String>,
     req: Option<Sender<String>>,
@@ -45,6 +51,8 @@ impl FxThumbs {
             slots: HashMap::new(),
             tick: 0,
             cap: MAX_THUMBS,
+            frame_floor: None,
+            frame_start: 0,
             wanted: vec![],
             req: None,
             tx,
@@ -60,15 +68,13 @@ impl FxThumbs {
         let (req, rx) = channel::<String>();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let r = Renderer::new(&device, &queue);
-            while let Ok(id) = rx.recv() {
-                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.render(&id)))
-                    .unwrap_or_else(|_| Err("thumbnail render panicked".into()));
-                if tx.send((id, out)).is_err() {
-                    break;
-                }
-                ctx.request_repaint();
-            }
+            run_worker(
+                rx,
+                tx,
+                || ctx.request_repaint(),
+                || Renderer::new(&device, &queue),
+                |r, id| r.render(id),
+            )
         });
         self.req = Some(req);
     }
@@ -145,7 +151,12 @@ impl FxThumbs {
             if ready.len() <= self.cap {
                 return;
             }
-            let Some((oldest, _)) = ready.into_iter().min_by_key(|(_, u)| *u) else {
+            let floor = self.frame_floor;
+            let Some((oldest, _)) = ready
+                .into_iter()
+                .filter(|(_, u)| floor.is_none_or(|f| *u <= f))
+                .min_by_key(|(_, u)| *u)
+            else {
                 return;
             };
             self.slots.remove(&oldest);
@@ -154,6 +165,8 @@ impl FxThumbs {
 
     /// Once per frame: collects finished renders and starts a few new ones.
     pub fn step(&mut self, ctx: &egui::Context) {
+        self.frame_floor = Some(self.frame_start);
+        self.frame_start = self.tick;
         while let Ok((id, res)) = self.done.try_recv() {
             self.finish(ctx, &id, res);
         }
@@ -170,6 +183,29 @@ impl FxThumbs {
                 self.slots.remove(&id);
             }
         }
+    }
+}
+
+/// Worker loop. A panic while building the renderer must not kill the thread silently
+/// (every slot would stay Pending for ever): each request then answers with an error.
+fn run_worker<R>(
+    rx: Receiver<String>,
+    tx: Sender<Done>,
+    repaint: impl Fn(),
+    init: impl FnOnce() -> R,
+    render: impl Fn(&R, &str) -> Result<Vec<u8>, String>,
+) {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(init)).ok();
+    while let Ok(id) = rx.recv() {
+        let out = match &r {
+            Some(r) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(r, &id)))
+                .unwrap_or_else(|_| Err("thumbnail render panicked".into())),
+            None => Err("thumbnail renderer failed to start".into()),
+        };
+        if tx.send((id, out)).is_err() {
+            break;
+        }
+        repaint();
     }
 }
 
@@ -256,8 +292,23 @@ impl Renderer {
         }
     }
 
-    /// RGBA8 pixels (W x H, tightly packed) of the shader `id` at default params.
+    /// RGBA8 pixels (W x H, tightly packed) of the shader `id` at default params. Errors of
+    /// the whole job (submit and readback included) are caught here instead of reaching
+    /// the device's uncaptured handler, which panics.
     fn render(&self, id: &str) -> Result<Vec<u8>, String> {
+        let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let res = self.render_job(id);
+        // Pop both scopes before returning, so a failed render leaves none on the stack.
+        let v = pollster::block_on(validation.pop());
+        let o = pollster::block_on(oom.pop());
+        if let Some(e) = v.or(o) {
+            return Err(e.to_string());
+        }
+        res
+    }
+
+    fn render_job(&self, id: &str) -> Result<Vec<u8>, String> {
         let src = vjc_fx::builtin_source(id).ok_or("unknown effect")?;
         let isf = vjc_fx::parse(src).map_err(|e| e.to_string())?;
         let wgsl = vjc_fx::translate(&isf).map_err(|e| e.to_string())?;
@@ -464,6 +515,100 @@ mod tests {
         assert!(t.texture("b").is_none(), "oldest dropped");
     }
 
+    fn wait(rx: &Receiver<Done>) -> Done {
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker answered")
+    }
+
+    #[test]
+    fn worker_that_fails_to_start_answers_every_request_with_an_error() {
+        let (req, rx) = channel::<String>();
+        let (tx, done) = channel();
+        let h = std::thread::spawn(move || {
+            run_worker(
+                rx,
+                tx,
+                || {},
+                || -> u8 { panic!("no device") },
+                |_, _| Ok(vec![]),
+            )
+        });
+        req.send("a".into()).unwrap();
+        req.send("b".into()).unwrap();
+        for id in ["a", "b"] {
+            let (got, res) = wait(&done);
+            assert_eq!(got, id);
+            assert!(res.is_err(), "Failed, not Pending for ever");
+        }
+        drop(req);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn worker_with_a_renderer_returns_its_pixels_and_survives_a_render_panic() {
+        let (req, rx) = channel::<String>();
+        let (tx, done) = channel();
+        let h = std::thread::spawn(move || {
+            run_worker(
+                rx,
+                tx,
+                || {},
+                || 7u8,
+                |r, id| {
+                    if id == "boom" {
+                        panic!("shader")
+                    }
+                    Ok(vec![*r])
+                },
+            )
+        });
+        req.send("ok".into()).unwrap();
+        req.send("boom".into()).unwrap();
+        req.send("ok".into()).unwrap();
+        assert_eq!(wait(&done).1, Ok(vec![7]));
+        assert!(wait(&done).1.is_err());
+        assert_eq!(wait(&done).1, Ok(vec![7]), "still serving");
+        drop(req);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn thumbnails_on_screen_are_not_evicted_even_over_cap() {
+        let ctx = egui::Context::default();
+        let mut t = FxThumbs::new();
+        let ids = ["a", "b", "c", "d"];
+        for id in ids {
+            t.texture(id);
+            t.take_batch(1);
+            t.finish(&ctx, id, Ok(rgba(1)));
+        }
+        t.cap = 2;
+        t.step(&ctx);
+        for id in ids {
+            assert!(t.texture(id).is_some());
+        }
+        t.step(&ctx);
+        t.texture("e");
+        t.take_batch(1);
+        t.finish(&ctx, "e", Ok(rgba(1)));
+        assert!(
+            ids.iter().all(|i| t.texture(i).is_some()),
+            "visible survive"
+        );
+        // Negative control: unseen for two frames, they are evicted again.
+        t.step(&ctx);
+        t.step(&ctx);
+        t.texture("f");
+        t.take_batch(1);
+        t.finish(&ctx, "f", Ok(rgba(1)));
+        let ready = t
+            .slots
+            .values()
+            .filter(|s| matches!(s, Slot::Ready(..)))
+            .count();
+        assert!(ready <= 2, "cap holds again: {ready}");
+    }
+
     #[test]
     fn negative_control_under_cap_keeps_all() {
         let ctx = egui::Context::default();
@@ -516,6 +661,10 @@ mod tests {
         let pat = test_pattern();
         // Invert flips the first bar (235,235,235) to about (20,20,20).
         assert!(inv[0] < 40 && pat[0] > 200, "effect applied to the pattern");
+        assert!(
+            inv.chunks(4).any(|a| a[..3] != inv[..3]),
+            "invert of a non-flat pattern is not flat"
+        );
         assert!(r.render("nope").is_err(), "unknown shader falls back");
         let ids = vjc_fx::BUILTIN.iter().chain(vjc_fx::GENERATORS);
         let failed: Vec<String> = ids

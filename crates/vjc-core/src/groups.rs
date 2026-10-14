@@ -72,7 +72,30 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 }
             }
             let g = p.composition.groups.remove(gi);
+            if layers.is_empty() {
+                return undoable(
+                    Command::RestoreEmptyGroup {
+                        group: g,
+                        index: gi,
+                    },
+                    vec![],
+                );
+            }
             undoable(Command::CreateGroup { group: g, layers }, vec![])
+        }
+        Command::RestoreEmptyGroup { group, index } => {
+            if p.composition.groups.iter().any(|g| g.id == group.id)
+                || p.composition
+                    .layers
+                    .iter()
+                    .any(|l| l.group == Some(group.id))
+            {
+                return Err(Error::BadGroup);
+            }
+            let id = group.id;
+            let gs = &mut p.composition.groups;
+            gs.insert(index.min(gs.len()), group);
+            undoable(Command::Ungroup { group: id }, vec![])
         }
         Command::RenameGroup { group, name } => {
             let gi = check_group(p, group)?;
@@ -119,7 +142,10 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             check_group(p, group)?;
             let li = layer_idx(p, layer)?;
             let m = members(p, group);
-            let (first, last) = (m[0], m[m.len() - 1]);
+            // A group from a file can be empty: there is no edge to join.
+            let (Some(&first), Some(&last)) = (m.first(), m.last()) else {
+                return Err(Error::BadGroup);
+            };
             if p.composition.layers[li].group.is_some() || (li + 1 != first && li != last + 1) {
                 return Err(Error::BadGroup);
             }
@@ -242,6 +268,61 @@ mod tests {
         assert_eq!(p.composition.groups.len(), 1);
         assert_eq!(p.composition.groups[0].id, eid);
         assert_eq!(p.composition.groups[0].speed, 2.0);
+    }
+
+    #[test]
+    fn empty_group_from_a_file_can_be_renamed_ungrouped_undone_and_never_panics() {
+        let (mut p, ids) = setup();
+        let mut e = LayerGroup::new("empty");
+        e.speed = 2.0;
+        let eid = e.id;
+        p.composition.groups.push(e);
+        let mut h = History::new();
+        exec(
+            &mut p,
+            &mut h,
+            Command::RenameGroup {
+                group: eid,
+                name: "x".into(),
+            },
+        )
+        .unwrap();
+        // Joining an empty group has no edge to attach to: an error, not a panic.
+        assert_eq!(
+            exec(
+                &mut p,
+                &mut h,
+                Command::MoveLayerToGroup {
+                    layer: ids[0],
+                    group: eid
+                }
+            )
+            .unwrap_err(),
+            Error::BadGroup
+        );
+        let before = p.clone();
+        exec(&mut p, &mut h, Command::Ungroup { group: eid }).unwrap();
+        assert!(p.composition.groups.is_empty());
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before, "undo brings the empty group back");
+        h.redo(&mut p).unwrap().unwrap();
+        assert!(p.composition.groups.is_empty());
+        // Control: a group with members still refuses to be restored over itself.
+        let g = create(&mut p, &mut h, &[ids[0], ids[1]]).unwrap();
+        let dup = LayerGroup::new("dup");
+        let dup = LayerGroup { id: g, ..dup };
+        assert_eq!(
+            exec(
+                &mut p,
+                &mut h,
+                Command::RestoreEmptyGroup {
+                    group: dup,
+                    index: 0
+                }
+            )
+            .unwrap_err(),
+            Error::BadGroup
+        );
     }
 
     #[test]

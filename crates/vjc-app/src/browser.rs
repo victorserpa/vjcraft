@@ -215,16 +215,20 @@ pub fn cell_width(avail: f32, cols: usize, grid: bool) -> f32 {
 /// A recording touched this recently is still being written.
 const REC_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Videos in `dir` (the app's recordings), newest first, without the file still being
-/// written at `now`. Missing folder = empty.
-pub fn list_recordings(dir: &Path, now: SystemTime) -> Vec<Entry> {
+/// Videos in `dir` (the app's recordings), newest first, without `active` (the file being
+/// recorded now) and without a file touched in the last few seconds at `now`. A modified
+/// time far in the future (clock skew, network share) is not "recent": the file is listed.
+/// Missing folder = empty.
+pub fn list_recordings(dir: &Path, now: SystemTime, active: Option<&Path>) -> Vec<Entry> {
+    let settled = |t: SystemTime| match now.duration_since(t) {
+        Ok(age) => age >= REC_SETTLE,
+        Err(ahead) => ahead.duration() >= REC_SETTLE,
+    };
     let mut out: Vec<Entry> = list_dir(dir)
         .into_iter()
         .filter(|e| !e.is_dir)
-        .filter(|e| {
-            e.mtime
-                .is_none_or(|t| now.duration_since(t).is_ok_and(|age| age >= REC_SETTLE))
-        })
+        .filter(|e| active.is_none_or(|a| a != e.path))
+        .filter(|e| e.mtime.is_none_or(settled))
         .collect();
     out.sort_by(|a, b| {
         b.mtime
@@ -504,6 +508,8 @@ pub struct Browser {
     /// Recordings made by the app (Record tab), refreshed every few seconds.
     rec: Vec<Entry>,
     rec_dir: PathBuf,
+    /// The file being recorded now: never listed, whatever its modified time says.
+    rec_active: Option<PathBuf>,
     rec_at: Option<std::time::Instant>,
     checks: PathChecks,
 }
@@ -523,6 +529,7 @@ impl Browser {
             net_at: None,
             rec: vec![],
             rec_dir: crate::capture::recordings_dir(),
+            rec_active: None,
             rec_at: None,
             checks: PathChecks::default(),
         }
@@ -544,6 +551,15 @@ impl Browser {
     fn go(&mut self, dir: PathBuf) {
         self.entries = list_dir(&dir);
         self.dir = dir;
+    }
+
+    /// Tells the Record tab which file is being written (None when not recording). A change
+    /// refreshes the list at once.
+    pub fn set_recording(&mut self, active: Option<&Path>) {
+        if self.rec_active.as_deref() != active {
+            self.rec_active = active.map(Path::to_path_buf);
+            self.rec_at = None;
+        }
     }
 
     /// Draws the panel contents; returns what the user double-clicked and whether the
@@ -629,7 +645,8 @@ impl Browser {
                 .rec_at
                 .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3));
             if stale {
-                self.rec = list_recordings(&self.rec_dir, SystemTime::now());
+                self.rec =
+                    list_recordings(&self.rec_dir, SystemTime::now(), self.rec_active.as_deref());
                 self.rec_at = Some(std::time::Instant::now());
             }
             ui.ctx()
@@ -1303,13 +1320,50 @@ mod tests {
         }
         std::fs::write(d.join("notes.txt"), b"").unwrap();
         std::fs::create_dir_all(d.join("sub")).unwrap();
-        let names: Vec<String> = list_recordings(&d, now)
+        let names: Vec<String> = list_recordings(&d, now, None)
             .into_iter()
             .map(|e| e.name)
             .collect();
         std::fs::remove_dir_all(&d).ok();
         assert_eq!(names, ["new.mp4", "mid.mp4", "old.mp4"]);
-        assert!(list_recordings(Path::new("/no/such/dir"), now).is_empty());
+        assert!(list_recordings(Path::new("/no/such/dir"), now, None).is_empty());
+    }
+
+    #[test]
+    fn recordings_skip_the_active_file_and_list_future_mtimes() {
+        let d = std::env::temp_dir().join(format!("vjc-rec2-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let now = t0 + std::time::Duration::from_secs(1000);
+        // Long untouched but still the file being recorded (a muxer that buffers).
+        let live = d.join("live.mp4");
+        // Written by a machine whose clock runs a minute ahead.
+        let skew = d.join("skew.mp4");
+        let fresh = d.join("fresh.mp4");
+        for (f, at) in [(&live, 0), (&skew, 1060), (&fresh, 999)] {
+            let h = std::fs::File::create(f).unwrap();
+            h.set_modified(t0 + std::time::Duration::from_secs(at))
+                .unwrap();
+        }
+        let names = |active: Option<&Path>| -> Vec<String> {
+            list_recordings(&d, now, active)
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        let with_active = names(Some(&live));
+        let without = names(None);
+        std::fs::remove_dir_all(&d).ok();
+        assert_eq!(
+            with_active,
+            ["skew.mp4"],
+            "active hidden, skewed one listed"
+        );
+        assert_eq!(
+            without,
+            ["skew.mp4", "live.mp4"],
+            "control: only fresh.mp4 is held back"
+        );
     }
 
     #[test]

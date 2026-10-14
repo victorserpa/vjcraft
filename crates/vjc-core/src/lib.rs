@@ -385,6 +385,12 @@ pub enum Command {
         group: vjc_model::LayerGroup,
         layers: Vec<LayerId>,
     },
+    /// Inverse of `Ungroup` on a group that has no layers (only a file can hold one):
+    /// puts it back at `index` in `Composition::groups`.
+    RestoreEmptyGroup {
+        group: vjc_model::LayerGroup,
+        index: usize,
+    },
     /// Dissolves the group; its layers stay where they are.
     Ungroup {
         group: GroupId,
@@ -450,6 +456,10 @@ pub enum Command {
         layer: Layer,
         index: usize,
         clips: Vec<(DeckId, usize, CellClip)>,
+        /// (screen, slice, source) of slices that routed from the layer; put back on undo.
+        slices: Vec<(Uuid, Uuid, vjc_model::SliceSource)>,
+        /// (position, cue) of timecode cues aimed at the layer.
+        cues: Vec<(usize, vjc_model::TimecodeCue)>,
     },
     AddColumn {
         column: Column,
@@ -2190,6 +2200,18 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         }
         Command::RemoveLayerWithClips { layer } => {
             let i = layer_idx(p, layer)?;
+            if p.composition.layers.len() <= 1 {
+                return Err(Error::InUse);
+            }
+            // A router clip on another layer would point at nothing.
+            if p.composition.decks.iter().any(|d| {
+                d.clips.iter().any(|c| {
+                    c.layer != layer
+                        && matches!(c.clip.source, Source::LayerRouter { layer: l } if l == layer)
+                })
+            }) {
+                return Err(Error::InUse);
+            }
             if let Some(g) = p.composition.layers[i].group
                 && groups::members(p, g).len() < 2
             {
@@ -2206,12 +2228,34 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     }
                 }
             }
+            let mut slices = vec![];
+            for sc in &mut p.output.screens {
+                for sl in &mut sc.slices {
+                    if sl.source == vjc_model::SliceSource::Layer(layer) {
+                        slices.push((sc.id, sl.id, sl.source));
+                        sl.source = vjc_model::SliceSource::Composition;
+                    }
+                }
+            }
+            let mut cues = vec![];
+            let mut at = 0;
+            let mut k = 0;
+            while at < p.composition.timecode_cues.len() {
+                if p.composition.timecode_cues[at].layer == Some(layer) {
+                    cues.push((k, p.composition.timecode_cues.remove(at)));
+                } else {
+                    at += 1;
+                }
+                k += 1;
+            }
             let removed = p.composition.layers.remove(i);
             undoable(
                 Command::RestoreLayer {
                     layer: removed,
                     index: i,
                     clips,
+                    slices,
+                    cues,
                 },
                 vec![Event::LayerCleared { layer }],
             )
@@ -2220,19 +2264,33 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             layer,
             index,
             clips,
+            slices,
+            cues,
         } => {
             let id = layer.id;
+            // Check everything first so a failure leaves the project untouched.
+            if clips
+                .iter()
+                .any(|(deck, _, _)| !p.composition.decks.iter().any(|d| d.id == *deck))
+            {
+                return Err(Error::NoDeck);
+            }
             let ls = &mut p.composition.layers;
             ls.insert(index.min(ls.len()), layer);
             // Ascending positions per deck rebuild the original order.
             for (deck, at, clip) in clips {
-                let d = p
-                    .composition
-                    .decks
-                    .iter_mut()
-                    .find(|d| d.id == deck)
-                    .ok_or(Error::NoDeck)?;
-                d.clips.insert(at.min(d.clips.len()), clip);
+                if let Some(d) = p.composition.decks.iter_mut().find(|d| d.id == deck) {
+                    d.clips.insert(at.min(d.clips.len()), clip);
+                }
+            }
+            for (sc, sl, source) in slices {
+                if let Ok(s) = slice_mut(p, sc, sl) {
+                    s.source = source;
+                }
+            }
+            for (at, cue) in cues {
+                let cs = &mut p.composition.timecode_cues;
+                cs.insert(at.min(cs.len()), cue);
             }
             undoable(Command::RemoveLayerWithClips { layer: id }, vec![])
         }
@@ -2605,6 +2663,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::SetEffectDryWet { .. }
         | Command::SetEffectParam { .. } => effects::apply(p, cmd),
         Command::CreateGroup { .. }
+        | Command::RestoreEmptyGroup { .. }
         | Command::Ungroup { .. }
         | Command::RenameGroup { .. }
         | Command::SetGroupOpacity { .. }
@@ -2704,7 +2763,8 @@ impl History {
                 Some(old) if old.len() == new.len() => {
                     old.iter().zip(new).position(|(a, b)| a != b).unwrap_or(0)
                 }
-                _ => 0,
+                // Creating the mask or changing its point count is no drag of point 0.
+                _ => usize::MAX,
             };
             target = Some(Target::SliceMask(sl, n, idx));
         }
@@ -3878,6 +3938,7 @@ mod tests {
     #[test]
     fn remove_layer_with_clips_undo_restores_layer_clips_and_effects_in_all_decks() {
         let (mut p, l) = setup();
+        p.composition.layers.push(layer(9));
         let mut h = History::new();
         import(&mut p, &mut h, l, Instant::now());
         let b = Deck {
@@ -3927,6 +3988,111 @@ mod tests {
         assert_eq!(p, before, "layer, clips and effects restored in every deck");
         h.redo(&mut p).unwrap().unwrap();
         assert!(p.composition.layers.iter().all(|x| x.id != l));
+    }
+
+    fn two_layer_project() -> (Project, LayerId, LayerId) {
+        let (mut p, l) = setup();
+        let other = layer(7);
+        let oid = other.id;
+        p.composition.layers.push(other);
+        (p, l, oid)
+    }
+
+    #[test]
+    fn removing_the_last_layer_is_refused() {
+        let (mut p, l) = setup();
+        assert_eq!(p.composition.layers.len(), 1);
+        assert_eq!(
+            apply(&mut p, Command::RemoveLayerWithClips { layer: l }),
+            Err(Error::InUse)
+        );
+        assert_eq!(p.composition.layers.len(), 1);
+        // Negative control: with a second layer the same command works.
+        p.composition.layers.push(layer(2));
+        assert!(apply(&mut p, Command::RemoveLayerWithClips { layer: l }).is_ok());
+    }
+
+    #[test]
+    fn remove_layer_resets_slices_and_drops_cues_and_undo_brings_them_back() {
+        use vjc_model::SliceSource;
+        let (mut p, l, other) = two_layer_project();
+        let mut scr = mapping::new_screen("S", 1920, 1080);
+        let (a, b) = (mapping::new_slice(100, 100), mapping::new_slice(100, 100));
+        scr.slices = vec![a, b];
+        scr.slices[0].source = SliceSource::Layer(l);
+        scr.slices[1].source = SliceSource::Layer(other);
+        p.output.screens.push(scr);
+        let cue = |layer| TimecodeCue {
+            time: Timecode::from_frames(vjc_model::TcFps::F30, 0),
+            column: 0,
+            layer,
+        };
+        p.composition.timecode_cues = vec![cue(Some(l)), cue(None), cue(Some(other))];
+        let before = p.clone();
+        let mut h = History::new();
+        h.exec(
+            &mut p,
+            Command::RemoveLayerWithClips { layer: l },
+            Instant::now(),
+        )
+        .unwrap();
+        let sl = &p.output.screens[0].slices;
+        assert_eq!(sl[0].source, SliceSource::Composition);
+        assert_eq!(
+            sl[1].source,
+            SliceSource::Layer(other),
+            "other layer untouched"
+        );
+        assert_eq!(
+            p.composition.timecode_cues,
+            vec![cue(None), cue(Some(other))]
+        );
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn remove_layer_refused_while_a_router_clip_reads_it() {
+        let (mut p, l, other) = two_layer_project();
+        let mut k = clip_from_path("/x/r.mov".into());
+        k.source = Source::LayerRouter { layer: l };
+        p.composition.decks[0].clips.push(CellClip {
+            layer: other,
+            column: 0,
+            clip: k,
+        });
+        assert_eq!(
+            apply(&mut p, Command::RemoveLayerWithClips { layer: l }),
+            Err(Error::InUse)
+        );
+        // Negative control: nothing routes from `other` to itself, so it can go.
+        p.composition.decks[0].clips.clear();
+        assert!(apply(&mut p, Command::RemoveLayerWithClips { layer: l }).is_ok());
+    }
+
+    #[test]
+    fn restore_layer_with_a_missing_deck_changes_nothing() {
+        let (mut p, _, other) = two_layer_project();
+        let lay = layer(8);
+        let before = p.clone();
+        let clip = CellClip {
+            layer: lay.id,
+            column: 0,
+            clip: clip_from_path("/x/a.mov".into()),
+        };
+        let cmd = |deck| Command::RestoreLayer {
+            layer: lay.clone(),
+            index: 0,
+            clips: vec![(deck, 0, clip.clone())],
+            slices: vec![],
+            cues: vec![],
+        };
+        assert_eq!(apply(&mut p, cmd(Uuid::new_v4())), Err(Error::NoDeck));
+        assert_eq!(p, before);
+        // Negative control: with a real deck it applies.
+        let d = p.composition.decks[0].id;
+        assert!(apply(&mut p, cmd(d)).is_ok());
+        let _ = other;
     }
 
     #[test]
@@ -5940,14 +6106,21 @@ mod tests {
         let mut quad = tri(0.2);
         quad.push((1.0, 1.0));
         let state = |p: &Project| p.output.screens[0].slices[0].mask.clone();
-        h.exec(&mut p, mask(Some(tri(0.0))), now).unwrap();
-        h.exec(&mut p, mask(Some(tri(0.1))), now).unwrap(); // drag: same step
+        h.exec(&mut p, mask(Some(tri(0.0))), now).unwrap(); // create
+        h.exec(&mut p, mask(Some(tri(0.1))), now).unwrap(); // drag point 0: own step
+        h.exec(&mut p, mask(Some(tri(0.15))), now).unwrap(); // same drag
         h.exec(&mut p, mask(Some(quad.clone())), now).unwrap(); // add point
         h.exec(&mut p, mask(None), now).unwrap(); // clear
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(state(&p), Some(quad));
         h.undo(&mut p).unwrap().unwrap();
-        assert_eq!(state(&p), Some(tri(0.1)));
+        assert_eq!(state(&p), Some(tri(0.15)));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(
+            state(&p),
+            Some(tri(0.0)),
+            "the drag did not swallow the creation"
+        );
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(state(&p), None);
     }

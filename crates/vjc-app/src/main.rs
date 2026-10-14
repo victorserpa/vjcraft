@@ -96,6 +96,10 @@ struct State {
     gens: HashMap<LayerId, (DeckId, u32, f64)>,
     /// Deck tab being renamed, with its edit buffer.
     renaming: Option<(DeckId, String)>,
+    /// Tests pin the clock the undo history coalesces with, so a slow machine cannot split
+    /// one gesture into two steps.
+    #[cfg(test)]
+    history_now: Option<std::time::Instant>,
     /// Column header being renamed: (column id, text so far).
     col_renaming: Option<(Uuid, String)>,
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
@@ -1138,6 +1142,8 @@ impl State {
             remove_layer_confirm: None,
             help_shown: None,
             renaming: None,
+            #[cfg(test)]
+            history_now: None,
             col_renaming: None,
         }
     }
@@ -1724,11 +1730,13 @@ impl State {
             _ => None,
         };
         let is_step = matches!(cmd, Command::StepClip { .. });
+        let deck_switch = matches!(cmd, Command::SelectDeck { .. });
         let is_set_bpm = matches!(cmd, Command::SetBpm { .. });
-        match self
-            .history
-            .exec(&mut self.project, cmd, std::time::Instant::now())
-        {
+        #[cfg(test)]
+        let now = self.history_now.unwrap_or_else(std::time::Instant::now);
+        #[cfg(not(test))]
+        let now = std::time::Instant::now();
+        match self.history.exec(&mut self.project, cmd, now) {
             Ok(events) => {
                 if is_set_bpm {
                     self.link_sync.note_bpm_edit();
@@ -1747,6 +1755,10 @@ impl State {
                     });
                     self.col_sel = landed.or(self.col_sel);
                 }
+                if deck_switch {
+                    self.col_sel = None;
+                }
+                self.prune_col_sel();
                 if !runtime {
                     self.dirty = true;
                 }
@@ -1768,6 +1780,7 @@ impl State {
                     self.link_sync.note_bpm_edit();
                 }
                 self.dirty = true;
+                self.prune_col_sel();
                 self.handle(ev);
             }
             Some(Err(e)) => self.status = format!("Undo failed: {e}"),
@@ -1783,10 +1796,19 @@ impl State {
                     self.link_sync.note_bpm_edit();
                 }
                 self.dirty = true;
+                self.prune_col_sel();
                 self.handle(ev);
             }
             Some(Err(e)) => self.status = format!("Redo failed: {e}"),
             None => {}
+        }
+    }
+
+    /// The selected column index must point at a column that still exists.
+    pub(crate) fn prune_col_sel(&mut self) {
+        let n = self.project.composition.columns.len() as u32;
+        if self.col_sel.is_some_and(|c| c >= n) {
+            self.col_sel = None;
         }
     }
 
@@ -1860,6 +1882,8 @@ impl State {
                     self.flow.loops.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
                     self.cross_from_old(layer);
+                    self.flow.regions.remove(&layer);
+                    self.flow.pos.remove(&layer);
                     self.players
                         .insert(layer, (deck, column, Player::open_capture(&device)));
                     self.heads.remove(&layer);
@@ -1875,6 +1899,8 @@ impl State {
                     self.flow.loops.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
                     self.cross_from_old(layer);
+                    self.flow.regions.remove(&layer);
+                    self.flow.pos.remove(&layer);
                     match browser::net_backend(&protocol) {
                         Some(p) => {
                             self.players
@@ -1894,6 +1920,8 @@ impl State {
                     self.flow.loops.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
                     self.flow.gen_bars.remove(&layer);
+                    self.flow.regions.remove(&layer);
+                    self.flow.pos.remove(&layer);
                     self.gens.insert(layer, (deck, column, 0.0));
                 }
                 Event::Seek {
@@ -1915,6 +1943,10 @@ impl State {
                 Event::LayerCleared { layer } => {
                     self.flow.outgoing.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
+                    self.flow.regions.remove(&layer);
+                    self.flow.pos.remove(&layer);
+                    self.flow.gen_bars.remove(&layer);
+                    self.flow.loops.remove(&layer);
                     self.players.remove(&layer);
                     self.gens.remove(&layer);
                 }
@@ -2103,6 +2135,7 @@ impl State {
                 self.flow.beat_loops.remove(&to.0);
                 self.flow.regions.remove(&to.0);
                 self.flow.gen_bars.remove(&to.0);
+                self.flow.pos.remove(&to.0);
                 if let Some(v) = c.loops {
                     self.flow.loops.insert(to.0, v);
                 }
@@ -3598,6 +3631,30 @@ impl State {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = theme::SP_2;
             let tbtn = vec2_btn();
+            // Link is laid out first, on the right; the rest scrolls in what is left, so a
+            // narrow window never overlaps it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(theme::SP_3);
+                let mut link = self.project.composition.tempo.link_enabled;
+                let label = if link {
+                    format!("Link ({})", self.link_sync.peers)
+                } else {
+                    "Link".to_owned()
+                };
+                let text = icons::with_text(ui, icons::i::LINK, &label);
+                let lr = ui.add(egui::Button::new(text).selected(link));
+                lr.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, link, label.clone())
+                });
+                if help(lr, "link").clicked() {
+                    link = !link;
+                    cmds.push(Command::SetLink { enabled: link });
+                }
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = theme::SP_2;
             let play = icons::name(
                 ui.add(
                     egui::Button::new(icons::glyph(icons::i::PLAY).color(theme::ON_ACCENT))
@@ -3771,23 +3828,8 @@ impl State {
                     });
                 help(r, "timecode");
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(theme::SP_3);
-                let mut link = self.project.composition.tempo.link_enabled;
-                let label = if link {
-                    format!("Link ({})", self.link_sync.peers)
-                } else {
-                    "Link".to_owned()
-                };
-                let text = icons::with_text(ui, icons::i::LINK, &label);
-                let lr = ui.add(egui::Button::new(text).selected(link));
-                lr.widget_info(|| {
-                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, link, label.clone())
-                });
-                if help(lr, "link").clicked() {
-                    link = !link;
-                    cmds.push(Command::SetLink { enabled: link });
-                }
+                        });
+                    });
             });
         });
         if self.learn {
@@ -3806,6 +3848,7 @@ impl State {
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.prune_screen_state();
+        self.prune_sel_slices();
         self.ui_body(ui);
         self.sync_clip_preview();
         // The help bar is drawn before the widgets, so it shows last frame's hover. If this
@@ -4046,6 +4089,8 @@ impl State {
                             ui.add(egui::Label::new(help_shown).wrap());
                         });
                 }
+                self.browser
+                    .set_recording(self.capture.as_ref().map(|c| c.path()));
                 let (o, changed) = self.browser.show(ui, fxs, &mut self.prefs.general);
                 opened = o;
                 if changed {
@@ -4482,8 +4527,11 @@ impl State {
                                     (r, nr)
                                 })
                                 .inner;
-                            self.targets
-                                .push((r.rect, vjc_core::shortcuts::column_address(ci as u32)));
+                            // The whole header (arrow row and name row) is the learn target.
+                            self.targets.push((
+                                r.rect.union(nr.rect),
+                                vjc_core::shortcuts::column_address(ci as u32),
+                            ));
                             if r.clicked() {
                                 cmds.push(Command::TriggerColumn {
                                     deck: cur,

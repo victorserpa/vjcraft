@@ -7,12 +7,23 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use vjc_media::SourceInfo;
 
+/// A file that keeps failing is probed at most this often.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+
+/// Wait before probe number `fails + 1` of a path that failed `fails` times (>= 1) in a row.
+fn backoff(base: Duration, fails: u32) -> Duration {
+    base.saturating_mul(1u32 << fails.saturating_sub(1).min(16))
+        .min(MAX_RETRY_WAIT.max(base))
+}
+
 pub struct SourceInfos {
     known: HashMap<PathBuf, Option<SourceInfo>>,
     pending: HashSet<PathBuf>,
     /// When each failed probe may be tried again (the file may appear or become readable).
     retry_at: HashMap<PathBuf, Instant>,
     retry_after: Duration,
+    /// Failed probes in a row per path: each wait doubles, up to `MAX_RETRY_WAIT`.
+    fails: HashMap<PathBuf, u32>,
     tx: Sender<(PathBuf, Option<SourceInfo>)>,
     rx: Receiver<(PathBuf, Option<SourceInfo>)>,
 }
@@ -25,6 +36,7 @@ impl Default for SourceInfos {
             pending: HashSet::new(),
             retry_at: HashMap::new(),
             retry_after: Duration::from_secs(3),
+            fails: HashMap::new(),
             tx,
             rx,
         }
@@ -38,8 +50,12 @@ impl SourceInfos {
         while let Ok((p, info)) = self.rx.try_recv() {
             self.pending.remove(&p);
             if info.is_none() {
-                self.retry_at
-                    .insert(p.clone(), Instant::now() + self.retry_after);
+                let n = self.fails.entry(p.clone()).or_insert(0);
+                *n += 1;
+                let wait = backoff(self.retry_after, *n);
+                self.retry_at.insert(p.clone(), Instant::now() + wait);
+            } else {
+                self.fails.remove(&p);
             }
             self.known.insert(p, info);
         }
@@ -160,5 +176,35 @@ mod tests {
             }
         }
         panic!("probe never answered");
+    }
+
+    #[test]
+    fn retry_wait_doubles_and_is_capped() {
+        let base = Duration::from_secs(3);
+        let waits: Vec<u64> = (1..=8).map(|n| backoff(base, n).as_secs()).collect();
+        assert_eq!(waits, [3, 6, 12, 24, 48, 60, 60, 60]);
+        // Control: a zero base (tests) never waits.
+        assert_eq!(backoff(Duration::ZERO, 5), Duration::ZERO);
+    }
+
+    #[test]
+    fn repeated_failures_wait_longer_each_time() {
+        let mut s = SourceInfos::default();
+        let p = Path::new("/definitely/not/here.mov");
+        let mut waits = vec![];
+        for _ in 0..2 {
+            s.get(p);
+            for _ in 0..300 {
+                std::thread::sleep(Duration::from_millis(10));
+                s.get(p);
+                if !s.pending.contains(p) && s.retry_at.contains_key(p) {
+                    break;
+                }
+            }
+            waits.push(s.retry_at[p] - Instant::now());
+            // Make the retry due now.
+            s.retry_at.insert(p.to_path_buf(), Instant::now());
+        }
+        assert!(waits[1] > waits[0] + Duration::from_secs(2), "{waits:?}");
     }
 }

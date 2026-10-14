@@ -315,4 +315,50 @@ mod tests {
         assert_eq!(s.visuals.widgets.hovered.bg_stroke.color, ACCENT);
         assert_eq!(s.text_styles[&TextStyle::Body].size, FS_SM);
     }
+
+    /// replica/design/tokens.json must say what this file does.
+    #[test]
+    fn tokens_json_matches_theme_constants() {
+        let j: serde_json::Value =
+            serde_json::from_str(include_str!("../../../replica/design/tokens.json")).unwrap();
+        let hex = |c: Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+        for (name, c) in [
+            ("bg", BG),
+            ("surface", SURFACE),
+            ("surface-raised", SURFACE_RAISED),
+            ("border", BORDER),
+            ("border-input", BORDER_INPUT),
+            ("text", TEXT),
+            ("text-muted", TEXT_MUTED),
+            ("accent", ACCENT),
+            ("on-accent", ON_ACCENT),
+            ("danger", DANGER),
+            ("playing", CELL_PLAYING),
+            ("selected", CELL_SELECTED),
+            ("warning", CELL_DROP),
+            ("pending", CELL_PENDING),
+        ] {
+            assert_eq!(j["color"][name], hex(c).as_str(), "color {name}");
+        }
+        let l = &j["layout"];
+        for (name, v) in [
+            ("layer_head_w", LAYER_HEAD_W),
+            ("column_head_h", COLUMN_HEAD_H),
+            ("deck_tabs_h", DECK_TABS_H),
+            ("transport_h", TRANSPORT_H),
+            ("status_h", STATUS_H),
+            ("section_row_h", SECTION_ROW_H),
+            ("param_value_w", PROP_VALUE_W),
+            ("monitor_col_w", MONITOR_COL_W),
+            ("monitor_min_w", MONITOR_MIN_W),
+            ("clip_panel_w", CLIP_PANEL_W),
+            ("clip_panel_min_w", CLIP_PANEL_MIN_W),
+            ("fx_slider_w", FX_SLIDER_W),
+        ] {
+            assert_eq!(l[name].as_f64(), Some(f64::from(v)), "layout {name}");
+        }
+        for (name, v) in [("w", CELL_W), ("thumb_h", THUMB_H), ("name_h", NAME_H)] {
+            assert_eq!(l["cell"][name].as_f64(), Some(f64::from(v)), "cell {name}");
+        }
+    }
 }

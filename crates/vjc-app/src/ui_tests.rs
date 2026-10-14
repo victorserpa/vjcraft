@@ -2142,6 +2142,9 @@ fn type_in_field(h: &mut Harness<'_, State>, shown: &str, text: &str) {
 #[test]
 fn slice_inspector_math_fields_buttons_and_undo() {
     let mut h = precise_slice_setup();
+    // Root cause of the old flake: the two field edits only coalesce inside the 500 ms
+    // history window, and typing through the UI could take longer on a loaded machine.
+    h.state_mut().history_now = Some(std::time::Instant::now());
     let before = h.state().project.clone();
     // 480 / 3 = 160 wide, same height.
     type_in_field(&mut h, "480", "/3");
@@ -2631,6 +2634,25 @@ fn stale_multi_selection_is_pruned_after_undo() {
     assert!(h.state().sel_slices.is_empty());
 }
 
+// #195: a multi-selection does not follow the user to another screen.
+#[test]
+fn multi_selection_is_dropped_when_another_screen_is_selected() {
+    let mut h = precise_slice_setup();
+    two_slices_selected(&mut h);
+    // Negative control: the selection survives frames on its own screen.
+    settle(&mut h);
+    assert_eq!(h.state().sel_slices.len(), 2);
+    let b = vjc_core::mapping::new_screen("Wall B", 640, 480);
+    let bid = b.id;
+    h.state_mut().exec(Command::AddScreen {
+        screen: b,
+        index: 1,
+    });
+    h.state_mut().sel_screen = Some(bid);
+    settle(&mut h);
+    assert!(h.state().sel_slices.is_empty());
+}
+
 fn first_column_name(h: &Harness<'_, State>) -> String {
     h.state().project.composition.columns[0].name.clone()
 }
@@ -2818,6 +2840,127 @@ fn column_rename_is_dropped_when_the_column_is_gone() {
     h.state_mut().col_renaming = Some((Uuid::new_v4(), "x".into()));
     settle(&mut h);
     assert!(h.state().col_renaming.is_none());
+}
+
+#[test]
+fn column_rename_is_dropped_when_the_column_is_gone_and_the_grid_is_hidden() {
+    let mut h = app();
+    h.state_mut().prefs.layouts.current.grid = false;
+    h.state_mut().col_renaming = Some((Uuid::new_v4(), "x".into()));
+    settle(&mut h);
+    assert!(h.state().col_renaming.is_none());
+    // Negative control: a live column keeps its rename editor.
+    let col = h.state().project.composition.columns[0].id;
+    h.state_mut().col_renaming = Some((col, "x".into()));
+    settle(&mut h);
+    assert!(h.state().col_renaming.is_some());
+}
+
+#[test]
+fn col_sel_is_cleared_when_its_column_goes_or_the_deck_changes() {
+    let mut h = app();
+    let st = h.state_mut();
+    let extra = Uuid::new_v4();
+    st.exec(Command::AddColumn {
+        column: vjc_model::Column {
+            id: extra,
+            name: "extra".into(),
+        },
+    });
+    let last = st.project.composition.columns.len() as u32 - 1;
+    st.col_sel = Some(last);
+    st.exec(Command::RemoveColumn { column: extra });
+    assert_eq!(st.col_sel, None, "removed column");
+    // Negative control: removing a different column leaves a valid selection alone.
+    st.col_sel = Some(0);
+    st.exec(Command::AddColumn {
+        column: vjc_model::Column {
+            id: extra,
+            name: "extra".into(),
+        },
+    });
+    assert_eq!(st.col_sel, Some(0));
+    // Undo of the add also drops a selection that points past the end.
+    st.col_sel = Some(st.project.composition.columns.len() as u32 - 1);
+    st.undo();
+    assert_eq!(st.col_sel, None, "undo");
+    let b = vjc_model::Deck {
+        id: Uuid::new_v4(),
+        name: "B".into(),
+        clips: vec![],
+    };
+    let bid = b.id;
+    st.exec(Command::AddDeck {
+        deck: b,
+        index: 1,
+        select: None,
+    });
+    st.col_sel = Some(0);
+    st.exec(Command::SelectDeck { deck: bid });
+    assert_eq!(st.col_sel, None, "deck switch");
+}
+
+// #210: on a narrow window the transport scrolls and Link stays on screen, apart from the
+// controls.
+#[test]
+fn transport_link_stays_on_screen_on_a_narrow_window() {
+    let link_rect = |w: f32| {
+        let mut h = app_sized(w, 800.0);
+        settle(&mut h);
+        (h.get_by_label("Link").rect(), h.get_by_label("Undo").rect())
+    };
+    let (link, undo) = link_rect(520.0);
+    assert!(link.max.x <= 520.0, "Link inside the window: {link:?}");
+    assert!(!link.intersects(undo), "Link apart from Undo");
+    // Control: at a wide size it also fits, so the check is not vacuous.
+    assert!(link_rect(1280.0).0.max.x <= 1280.0);
+}
+
+// #210: the MIDI-learn target of a column is its whole header, name row included.
+#[test]
+fn column_learn_target_covers_the_name_row() {
+    let mut h = app();
+    settle(&mut h);
+    let addr = vjc_core::shortcuts::column_address(0);
+    let r = h
+        .state()
+        .targets
+        .iter()
+        .find(|t| t.1 == addr)
+        .expect("column target")
+        .0;
+    assert!(
+        r.height() > theme::COLUMN_HEAD_H * 1.5,
+        "target {r:?} must span both header rows"
+    );
+}
+
+// #193: a layer's flow state goes with its player, so a later clip never inherits it.
+#[test]
+fn flow_state_is_dropped_when_a_layer_is_cleared_or_gets_another_source() {
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    let deck = h.state().project.composition.current_deck;
+    let st = h.state_mut();
+    let fill = |st: &mut State| {
+        st.flow.regions.insert(layer, (0.25, 0.75));
+        st.flow.pos.insert(layer, 0.5);
+    };
+    for ev in [
+        Event::LayerCleared { layer },
+        Event::GeneratorStarted {
+            deck,
+            layer,
+            column: 0,
+        },
+    ] {
+        fill(st);
+        // Control: before the event the state is there.
+        assert!(st.flow.regions.contains_key(&layer));
+        st.handle(vec![ev]);
+        assert!(!st.flow.regions.contains_key(&layer), "region");
+        assert!(!st.flow.pos.contains_key(&layer), "position");
+    }
 }
 
 /// Primary click at `pos`, like the mouse.
@@ -3450,6 +3593,21 @@ fn moving_a_playing_clip_across_layers_carries_its_flow_state() {
     assert_eq!(st.flow.gen_bars.get(&l1), Some(&(3, 1)));
     assert!(st.flow.loops.contains_key(&l1));
     assert!(!st.flow.regions.contains_key(&l0) && !st.flow.gen_bars.contains_key(&l0));
+}
+
+// Review (#212): a stale playhead position on the target layer must not survive a move
+// that carries no position of its own.
+#[test]
+fn moving_a_playing_clip_clears_the_stale_position_of_the_target_layer() {
+    let mut h = app();
+    let l0 = playing_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let l1 = h.state().project.composition.layers[1].id;
+    let st = h.state_mut();
+    st.flow.pos.insert(l1, 0.9);
+    st.follow_moves(deck, &[((l0, 1), (l1, 1))]);
+    assert_eq!(st.flow.pos.get(&l1), None);
+    assert!(!st.flow.pos.contains_key(&l0));
 }
 
 // Review: cell widget ids come from the cell identity, not from where it is drawn.

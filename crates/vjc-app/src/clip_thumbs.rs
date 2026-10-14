@@ -25,6 +25,11 @@ pub struct ClipThumbs {
     /// Logical clock for LRU: bumped on every insert and hit.
     tick: u64,
     cap: usize,
+    /// Thumbnails shown since this tick (the previous frame on) are not evicted: with more
+    /// visible than `cap` they would be decoded again every frame. None until the first poll.
+    frame_floor: Option<u64>,
+    /// `tick` when the current frame's poll ran.
+    frame_start: u64,
     pending: HashMap<ClipId, (PathBuf, Instant)>,
     failed: HashMap<ClipId, (PathBuf, Instant)>,
     req: Sender<(ClipId, PathBuf)>,
@@ -47,6 +52,8 @@ impl ClipThumbs {
             textures: HashMap::new(),
             tick: 0,
             cap: MAX_THUMBS,
+            frame_floor: None,
+            frame_start: 0,
             pending: HashMap::new(),
             failed: HashMap::new(),
             req,
@@ -57,6 +64,8 @@ impl ClipThumbs {
     /// Uploads finished thumbnails. Returns true if any arrived (caller repaints).
     pub fn poll(&mut self, ctx: &egui::Context) -> bool {
         let mut any = false;
+        self.frame_floor = Some(self.frame_start);
+        self.frame_start = self.tick;
         while let Ok((id, path, f)) = self.done.try_recv() {
             // A result for a path the clip no longer has is stale.
             if self.pending.get(&id).is_none_or(|(p, _)| *p != path) {
@@ -121,12 +130,16 @@ impl ClipThumbs {
         None
     }
 
-    /// Drops the least recently used thumbnails until at most `cap` remain.
+    /// Drops the least recently used thumbnails until at most `cap` remain, never one
+    /// shown in the last frame or two (the cache then grows past `cap` until they scroll
+    /// away).
     fn evict(&mut self) {
         while self.textures.len() > self.cap {
+            let floor = self.frame_floor;
             let Some(oldest) = self
                 .textures
                 .iter()
+                .filter(|(_, (_, _, used))| floor.is_none_or(|f| *used <= f))
                 .min_by_key(|(_, (_, _, used))| *used)
                 .map(|(id, _)| *id)
             else {
@@ -252,5 +265,35 @@ mod tests {
             ),
         );
         assert!(!t.is_pending());
+    }
+
+    #[test]
+    fn thumbnails_on_screen_are_not_evicted_even_over_cap() {
+        let ctx = egui::Context::default();
+        let mut t = ClipThumbs::new();
+        let ids = [id(), id(), id(), id()];
+        for c in ids {
+            put(&mut t, &ctx, c);
+        }
+        t.cap = 2;
+        let p = Path::new("/x.mp4");
+        // Frame boundary, then all four are drawn: more visible than the cap.
+        t.poll(&ctx);
+        for c in ids {
+            assert!(t.texture(c, p).is_some());
+        }
+        t.poll(&ctx);
+        let late = id();
+        put(&mut t, &ctx, late);
+        assert!(ids.iter().all(|c| t.ready(*c)), "visible ones survive");
+        // Negative control: once they stop being drawn for two frames, they go.
+        t.poll(&ctx);
+        t.poll(&ctx);
+        put(&mut t, &ctx, id());
+        assert!(
+            t.textures.len() <= 2,
+            "cap holds again: {}",
+            t.textures.len()
+        );
     }
 }
