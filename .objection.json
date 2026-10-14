@@ -1,0 +1,15 @@
+{
+  "bases": ["main"],
+  "defaultBase": "main",
+  "verify": [
+    "cargo fmt --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo test --workspace"
+  ],
+  "budget": "lean",
+  "invariants": [
+    { "paths": "^crates/vjc-app/src/(output_overlay|artnet_out|netout|capture|compositor)\\.rs$", "rule": "with black-out on, every output (screens, Art-Net, Syphon, NDI) sends only black" },
+    { "paths": "^crates/vjc-app/src/(main|grid_ui)\\.rs$", "rule": "selecting, loading or dropping a clip into a cell never changes what is on air unless that cell is already on air; only the thumbnail/trigger fires a clip" },
+    { "paths": "^crates/vjc-app/src/(main|persist)\\.rs$", "rule": "autosave never overwrites a recovery file the user has not yet answered" }
+  ]
+}
