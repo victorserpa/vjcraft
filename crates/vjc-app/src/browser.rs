@@ -139,6 +139,11 @@ pub fn grid_cols(width: f32, grid: bool) -> usize {
     }
 }
 
+/// Splits `idx` into grid lines of `cols` cells; `cols == 0` counts as 1 (`chunks(0)` panics).
+pub fn chunk_lines(idx: &[usize], cols: usize) -> std::slice::Chunks<'_, usize> {
+    idx.chunks(cols.max(1))
+}
+
 const GRID_CELL_W: f32 = 84.0;
 const GRID_CELL_H: f32 = 74.0;
 const LIST_ROW_H: f32 = 40.0;
@@ -812,7 +817,7 @@ impl Browser {
                         .id_salt(("fx-cat", cat))
                         .default_open(true)
                         .show(ui, |ui| {
-                            for line in idx.chunks(cols) {
+                            for line in chunk_lines(idx, cols) {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 0.0;
                                     for &i in line {
@@ -1133,6 +1138,13 @@ mod tests {
             fav,
             item: None,
         }
+    }
+
+    #[test]
+    fn chunk_lines_survives_zero_columns() {
+        let idx = [1, 2, 3];
+        assert_eq!(chunk_lines(&idx, 0).count(), 3);
+        assert_eq!(chunk_lines(&idx, 2).count(), 2);
     }
 
     #[test]

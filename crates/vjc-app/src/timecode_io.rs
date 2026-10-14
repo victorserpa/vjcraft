@@ -43,6 +43,7 @@ fn real_opener() -> Opener {
             move |s: &[f32]| {
                 dec.feed(s, |tc| {
                     let _ = tx.send((tc, Instant::now()));
+                    crate::wake::now();
                 })
             }
         }))

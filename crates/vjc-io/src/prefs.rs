@@ -57,6 +57,14 @@ impl General {
         let mut seen = std::collections::HashSet::new();
         self.recent_projects.retain(|p| seen.insert(p.clone()));
         self.recent_projects.truncate(MAX_RECENT);
+        // Old effect keys were `fx:<Category> / <Name>`; keep only the name.
+        for f in &mut self.favorites {
+            if let Some(rest) = f.strip_prefix("fx:")
+                && let Some((_, name)) = rest.rsplit_once(" / ")
+            {
+                *f = format!("fx:{name}");
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         self.favorites
             .retain(|f| !f.is_empty() && seen.insert(f.clone()));
@@ -719,6 +727,16 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn old_category_favorite_keys_migrate_on_load() {
+        let mut g = General {
+            favorites: vec!["fx:Color / Blur".into(), "fx:Blur".into(), "dir:/a".into()],
+            ..General::default()
+        };
+        g.sanitize();
+        assert_eq!(g.favorites, ["fx:Blur", "dir:/a"]);
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod slice_render;
 mod source_info;
 mod theme;
 mod timecode_io;
+mod wake;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
@@ -518,6 +519,9 @@ fn add_effect_list(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Comma
         }
     }
 }
+
+/// Repaint period while nothing is live.
+const IDLE_REPAINT: std::time::Duration = std::time::Duration::from_millis(100);
 
 type Gens = HashMap<LayerId, (DeckId, u32, f64)>;
 
@@ -1812,6 +1816,23 @@ impl State {
             .filter_map(|l| active_of(&self.players, &self.gens, l.id).map(|(d, c)| (l.id, d, c)))
             .collect();
         vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass).with_active(active)
+    }
+
+    /// True while something changes every frame: a playing clip or generator, a fade,
+    /// a recording, or any output screen / window.
+    fn is_live(&self) -> bool {
+        !self.players.is_empty()
+            || !self.gens.is_empty()
+            || !self.flow.outgoing.is_empty()
+            || self.capture.is_some()
+            || self.rec_request.is_some()
+            || self.output.is_some()
+            || !self.project.output.screens.is_empty()
+            // Time-driven work (beat clock, Link, timecode cues, metronome) must not wait
+            // for the idle repaint.
+            || self.project.composition.tempo.metronome
+            || self.project.composition.tempo.link_enabled
+            || self.prefs.timecode.source != vjc_io::prefs::TcSource::Off
     }
 
     fn active(&self, layer: LayerId) -> Option<(DeckId, u32)> {
@@ -5664,8 +5685,13 @@ impl eframe::App for State {
         State::ui(self, ui);
         let ctx = ui.ctx().clone();
         self.output_window(&ctx);
-        // Video is live: keep repainting.
-        ctx.request_repaint();
+        // Video is live: keep repainting. With nothing playing or published, wake up
+        // at a low rate (input events still repaint at once).
+        if self.is_live() {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(IDLE_REPAINT);
+        }
     }
 
     /// Closing the app mid-recording still writes the mp4 trailer (bounded wait).
@@ -5705,6 +5731,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             theme::apply_style(&cc.egui_ctx);
+            wake::install(&cc.egui_ctx);
             let mut s = State::new(prefs);
             if let Some(w) = warn {
                 s.status = w.clone();

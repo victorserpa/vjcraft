@@ -107,6 +107,7 @@ fn run(tx: Sender<In>, out_rx: Receiver<(String, [u8; 3])>) {
 /// MIDI callback body: stamps the message on arrival, not when the UI drains it.
 fn on_message(tx: &Sender<In>, device: &str, bytes: &[u8]) {
     let _ = tx.send(In::Msg(device.to_owned(), bytes.to_vec(), Instant::now()));
+    crate::wake::now();
 }
 
 /// Opens new input ports; returns the names newly connected.

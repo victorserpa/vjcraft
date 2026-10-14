@@ -138,6 +138,7 @@ fn run(tx: Sender<Event>, cfg_rx: Receiver<Cfg>, out_rx: Receiver<Vec<u8>>) {
                     if tx.send(ev).is_err() {
                         return;
                     }
+                    crate::wake::now();
                 }
             }
             None => std::thread::sleep(TICK),
