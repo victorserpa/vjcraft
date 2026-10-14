@@ -4628,3 +4628,113 @@ fn composition_param_labels_are_not_truncated() {
     assert!(full <= crate::theme::PARAM_LABEL_MAX);
     snap(&mut h, "params");
 }
+
+fn multi_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("vjc-multidrop-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn touch(d: &std::path::Path, n: &str) -> PathBuf {
+    let p = d.join(n);
+    std::fs::write(&p, b"x").unwrap();
+    p
+}
+
+fn drop_paths_on_cell(h: &mut Harness<'_, State>, layer_idx: usize, col: u32, ps: &[PathBuf]) {
+    let (_, pos) = cell_center(h, layer_idx, col);
+    h.hover_at(pos);
+    settle(h);
+    for p in ps {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(p.clone())));
+    }
+    settle(h);
+}
+
+fn clip_name(s: &State, l: LayerId, c: u32) -> Option<String> {
+    let deck = s.project.composition.current_deck;
+    vjc_core::clip_in(&s.project, deck, l, c).map(|k| k.name.clone())
+}
+
+#[test]
+fn multi_drop_three_files_fill_consecutive_cells() {
+    let d = multi_dir("three");
+    let ps = [touch(&d, "c.mp4"), touch(&d, "a.mp4"), touch(&d, "b.mp4")];
+    let mut h = app();
+    drop_paths_on_cell(&mut h, 1, 2, &ps);
+    let l = h.state().project.composition.layers[1].id;
+    let s = h.state();
+    assert_eq!(clip_name(s, l, 2).as_deref(), Some("a"));
+    assert_eq!(clip_name(s, l, 3).as_deref(), Some("b"));
+    assert_eq!(clip_name(s, l, 4).as_deref(), Some("c"));
+}
+
+#[test]
+fn multi_drop_folder_takes_media_only_and_one_undo() {
+    let d = multi_dir("folder");
+    touch(&d, "v2.mp4");
+    touch(&d, "v10.mov");
+    touch(&d, "notes.txt");
+    let mut st = State::headless(prefs());
+    let l = st.project.composition.layers[0].id;
+    let (n, ignored) = st.drop_many(l, 0, vec![d.clone()]);
+    assert_eq!((n, ignored), (2, 1));
+    assert_eq!(clip_name(&st, l, 0).as_deref(), Some("v2"));
+    assert_eq!(clip_name(&st, l, 1).as_deref(), Some("v10"));
+    st.undo();
+    assert_eq!(clip_name(&st, l, 0), None);
+    assert_eq!(clip_name(&st, l, 1), None);
+}
+
+#[test]
+fn multi_drop_adds_missing_columns_and_undo_removes_them() {
+    let d = multi_dir("cols");
+    let ps: Vec<PathBuf> = (0..4).map(|i| touch(&d, &format!("f{i}.png"))).collect();
+    let mut st = State::headless(prefs());
+    let l = st.project.composition.layers[0].id;
+    let cols = st.project.composition.columns.len() as u32;
+    let last = cols - 1;
+    st.drop_many(l, last, ps);
+    assert_eq!(st.project.composition.columns.len() as u32, cols + 3);
+    assert_eq!(clip_name(&st, l, last + 3).as_deref(), Some("f3"));
+    st.undo();
+    assert_eq!(st.project.composition.columns.len() as u32, cols);
+    assert_eq!(clip_name(&st, l, last), None);
+}
+
+#[test]
+fn multi_drop_keeps_on_air() {
+    let d = multi_dir("air");
+    let ps = [touch(&d, "a.mp4"), touch(&d, "b.mp4")];
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let on_air = h.state().active(lid);
+    h.state_mut().drop_many(lid, 3, ps.to_vec());
+    settle(&mut h);
+    assert_eq!(h.state().active(lid), on_air);
+}
+
+#[test]
+fn multi_drop_keeps_loose_files_of_any_format_and_skips_hidden_in_folders() {
+    let d = multi_dir("loose");
+    let gif = touch(&d, "loop.gif");
+    let mut st = State::headless(prefs());
+    let l = st.project.composition.layers[0].id;
+    assert_eq!(
+        st.drop_many(l, 0, vec![gif]),
+        (1, 0),
+        "a loose file always loads"
+    );
+    assert_eq!(clip_name(&st, l, 0).as_deref(), Some("loop"));
+    let f = multi_dir("hidden");
+    touch(&f, "a.mp4");
+    touch(&f, "._a.mp4");
+    assert_eq!(
+        st.drop_many(l, 1, vec![f]),
+        (1, 0),
+        "AppleDouble sidecar skipped"
+    );
+}

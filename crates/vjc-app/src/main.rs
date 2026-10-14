@@ -783,6 +783,78 @@ fn repaint_fps_never_panics_on_bad_project_values() {
     assert_eq!(repaint_fps(30.0), 30.0);
 }
 
+const MEDIA_EXTS: [&str; 10] = [
+    "mov", "mp4", "m4v", "mkv", "avi", "webm", "png", "jpg", "jpeg", "webp",
+];
+
+fn is_media(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| MEDIA_EXTS.iter().any(|m| m.eq_ignore_ascii_case(e)))
+}
+
+/// Most files one drop places (a huge folder must not add hundreds of columns at once).
+const MAX_DROP: usize = 128;
+
+/// Expands dropped folders (first level) into their media files; sorts by natural name.
+/// Loose files are kept whatever their extension (the decoder decides, as before); inside a
+/// folder only known media counts and hidden files (`._x.mp4` sidecars) are skipped.
+/// Returns the files and how many entries were left out.
+fn expand_drop(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+    let mut files = Vec::new();
+    let mut ignored = 0;
+    for p in paths {
+        if p.is_dir() {
+            let Ok(rd) = std::fs::read_dir(&p) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let q = e.path();
+                let hidden = q
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+                if q.is_file() && !hidden {
+                    if is_media(&q) {
+                        files.push(q);
+                    } else {
+                        ignored += 1;
+                    }
+                }
+            }
+        } else {
+            files.push(p);
+        }
+    }
+    files.sort_by_cached_key(|p| natural_key(p));
+    if files.len() > MAX_DROP {
+        ignored += files.len() - MAX_DROP;
+        files.truncate(MAX_DROP);
+    }
+    (files, ignored)
+}
+
+/// Lowercased name with digit runs zero-padded, so "2" sorts before "10".
+fn natural_key(p: &std::path::Path) -> String {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut out = String::new();
+    let mut digits = String::new();
+    for ch in name.chars().chain(std::iter::once('\0')) {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            if !digits.is_empty() {
+                out.push_str(&format!("{:0>12}", digits));
+                digits.clear();
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn active_of(
     players: &HashMap<LayerId, (DeckId, u32, Player)>,
     gens: &Gens,
@@ -3283,6 +3355,54 @@ impl State {
         self.preview_target = PreviewTarget::Clip(deck, layer, column);
     }
 
+    /// Several files/folders dropped from `column` on: one per column, in name order, adding
+    /// the missing columns, as a single undo step. Nothing is triggered unless the first cell
+    /// is on air (then it reloads, as `drop_cell`). Returns (placed, ignored).
+    fn drop_many(&mut self, layer: LayerId, column: u32, paths: Vec<PathBuf>) -> (usize, usize) {
+        let (files, ignored) = expand_drop(paths);
+        if files.is_empty() {
+            return (0, ignored);
+        }
+        let deck = self.project.composition.current_deck;
+        // The layer's on-air cell, if the drop replaces it: reload it after the batch.
+        let n = files.len() as u32;
+        let live = active_of(&self.players, &self.gens, layer)
+            .filter(|&(d, c)| d == deck && (column..column + n).contains(&c))
+            .map(|(_, c)| c);
+        let have = self.project.composition.columns.len() as u32;
+        let mut commands = Vec::new();
+        for i in have..column + files.len() as u32 {
+            commands.push(Command::AddColumn {
+                column: vjc_model::Column {
+                    id: Uuid::new_v4(),
+                    name: (i + 1).to_string(),
+                },
+            });
+        }
+        for (i, path) in files.iter().enumerate() {
+            let mut clip = vjc_core::clip_from_path(path.clone());
+            clip.fit = self.prefs.video.fit;
+            commands.push(Command::SetClip {
+                deck,
+                layer,
+                column: column + i as u32,
+                clip,
+            });
+        }
+        self.exec(Command::Batch { commands });
+        if let Some(c) = live {
+            self.exec(Command::TriggerClip {
+                deck,
+                layer,
+                column: c,
+            });
+        }
+        self.selected = Some((layer, column));
+        self.selected_deck = Some(deck);
+        self.preview_target = PreviewTarget::Clip(deck, layer, column);
+        (files.len(), ignored)
+    }
+
     /// Loads `path` into the cell and plays it.
     fn drop_file(&mut self, layer: LayerId, column: u32, path: PathBuf) {
         self.load_file(layer, column, path);
@@ -5133,7 +5253,7 @@ impl State {
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
-        for path in dropped {
+        if !dropped.is_empty() {
             match resolve_drop(&self.cells, self.last_pointer, self.selected) {
                 Some((l, c, w)) => {
                     let how = match w {
@@ -5142,12 +5262,12 @@ impl State {
                         DropWhere::FirstEmpty => "first empty cell of bottom layer",
                         DropWhere::FirstCell => "first cell of bottom layer",
                     };
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.drop_cell(l, c, path);
-                    self.status = format!("Dropped {name} on column {} ({how})", c + 1);
+                    let (n, ignored) = self.drop_many(l, c, dropped);
+                    let mut msg = format!("Dropped {n} file(s) from column {} ({how})", c + 1);
+                    if ignored > 0 {
+                        msg.push_str(&format!(", {ignored} unsupported ignored"));
+                    }
+                    self.status = msg;
                 }
                 None => self.status = "No grid cells to drop on".into(),
             }
