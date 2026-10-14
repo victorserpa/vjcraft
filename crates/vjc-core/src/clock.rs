@@ -330,6 +330,47 @@ pub fn generator_sync_rate(beats: Option<f64>, bpm: f64) -> f64 {
     beats.map_or(1.0, |n| beat_sync_rate(1.0, n, bpm))
 }
 
+/// Beats in a bar for [`BeatSnap::Bar`] (the clock has no time signature: 4/4).
+pub const BEATS_PER_BAR: f64 = 4.0;
+/// A phase this close after a grid line still counts as on it.
+const SNAP_EPS: f64 = 1e-6;
+
+/// Phase (in beats) at which an action requested at `phase` should run: the next beat or
+/// bar line, or `phase` itself when snap is off or the request lands on a line.
+pub fn snap_target(phase: f64, snap: vjc_model::BeatSnap) -> f64 {
+    let grid = match snap {
+        vjc_model::BeatSnap::Off => return phase,
+        vjc_model::BeatSnap::Beat => 1.0,
+        vjc_model::BeatSnap::Bar => BEATS_PER_BAR,
+    };
+    if !phase.is_finite() {
+        return phase;
+    }
+    let line = (phase / grid).floor() * grid;
+    if phase - line < SNAP_EPS {
+        phase
+    } else {
+        line + grid
+    }
+}
+
+/// Removes and returns the actions whose target phase has come. A target further ahead
+/// than one bar can only come from a clock jump back (resync, Link), so it runs at once
+/// instead of waiting for the phase to catch up.
+pub fn take_due<T>(pending: &mut Vec<(f64, T)>, phase: f64) -> Vec<T> {
+    let mut due = vec![];
+    let mut i = 0;
+    while i < pending.len() {
+        let t = pending[i].0;
+        if phase >= t || t - phase > BEATS_PER_BAR + SNAP_EPS || !t.is_finite() {
+            due.push(pending.remove(i).1);
+        } else {
+            i += 1;
+        }
+    }
+    due
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -653,5 +694,37 @@ mod tests {
         // 4 s clip over 128 beats at 120 bpm: 0.0625, below the old 0.05..20 floor region.
         assert!((beat_sync_rate(4.0, 400.0, 120.0) - 0.02).abs() < 1e-9);
         assert_eq!(beat_sync_rate(100.0, 1.0, 240.0), 100.0);
+    }
+
+    #[test]
+    fn snap_targets_next_line() {
+        use vjc_model::BeatSnap::*;
+        assert_eq!(snap_target(1.3, Off), 1.3);
+        assert_eq!(snap_target(1.3, Beat), 2.0);
+        assert_eq!(snap_target(1.3, Bar), 4.0);
+        assert_eq!(snap_target(4.2, Bar), 8.0);
+        assert_eq!(snap_target(3.999, Beat), 4.0);
+        // On a line (or a hair past it): runs now, not a full period later.
+        assert_eq!(snap_target(2.0, Beat), 2.0);
+        assert_eq!(snap_target(8.0, Bar), 8.0);
+        assert_eq!(snap_target(2.0000001, Beat), 2.0000001);
+        assert_eq!(snap_target(0.0, Bar), 0.0);
+        assert!(snap_target(f64::NAN, Beat).is_nan());
+    }
+
+    #[test]
+    fn take_due_waits_for_the_line() {
+        let mut p = vec![(2.0, 'a'), (4.0, 'b')];
+        assert!(take_due(&mut p, 1.9).is_empty());
+        assert_eq!(take_due(&mut p, 2.0), vec!['a']);
+        assert_eq!(p.len(), 1);
+        assert_eq!(take_due(&mut p, 4.5), vec!['b']);
+        assert!(p.is_empty());
+        // A clock jump back (resync) must not strand an action for ages.
+        let mut p = vec![(400.0, 'c')];
+        assert_eq!(take_due(&mut p, 0.0), vec!['c']);
+        // Within a bar ahead it still waits.
+        let mut p = vec![(4.0, 'd')];
+        assert!(take_due(&mut p, 0.0).is_empty());
     }
 }

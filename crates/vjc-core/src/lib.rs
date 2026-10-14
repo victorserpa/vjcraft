@@ -217,6 +217,20 @@ pub enum Command {
         dial: u32,
         value: f64,
     },
+    /// Dial `dial` (0..8) of a layer's own dashboard, value 0..=1 (coalesces).
+    SetLayerDial {
+        layer: LayerId,
+        dial: u32,
+        value: f64,
+    },
+    /// Dial `dial` (0..8) of a clip's own dashboard, value 0..=1 (coalesces).
+    SetClipDial {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        dial: u32,
+        value: f64,
+    },
     SetBlend {
         layer: LayerId,
         blend: BlendMode,
@@ -704,6 +718,8 @@ enum Target {
     EffectDryWet(EffectId),
     GeneratorParam(DeckId, LayerId, ColumnIdx, usize),
     Dial(u32),
+    LayerDial(LayerId, u32),
+    ClipDial(DeckId, LayerId, ColumnIdx, u32),
     Transform(EffectTarget, TransformField),
     Anim(AnimTarget),
     SliceMesh(Uuid),
@@ -755,6 +771,14 @@ impl Command {
                 Some(Target::SliceInput(*screen, *slice))
             }
             Command::SetDashboardDial { dial, .. } => Some(Target::Dial(*dial)),
+            Command::SetLayerDial { layer, dial, .. } => Some(Target::LayerDial(*layer, *dial)),
+            Command::SetClipDial {
+                deck,
+                layer,
+                column,
+                dial,
+                ..
+            } => Some(Target::ClipDial(*deck, *layer, *column, *dial)),
             Command::SetTransform { target, field, .. } => Some(Target::Transform(*target, *field)),
             // Dragging an animation field emits one command per frame.
             Command::SetAnimation { target, .. } => Some(Target::Anim(*target)),
@@ -1061,6 +1085,22 @@ fn check_cell(p: &Project, layer: LayerId, column: ColumnIdx) -> Result<(), Erro
     } else {
         Err(Error::NoColumn)
     }
+}
+
+/// Sets dial `dial` of a dashboard (growing it to `anim::DIALS` named dials first) and
+/// returns the previous value.
+fn set_dial(dials: &mut Vec<Param>, dial: u32, value: f64) -> Result<f64, Error> {
+    if dial as usize >= anim::DIALS || !value.is_finite() {
+        return Err(Error::InvalidValue);
+    }
+    while dials.len() < anim::DIALS {
+        let n = dials.len() + 1;
+        dials.push(Param::number(&format!("Dial {n}"), 0.0, Some((0.0, 1.0))));
+    }
+    let prm = &mut dials[dial as usize];
+    let prev = number(&prm.value);
+    prm.set_number(value);
+    Ok(prev)
 }
 
 fn transport_mut(
@@ -2780,18 +2820,45 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             )
         }
         Command::SetDashboardDial { dial, value } => {
-            if dial as usize >= anim::DIALS || !value.is_finite() {
-                return Err(Error::InvalidValue);
-            }
-            let d = &mut p.composition.dashboard;
-            while d.len() < anim::DIALS {
-                let n = d.len() + 1;
-                d.push(Param::number(&format!("Dial {n}"), 0.0, Some((0.0, 1.0))));
-            }
-            let prm = &mut d[dial as usize];
-            let prev = number(&prm.value);
-            prm.set_number(value);
+            let prev = set_dial(&mut p.composition.dashboard, dial, value)?;
             undoable(Command::SetDashboardDial { dial, value: prev }, vec![])
+        }
+        Command::SetLayerDial { layer, dial, value } => {
+            let i = layer_idx(p, layer)?;
+            let prev = set_dial(&mut p.composition.layers[i].track.dials, dial, value)?;
+            undoable(
+                Command::SetLayerDial {
+                    layer,
+                    dial,
+                    value: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetClipDial {
+            deck,
+            layer,
+            column,
+            dial,
+            value,
+        } => {
+            check_cell(p, layer, column)?;
+            let k = deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .ok_or(Error::NoClip)?;
+            let prev = set_dial(&mut k.clip.track.dials, dial, value)?;
+            undoable(
+                Command::SetClipDial {
+                    deck,
+                    layer,
+                    column,
+                    dial,
+                    value: prev,
+                },
+                vec![],
+            )
         }
         Command::AddEffect { .. }
         | Command::RemoveEffect { .. }
@@ -4899,7 +4966,10 @@ mod tests {
         .unwrap();
         let before = p.clone();
         let mut loud = vjc_model::Param::number("amount", 9.0, Some((0.0, 100.0)));
-        loud.animation = Some(vjc_model::Animation::Dashboard { dial: 1 });
+        loud.animation = Some(vjc_model::Animation::Dashboard {
+            dial: 1,
+            scope: Default::default(),
+        });
         let stray = vjc_model::Param::number("nope", 1.0, None);
         let wrong = vjc_model::Param {
             value: Value::Text("x".into()),
@@ -5253,7 +5323,10 @@ mod tests {
         let mut h = History::new();
         let t = Instant::now();
         let target = AnimTarget::LayerOpacity(l);
-        let a = vjc_model::Animation::Dashboard { dial: 2 };
+        let a = vjc_model::Animation::Dashboard {
+            dial: 2,
+            scope: Default::default(),
+        };
         let get = |p: &Project| p.composition.layers[0].track.opacity.animation.clone();
         h.exec(
             &mut p,
@@ -5291,7 +5364,10 @@ mod tests {
                 &mut p,
                 Command::SetAnimation {
                     target,
-                    animation: Some(vjc_model::Animation::Dashboard { dial: d }),
+                    animation: Some(vjc_model::Animation::Dashboard {
+                        dial: d,
+                        scope: Default::default(),
+                    }),
                 },
                 t + Duration::from_millis(16 * i as u64),
             )
@@ -6779,5 +6855,162 @@ mod tests {
             ),
             Err(Error::BadGroup)
         ));
+    }
+
+    #[test]
+    fn cue_address_jumps_the_playing_clip() {
+        let (mut p, l1, _) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        for pos in [0.2, 0.7] {
+            h.exec(
+                &mut p,
+                Command::AddCue {
+                    deck: A,
+                    layer: l1,
+                    column: 0,
+                    pos,
+                },
+                t,
+            )
+            .unwrap();
+        }
+        // l1 is the second layer from the bottom: "Layer 2".
+        let addr = shortcuts::cue_address(&p, l1, 1).unwrap();
+        assert_eq!(addr, "/comp/layer/2/clip/cue/2");
+        let ctx = shortcuts::Ctx::new(None, false).with_active(vec![(l1, A, 0)]);
+        let cmd = shortcuts::resolve_with(&p, &ctx, &addr, 1.0).unwrap();
+        assert_eq!(
+            cmd,
+            Command::JumpToCue {
+                deck: A,
+                layer: l1,
+                column: 0,
+                index: 1
+            }
+        );
+        let ev = apply(&mut p, cmd).unwrap().events;
+        assert!(matches!(ev[..], [Event::Seek { pos, .. }] if pos == 0.7));
+        // Negative controls: release, nothing playing, missing cue, bad numbers.
+        assert!(shortcuts::resolve_with(&p, &ctx, &addr, 0.0).is_none());
+        let idle = shortcuts::Ctx::new(None, false);
+        assert!(shortcuts::resolve_with(&p, &idle, &addr, 1.0).is_none());
+        for bad in ["clip/cue/3", "clip/cue/0", "clip/cue/x"] {
+            let a = format!("/comp/layer/2/{bad}");
+            assert!(shortcuts::resolve_with(&p, &ctx, &a, 1.0).is_none(), "{a}");
+        }
+        assert!(shortcuts::resolve_with(&p, &ctx, "/comp/layer/1/clip/cue/1", 1.0).is_none());
+        // Triggers have no current value, so a shortcut on it fires.
+        assert_eq!(shortcuts::current(&p, &ctx, &addr), None);
+    }
+
+    #[test]
+    fn layer_and_clip_dials_by_address_undo_and_stay_apart() {
+        let (mut p, l1, l2) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        let ctx = shortcuts::Ctx::new(None, false).with_active(vec![(l1, A, 0)]);
+        // l1 is "Layer 2", l2 is "Layer 1".
+        let a = shortcuts::dial_address(&p, l1, None, None, 2).unwrap();
+        assert_eq!(a, "/comp/layer/2/dashboard/3");
+        let cmd = shortcuts::resolve_with(&p, &ctx, &a, 0.75).unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetLayerDial {
+                layer: l1,
+                dial: 2,
+                value: 0.75
+            }
+        );
+        h.exec(&mut p, cmd, t).unwrap();
+        let ix = |p: &Project, l| p.composition.layers.iter().position(|x| x.id == l).unwrap();
+        assert_eq!(
+            p.composition.layers[ix(&p, l1)].track.dials.len(),
+            anim::DIALS
+        );
+        assert_eq!(shortcuts::current(&p, &ctx, &a), Some(0.75));
+        // Another layer, the composition and the clip are untouched.
+        assert_eq!(
+            shortcuts::current(&p, &ctx, "/comp/layer/1/dashboard/3"),
+            Some(0.0)
+        );
+        assert!(p.composition.dashboard.is_empty());
+        let ca = "/comp/layer/2/clip/dashboard/3";
+        assert_eq!(shortcuts::current(&p, &ctx, ca), Some(0.0));
+        let cmd = shortcuts::resolve_with(&p, &ctx, ca, 2.0).unwrap();
+        assert!(matches!(cmd, Command::SetClipDial { dial: 2, value, .. } if value == 1.0));
+        h.exec(&mut p, cmd, t + Duration::from_secs(1)).unwrap();
+        assert_eq!(shortcuts::current(&p, &ctx, ca), Some(1.0));
+        assert_eq!(shortcuts::current(&p, &ctx, &a), Some(0.75));
+        assert_eq!(
+            clip_in(&p, A, l1, 0).unwrap().track.dials.len(),
+            anim::DIALS
+        );
+        // Undo walks back one by one.
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(shortcuts::current(&p, &ctx, ca), Some(0.0));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(shortcuts::current(&p, &ctx, &a), Some(0.0));
+        // Negative controls: out of range dial, no playing clip, unknown layer, NaN.
+        for bad in [
+            "/comp/layer/2/dashboard/9",
+            "/comp/layer/2/dashboard/0",
+            "/comp/layer/9/dashboard/1",
+        ] {
+            assert!(
+                shortcuts::resolve_with(&p, &ctx, bad, 1.0).is_none(),
+                "{bad}"
+            );
+        }
+        let idle = shortcuts::Ctx::new(None, false);
+        assert!(shortcuts::resolve_with(&p, &idle, ca, 1.0).is_none());
+        assert!(shortcuts::dial_address(&p, l1, Some((A, 0)), None, 0).is_none());
+        assert_eq!(
+            apply(
+                &mut p,
+                Command::SetLayerDial {
+                    layer: l2,
+                    dial: 0,
+                    value: f64::NAN
+                }
+            )
+            .unwrap_err(),
+            Error::InvalidValue
+        );
+        assert_eq!(
+            apply(
+                &mut p,
+                Command::SetClipDial {
+                    deck: A,
+                    layer: l2,
+                    column: 1,
+                    dial: 0,
+                    value: 0.5
+                }
+            )
+            .unwrap_err(),
+            Error::NoClip
+        );
+    }
+
+    #[test]
+    fn layer_dial_drag_is_one_undo_step() {
+        let (mut p, l1, _) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        for (i, v) in [0.1, 0.2, 0.3].into_iter().enumerate() {
+            h.exec(
+                &mut p,
+                Command::SetLayerDial {
+                    layer: l1,
+                    dial: 0,
+                    value: v,
+                },
+                t + Duration::from_millis(16 * i as u64),
+            )
+            .unwrap();
+        }
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(number(&p.composition.layers[0].track.dials[0].value), 0.0);
     }
 }

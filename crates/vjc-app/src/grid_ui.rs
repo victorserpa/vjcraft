@@ -220,6 +220,8 @@ pub struct MasterState {
     pub bypass: bool,
     pub recording: bool,
     pub dropped: Option<u64>,
+    /// Elapsed time and file size while recording.
+    pub rec_info: Option<String>,
     pub layers: usize,
     pub columns: usize,
 }
@@ -294,6 +296,15 @@ pub fn composition_header(
         } else {
             Command::StartRecording
         });
+    }
+    if let Some(info) = &m.rec_info {
+        ui.painter().text(
+            slot(3.0).left_center() + egui::vec2(4.0, -6.0),
+            Align2::LEFT_CENTER,
+            info,
+            FontId::proportional(theme::FS_XS),
+            theme::TEXT,
+        );
     }
     if let Some(n) = m.dropped {
         ui.painter().text(

@@ -170,7 +170,10 @@ mod tests {
     fn detects_audio_animation_only() {
         let mut c = comp();
         assert!(!uses_audio(&c));
-        c.master.opacity.animation = Some(Animation::Dashboard { dial: 0 });
+        c.master.opacity.animation = Some(Animation::Dashboard {
+            dial: 0,
+            scope: Default::default(),
+        });
         assert!(!uses_audio(&c));
         c.master.transform.rotation.animation = Some(audio());
         assert!(uses_audio(&c));

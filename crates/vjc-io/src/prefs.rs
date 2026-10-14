@@ -25,6 +25,8 @@ pub struct General {
     pub favorites: Vec<String>,
     /// Browser shows thumbnails in a grid instead of a list.
     pub browser_grid: bool,
+    /// Folder the output recorder writes into; `None` = `~/Movies/VJCraft`.
+    pub record_folder: Option<PathBuf>,
 }
 
 /// Longest recent-projects list kept.
@@ -83,6 +85,7 @@ impl Default for General {
             recent_projects: vec![],
             favorites: vec![],
             browser_grid: false,
+            record_folder: None,
         }
     }
 }
@@ -117,6 +120,8 @@ pub struct Control {
     pub default_shortcuts: bool,
     /// Offer the preset when opening a project that has no shortcuts.
     pub offer_shortcuts: bool,
+    /// Quantizes clip triggers and beat-loop starts to the tempo clock.
+    pub beat_snap: vjc_model::BeatSnap,
 }
 
 impl Default for Control {
@@ -124,6 +129,7 @@ impl Default for Control {
         Control {
             default_shortcuts: true,
             offer_shortcuts: true,
+            beat_snap: vjc_model::BeatSnap::Off,
         }
     }
 }
@@ -766,5 +772,19 @@ mod tests {
         std::fs::remove_file(&f).ok();
         assert_eq!(back.general.favorites, ["fx:Blur"]);
         assert!(back.general.browser_grid);
+    }
+
+    #[test]
+    fn beat_snap_defaults_off_and_roundtrips() {
+        use super::Prefs;
+        let (old, _) = Prefs::from_json(r#"{"control":{"default_shortcuts":false}}"#);
+        assert_eq!(old.control.beat_snap, vjc_model::BeatSnap::Off);
+        let mut p = Prefs::default();
+        p.control.beat_snap = vjc_model::BeatSnap::Bar;
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(
+            Prefs::from_json(&json).0.control.beat_snap,
+            vjc_model::BeatSnap::Bar
+        );
     }
 }

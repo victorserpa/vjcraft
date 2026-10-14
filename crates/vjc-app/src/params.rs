@@ -164,7 +164,10 @@ pub fn default_animation(kind: &str) -> Option<Animation> {
             points: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
             beats: 4.0,
         }),
-        "Dashboard" => Some(Animation::Dashboard { dial: 0 }),
+        "Dashboard" => Some(Animation::Dashboard {
+            dial: 0,
+            scope: Default::default(),
+        }),
         "Audio" => Some(Animation::Audio {
             band: FftBand::Low,
             gain: 1.0,
@@ -257,6 +260,15 @@ fn anim_menu(
                         .suffix(" beats"),
                 )
                 .changed();
+            ui.menu_button("Preset", |ui| {
+                for pre in vjc_core::anim::EnvPreset::ALL {
+                    if ui.button(pre.label()).clicked() {
+                        *points = pre.points();
+                        changed = true;
+                        ui.close();
+                    }
+                }
+            });
             let mut remove = None;
             for (i, (x, y)) in points.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -280,7 +292,16 @@ fn anim_menu(
                 changed = true;
             }
         }
-        Some(Animation::Dashboard { dial }) => {
+        Some(Animation::Dashboard { dial, scope }) => {
+            let before = *scope;
+            egui::ComboBox::from_id_salt(id.with("scope"))
+                .selected_text(scope.label())
+                .show_ui(ui, |ui| {
+                    for s in vjc_model::DialScope::ALL {
+                        ui.selectable_value(scope, s, s.label());
+                    }
+                });
+            changed |= *scope != before;
             let mut n = *dial + 1;
             changed |= ui
                 .add(egui::DragValue::new(&mut n).range(1..=8).prefix("Dial "))

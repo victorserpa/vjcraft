@@ -2,7 +2,7 @@
 //! value is computed per frame from beat phase, time, FFT bands and dashboard dials, so
 //! animating never dirties the project nor enters the history.
 
-use vjc_model::{Animation, Curve, FftBand, Param, Value};
+use vjc_model::{Animation, Curve, DialScope, FftBand, Param, Value};
 
 /// Dials per composition.
 pub const DIALS: usize = 8;
@@ -20,6 +20,35 @@ pub struct AnimCtx<'a> {
     pub smoother: Option<&'a AudioSmoother>,
     /// Dial values 0..1 (missing dials read 0).
     pub dashboard: &'a [f64],
+    /// Dials of the layer the evaluated param belongs to (`DialScope::Layer`); `None` for
+    /// params outside any layer, whose Layer-scoped animations fall back to the base value.
+    pub layer_dials: Option<&'a [f64]>,
+    /// Dials of the clip the evaluated param belongs to (`DialScope::Clip`); `None` as above.
+    pub clip_dials: Option<&'a [f64]>,
+}
+
+impl AnimCtx<'_> {
+    /// This frame's context for params owned by a layer and, when given, its clip.
+    pub fn scoped<'b>(&self, layer: &'b [f64], clip: &'b [f64]) -> AnimCtx<'b>
+    where
+        Self: 'b,
+    {
+        AnimCtx {
+            layer_dials: Some(layer),
+            clip_dials: Some(clip),
+            ..*self
+        }
+    }
+}
+
+/// Current dial values (0..=1) of a dials list, padded with zeros to `DIALS`.
+pub fn dial_values(dials: &[vjc_model::Param]) -> Vec<f64> {
+    (0..DIALS)
+        .map(|i| match dials.get(i).map(|p| &p.value) {
+            Some(Value::Number(n)) => *n,
+            _ => 0.0,
+        })
+        .collect()
 }
 
 /// One step of attack/release smoothing: `prev` moves toward `target` with time constant
@@ -134,6 +163,71 @@ fn safe_div(a: f64, b: f64) -> f64 {
     if b.is_finite() && b > 0.0 { a / b } else { 0.0 }
 }
 
+/// Ready-made envelope shapes. `points` gives ordinary envelope points (x = position in
+/// the cycle, y = level, both 0..=1), so a preset is just a starting point to edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvPreset {
+    RampUp,
+    RampDown,
+    Sine,
+    Saw,
+    Square,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
+impl EnvPreset {
+    pub const ALL: [EnvPreset; 8] = [
+        EnvPreset::RampUp,
+        EnvPreset::RampDown,
+        EnvPreset::Sine,
+        EnvPreset::Saw,
+        EnvPreset::Square,
+        EnvPreset::EaseIn,
+        EnvPreset::EaseOut,
+        EnvPreset::EaseInOut,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EnvPreset::RampUp => "Ramp up",
+            EnvPreset::RampDown => "Ramp down",
+            EnvPreset::Sine => "Sine",
+            EnvPreset::Saw => "Saw",
+            EnvPreset::Square => "Square",
+            EnvPreset::EaseIn => "Ease in",
+            EnvPreset::EaseOut => "Ease out",
+            EnvPreset::EaseInOut => "Ease in/out",
+        }
+    }
+
+    /// Envelope points of the shape, sorted by x, first at 0 and last at 1.
+    pub fn points(self) -> Vec<(f64, f64)> {
+        // Curves are sampled; the envelope interpolates linearly between the samples.
+        let sampled = |n: usize, f: &dyn Fn(f64) -> f64| -> Vec<(f64, f64)> {
+            (0..=n)
+                .map(|i| {
+                    let x = i as f64 / n as f64;
+                    (x, f(x).clamp(0.0, 1.0))
+                })
+                .collect()
+        };
+        // A jump is a pair of points a hair apart.
+        const JUMP: f64 = 0.001;
+        match self {
+            EnvPreset::RampUp => vec![(0.0, 0.0), (1.0, 1.0)],
+            EnvPreset::RampDown => vec![(0.0, 1.0), (1.0, 0.0)],
+            EnvPreset::Sine => sampled(16, &|x| 0.5 - 0.5 * (std::f64::consts::TAU * x).cos()),
+            EnvPreset::Saw => vec![(0.0, 0.0), (1.0 - JUMP, 1.0), (1.0, 0.0)],
+            EnvPreset::Square => vec![(0.0, 1.0), (0.5 - JUMP, 1.0), (0.5, 0.0), (1.0, 0.0)],
+            EnvPreset::EaseIn => sampled(8, &|x| x * x * x),
+            EnvPreset::EaseOut => sampled(8, &|x| 1.0 - (1.0 - x).powi(3)),
+            EnvPreset::EaseInOut => sampled(8, &|x| x * x * (3.0 - 2.0 * x)),
+        }
+    }
+}
+
 /// Normalised 0..=1 output of the animation.
 fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
     let t = match anim {
@@ -187,7 +281,14 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
             f64::from(*min) + level * f64::from(*max - *min)
         }
         Animation::Envelope { points, beats } => envelope(points, safe_div(ctx.beat_phase, *beats)),
-        Animation::Dashboard { dial } => ctx.dashboard.get(*dial as usize).copied().unwrap_or(0.0),
+        Animation::Dashboard { dial, scope } => {
+            let dials = match scope {
+                DialScope::Comp => ctx.dashboard,
+                DialScope::Layer => ctx.layer_dials.unwrap_or(&[]),
+                DialScope::Clip => ctx.clip_dials.unwrap_or(&[]),
+            };
+            dials.get(*dial as usize).copied().unwrap_or(0.0)
+        }
     };
     if t.is_finite() {
         t.clamp(0.0, 1.0)
@@ -199,7 +300,22 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
 /// Animated value of a numeric param, always inside `param.range` (0..=1 if none).
 pub fn evaluate(param: &Param, anim: &Animation, ctx: &AnimCtx) -> f64 {
     let (lo, hi) = param.range.unwrap_or((0.0, 1.0));
+    if out_of_scope(anim, ctx) {
+        let base = if let Value::Number(n) = param.value {
+            n
+        } else {
+            lo
+        };
+        return base.clamp(lo.min(hi), lo.max(hi));
+    }
     (lo + unit(anim, ctx) * (hi - lo)).clamp(lo.min(hi), lo.max(hi))
+}
+
+/// A dial animation whose scope has no owner in this context (a Layer/Clip dial read by a
+/// composition-level param).
+fn out_of_scope(anim: &Animation, ctx: &AnimCtx) -> bool {
+    matches!(anim, Animation::Dashboard { scope: DialScope::Layer, .. } if ctx.layer_dials.is_none())
+        || matches!(anim, Animation::Dashboard { scope: DialScope::Clip, .. } if ctx.clip_dials.is_none())
 }
 
 /// The value used for rendering and display: the animation if any, else the base value.
@@ -244,6 +360,7 @@ mod tests {
             fft_bands: fft,
             smoother: None,
             dashboard: dash,
+            ..Default::default()
         }
     }
     fn beats(c: Curve) -> Animation {
@@ -354,7 +471,10 @@ mod tests {
             0.0
         );
         assert_eq!(evaluate(&pr, &au, &ctx(0.0, 0.0, &[], &[])), 0.0);
-        let d = Animation::Dashboard { dial: 1 };
+        let d = Animation::Dashboard {
+            dial: 1,
+            scope: Default::default(),
+        };
         assert_eq!(evaluate(&pr, &d, &ctx(0.0, 0.0, &[], &[0.0, 0.7])), 0.7);
         assert_eq!(evaluate(&pr, &d, &ctx(0.0, 0.0, &[], &[])), 0.0);
     }
@@ -443,5 +563,88 @@ mod tests {
     fn smooth_step_instant_when_zero() {
         assert_eq!(smooth_step(0.0, 1.0, 0.016, 0.0, 0.0), 1.0);
         assert!(smooth_step(0.0, 1.0, 0.016, 1.0, 0.0) < 0.05);
+    }
+
+    #[test]
+    fn envelope_presets_shape_the_cycle() {
+        let at = |pre: EnvPreset, x: f64| {
+            let a = Animation::Envelope {
+                points: pre.points(),
+                beats: 4.0,
+            };
+            evaluate(&p((0.0, 1.0)), &a, &ctx(x * 4.0, 0.0, &[], &[]))
+        };
+        assert_eq!(at(EnvPreset::RampUp, 0.25), 0.25);
+        assert_eq!(at(EnvPreset::RampDown, 0.25), 0.75);
+        assert!((at(EnvPreset::Sine, 0.25) - 0.5).abs() < 1e-9);
+        assert!((at(EnvPreset::Sine, 0.5) - 1.0).abs() < 1e-9);
+        assert!((at(EnvPreset::Saw, 0.5) - 0.5).abs() < 0.01);
+        assert!(at(EnvPreset::Saw, 0.9995) > 0.4);
+        assert_eq!(at(EnvPreset::Square, 0.25), 1.0);
+        assert_eq!(at(EnvPreset::Square, 0.75), 0.0);
+        // Ease in starts slow and ease out starts fast; in/out is symmetric.
+        assert!(at(EnvPreset::EaseIn, 0.25) < 0.1);
+        assert!(at(EnvPreset::EaseOut, 0.25) > 0.5);
+        assert!((at(EnvPreset::EaseInOut, 0.5) - 0.5).abs() < 1e-9);
+        assert!(
+            (at(EnvPreset::EaseInOut, 0.25) + at(EnvPreset::EaseInOut, 0.75) - 1.0).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn envelope_presets_are_well_formed_and_distinct() {
+        for pre in EnvPreset::ALL {
+            let pts = pre.points();
+            assert_eq!(pts.first().unwrap().0, 0.0, "{}", pre.label());
+            assert_eq!(pts.last().unwrap().0, 1.0, "{}", pre.label());
+            assert!(pts.windows(2).all(|w| w[0].0 < w[1].0), "{}", pre.label());
+            assert!(
+                pts.iter()
+                    .all(|(x, y)| (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y))
+            );
+            // Every preset moves: a flat envelope would be a bug.
+            assert!(pts.iter().any(|q| q.1 != pts[0].1), "{}", pre.label());
+        }
+        let all: Vec<_> = EnvPreset::ALL.iter().map(|p| p.points()).collect();
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_scope_picks_the_dial_list() {
+        let (comp, layer, clip) = ([0.1], [0.2], [0.3]);
+        let base = ctx(0.0, 0.0, &[], &comp);
+        let c = base.scoped(&layer, &clip);
+        let read = |scope| {
+            let a = Animation::Dashboard { dial: 0, scope };
+            evaluate(&p((0.0, 1.0)), &a, &c)
+        };
+        assert_eq!(read(DialScope::Comp), 0.1);
+        assert_eq!(read(DialScope::Layer), 0.2);
+        assert_eq!(read(DialScope::Clip), 0.3);
+        // A scope with no dials (param outside any layer/clip) reads 0, not the comp's.
+        let none = base.scoped(&[], &[]);
+        let a = Animation::Dashboard {
+            dial: 0,
+            scope: DialScope::Layer,
+        };
+        assert_eq!(evaluate(&p((0.0, 1.0)), &a, &none), 0.0);
+        // An unscoped context (composition-level param) reads the base value.
+        let mut q = p((0.0, 1.0));
+        q.value = Value::Number(0.7);
+        assert_eq!(evaluate(&q, &a, &base), 0.7);
+    }
+
+    #[test]
+    fn dial_values_pads_to_eight() {
+        let mut d = Param::number("Dial 1", 0.5, Some((0.0, 1.0)));
+        d.set_number(0.5);
+        let v = dial_values(&[d]);
+        assert_eq!(v.len(), DIALS);
+        assert_eq!(v[0], 0.5);
+        assert!(v[1..].iter().all(|x| *x == 0.0));
     }
 }

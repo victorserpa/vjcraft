@@ -92,6 +92,35 @@ impl State {
                             "Where Depth and Remove Background look for their .onnx files \
                              (empty = the app data folder, models/). See docs/ml.md.",
                         );
+                        ui.horizontal(|ui| {
+                            ui.label("Recording folder");
+                            // Edited in a scratch string; committed on Enter or focus loss.
+                            let id = ui.id().with("record-folder-text");
+                            let saved = p
+                                .general
+                                .record_folder
+                                .as_ref()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default();
+                            let mut t = ui
+                                .data(|d| d.get_temp::<String>(id))
+                                .unwrap_or_else(|| saved.clone());
+                            let r = ui.text_edit_singleline(&mut t);
+                            if r.lost_focus() {
+                                p.general.record_folder = crate::capture::absolute_folder(&t);
+                                ui.data_mut(|d| d.remove_temp::<String>(id));
+                            } else if r.has_focus() {
+                                ui.data_mut(|d| d.insert_temp(id, t));
+                            } else {
+                                ui.data_mut(|d| d.remove_temp::<String>(id));
+                            }
+                            if ui.button("Choose...").clicked()
+                                && let Some(d) = rfd::FileDialog::new().pick_folder()
+                            {
+                                p.general.record_folder = Some(d);
+                            }
+                        });
+                        ui.weak("Empty = ~/Movies/VJCraft. Recordings have no audio yet.");
                     }
                     PrefsTab::Audio => {
                         let outputs = self
@@ -141,6 +170,17 @@ impl State {
                             &mut p.control.offer_shortcuts,
                             "Offer the preset when opening a project without shortcuts",
                         );
+                        ui.horizontal(|ui| {
+                            ui.label("Beat snap");
+                            for (m, l) in [
+                                (vjc_model::BeatSnap::Off, "Off"),
+                                (vjc_model::BeatSnap::Beat, "Beat"),
+                                (vjc_model::BeatSnap::Bar, "Bar"),
+                            ] {
+                                ui.selectable_value(&mut p.control.beat_snap, m, l);
+                            }
+                        });
+                        ui.weak("Clip triggers and beat loops wait for the next beat or bar.");
                     }
                     PrefsTab::Midi => {
                         let (ins, outs) = self.midi_ports.get_or_insert_with(|| {

@@ -397,6 +397,27 @@ pub fn clip_address(p: &Project, layer: LayerId, column: ColumnIdx) -> Option<St
     layer_address(p, layer, &format!("clip/{}/connect", column + 1))
 }
 
+/// "/comp/layer/N/clip/cue/M": jumps the clip playing on layer N to its cue M (from 1).
+pub fn cue_address(p: &Project, layer: LayerId, index: usize) -> Option<String> {
+    layer_address(p, layer, &format!("clip/cue/{}", index + 1))
+}
+
+/// Dial addresses: "/comp/layer/N/dashboard/M" (the layer's dial) and
+/// "/comp/layer/N/clip/dashboard/M" (the clip playing on the layer); M counts from 1.
+pub fn dial_address(
+    p: &Project,
+    layer: LayerId,
+    clip: Option<(DeckId, ColumnIdx)>,
+    active: Option<(DeckId, ColumnIdx)>,
+    dial: usize,
+) -> Option<String> {
+    match clip {
+        None => layer_address(p, layer, &format!("dashboard/{}", dial + 1)),
+        Some(c) => (active == Some(c))
+            .then(|| layer_address(p, layer, &format!("clip/dashboard/{}", dial + 1)))?,
+    }
+}
+
 pub fn column_address(column: ColumnIdx) -> String {
     format!("/comp/column/{}/connect", column + 1)
 }
@@ -404,6 +425,18 @@ pub fn column_address(column: ColumnIdx) -> String {
 fn layer_by_number(p: &Project, n: usize) -> Option<LayerId> {
     let ls = &p.composition.layers;
     (n >= 1 && n <= ls.len()).then(|| ls[ls.len() - n].id)
+}
+
+/// Zero-based dial of a 1-based address segment, None when outside 1..=DIALS.
+fn dial_of(s: &str) -> Option<u32> {
+    let i = number_of(s)?
+        .checked_sub(1)
+        .filter(|i| *i < super::anim::DIALS)?;
+    Some(i as u32)
+}
+
+fn dial_value(dials: &[vjc_model::Param], dial: u32) -> f64 {
+    dials.get(dial as usize).map_or(0.0, |d| number(&d.value))
 }
 
 fn number_of(s: &str) -> Option<usize> {
@@ -421,6 +454,17 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
         return param_norm(effects::track(p, t)?.transform.field(f));
     }
     match parts.as_slice() {
+        ["comp", "layer", n, "dashboard", m] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            let l = p.composition.layers.iter().find(|x| x.id == layer)?;
+            Some(dial_value(&l.track.dials, dial_of(m)?))
+        }
+        ["comp", "layer", n, "clip", "dashboard", m] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            let &(_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+            let k = super::clip_in(p, deck, layer, column)?;
+            Some(dial_value(&k.track.dials, dial_of(m)?))
+        }
         ["comp", "layer", n, "opacity"] => {
             let l = layer_by_number(p, number_of(n)?)?;
             let l = p.composition.layers.iter().find(|x| x.id == l)?;
@@ -491,6 +535,35 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
                 deck,
                 layer,
                 column,
+            })
+        }
+        ["comp", "layer", n, "clip", "cue", m] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            let index = number_of(m)?.checked_sub(1)?;
+            let &(_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+            let k = super::clip_in(p, deck, layer, column)?;
+            // A cue that does not exist resolves to nothing, so a stray message is inert.
+            (fire && index < k.transport.cue_points.len()).then_some(Command::JumpToCue {
+                deck,
+                layer,
+                column,
+                index,
+            })
+        }
+        ["comp", "layer", n, "dashboard", m] => Some(Command::SetLayerDial {
+            layer: layer_by_number(p, number_of(n)?)?,
+            dial: dial_of(m)?,
+            value: value.clamp(0.0, 1.0),
+        }),
+        ["comp", "layer", n, "clip", "dashboard", m] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            let &(_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+            Some(Command::SetClipDial {
+                deck,
+                layer,
+                column,
+                dial: dial_of(m)?,
+                value: value.clamp(0.0, 1.0),
             })
         }
         ["comp", "layer", n, "opacity"] => Some(Command::SetOpacity {

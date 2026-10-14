@@ -69,6 +69,27 @@ pub struct Capture {
     last_pts: i64,
     /// Kept from `poll` so `shutdown` can settle the readbacks still in flight.
     device: Option<wgpu::Device>,
+    /// Last file size read for the status text, and when (see `SizePoll`).
+    size_poll: std::cell::Cell<Option<(Instant, u64)>>,
+}
+
+/// Longest the status text reuses a file size before asking the disk again.
+const SIZE_POLL: Duration = Duration::from_millis(500);
+
+/// File size through the cache `slot`: `probe` runs at most once per `SIZE_POLL`.
+fn polled_size(
+    slot: &std::cell::Cell<Option<(Instant, u64)>>,
+    now: Instant,
+    probe: impl FnOnce() -> u64,
+) -> u64 {
+    match slot.get() {
+        Some((at, bytes)) if now.saturating_duration_since(at) < SIZE_POLL => bytes,
+        _ => {
+            let bytes = probe();
+            slot.set(Some((now, bytes)));
+            bytes
+        }
+    }
 }
 
 /// How long the app waits at exit for the encoder: a base, plus time for each frame still
@@ -185,11 +206,21 @@ impl Capture {
             t0: Instant::now(),
             last_pts: -1,
             device: None,
+            size_poll: std::cell::Cell::new(None),
         })
     }
 
     pub fn size(&self) -> (u32, u32) {
         self.rec.size()
+    }
+
+    /// Time and file size so far, for the master bar. The size is what the muxer has
+    /// written to disk, which trails the encoder by a few frames.
+    pub fn info(&self) -> String {
+        let bytes = polled_size(&self.size_poll, Instant::now(), || {
+            std::fs::metadata(self.rec.path()).map_or(0, |m| m.len())
+        });
+        rec_info(self.t0.elapsed(), bytes)
     }
 
     pub fn failed(&self) -> bool {
@@ -299,12 +330,66 @@ impl Capture {
     }
 }
 
-/// `~/Movies/VJCraft/<UTC timestamp>.mp4` (the platform's video folder when known).
-pub fn default_path() -> PathBuf {
+/// `<folder>/<UTC timestamp>.mp4`, the folder being the preference or `recordings_dir`.
+pub fn default_path(pref: Option<&std::path::Path>) -> PathBuf {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    unique_path(&recordings_dir(), &timestamp(secs))
+    unique_path(&recording_folder(pref), &timestamp(secs))
+}
+
+/// A typed recording folder as an absolute path: `~/` and relative paths resolve against
+/// the home folder (the app's working directory is not meaningful); blank is `None`.
+pub fn absolute_folder(text: &str) -> Option<PathBuf> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    if p.is_absolute() {
+        return Some(p);
+    }
+    let home = directories::UserDirs::new()
+        .map_or_else(std::env::temp_dir, |d| d.home_dir().to_path_buf());
+    Some(home.join(p.strip_prefix("~").unwrap_or(&p)))
+}
+
+/// The chosen recording folder, or the default one when none is set (blank counts as none).
+pub fn recording_folder(pref: Option<&std::path::Path>) -> PathBuf {
+    match pref {
+        Some(p) => absolute_folder(&p.to_string_lossy()).unwrap_or_else(recordings_dir),
+        _ => recordings_dir(),
+    }
+}
+
+/// "75 s" -> "01:15"; an hour or more -> "1:02:03".
+pub(crate) fn format_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// Byte count in decimal units: "512 B", "1.5 kB", "12.3 MB", "1.20 GB".
+pub(crate) fn format_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if bytes < 1000 {
+        format!("{bytes} B")
+    } else if bytes < 1_000_000 {
+        format!("{:.1} kB", b / 1e3)
+    } else if bytes < 1_000_000_000 {
+        format!("{:.1} MB", b / 1e6)
+    } else {
+        format!("{:.2} GB", b / 1e9)
+    }
+}
+
+/// Status text while recording: "01:15  12.3 MB".
+pub(crate) fn rec_info(elapsed: Duration, bytes: u64) -> String {
+    format!("{}  {}", format_elapsed(elapsed), format_size(bytes))
 }
 
 /// Folder the app records into (`~/Movies/VJCraft`); the browser's Record tab lists it.
@@ -350,6 +435,40 @@ fn timestamp(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_poll_hits_the_disk_at_most_every_500_ms() {
+        let slot = std::cell::Cell::new(None);
+        let calls = std::cell::Cell::new(0u64);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            calls.get() * 10
+        };
+        let t0 = Instant::now();
+        assert_eq!(polled_size(&slot, t0, probe), 10);
+        assert_eq!(
+            polled_size(&slot, t0 + Duration::from_millis(400), probe),
+            10
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            polled_size(&slot, t0 + Duration::from_millis(500), probe),
+            20
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn relative_record_folders_become_absolute_under_home() {
+        assert_eq!(absolute_folder("  "), None);
+        let abs = absolute_folder("/tmp/rec").unwrap();
+        assert_eq!(abs, PathBuf::from("/tmp/rec"));
+        let rel = absolute_folder("clips/out").unwrap();
+        assert!(rel.is_absolute());
+        assert!(rel.ends_with("clips/out"));
+        let tilde = absolute_folder("~/Movies/x").unwrap();
+        assert!(tilde.is_absolute() && !tilde.to_string_lossy().contains('~'));
+    }
 
     #[test]
     fn failed_map_does_not_block_later_frames() {
@@ -439,5 +558,34 @@ mod tests {
         let out = unpad(&src, w, h);
         assert_eq!(out.len(), 24);
         assert_eq!((out[0], out[12]), (1, 2));
+    }
+
+    #[test]
+    fn recording_folder_prefers_the_pref_and_ignores_blank() {
+        let d = std::path::Path::new("/somewhere/else");
+        assert_eq!(recording_folder(Some(d)), d);
+        assert_eq!(recording_folder(None), recordings_dir());
+        assert_eq!(
+            recording_folder(Some(std::path::Path::new("  "))),
+            recordings_dir()
+        );
+        let dir = std::env::temp_dir().join(format!("vjc-recdir-{}", std::process::id()));
+        let p = default_path(Some(&dir));
+        assert_eq!(p.parent().unwrap(), dir);
+        assert_eq!(p.extension().unwrap(), "mp4");
+        assert_ne!(default_path(None).parent().unwrap(), dir);
+    }
+
+    #[test]
+    fn elapsed_and_size_format() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
+        assert_eq!(format_elapsed(Duration::from_millis(75_900)), "01:15");
+        assert_eq!(format_elapsed(Duration::from_secs(3723)), "1:02:03");
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(999), "999 B");
+        assert_eq!(format_size(1500), "1.5 kB");
+        assert_eq!(format_size(12_345_678), "12.3 MB");
+        assert_eq!(format_size(1_200_000_000), "1.20 GB");
+        assert_eq!(rec_info(Duration::from_secs(5), 2_000_000), "00:05  2.0 MB");
     }
 }

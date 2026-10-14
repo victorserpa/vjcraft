@@ -388,6 +388,10 @@ pub struct Track {
     /// Reframing of the picture; projects saved before it existed open with identity.
     #[serde(default)]
     pub transform: Transform,
+    /// Dashboard dials of a layer or clip (empty until first used; the composition keeps
+    /// its own in `Composition::dashboard`). 0..=1 numbers.
+    #[serde(default)]
+    pub dials: Vec<Param>,
 }
 
 /// Position, scale, rotation and anchor of a picture, all animatable params.
@@ -699,7 +703,41 @@ pub enum Animation {
     },
     Dashboard {
         dial: u32,
+        /// Whose dial: the composition's, the layer's or the clip's the param lives on.
+        #[serde(default)]
+        scope: DialScope,
     },
+}
+
+/// Which dashboard a `Animation::Dashboard` reads. Layer and Clip mean the layer or clip
+/// that owns the animated param (its track, effects, transform or generator params).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialScope {
+    #[default]
+    Comp,
+    Layer,
+    Clip,
+}
+
+impl DialScope {
+    pub const ALL: [DialScope; 3] = [DialScope::Comp, DialScope::Layer, DialScope::Clip];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DialScope::Comp => "Comp",
+            DialScope::Layer => "Layer",
+            DialScope::Clip => "Clip",
+        }
+    }
+}
+
+/// Global quantization of clip triggers and beat-loop starts to the tempo clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BeatSnap {
+    #[default]
+    Off,
+    Beat,
+    Bar,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -957,6 +995,7 @@ impl Track {
             volume: Param::number("Volume", 1.0, Some((0.0, 1.0))),
             pan: Param::number("Pan", 0.0, Some((-1.0, 1.0))),
             transform: Transform::default(),
+            dials: vec![],
         }
     }
 }
@@ -1133,6 +1172,7 @@ impl Track {
         self.effects
             .iter()
             .for_each(|e| e.params.iter().for_each(&mut *f));
+        self.dials.iter().for_each(&mut *f);
     }
 }
 
@@ -1527,6 +1567,8 @@ mod tests {
             blend: None,
         });
         c.dashboard = vec![p()];
+        c.layers[0].track.dials = vec![p()];
+        c.decks[0].clips[0].clip.track.dials = vec![p()];
         c
     }
 
@@ -1568,5 +1610,28 @@ mod tests {
             });
             assert_eq!(found, 1, "param #{i} not visited");
         }
+    }
+
+    #[test]
+    fn dashboard_animation_without_scope_loads_as_comp() {
+        let old: Animation = serde_json::from_str(r#"{"Dashboard":{"dial":2}}"#).unwrap();
+        assert_eq!(
+            old,
+            Animation::Dashboard {
+                dial: 2,
+                scope: DialScope::Comp
+            }
+        );
+        let new = Animation::Dashboard {
+            dial: 1,
+            scope: DialScope::Clip,
+        };
+        let back: Animation = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back, new);
+        // A track saved before dials existed opens with none.
+        let mut t = serde_json::to_value(Track::new(BlendMode::Normal)).unwrap();
+        t.as_object_mut().unwrap().remove("dials");
+        let t: Track = serde_json::from_value(t).unwrap();
+        assert!(t.dials.is_empty());
     }
 }

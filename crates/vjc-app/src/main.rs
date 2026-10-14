@@ -64,6 +64,10 @@ const DURATION_STEP: f64 = 0.1;
 /// Per-frame inputs of animations, owned (dials 0..1 and audio levels).
 struct AnimIn {
     dials: Vec<f64>,
+    /// Dials of the owner of the params being drawn (`None` for composition-level ones): what
+    /// scoped dial animations read. The renderer picks each layer's own.
+    layer_dials: Option<Vec<f64>>,
+    clip_dials: Option<Vec<f64>>,
     bands: [f32; vjc_media::analysis::BANDS],
     smoother: std::sync::Arc<vjc_core::anim::AudioSmoother>,
 }
@@ -272,6 +276,8 @@ struct State {
     /// Latest beat index and phase from `clock.tick`, for the indicator.
     beat: i64,
     phase: f64,
+    /// Triggers and beat loops waiting for their beat or bar (beat snap).
+    snap_pending: Vec<(f64, Held)>,
     nudge_dir: i8,
     /// Visual only for now. TODO(#9): click sound (see build-log).
     metronome: bool,
@@ -367,6 +373,28 @@ struct Outgoing {
     /// The outgoing clip, kept so its audio follows layer/master mix and fades out.
     clip: Option<vjc_model::Clip>,
 }
+
+/// Whose dashboard a dial row edits.
+#[derive(Clone, Copy)]
+enum DialOwner {
+    Layer(LayerId),
+    Clip(DeckId, LayerId, u32),
+}
+
+/// An action held back by beat snap until its beat or bar.
+enum SnapAct {
+    Cmd(Box<Command>),
+    BeatLoop(LayerId, f64),
+}
+
+/// A snapped action and the wall time it was queued (a stalled clock must not hold it forever).
+struct Held {
+    act: SnapAct,
+    at: std::time::Instant,
+}
+
+/// Longest an action waits for its beat or bar, in bars of wall time.
+const SNAP_MAX_BARS: f64 = 2.0;
 
 #[derive(Default)]
 struct Flow {
@@ -1230,6 +1258,7 @@ impl State {
             clock: Clock::new(120.0, std::time::Instant::now()),
             beat: 0,
             phase: 0.0,
+            snap_pending: vec![],
             nudge_dir: 0,
             metronome: false,
             link: link_io::Link::new(120.0),
@@ -1286,6 +1315,7 @@ impl State {
         self.players.clear();
         self.gens.clear();
         self.history.clear();
+        self.snap_pending.clear();
         self.selected = None;
         self.selected_deck = None;
         self.layer_drag = None;
@@ -1945,6 +1975,7 @@ impl State {
                 self.project = i.project;
                 self.link_sync.note_project_replaced();
                 self.history.clear();
+                self.snap_pending.clear();
                 self.flow = Flow::default();
                 self.players.clear();
                 self.gens.clear();
@@ -1958,7 +1989,73 @@ impl State {
     /// Sends a command through the bus and reacts to the resulting events.
     /// Runs a command; a rejection is reported in the status line.
     fn exec(&mut self, cmd: Command) {
-        self.exec_ok(cmd);
+        if let Some(cmd) = self.snap_defer(cmd) {
+            self.exec_ok(cmd);
+        }
+    }
+
+    /// With beat snap on, a clip or column trigger that arrives off the grid waits in
+    /// `snap_pending` for the next beat or bar; anything else passes through.
+    fn snap_defer(&mut self, cmd: Command) -> Option<Command> {
+        if !matches!(
+            cmd,
+            Command::TriggerClip { .. } | Command::TriggerColumn { .. }
+        ) {
+            return Some(cmd);
+        }
+        let phase = self.clock.phase(std::time::Instant::now());
+        let target = vjc_core::clock::snap_target(phase, self.prefs.control.beat_snap);
+        if target > phase {
+            self.snap_pending.push((
+                target,
+                Held {
+                    act: SnapAct::Cmd(Box::new(cmd)),
+                    at: std::time::Instant::now(),
+                },
+            ));
+            None
+        } else {
+            Some(cmd)
+        }
+    }
+
+    /// Drops held actions whose layer or column no longer exists.
+    fn prune_snapped(&mut self) {
+        let c = &self.project.composition;
+        let ncols = c.columns.len() as u32;
+        self.snap_pending.retain(|(_, h)| match &h.act {
+            SnapAct::Cmd(cmd) => match **cmd {
+                Command::TriggerClip { layer, column, .. } => {
+                    column < ncols && c.layers.iter().any(|l| l.id == layer)
+                }
+                Command::TriggerColumn { column, .. } => column < ncols,
+                _ => true,
+            },
+            SnapAct::BeatLoop(layer, _) => c.layers.iter().any(|l| l.id == *layer),
+        });
+    }
+
+    /// Runs the snapped actions whose beat or bar has come, or that waited
+    /// `SNAP_MAX_BARS` of wall time (the clock may be stalled).
+    fn run_snapped(&mut self, phase: f64, now: std::time::Instant) {
+        self.prune_snapped();
+        let max = std::time::Duration::from_secs_f64(
+            SNAP_MAX_BARS * vjc_core::clock::BEATS_PER_BAR * 60.0 / self.clock.bpm().max(1.0),
+        );
+        // Overdue actions get a due target so `take_due` releases them with the rest.
+        for (t, h) in &mut self.snap_pending {
+            if now.saturating_duration_since(h.at) >= max {
+                *t = f64::NEG_INFINITY;
+            }
+        }
+        for h in vjc_core::clock::take_due(&mut self.snap_pending, phase) {
+            match h.act {
+                SnapAct::Cmd(c) => {
+                    self.exec_ok(*c);
+                }
+                SnapAct::BeatLoop(layer, b) => self.start_beat_loop(layer, b),
+            }
+        }
     }
 
     /// Like `exec`, but says whether the command was accepted.
@@ -2019,6 +2116,7 @@ impl State {
                 }
                 if deck_switch {
                     self.col_sel = None;
+                    self.snap_pending.clear();
                     let cur = self.project.composition.current_deck;
                     self.preload_deck(cur);
                 }
@@ -2538,6 +2636,31 @@ impl State {
 
     /// Beat loop: repeat `beats` beats from the current position (None clears it).
     fn set_beat_loop(&mut self, layer: LayerId, beats: Option<f64>) {
+        let Some(b) = beats else {
+            self.snap_pending
+                .retain(|(_, a)| !matches!(a.act, SnapAct::BeatLoop(l, _) if l == layer));
+            self.flow.beat_loops.remove(&layer);
+            return;
+        };
+        let phase = self.clock.phase(std::time::Instant::now());
+        let target = vjc_core::clock::snap_target(phase, self.prefs.control.beat_snap);
+        if target > phase {
+            self.snap_pending
+                .retain(|(_, a)| !matches!(a.act, SnapAct::BeatLoop(l, _) if l == layer));
+            self.snap_pending.push((
+                target,
+                Held {
+                    act: SnapAct::BeatLoop(layer, b),
+                    at: std::time::Instant::now(),
+                },
+            ));
+        } else {
+            self.start_beat_loop(layer, b);
+        }
+    }
+
+    fn start_beat_loop(&mut self, layer: LayerId, beats: f64) {
+        let beats = Some(beats);
         let dur = self.players.get(&layer).and_then(|(_, _, p)| p.duration());
         let win = beats.and_then(|b| {
             let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
@@ -2628,6 +2751,7 @@ impl State {
         let bpm = self.clock.bpm();
         let t = self.clock.tick(now);
         self.phase = t.phase;
+        self.run_snapped(t.phase, now);
         if let Some(b) = t.beat {
             self.beat = b;
         }
@@ -2861,7 +2985,7 @@ impl State {
                 let deck = self.project.composition.current_deck;
                 for i in self.tc.cues.step(&cues, cur) {
                     let c = &cues[i];
-                    self.exec(match c.layer {
+                    self.exec_ok(match c.layer {
                         Some(layer) => Command::TriggerClip {
                             deck,
                             layer,
@@ -2878,18 +3002,18 @@ impl State {
         }
         // Once: clear the layer after the last frame.
         for layer in finished {
-            match self.autopilot_target(layer) {
-                Some((deck, column)) => self.exec(Command::TriggerClip {
+            let _ = match self.autopilot_target(layer) {
+                Some((deck, column)) => self.exec_ok(Command::TriggerClip {
                     deck,
                     layer,
                     column,
                 }),
-                None => self.exec(Command::ClearLayer { layer }),
-            }
+                None => self.exec_ok(Command::ClearLayer { layer }),
+            };
         }
         for layer in autopilot {
             if let Some((deck, column)) = self.autopilot_target(layer) {
-                self.exec(Command::TriggerClip {
+                self.exec_ok(Command::TriggerClip {
                     deck,
                     layer,
                     column,
@@ -2990,10 +3114,39 @@ impl State {
         });
     }
 
-    /// Dashboard dials and audio levels of this frame, owned so no borrow of the app is held.
+    /// Dashboard dials and audio levels of this frame, for composition-level params.
     fn dials(&self) -> AnimIn {
+        self.dials_for(None)
+    }
+
+    /// Like `dials`, with the scoped dials of `owner`'s own layer and clip (never the UI
+    /// selection's).
+    fn dials_for(&self, owner: Option<EffectTarget>) -> AnimIn {
         let d = &self.project.composition.dashboard;
+        let layer_of = |l: LayerId| {
+            self.project
+                .composition
+                .layers
+                .iter()
+                .find(|x| x.id == l)
+                .map(|l| vjc_core::anim::dial_values(&l.track.dials))
+        };
+        let (layer_dials, clip_dials) = match owner {
+            Some(EffectTarget::Layer(l)) => (layer_of(l), None),
+            Some(EffectTarget::Clip {
+                deck,
+                layer,
+                column,
+            }) => (
+                layer_of(layer),
+                vjc_core::clip_in(&self.project, deck, layer, column)
+                    .map(|k| vjc_core::anim::dial_values(&k.track.dials)),
+            ),
+            _ => (None, None),
+        };
         AnimIn {
+            layer_dials,
+            clip_dials,
             dials: (0..vjc_core::anim::DIALS)
                 .map(|i| d.get(i).map_or(0.0, |p| number_of(&p.value)))
                 .collect(),
@@ -3010,6 +3163,8 @@ impl State {
             fft_bands: &input.bands,
             smoother: Some(&input.smoother),
             dashboard: &input.dials,
+            layer_dials: input.layer_dials.as_deref(),
+            clip_dials: input.clip_dials.as_deref(),
         }
     }
 
@@ -3162,6 +3317,12 @@ impl State {
             let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
             let clip = active_of(players, gens, l.id)
                 .and_then(|(d, col)| vjc_core::clip_in(&self.project, d, l.id, col));
+            // Layer and clip dashboards: dial animations on this layer's params read them.
+            let (layer_dials, clip_dials) = (
+                vjc_core::anim::dial_values(&l.track.dials),
+                clip.map_or_else(Vec::new, |k| vjc_core::anim::dial_values(&k.track.dials)),
+            );
+            let lctx = actx.scoped(&layer_dials, &clip_dials);
             let clip_fx = clip.map(|k| k.track.effects.as_slice());
             let generator = match (clip.map(|k| &k.source), gens.get(&l.id)) {
                 (Some(vjc_model::Source::Generator { kind, params }), Some((_, _, t)))
@@ -3172,7 +3333,7 @@ impl State {
                     self.fx.isf(kind).filter(|_| ready).map(|isf| EffectDraw {
                         kind: kind.clone(),
                         uniforms: isf.pack(
-                            &vjc_core::anim::resolve(params, &actx),
+                            &vjc_core::anim::resolve(params, &lctx),
                             *t as f32,
                             (w, h),
                         ),
@@ -3197,7 +3358,7 @@ impl State {
                 clip_fx.unwrap_or_default(),
                 time,
                 size,
-                &actx,
+                &lctx,
             );
             effects.extend(draw_chain(
                 &mut self.fx,
@@ -3206,15 +3367,15 @@ impl State {
                 &l.track.effects,
                 time,
                 size,
-                &actx,
+                &lctx,
             ));
             // Clip transform first, then the layer's (see vjc_core::transform).
             let layer_xf = vjc_core::transform::Affine::inverse_of(
-                &vjc_core::transform::Resolved::of(&l.track.transform, &actx),
+                &vjc_core::transform::Resolved::of(&l.track.transform, &lctx),
             );
             let xf = clip.map_or(layer_xf, |k| {
                 layer_xf.through(&vjc_core::transform::Affine::inverse_of(
-                    &vjc_core::transform::Resolved::of(&k.track.transform, &actx),
+                    &vjc_core::transform::Resolved::of(&k.track.transform, &lctx),
                 ))
             });
             let cross = self
@@ -3223,7 +3384,7 @@ impl State {
                 .get(&l.id)
                 .filter(|_| !c.layer_off(l))
                 .and_then(|o| Some((o, o.state.current()?, out_frames.get(&l.id)?)));
-            let opacity = (vjc_core::anim::effective_number(&l.track.opacity, &actx)
+            let opacity = (vjc_core::anim::effective_number(&l.track.opacity, &lctx)
                 * vjc_core::crossfader::layer_gain(
                     c.crossfader.as_ref(),
                     l.crossfader_bus.as_ref(),
@@ -3245,7 +3406,7 @@ impl State {
                     &l.track.effects,
                     time,
                     (of.width, of.height),
-                    &actx,
+                    &lctx,
                 );
                 draw_groups.push(l.group);
                 draws.push(LayerDraw {
@@ -3283,6 +3444,14 @@ impl State {
             && let PreviewTarget::Clip(d, l, col) = self.preview_target
             && let Some(k) = vjc_core::clip_in(&self.project, d, l, col)
         {
+            let (layer_dials, clip_dials) = (
+                c.layers
+                    .iter()
+                    .find(|x| x.id == l)
+                    .map_or_else(Vec::new, |x| vjc_core::anim::dial_values(&x.track.dials)),
+                vjc_core::anim::dial_values(&k.track.dials),
+            );
+            let pctx = actx.scoped(&layer_dials, &clip_dials);
             let t = self
                 .clip_prev
                 .as_ref()
@@ -3294,7 +3463,7 @@ impl State {
                     let ready = self.fx.status(kind) == Some(&fx::Status::Ready);
                     self.fx.isf(kind).filter(|_| ready).map(|isf| EffectDraw {
                         kind: kind.clone(),
-                        uniforms: isf.pack(&vjc_core::anim::resolve(params, &actx), t, (w, h)),
+                        uniforms: isf.pack(&vjc_core::anim::resolve(params, &pctx), t, (w, h)),
                         dry_wet: 1.0,
                         ml: None,
                         persistent: None,
@@ -3315,7 +3484,7 @@ impl State {
                 &k.track.effects,
                 time,
                 size,
-                &actx,
+                &pctx,
             );
             let frame = prev_frame
                 .as_ref()
@@ -3331,7 +3500,7 @@ impl State {
                     generator,
                     transition: None,
                     transform: vjc_core::transform::Affine::inverse_of(
-                        &vjc_core::transform::Resolved::of(&k.track.transform, &actx),
+                        &vjc_core::transform::Resolved::of(&k.track.transform, &pctx),
                     ),
                     channels: k.channels,
                     frame,
@@ -3416,7 +3585,11 @@ impl State {
         match self.rec_request.take() {
             Some(true) if self.capture.is_none() => {
                 let size = comp.size;
-                match capture::Capture::start(capture::default_path(), size, c.fps) {
+                match capture::Capture::start(
+                    capture::default_path(self.prefs.general.record_folder.as_deref()),
+                    size,
+                    c.fps,
+                ) {
                     Ok(cap) => {
                         self.status = format!("Recording to {}", cap.path().display());
                         self.capture = Some(cap);
@@ -4234,6 +4407,8 @@ impl State {
 
     fn ui_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // Before any panel draws: the panels register their learn targets too.
+        self.targets.clear();
         self.help_shown = help::take_hovered(&ctx);
         if self.thumbs.poll(&ctx) || self.thumbs.is_pending() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -4603,7 +4778,6 @@ impl State {
             self.browser_drop((*item).clone(), pos);
         }
         self.layer_rects.clear();
-        self.targets.clear();
         self.shortcut_keys(&ctx);
         self.layout_keys(&ctx);
         self.collect_pump();
@@ -4747,6 +4921,7 @@ impl State {
         };
         let recording = self.capture.is_some();
         let rec_dropped = self.capture.as_ref().map(|c| c.dropped());
+        let rec_info = self.capture.as_ref().map(|c| c.info());
         let master_bypass = self.master_bypass;
         let mut cmds: Vec<Command> = vec![];
         let mut cells = vec![];
@@ -4814,6 +4989,7 @@ impl State {
                                     bypass: master_bypass,
                                     recording,
                                     dropped: rec_dropped,
+                                    rec_info: rec_info.clone(),
                                     layers: comp.layers.len(),
                                     columns: ncols as usize,
                                 },
@@ -5574,6 +5750,7 @@ impl State {
                     bypass: master_bypass,
                     recording,
                     dropped: rec_dropped,
+                    rec_info: rec_info.clone(),
                     layers: comp.layers.len(),
                     columns: ncols as usize,
                 },
@@ -6057,15 +6234,16 @@ impl State {
     }
 
     fn layer_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-        let dials = self.dials();
-        let actx = self.anim_ctx(&dials);
         let Some(lid) = self.selected.map(|s| s.0) else {
             ui.label("Select a layer (click its name or a cell).");
             return;
         };
+        let dials = self.dials_for(Some(EffectTarget::Layer(lid)));
+        let actx = self.anim_ctx(&dials);
         let Some(l) = self.project.composition.layers.iter().find(|l| l.id == lid) else {
             return;
         };
+        let layer_dials = vjc_core::anim::dial_values(&l.track.dials);
         if params::section(ui, "sec-layer", "Layer") {
             if let Some(name) = params::text_field(ui, ("lname", lid), "Name", &l.name) {
                 cmds.push(Command::RenameLayer { layer: lid, name });
@@ -6265,6 +6443,9 @@ impl State {
         if params::section(ui, "sec-layer-transform", "Transform") {
             self.transform_rows(ui, EffectTarget::Layer(lid), cmds);
         }
+        if params::section(ui, "sec-layer-dashboard", "Dashboard") {
+            self.dial_rows(ui, DialOwner::Layer(lid), &layer_dials, cmds);
+        }
         if params::section(ui, "sec-layer-effects", "Effects") {
             self.chain_ui(ui, EffectTarget::Layer(lid), cmds);
         }
@@ -6365,7 +6546,11 @@ impl State {
             return;
         };
         let k = k.clone();
-        let dials = self.dials();
+        let dials = self.dials_for(Some(EffectTarget::Clip {
+            deck,
+            layer,
+            column,
+        }));
         let actx = self.anim_ctx(&dials);
         let t = &k.transport;
         if let Some(name) = params::text_field(ui, ("kname", layer, column), "Name", &k.name) {
@@ -6604,10 +6789,12 @@ impl State {
                     });
                 }
                 for (i, c) in t.cue_points.iter().enumerate() {
-                    if ui
-                        .add_enabled(playing, egui::Button::new(format!("Jump {}", i + 1)))
-                        .clicked()
-                    {
+                    let jump =
+                        ui.add_enabled(playing, egui::Button::new(format!("Jump {}", i + 1)));
+                    if let Some(a) = vjc_core::shortcuts::cue_address(&self.project, layer, i) {
+                        self.targets.push((jump.rect, a));
+                    }
+                    if jump.clicked() {
                         cmds.push(Command::JumpToCue {
                             deck,
                             layer,
@@ -6642,6 +6829,10 @@ impl State {
             if let Some(b) = loop_pick {
                 self.set_beat_loop(layer, b);
             }
+        }
+        let clip_dials = vjc_core::anim::dial_values(&k.track.dials);
+        if params::section(ui, "sec-clip-dashboard", "Dashboard") {
+            self.dial_rows(ui, DialOwner::Clip(deck, layer, column), &clip_dials, cmds);
         }
         if params::section(ui, "sec-clip-video", "Video") {
             let fits: Vec<(FitMode, String)> = FitMode::ALL
@@ -6902,6 +7093,59 @@ impl State {
         }
     }
 
+    /// The 8 dials of a layer's or clip's own dashboard; each is a mappable target.
+    fn dial_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        owner: DialOwner,
+        vals: &[f64],
+        cmds: &mut Vec<Command>,
+    ) {
+        for (i, v) in vals.iter().enumerate() {
+            let n = i + 1;
+            let id = match owner {
+                DialOwner::Layer(l) => ("ldial", l.as_u128() as u64 ^ i as u64),
+                DialOwner::Clip(_, l, c) => {
+                    ("cdial", l.as_u128() as u64 ^ u64::from(c) << 8 ^ i as u64)
+                }
+            };
+            let r = ui.horizontal(|ui| {
+                params::param_slider(ui, id, &format!("Dial {n}"), *v, 0.0, (0.0, 1.0))
+            });
+            if let Some(value) = r.inner {
+                cmds.push(match owner {
+                    DialOwner::Layer(layer) => Command::SetLayerDial {
+                        layer,
+                        dial: i as u32,
+                        value,
+                    },
+                    DialOwner::Clip(deck, layer, column) => Command::SetClipDial {
+                        deck,
+                        layer,
+                        column,
+                        dial: i as u32,
+                        value,
+                    },
+                });
+            }
+            let addr = match owner {
+                DialOwner::Layer(l) => {
+                    vjc_core::shortcuts::dial_address(&self.project, l, None, None, i)
+                }
+                DialOwner::Clip(deck, l, c) => vjc_core::shortcuts::dial_address(
+                    &self.project,
+                    l,
+                    Some((deck, c)),
+                    active_of(&self.players, &self.gens, l),
+                    i,
+                ),
+            };
+            if let Some(a) = addr {
+                self.targets.push((r.response.rect, a));
+            }
+        }
+    }
+
     /// Position, scale, rotation and anchor sliders of a track's transform; each row is a
     /// mappable target (`/comp/.../transform/...`) and animatable like the other params.
     fn transform_rows(&mut self, ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
@@ -6909,7 +7153,7 @@ impl State {
         else {
             return;
         };
-        let dials = self.dials();
+        let dials = self.dials_for(Some(target));
         let actx = self.anim_ctx(&dials);
         let (cw, ch) = {
             let c = &self.project.composition;
@@ -7021,7 +7265,7 @@ impl State {
         let n = chain.len();
         for (i, e) in chain.iter().enumerate() {
             let inputs = self.fx.isf(&e.kind).map(|f| f.inputs.clone());
-            let dials = self.dials();
+            let dials = self.dials_for(Some(target));
             let actx = self.anim_ctx(&dials);
             let failure = match self.fx.status(&e.kind) {
                 Some(fx::Status::Failed(why)) => Some(why.clone()),

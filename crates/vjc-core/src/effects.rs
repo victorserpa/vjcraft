@@ -292,7 +292,10 @@ mod merge_tests {
     use vjc_model::{Animation, Param};
 
     fn anim() -> Animation {
-        Animation::Dashboard { dial: 1 }
+        Animation::Dashboard {
+            dial: 1,
+            scope: Default::default(),
+        }
     }
 
     #[test]

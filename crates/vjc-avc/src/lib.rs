@@ -750,6 +750,7 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
         w.mapped_anim.insert(node_id(d));
         return Some(Animation::Dashboard {
             dial: id as u32 - 1,
+            scope: Default::default(),
         });
     }
     if let Some(t) = sp.child("PhaseSourceTimeline") {
@@ -844,7 +845,13 @@ mod tests {
     #[test]
     fn dashboard_link_maps() {
         let (i, a) = anim_of(r#"<PhaseSourceDashboardLink linkId="3" linkName="Link 3"/>"#);
-        assert_eq!(a, Some(Animation::Dashboard { dial: 2 }));
+        assert_eq!(
+            a,
+            Some(Animation::Dashboard {
+                dial: 2,
+                scope: Default::default()
+            })
+        );
         assert!(i.warning_counts.keys().all(|k| !k.contains("dashboard")));
     }
 

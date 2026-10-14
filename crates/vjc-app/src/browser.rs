@@ -571,6 +571,11 @@ impl Browser {
         general: &mut vjc_io::prefs::General,
     ) -> (Option<Opened>, bool) {
         let ctx = ui.ctx().clone();
+        let rec_dir = crate::capture::recording_folder(general.record_folder.as_deref());
+        if rec_dir != self.rec_dir {
+            self.rec_dir = rec_dir;
+            self.rec_at = None;
+        }
         self.thumbs.poll();
         self.fx_thumbs.step(&ctx);
         let mut changed = false;

@@ -1050,7 +1050,13 @@ fn small_window_no_panic_no_overlap() {
             .fold(egui::Rect::NOTHING, |a, r| a.union(r));
         let st = h.state();
         let ncols = st.project.composition.columns.len();
-        let header = st.targets[ncols - 1].0;
+        let last_col = vjc_core::shortcuts::column_address(ncols as u32 - 1);
+        let header = st
+            .targets
+            .iter()
+            .find(|t| t.1 == last_col)
+            .expect("last column header")
+            .0;
         let row = st.layer_rects.first().expect("layer row").0;
         for (name, r) in [("last header", header), ("first layer row", row)] {
             assert!(
@@ -4287,4 +4293,189 @@ fn collect_job_is_dropped_when_the_worker_dies() {
         s.collect_job.is_none(),
         "a dead worker must not block new collects"
     );
+}
+
+// Beat snap: a column trigger waits for the next bar; with snap off it runs at once
+#[test]
+fn beat_snap_holds_a_trigger_until_the_bar() {
+    let mut h = app();
+    let (gen_id, _) = vjc_fx::GENERATORS[0];
+    let (_, pos) = cell_center(&h, 0, 1);
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    let deck = h.state().project.composition.current_deck;
+    let layer = h.state().project.composition.layers[0].id;
+    let mid_bar = || {
+        // 0.2 beats into a bar at 120 bpm.
+        vjc_core::clock::Clock::new(
+            120.0,
+            std::time::Instant::now() - std::time::Duration::from_millis(100),
+        )
+    };
+    // Negative control: snap off runs the trigger now.
+    h.state_mut().clock = mid_bar();
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    assert!(h.state().snap_pending.is_empty());
+    assert_eq!(
+        active_of(&h.state().players, &h.state().gens, layer),
+        Some((deck, 1))
+    );
+    h.state_mut().exec(Command::ClearAll);
+    settle(&mut h);
+    // Snap on: held, then released at the bar.
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Bar;
+    h.state_mut().clock = mid_bar();
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 1 });
+    settle(&mut h);
+    assert_eq!(h.state().snap_pending.len(), 1);
+    assert_eq!(active_of(&h.state().players, &h.state().gens, layer), None);
+    h.state_mut().run_snapped(3.9, std::time::Instant::now());
+    assert_eq!(h.state().snap_pending.len(), 1);
+    h.state_mut().run_snapped(4.0, std::time::Instant::now());
+    settle(&mut h);
+    assert!(h.state().snap_pending.is_empty());
+    assert_eq!(
+        active_of(&h.state().players, &h.state().gens, layer),
+        Some((deck, 1))
+    );
+}
+
+#[test]
+fn beat_snap_defers_beat_loop_start_but_not_its_clear() {
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    let st = h.state_mut();
+    st.clock = vjc_core::clock::Clock::new(
+        120.0,
+        std::time::Instant::now() - std::time::Duration::from_millis(100),
+    );
+    st.set_beat_loop(layer, Some(4.0));
+    assert!(st.snap_pending.is_empty(), "snap off: starts at once");
+    st.prefs.control.beat_snap = vjc_model::BeatSnap::Beat;
+    st.set_beat_loop(layer, Some(4.0));
+    assert_eq!(st.snap_pending.len(), 1);
+    st.set_beat_loop(layer, Some(2.0));
+    assert_eq!(st.snap_pending.len(), 1, "a new pick replaces the held one");
+    st.set_beat_loop(layer, None);
+    assert!(st.snap_pending.is_empty());
+}
+
+// Layer dashboard: the Layer tab lists 8 dials, each a mappable target
+#[test]
+fn layer_tab_has_its_own_dashboard_dials_as_targets() {
+    let mut h = app_sized(1400.0, 1500.0);
+    h.state_mut().apply_layout(Layout {
+        params_h: 900.0,
+        ..Layout::default()
+    });
+    settle(&mut h);
+    let has_target = |h: &Harness<'_, State>, a: &str| h.state().targets.iter().any(|t| t.1 == a);
+    // Composition tab: only the composition's dials.
+    assert!(has_target(&h, "/comp/dashboard/1"));
+    assert!(!has_target(&h, "/comp/layer/2/dashboard/1"));
+    click(&mut h, "Layer");
+    h.query_all_by_value("Layer 2").next().unwrap().click();
+    settle(&mut h);
+    assert!(has_text(&h, "Dial 8"));
+    for n in 1..=8 {
+        assert!(
+            has_target(&h, &format!("/comp/layer/2/dashboard/{n}")),
+            "{n}"
+        );
+    }
+    assert!(!has_target(&h, "/comp/layer/2/dashboard/9"));
+    // A dial command moves that layer's dial only.
+    let lid = h.state().project.composition.layers[0].id;
+    h.state_mut().exec(Command::SetLayerDial {
+        layer: lid,
+        dial: 0,
+        value: 0.5,
+    });
+    settle(&mut h);
+    let c = &h.state().project.composition;
+    assert!(h.state().dirty);
+    assert_eq!(
+        vjc_core::anim::dial_values(&c.layers[0].track.dials)[0],
+        0.5
+    );
+    assert!(c.layers[1].track.dials.is_empty() && c.dashboard.is_empty());
+}
+
+// Held snap triggers: dropped when the project or deck changes, released when the clock stalls.
+#[test]
+fn snap_pending_is_cleared_by_new_project_and_deck_change() {
+    let mut h = app();
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Bar;
+    let hold = |h: &mut Harness<'static, State>| {
+        h.state_mut().clock = vjc_core::clock::Clock::new(
+            120.0,
+            std::time::Instant::now() - std::time::Duration::from_millis(100),
+        );
+        h.state_mut()
+            .exec(Command::TriggerColumn { deck, column: 0 });
+    };
+    hold(&mut h);
+    assert_eq!(h.state().snap_pending.len(), 1);
+    h.state_mut().new_project();
+    assert!(h.state().snap_pending.is_empty());
+    // Negative control: without the clear the action stays held.
+    hold(&mut h);
+    assert_eq!(h.state().snap_pending.len(), 1);
+    // A vanished column drops the action on the next release pass.
+    h.state_mut().project.composition.columns.clear();
+    h.state_mut().run_snapped(0.1, std::time::Instant::now());
+    assert!(h.state().snap_pending.is_empty());
+}
+
+#[test]
+fn snap_releases_after_two_bars_of_wall_time() {
+    let mut h = app();
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Bar;
+    h.state_mut().clock = vjc_core::clock::Clock::new(
+        120.0,
+        std::time::Instant::now() - std::time::Duration::from_millis(100),
+    );
+    h.state_mut()
+        .exec(Command::TriggerColumn { deck, column: 0 });
+    let t0 = std::time::Instant::now();
+    // Stalled clock (phase stays put): still held just under 2 bars (4 s at 120 bpm).
+    h.state_mut()
+        .run_snapped(0.2, t0 + std::time::Duration::from_millis(3900));
+    assert_eq!(h.state().snap_pending.len(), 1);
+    h.state_mut()
+        .run_snapped(0.2, t0 + std::time::Duration::from_millis(4100));
+    assert!(h.state().snap_pending.is_empty());
+}
+
+#[test]
+fn layer_dial_reads_its_own_layer_not_the_selected_one() {
+    let mut h = app();
+    let ls = h.state().project.composition.layers.clone();
+    assert!(ls.len() >= 2);
+    let (a, b) = (ls[0].id, ls[1].id);
+    for (layer, value) in [(a, 0.2), (b, 0.9)] {
+        h.state_mut().exec(Command::SetLayerDial {
+            layer,
+            dial: 0,
+            value,
+        });
+    }
+    h.state_mut().selected = Some((a, 0));
+    let st = h.state();
+    let input = st.dials_for(Some(EffectTarget::Layer(b)));
+    let ctx = st.anim_ctx(&input);
+    let mut p = vjc_model::Param::number("x", 0.0, Some((0.0, 1.0)));
+    p.animation = Some(vjc_model::Animation::Dashboard {
+        dial: 0,
+        scope: vjc_model::DialScope::Layer,
+    });
+    assert_eq!(vjc_core::anim::effective_number(&p, &ctx), 0.9);
+    // Composition-level params (no owner) read their base value.
+    let comp = st.dials();
+    let cctx = st.anim_ctx(&comp);
+    assert_eq!(vjc_core::anim::effective_number(&p, &cctx), 0.0);
 }
