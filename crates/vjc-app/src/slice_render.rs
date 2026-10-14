@@ -19,7 +19,9 @@ struct VO {
 struct U {
     edge: vec4<f32>,            // left, right, top, bottom
     misc: vec4<f32>,            // gamma, mask point count, screen w, screen h
-    gain: vec4<f32>,            // rgb multiplier
+    gain: vec4<f32>,            // slice rgb multiplier
+    con: vec4<f32>,             // slice contrast, screen contrast, screen opacity, 0
+    sgain: vec4<f32>,           // screen rgb multiplier
     pts: array<vec4<f32>, 16>,  // two mask points per entry
 };
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -39,6 +41,10 @@ fn pt(i: u32) -> vec2<f32> {
 }
 fn ramp(d: f32, w: f32) -> f32 {
     return select(1.0, clamp(d / w, 0.0, 1.0), w > 0.0);
+}
+fn contrast(c: vec3<f32>, k: f32) -> vec3<f32> {
+    // Exactly 1.0 must not touch the pixel (no float round trip).
+    return select(clamp((c - vec3(0.5)) * k + vec3(0.5), vec3(0.0), vec3(1.0)), c, k == 1.0);
 }
 @fragment
 fn fs(in: VO) -> @location(0) vec4<f32> {
@@ -63,12 +69,16 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     let lin = ramp(in.st.x, u.edge.x) * ramp(1.0 - in.st.x, u.edge.y)
         * ramp(in.st.y, u.edge.z) * ramp(1.0 - in.st.y, u.edge.w);
     let c = textureSample(src, smp, in.uv);
-    return vec4(c.rgb * pow(lin, u.misc.x) * u.gain.rgb, c.a);
+    // Slice colour first, then the screen colour on top (the screen's final stage). The soft
+    // edge fades last, so contrast below 1 never lifts a blended edge off black.
+    let s1 = contrast(c.rgb, u.con.x) * u.gain.rgb;
+    let s2 = contrast(s1, u.con.y) * u.sgain.rgb * u.con.z;
+    return vec4(s2 * pow(lin, u.misc.x), c.a);
 }
 "#;
 
-/// Uniform block size: 3 vec4 + 16 vec4 mask points.
-const UNIFORM_FLOATS: usize = 12 + 4 * (mapping::MAX_MASK_POINTS / 2);
+/// Uniform block size: 5 vec4 + 16 vec4 mask points.
+const UNIFORM_FLOATS: usize = 20 + 4 * (mapping::MAX_MASK_POINTS / 2);
 
 /// Packs the per-slice uniform (see `U` in the shader).
 fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
@@ -82,14 +92,19 @@ fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
     if let Some(m) = s.mask.as_ref().filter(|m| mapping::mask_valid(m)) {
         u[5] = m.len() as f32;
         for (i, p) in m.iter().enumerate() {
-            u[12 + 2 * i] = p.0;
-            u[13 + 2 * i] = p.1;
+            u[20 + 2 * i] = p.0;
+            u[21 + 2 * i] = p.1;
         }
     }
     u[6] = screen.width.max(1) as f32;
     u[7] = screen.height.max(1) as f32;
     u[8..11].copy_from_slice(&mapping::slice_gain(&s.color));
     u[11] = 1.0;
+    u[12] = s.color.contrast;
+    u[13] = screen.color.color.contrast;
+    u[14] = screen.color.opacity;
+    u[16..19].copy_from_slice(&mapping::slice_gain(&screen.color.color));
+    u[19] = 1.0;
     u
 }
 
@@ -233,8 +248,10 @@ impl SliceRenderer {
             (wgpu::BindGroup, wgpu::BindGroup),
             bool,
         );
-        let bufs: Vec<Drawn> = screen
-            .slices
+        // Off screen: the pass below still clears the target, so it is a black frame that
+        // keeps flowing to every output (a frozen last frame on an LED processor is worse).
+        let slices: &[Slice] = if screen.enabled { &screen.slices } else { &[] };
+        let bufs: Vec<Drawn> = slices
             .iter()
             .filter_map(|s| {
                 let v = mapping::slice_vertices_st(screen.width, screen.height, s);
@@ -447,6 +464,7 @@ mod tests {
             r: 1.0,
             g: 0.5,
             b: 0.0,
+            contrast: 1.0,
         };
         screen.slices.push(sl);
         let Some(img) = render_rgba(&screen, [200, 200, 200, 255]) else {
@@ -460,6 +478,66 @@ mod tests {
         screen.slices[0].color = Default::default();
         let id = render_rgba(&screen, [200, 200, 200, 255]).unwrap();
         assert_eq!(px(&id, 1, 0, 0), [200, 200, 200, 255]);
+    }
+
+    fn one_slice_screen() -> Screen {
+        let mut screen = mapping::new_screen("t", 1, 1);
+        screen.slices.push(mapping::new_slice(1, 1));
+        screen
+    }
+
+    /// Screen brightness 0, opacity 0 and enabled=false all give black; a neutral screen
+    /// colour keeps the pixel exactly (negative control: brightness 0.5 does change it).
+    #[test]
+    fn gpu_screen_color_and_enabled() {
+        let src = [200, 120, 30, 255];
+        let mut screen = one_slice_screen();
+        let Some(base) = render_rgba(&screen, src) else {
+            eprintln!("gpu_screen_color_and_enabled: SKIPPED (no adapter)");
+            return;
+        };
+        assert_eq!(px(&base, 1, 0, 0), src, "neutral keeps the pixel");
+        screen.color.color.brightness = 0.0;
+        let img = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&img, 1, 0, 0), [0, 0, 0, 255], "brightness 0");
+        screen.color = Default::default();
+        screen.color.opacity = 0.0;
+        let img = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&img, 1, 0, 0), [0, 0, 0, 255], "opacity 0");
+        screen.color = Default::default();
+        screen.enabled = false;
+        let img = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&img, 1, 0, 0), [0, 0, 0, 255], "disabled");
+        screen.enabled = true;
+        screen.color.color.brightness = 0.5;
+        let img = render_rgba(&screen, src).unwrap();
+        assert!(
+            (px(&img, 1, 0, 0)[0] as i32 - 100).abs() <= 1,
+            "half bright"
+        );
+    }
+
+    /// Contrast 1.0 never changes a pixel (slice or screen); 2.0 stretches around grey.
+    #[test]
+    fn gpu_contrast_neutral_and_active() {
+        let src = [200, 120, 30, 255];
+        let mut screen = one_slice_screen();
+        let Some(_) = render_rgba(&screen, src) else {
+            eprintln!("gpu_contrast_neutral_and_active: SKIPPED (no adapter)");
+            return;
+        };
+        screen.slices[0].color.contrast = 1.0;
+        screen.color.color.contrast = 1.0;
+        let img = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&img, 1, 0, 0), src);
+        screen.slices[0].color.contrast = 2.0;
+        let img = render_rgba(&screen, src).unwrap();
+        let got = px(&img, 1, 0, 0);
+        assert!(got[0] > 200 && got[2] < 30, "stretched {got:?}");
+        screen.slices[0].color.contrast = 1.0;
+        screen.color.color.contrast = 0.0;
+        let img = render_rgba(&screen, src).unwrap();
+        assert!((px(&img, 1, 0, 0)[0] as i32 - 128).abs() <= 1, "flat grey");
     }
 
     /// Soft edge left 0.25 darkens the left border only.

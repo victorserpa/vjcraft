@@ -71,6 +71,8 @@ pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
         height: h,
         slices: vec![],
         pixel_perfect: false,
+        enabled: true,
+        color: Default::default(),
     }
 }
 
@@ -324,7 +326,7 @@ pub const MAX_GAIN: f32 = 2.0;
 
 /// Colour with every factor clamped to 0..=2; `None` if any is not finite.
 pub fn clamp_color(c: &vjc_model::SliceColor) -> Option<vjc_model::SliceColor> {
-    let all = [c.brightness, c.r, c.g, c.b];
+    let all = [c.brightness, c.r, c.g, c.b, c.contrast];
     if !all.iter().all(|v| v.is_finite()) {
         return None;
     }
@@ -334,7 +336,36 @@ pub fn clamp_color(c: &vjc_model::SliceColor) -> Option<vjc_model::SliceColor> {
         r: g(c.r),
         g: g(c.g),
         b: g(c.b),
+        contrast: g(c.contrast),
     })
+}
+
+/// Screen colour with every factor clamped to 0..=2 (opacity to 0..=1); `None` if any is
+/// not finite.
+pub fn clamp_screen_color(c: &vjc_model::ScreenColor) -> Option<vjc_model::ScreenColor> {
+    if !c.opacity.is_finite() {
+        return None;
+    }
+    Some(vjc_model::ScreenColor {
+        opacity: c.opacity.clamp(0.0, 1.0),
+        color: clamp_color(&c.color)?,
+    })
+}
+
+/// CPU twin of the shader's colour stage: contrast around 0.5 (clamped to 0..1), then the
+/// brightness x channel gain; `opacity` multiplies last. Neutral colour returns `rgb` as is.
+pub fn apply_color(rgb: [f32; 3], c: &vjc_model::SliceColor, opacity: f32) -> [f32; 3] {
+    let g = slice_gain(c);
+    let mut out = [0.0; 3];
+    for i in 0..3 {
+        let k = if c.contrast == 1.0 {
+            rgb[i]
+        } else {
+            ((rgb[i] - 0.5) * c.contrast + 0.5).clamp(0.0, 1.0)
+        };
+        out[i] = k * g[i] * opacity;
+    }
+    out
 }
 
 /// Final RGB multiplier of a slice: brightness times each channel gain. CPU twin of the
@@ -419,12 +450,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apply_color_neutral_is_identity_and_zero_is_black() {
+        let px = [0.001, 0.4, 0.93];
+        let n = vjc_model::SliceColor::default();
+        assert_eq!(apply_color(px, &n, 1.0), px);
+        let dark = vjc_model::SliceColor {
+            brightness: 0.0,
+            ..n
+        };
+        assert_eq!(apply_color(px, &dark, 1.0), [0.0; 3]);
+        assert_eq!(apply_color(px, &n, 0.0), [0.0; 3]);
+        // negative control: a non-neutral contrast does change the pixel
+        let hi = vjc_model::SliceColor { contrast: 2.0, ..n };
+        assert_ne!(apply_color(px, &hi, 1.0), px);
+    }
+
+    #[test]
     fn slice_gain_multiplies_brightness_into_each_channel() {
         let c = vjc_model::SliceColor {
             brightness: 0.5,
             r: 1.0,
             g: 0.8,
             b: 2.0,
+            contrast: 1.0,
         };
         assert_eq!(slice_gain(&c), [0.5, 0.4, 1.0]);
         assert_eq!(

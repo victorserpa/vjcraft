@@ -352,6 +352,16 @@ pub enum Command {
         slice: Uuid,
         color: vjc_model::SliceColor,
     },
+    /// Screen on/off. Off keeps sending, in black. Coalesces.
+    SetScreenEnabled {
+        screen: Uuid,
+        enabled: bool,
+    },
+    /// Screen opacity (0..=1), brightness, contrast and RGB (0..=2). Coalesces.
+    SetScreenColor {
+        screen: Uuid,
+        color: vjc_model::ScreenColor,
+    },
     /// Whole mesh plus its column count (rows = len / cols).
     SetSliceMesh {
         screen: Uuid,
@@ -735,6 +745,8 @@ enum Target {
     SliceMask(Uuid, usize, usize),
     SliceSoftEdge(Uuid),
     SliceColor(Uuid),
+    ScreenEnabled(Uuid),
+    ScreenColor(Uuid),
     SliceInput(Uuid, Uuid),
     ScreenSize(Uuid),
     /// Screen and device kind: switching type is its own undo step, editing the IP is not.
@@ -775,6 +787,8 @@ impl Command {
             )),
             Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),
             Command::SetSliceColor { slice, .. } => Some(Target::SliceColor(*slice)),
+            Command::SetScreenEnabled { screen, .. } => Some(Target::ScreenEnabled(*screen)),
+            Command::SetScreenColor { screen, .. } => Some(Target::ScreenColor(*screen)),
             Command::SetSliceInput { screen, slice, .. } => {
                 Some(Target::SliceInput(*screen, *slice))
             }
@@ -2164,6 +2178,29 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 Command::SetSliceColor {
                     screen,
                     slice,
+                    color: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetScreenEnabled { screen, enabled } => {
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.enabled, enabled);
+            undoable(
+                Command::SetScreenEnabled {
+                    screen,
+                    enabled: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetScreenColor { screen, color } => {
+            let color = mapping::clamp_screen_color(&color).ok_or(Error::InvalidValue)?;
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.color, color);
+            undoable(
+                Command::SetScreenColor {
+                    screen,
                     color: prev,
                 },
                 vec![],
@@ -6514,6 +6551,7 @@ mod tests {
                 r,
                 g: 1.0,
                 b: 1.0,
+                contrast: 1.0,
             },
         };
         assert!(h.exec(&mut p, cmd(f32::NAN, 1.0), now).is_err());
@@ -7118,5 +7156,66 @@ mod tests {
         }
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(number(&p.composition.layers[0].track.dials[0].value), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod screen_color_tests {
+    use super::*;
+
+    #[test]
+    fn screen_enabled_and_color_undo_and_clamp() {
+        let mut p = Project::new("t");
+        let scr = mapping::new_screen("s", 8, 8);
+        let id = scr.id;
+        apply(
+            &mut p,
+            Command::AddScreen {
+                screen: scr,
+                index: 0,
+            },
+        )
+        .unwrap();
+        let off = apply(
+            &mut p,
+            Command::SetScreenEnabled {
+                screen: id,
+                enabled: false,
+            },
+        )
+        .unwrap();
+        assert!(!p.output.screens[0].enabled);
+        apply(&mut p, off.inverse.unwrap()).unwrap();
+        assert!(p.output.screens[0].enabled);
+        let mut c = vjc_model::ScreenColor {
+            opacity: 7.0,
+            color: vjc_model::SliceColor {
+                contrast: 9.0,
+                ..Default::default()
+            },
+        };
+        let u = apply(
+            &mut p,
+            Command::SetScreenColor {
+                screen: id,
+                color: c,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.output.screens[0].color.opacity, 1.0);
+        assert_eq!(p.output.screens[0].color.color.contrast, 2.0);
+        apply(&mut p, u.inverse.unwrap()).unwrap();
+        assert_eq!(p.output.screens[0].color, vjc_model::ScreenColor::default());
+        c.opacity = f32::NAN;
+        assert!(
+            apply(
+                &mut p,
+                Command::SetScreenColor {
+                    screen: id,
+                    color: c
+                }
+            )
+            .is_err()
+        );
     }
 }

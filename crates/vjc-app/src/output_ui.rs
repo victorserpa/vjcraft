@@ -311,11 +311,24 @@ impl State {
         ui.strong("Screens");
         for s in screens {
             let on = cur.is_some_and(|c| c.id == s.id);
-            if crate::help::help(ui.selectable_label(on, &s.name), "out-screens").clicked() {
-                self.sel_screen = Some(s.id);
-                self.sel_slice = None;
-                self.sel_slices.clear();
-            }
+            ui.horizontal(|ui| {
+                let mut en = s.enabled;
+                if ui
+                    .checkbox(&mut en, "")
+                    .on_hover_text("On / off (off sends black)")
+                    .changed()
+                {
+                    cmds.push(Command::SetScreenEnabled {
+                        screen: s.id,
+                        enabled: en,
+                    });
+                }
+                if crate::help::help(ui.selectable_label(on, &s.name), "out-screens").clicked() {
+                    self.sel_screen = Some(s.id);
+                    self.sel_slice = None;
+                    self.sel_slices.clear();
+                }
+            });
         }
         ui.horizontal(|ui| {
             if crate::help::help(widgets::btn(ui, "Add", Kind::Secondary), "out-add-screen")
@@ -434,6 +447,25 @@ impl State {
                 pixel_perfect: pp,
             });
         }
+        widgets::section(ui, "Colour", |ui| {
+            let mut n = c.color;
+            widgets::slider(ui, &mut n.opacity, 0.0..=1.0, "Opacity");
+            let r = 0.0..=mapping::MAX_GAIN;
+            widgets::slider(ui, &mut n.color.brightness, r.clone(), "Brightness");
+            widgets::slider(ui, &mut n.color.contrast, r.clone(), "Contrast");
+            widgets::slider(ui, &mut n.color.r, r.clone(), "R");
+            widgets::slider(ui, &mut n.color.g, r.clone(), "G");
+            widgets::slider(ui, &mut n.color.b, r, "B");
+            if widgets::btn(ui, "Reset", Kind::Secondary).clicked() {
+                n = Default::default();
+            }
+            if n != c.color {
+                cmds.push(Command::SetScreenColor {
+                    screen: c.id,
+                    color: n,
+                });
+            }
+        });
         self.artnet_setup(ui, c, cmds);
     }
 
@@ -847,6 +879,7 @@ impl State {
                 let mut n = sl.color;
                 let r = 0.0..=mapping::MAX_GAIN;
                 ui.add(egui::Slider::new(&mut n.brightness, r.clone()).text("Brightness"));
+                ui.add(egui::Slider::new(&mut n.contrast, r.clone()).text("Contrast"));
                 ui.add(egui::Slider::new(&mut n.r, r.clone()).text("R"));
                 ui.add(egui::Slider::new(&mut n.g, r.clone()).text("G"));
                 widgets::slider(ui, &mut n.b, r, "B");

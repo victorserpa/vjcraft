@@ -777,6 +777,39 @@ pub struct Screen {
     /// window presents the canvas 1:1 in physical pixels.
     #[serde(default)]
     pub pixel_perfect: bool,
+    /// Off: the screen keeps its size and keeps sending, but every pixel is black (a frozen
+    /// last frame on an LED processor would be worse than black).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Opacity, brightness, contrast and RGB of the whole screen, applied after the slices.
+    #[serde(default)]
+    pub color: ScreenColor,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_one() -> f32 {
+    1.0
+}
+
+/// Colour of a whole screen. `opacity` fades the picture to black (outputs have no alpha).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScreenColor {
+    #[serde(default = "default_one")]
+    pub opacity: f32,
+    #[serde(flatten)]
+    pub color: SliceColor,
+}
+
+impl Default for ScreenColor {
+    fn default() -> Self {
+        ScreenColor {
+            opacity: 1.0,
+            color: SliceColor::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -875,6 +908,9 @@ pub struct SliceColor {
     pub r: f32,
     pub g: f32,
     pub b: f32,
+    /// Slope around mid grey: 1.0 = unchanged. Files saved before it existed load as 1.0.
+    #[serde(default = "default_one")]
+    pub contrast: f32,
 }
 
 impl Default for SliceColor {
@@ -884,6 +920,7 @@ impl Default for SliceColor {
             r: 1.0,
             g: 1.0,
             b: 1.0,
+            contrast: 1.0,
         }
     }
 }
@@ -1670,5 +1707,22 @@ mod tests {
         t.as_object_mut().unwrap().remove("dials");
         let t: Track = serde_json::from_value(t).unwrap();
         assert!(t.dials.is_empty());
+    }
+
+    /// A screen saved before `enabled` / `color` / `contrast` existed loads unchanged.
+    #[test]
+    fn old_screen_json_roundtrips_with_neutral_defaults() {
+        let old = r#"{"id":"00000000-0000-0000-0000-000000000001","name":"A",
+            "device":"Window","width":4,"height":2,
+            "slices":[{"id":"00000000-0000-0000-0000-000000000002","input":[],
+            "output_mesh":[],"mesh_cols":2,"mask":null,"soft_edge":null,
+            "color":{"brightness":0.5,"r":1.0,"g":1.0,"b":1.0}}]}"#;
+        let s: Screen = serde_json::from_str(old).unwrap();
+        assert!(s.enabled);
+        assert_eq!(s.color, ScreenColor::default());
+        assert_eq!(s.slices[0].color.contrast, 1.0);
+        assert_eq!(s.slices[0].color.brightness, 0.5);
+        let back: Screen = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 }
