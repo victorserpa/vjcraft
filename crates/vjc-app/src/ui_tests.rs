@@ -4493,3 +4493,34 @@ fn layer_dial_reads_its_own_layer_not_the_selected_one() {
     let cctx = st.anim_ctx(&comp);
     assert_eq!(vjc_core::anim::effective_number(&p, &cctx), 0.0);
 }
+
+fn chord(h: &mut Harness<'_, State>, key: egui::Key, modifiers: egui::Modifiers) {
+    for pressed in [true, false] {
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+    }
+    settle(h);
+}
+
+#[test]
+fn blackout_chord_shows_badge_and_does_not_collide_with_cmd_b() {
+    assert!(!OTHER_CHORDS.contains(&egui::Key::B), "Cmd+B is unbound");
+    let (m, k) = BLACKOUT_KEY;
+    assert!(m.shift && m.command && k == egui::Key::B);
+    let mut h = app();
+    assert!(!exists(&h, "BLACK-OUT"));
+    // Plain Cmd+B must not trigger it.
+    chord(&mut h, egui::Key::B, egui::Modifiers::COMMAND);
+    assert!(h.state().blackouts.is_empty());
+    chord(&mut h, k, m);
+    assert!(!h.state().blackouts.is_empty());
+    assert!(exists(&h, "BLACK-OUT"));
+    chord(&mut h, k, m);
+    assert!(h.state().blackouts.is_empty());
+    assert!(!exists(&h, "BLACK-OUT"));
+}

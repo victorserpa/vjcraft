@@ -356,6 +356,36 @@ pub fn readout(sl: &Slice, side: Side, comp: (u32, u32)) -> Option<[f32; 5]> {
     Some([b.x, b.y, b.w, b.h, edge_angle(a, c)])
 }
 
+/// One-click Mirror: a copy of `sl` (id `new_id`, right after it) flipped horizontally on
+/// `side`, as one `Batch` so a single undo removes it. Just the copy when the flip is a no-op.
+pub fn mirror(
+    scr: &Screen,
+    sl: &Slice,
+    side: Side,
+    comp: (u32, u32),
+    new_id: uuid::Uuid,
+) -> Command {
+    let mut copy = sl.clone();
+    copy.id = new_id;
+    let index = scr
+        .slices
+        .iter()
+        .position(|s| s.id == sl.id)
+        .map_or(scr.slices.len(), |i| i + 1);
+    let flip = edit(scr, &copy, side, comp, Op::FlipH);
+    let add = Command::AddSlice {
+        screen: scr.id,
+        slice: copy,
+        index,
+    };
+    match flip {
+        Some(f) => Command::Batch {
+            commands: vec![add, f],
+        },
+        None => add,
+    }
+}
+
 /// The command that applies `op` to `side` of the slice, or `None` when it changes nothing
 /// or does not apply. Every precise edit goes through here, so it is one undoable command.
 pub fn edit(scr: &Screen, sl: &Slice, side: Side, comp: (u32, u32), op: Op) -> Option<Command> {
@@ -639,6 +669,26 @@ mod tests {
         let r = readout(&sc.slices[0], Side::Output, (1920, 1080)).unwrap();
         assert!((r[4].abs() - 180.0).abs() < 1e-2, "{}", r[4]);
         assert!(run(&mut p, &mut h, Side::Output, Op::FlipH));
+    }
+
+    #[test]
+    fn mirror_is_one_undoable_batch_with_a_flipped_copy() {
+        let (mut p, _, _) = rig();
+        let before = p.clone();
+        let mut h = History::new();
+        let comp = (p.composition.width, p.composition.height);
+        let (scr, sl) = (&p.output.screens[0], &p.output.screens[0].slices[0]);
+        let new = Uuid::new_v4();
+        let orig_mesh = sl.output_mesh.clone();
+        let cmd = mirror(scr, sl, Side::Output, comp, new);
+        h.exec(&mut p, cmd, Instant::now()).unwrap();
+        let sc = &p.output.screens[0];
+        assert_eq!(sc.slices.len(), 2);
+        assert_eq!(sc.slices[0].output_mesh, orig_mesh);
+        assert_eq!(sc.slices[1].id, new);
+        assert_ne!(sc.slices[1].output_mesh, orig_mesh);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before, "one undo removes the copy");
     }
 
     #[test]

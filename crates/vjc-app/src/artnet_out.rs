@@ -14,7 +14,9 @@
 //! A sender is recreated only when the socket target (`ip`) changes; universe and fixture
 //! changes go to the running worker over a channel.
 
-use crate::capture::{Inflight, MAX_INFLIGHT, readback_buffer, start_readback_into, unpad_into};
+use crate::capture::{
+    Inflight, MAX_INFLIGHT, blacken, readback_buffer, start_readback_into, unpad_into,
+};
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -50,6 +52,7 @@ struct Frame {
     w: u32,
     h: u32,
     src: Src,
+    black: bool,
 }
 
 /// Fixture and first universe of a running sender.
@@ -100,6 +103,8 @@ struct Pub {
     /// Byte size of the pooled buffers for `size`; others are dropped.
     buf_size: Option<u64>,
     next_due: Instant,
+    /// Global black-out: zeros keep going out (a processor would hold the last frame).
+    black: bool,
 }
 
 impl Pub {
@@ -145,9 +150,19 @@ impl Pub {
                                     Err(_) => ready = false,
                                 }
                             }
-                            let rgba: &[u8] = match &f.src {
-                                Src::Cpu(v) => v,
-                                Src::Gpu(_) => &scratch,
+                            if f.black {
+                                match &f.src {
+                                    Src::Cpu(v) => {
+                                        scratch.clear();
+                                        scratch.extend_from_slice(v);
+                                    }
+                                    Src::Gpu(_) => {}
+                                }
+                                blacken(&mut scratch);
+                            }
+                            let rgba: &[u8] = match (&f.src, f.black) {
+                                (Src::Cpu(v), false) => v,
+                                _ => &scratch,
                             };
                             if !dmx::valid(&set.fixture) {
                                 // Reported once; the sender restarts on the next change.
@@ -181,6 +196,7 @@ impl Pub {
             size: (0, 0),
             buf_size: None,
             next_due: Instant::now(),
+            black: false,
         }
     }
 
@@ -262,6 +278,7 @@ impl ArtNetOut {
                         w,
                         h,
                         src: Src::Gpu(buf),
+                        black: p.black,
                     }),
                     None => continue,
                 };
@@ -291,10 +308,12 @@ impl ArtNetOut {
         id: Uuid,
         tex: &wgpu::Texture,
         size: (u32, u32),
+        black: bool,
     ) {
         let Some(p) = self.pubs.get_mut(&id) else {
             return;
         };
+        p.black = black;
         if p.failed() {
             return;
         }
@@ -435,6 +454,29 @@ mod tests {
     }
 
     #[test]
+    fn blacked_out_worker_keeps_sending_zeros_then_resumes() {
+        let (rx, addr) = local();
+        let mut out = ArtNetOut::default();
+        let w = want(addr, fixture(1, 1, PixelFormat::Rgbw), 0);
+        let id = w.id;
+        out.sync(&[w]);
+        let tx = out.pubs[&id].tx.as_ref().unwrap();
+        let send = |black| {
+            tx.send(Frame {
+                w: 1,
+                h: 1,
+                src: Src::Cpu(vec![200, 100, 50, 255]),
+                black,
+            })
+            .unwrap();
+        };
+        send(true);
+        assert!(recv_dmx(&rx).data.iter().all(|&b| b == 0));
+        send(false);
+        assert!(recv_dmx(&rx).data.iter().any(|&b| b != 0));
+    }
+
+    #[test]
     fn worker_thread_sends_frames_and_stops_on_drop() {
         let (rx, addr) = local();
         let mut out = ArtNetOut::default();
@@ -449,6 +491,7 @@ mod tests {
                 w: 1,
                 h: 1,
                 src: Src::Cpu(vec![200, 100, 50, 255]),
+                black: false,
             })
             .unwrap();
         let d = recv_dmx(&rx);
@@ -520,6 +563,7 @@ mod tests {
             w: 1,
             h: 1,
             src: Src::Cpu(vec![1, 2, 3, 255]),
+            black: false,
         };
         out.pubs[&w.id].tx.as_ref().unwrap().send(frame()).unwrap();
         assert_eq!(recv_dmx(&rx).universe, 4);
@@ -538,6 +582,7 @@ mod tests {
                 w: 1,
                 h: 1,
                 src: Src::Cpu(vec![1, 2, 3, 255]),
+                black: false,
             })
             .unwrap();
         for _ in 0..100 {
@@ -561,6 +606,7 @@ mod tests {
                 w: 1,
                 h: 1,
                 src: Src::Cpu(vec![1, 2, 3, 255]),
+                black: false,
             })
             .unwrap();
         recv_dmx(&rx);

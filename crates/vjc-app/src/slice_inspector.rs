@@ -336,6 +336,19 @@ impl State {
                     index: at,
                 });
             }
+            if ui
+                .button("Mirror")
+                .on_hover_text("Duplicate and flip the copy horizontally (one undo step)")
+                .clicked()
+            {
+                cmds.push(slice_geom::mirror(
+                    scr,
+                    sl,
+                    side,
+                    comp,
+                    uuid::Uuid::new_v4(),
+                ));
+            }
             let others: Vec<(uuid::Uuid, String, usize)> = self
                 .project
                 .output

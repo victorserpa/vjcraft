@@ -597,3 +597,23 @@ mod tests {
         assert_eq!(rec_info(Duration::from_secs(5), 2_000_000), "00:05  2.0 MB");
     }
 }
+
+/// Global black-out for a network frame: colour goes to zero, alpha stays opaque. Senders keep
+/// transmitting (a DMX processor would hold the last frame if they stopped).
+pub fn blacken(rgba: &mut [u8]) {
+    for px in rgba.as_chunks_mut::<4>().0 {
+        *px = [0, 0, 0, 255];
+    }
+}
+
+#[cfg(test)]
+mod blacken_tests {
+    use super::blacken;
+
+    #[test]
+    fn zeroes_colour_keeps_alpha() {
+        let mut v = vec![10, 20, 30, 40, 200, 100, 50, 255];
+        blacken(&mut v);
+        assert_eq!(v, [0, 0, 0, 255, 0, 0, 0, 255]);
+    }
+}

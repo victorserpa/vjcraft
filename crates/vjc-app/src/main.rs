@@ -3850,8 +3850,15 @@ impl State {
                 Some(t) => (&t.tex, t.size),
                 None => (&comp.target, comp.size),
             };
-            self.netout
-                .feed(&rs.device, &rs.queue, w.id, tex, size, fps);
+            self.netout.feed(
+                &rs.device,
+                &rs.queue,
+                w.id,
+                tex,
+                size,
+                fps,
+                self.blackouts.contains(&w.id),
+            );
         }
         for e in self.netout.poll(&rs.device) {
             self.status = e;
@@ -3861,7 +3868,14 @@ impl State {
                 Some(t) => (&t.tex, t.size),
                 None => (&comp.target, comp.size),
             };
-            self.artnet.feed(&rs.device, &rs.queue, w.id, tex, size);
+            self.artnet.feed(
+                &rs.device,
+                &rs.queue,
+                w.id,
+                tex,
+                size,
+                self.blackouts.contains(&w.id),
+            );
         }
         for e in self.artnet.poll(&rs.device) {
             self.status = e;
@@ -4672,6 +4686,16 @@ impl State {
                 ui.horizontal_centered(|ui| {
                     ui.weak(format!("VJCraft {}", env!("CARGO_PKG_VERSION")));
                     ui.separator();
+                    if !self.blackouts.is_empty() {
+                        // Runtime only: never saved with the project.
+                        ui.label(
+                            egui::RichText::new("BLACK-OUT")
+                                .strong()
+                                .color(theme::ON_ACCENT)
+                                .background_color(theme::DANGER),
+                        );
+                        ui.separator();
+                    }
                     ui.label(&self.status);
                     if let Some(w) = &self.vram_warn {
                         ui.separator();
@@ -7890,6 +7914,21 @@ impl State {
         }
     }
 }
+
+/// Every other app-wide Cmd chord, to prove none shares the black-out key.
+#[cfg(test)]
+const OTHER_CHORDS: &[egui::Key] = &[
+    egui::Key::Num1,
+    egui::Key::Num2,
+    egui::Key::Num3,
+    egui::Key::Num4,
+    egui::Key::Slash,
+    egui::Key::Z,
+    egui::Key::S,
+    egui::Key::O,
+    egui::Key::N,
+    egui::Key::Comma,
+];
 
 /// Global black-out chord (also read by the output windows).
 const BLACKOUT_KEY: (egui::Modifiers, egui::Key) = (

@@ -6,7 +6,7 @@
 //! pending; extra frames are dropped. Syphon with no connected client skips the readback.
 //! (A zero-copy path through the wgpu-hal MTLTexture is not implemented.)
 
-use crate::capture::{Inflight, MAX_INFLIGHT, start_readback, unpad};
+use crate::capture::{Inflight, MAX_INFLIGHT, blacken, start_readback, unpad};
 use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,6 +105,8 @@ struct Pub {
     size: (u32, u32),
     fps: f32,
     next_due: Instant,
+    /// Global black-out: frames go out as black, still at full rate.
+    black: bool,
     pub sent: u64,
 }
 
@@ -134,6 +136,7 @@ impl Pub {
             size: (0, 0),
             fps: 60.0,
             next_due: Instant::now(),
+            black: false,
             sent: 0,
         }
     }
@@ -185,8 +188,13 @@ impl NetOut {
             let (w, h) = p.size;
             for (buf, ok) in p.inflight.take_settled() {
                 if ok {
-                    let data = buf.slice(..).get_mapped_range().map(|m| unpad(&m, w, h));
+                    let mut data = buf.slice(..).get_mapped_range().map(|m| unpad(&m, w, h));
                     buf.unmap();
+                    if p.black
+                        && let Ok(d) = &mut data
+                    {
+                        blacken(d);
+                    }
                     if let (Ok(rgba), Some(tx)) = (data, &p.tx)
                         && tx
                             .try_send(Frame {
@@ -215,6 +223,7 @@ impl NetOut {
     }
 
     /// Queues a readback of `tex` (Rgba8Unorm, `size`) for the publisher of `id` when due.
+    #[allow(clippy::too_many_arguments)]
     pub fn feed(
         &mut self,
         device: &wgpu::Device,
@@ -223,10 +232,12 @@ impl NetOut {
         tex: &wgpu::Texture,
         size: (u32, u32),
         fps: f32,
+        black: bool,
     ) {
         let Some(p) = self.pubs.get_mut(&id) else {
             return;
         };
+        p.black = black;
         if p.failed() || !p.wanted.load(Ordering::Relaxed) {
             return;
         }
