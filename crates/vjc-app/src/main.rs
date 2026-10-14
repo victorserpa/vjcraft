@@ -264,6 +264,10 @@ struct State {
     rehearsal: bool,
     /// Screens showing the test card on their output (runtime only).
     test_cards: std::collections::HashSet<Uuid>,
+    /// Screens held black by the black-out switch (runtime only).
+    blackouts: std::collections::HashSet<Uuid>,
+    /// Pixel-map grid tile size per screen (runtime only).
+    pixel_grids: HashMap<Uuid, (u32, u32)>,
     /// FPS overlay on every output.
     show_fps: bool,
     /// When "Identify displays" was pressed (shows for `output_overlay::IDENTIFY_FOR`).
@@ -1254,6 +1258,8 @@ impl State {
             output_windowed: false,
             rehearsal: false,
             test_cards: Default::default(),
+            blackouts: Default::default(),
+            pixel_grids: Default::default(),
             show_fps: false,
             identify_at: None,
             display_info_open: false,
@@ -1498,6 +1504,20 @@ impl State {
         }
     }
 
+    /// Global black-out: every screen goes black, or all come back when any was black.
+    fn toggle_blackout(&mut self) {
+        let mut ids: Vec<Uuid> = self.project.output.screens.iter().map(|s| s.id).collect();
+        if ids.is_empty() {
+            ids.push(Uuid::nil()); // the legacy single output
+        }
+        self.blackouts = output_overlay::toggle_blackout(&self.blackouts, &ids);
+        self.status = if self.blackouts.is_empty() {
+            "Black-out off".into()
+        } else {
+            "Black-out ON".into()
+        };
+    }
+
     fn layout_keys(&mut self, ctx: &egui::Context) {
         use egui::Key;
         let cmd = egui::Modifiers::COMMAND;
@@ -1516,6 +1536,9 @@ impl State {
         if *l != before {
             self.force_panels = true;
             self.prefs_dirty = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(BLACKOUT_KEY.0, BLACKOUT_KEY.1)) {
+            self.toggle_blackout();
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::Slash)) {
             self.set_help(!self.prefs.layouts.help);
@@ -4557,6 +4580,37 @@ impl State {
                     ui.close();
                     self.output_setup_open = true;
                 }
+                if ui
+                    .add(
+                        egui::Button::new("Black-out all screens")
+                            .selected(!self.blackouts.is_empty())
+                            .shortcut_text("Cmd+Shift+B"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.toggle_blackout();
+                }
+                ui.menu_button("Pixel map grid", |ui| {
+                    if self.project.output.screens.is_empty() {
+                        ui.label("No screens");
+                    }
+                    for s in self.project.output.screens.clone() {
+                        let mut tile = self.pixel_grids.get(&s.id).copied();
+                        let mut on = tile.is_some();
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut on, &s.name);
+                            let mut t = tile.unwrap_or((128, 128));
+                            ui.add(egui::DragValue::new(&mut t.0).range(output_overlay::MIN_TILE..=16384).prefix("W "));
+                            ui.add(egui::DragValue::new(&mut t.1).range(output_overlay::MIN_TILE..=16384).prefix("H "));
+                            tile = on.then_some(t);
+                        });
+                        match tile {
+                            Some(t) => self.pixel_grids.insert(s.id, t),
+                            None => self.pixel_grids.remove(&s.id),
+                        };
+                    }
+                });
                 ui.menu_button("Show test card", |ui| {
                     if self.project.output.screens.is_empty() {
                         ui.label("No screens");
@@ -7623,6 +7677,8 @@ impl State {
         // The legacy single output is keyed by the nil id.
         let alive = |id: &Uuid| id.is_nil() || screens.iter().any(|s| s.id == *id);
         self.test_cards.retain(alive);
+        self.blackouts.retain(alive);
+        self.pixel_grids.retain(|id, _| alive(id));
         self.closed_screens.retain(alive);
         self.out_fps.retain(|id, _| alive(id));
     }
@@ -7750,6 +7806,9 @@ impl State {
             // Esc leaves learn mode first; it must not also close the output.
             let learning = self.learn;
             let card = self.test_cards.contains(&sid);
+            let black = self.blackouts.contains(&sid);
+            let grid = self.pixel_grids.get(&sid).copied();
+            let mut toggle_black = false;
             let identify = output_overlay::identifying(self.identify_at, std::time::Instant::now());
             let number = self
                 .project
@@ -7794,10 +7853,16 @@ impl State {
                             &output_overlay::Overlay {
                                 screen: s,
                                 test_card: card,
+                                blackout: black,
+                                grid,
                                 identify: identify.then_some(number),
                                 fps: show_fps.then_some(meter.fps),
                             },
                         );
+                    }
+                    if ctx.input_mut(|i| i.consume_key(BLACKOUT_KEY.0, BLACKOUT_KEY.1)) {
+                        // The main window never sees this viewport's keys.
+                        toggle_black = true;
                     }
                     let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
                     if esc && learning {
@@ -7812,6 +7877,9 @@ impl State {
             if leave_learn {
                 self.learn_key(egui::Key::Escape);
             }
+            if toggle_black {
+                self.toggle_blackout();
+            }
             if close {
                 if sid.is_nil() {
                     self.output = None;
@@ -7822,6 +7890,18 @@ impl State {
         }
     }
 }
+
+/// Global black-out chord (also read by the output windows).
+const BLACKOUT_KEY: (egui::Modifiers, egui::Key) = (
+    egui::Modifiers {
+        alt: false,
+        ctrl: false,
+        shift: true,
+        mac_cmd: false,
+        command: true,
+    },
+    egui::Key::B,
+);
 
 impl eframe::App for State {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {

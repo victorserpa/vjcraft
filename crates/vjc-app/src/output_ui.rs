@@ -683,6 +683,7 @@ impl State {
                 }
             });
             self.mask_and_edge_row(ui, scr, sl, cmds);
+            self.color_row(ui, scr, sl, cmds);
             self.slice_inspector(ui, scr, sl, cmds);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -776,6 +777,35 @@ impl State {
                     screen: scr.id,
                     slice: sl.id,
                     soft_edge: Some(n),
+                });
+            }
+        });
+    }
+
+    /// Brightness and RGB gains of a slice, to match panels of different batches.
+    fn color_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        scr: &Screen,
+        sl: &vjc_model::Slice,
+        cmds: &mut Vec<Command>,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Colour");
+            let mut n = sl.color;
+            let r = 0.0..=mapping::MAX_GAIN;
+            ui.add(egui::Slider::new(&mut n.brightness, r.clone()).text("Brightness"));
+            ui.add(egui::Slider::new(&mut n.r, r.clone()).text("R"));
+            ui.add(egui::Slider::new(&mut n.g, r.clone()).text("G"));
+            ui.add(egui::Slider::new(&mut n.b, r).text("B"));
+            if ui.button("Reset").clicked() {
+                n = Default::default();
+            }
+            if n != sl.color {
+                cmds.push(Command::SetSliceColor {
+                    screen: scr.id,
+                    slice: sl.id,
+                    color: n,
                 });
             }
         });

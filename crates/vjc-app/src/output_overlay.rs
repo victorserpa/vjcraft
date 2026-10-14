@@ -54,6 +54,44 @@ pub fn test_card(screen: &Screen) -> Vec<Item> {
     v
 }
 
+/// Smallest tile the pixel-map grid draws (finer would be thousands of lines).
+pub const MIN_TILE: u32 = 4;
+
+/// Pixel-map grid: a 1 px line on every multiple of the panel tile size (`tile` in canvas
+/// pixels, clamped to `MIN_TILE`), never on the canvas edges. Lines of the tile column /
+/// row that is cut by the canvas edge are the last ones drawn, so a partial panel shows.
+pub fn pixel_grid(screen: &Screen, tile: (u32, u32)) -> Vec<Item> {
+    let (w, h) = (screen.width.max(1), screen.height.max(1));
+    let (tw, th) = (tile.0.max(MIN_TILE), tile.1.max(MIN_TILE));
+    let mut v = vec![];
+    for x in (tw..w).step_by(tw as usize) {
+        v.push(Item::Fill(
+            [x as f32, 0.0, x as f32 + 1.0, h as f32],
+            theme::PIXEL_GRID,
+        ));
+    }
+    for y in (th..h).step_by(th as usize) {
+        v.push(Item::Fill(
+            [0.0, y as f32, w as f32, y as f32 + 1.0],
+            theme::PIXEL_GRID,
+        ));
+    }
+    v
+}
+
+/// Ids after the global black-out key: any screen already black -> all back on; otherwise
+/// every screen goes black.
+pub fn toggle_blackout(
+    current: &std::collections::HashSet<uuid::Uuid>,
+    all: &[uuid::Uuid],
+) -> std::collections::HashSet<uuid::Uuid> {
+    if all.iter().any(|id| current.contains(id)) {
+        Default::default()
+    } else {
+        all.iter().copied().collect()
+    }
+}
+
 /// Center of a slice's output mesh, in canvas pixels.
 pub fn slice_center(s: &vjc_model::Slice) -> Option<(f32, f32)> {
     let n = s.output_mesh.len();
@@ -70,6 +108,10 @@ pub fn slice_center(s: &vjc_model::Slice) -> Option<(f32, f32)> {
 pub struct Overlay<'a> {
     pub screen: &'a Screen,
     pub test_card: bool,
+    /// Whole canvas black (global black-out).
+    pub blackout: bool,
+    /// Pixel-map grid tile size in canvas pixels.
+    pub grid: Option<(u32, u32)>,
     /// Big number (1-based screen number) while identifying.
     pub identify: Option<usize>,
     pub fps: Option<f32>,
@@ -89,8 +131,8 @@ pub fn draw(painter: &egui::Painter, rect: Rect, o: &Overlay) {
         painter.galley(r.center() - g.size() / 2.0, g, color);
     };
     let unit = (rect.height() / 40.0).clamp(10.0, 48.0);
-    if o.test_card {
-        for it in test_card(s) {
+    let paint = |items: Vec<Item>| {
+        for it in items {
             match it {
                 Item::Fill([x0, y0, x1, y1], c) => {
                     painter.rect_filled(Rect::from_min_max(at(x0, y0), at(x1, y1)), 0.0, c);
@@ -101,6 +143,17 @@ pub fn draw(painter: &egui::Painter, rect: Rect, o: &Overlay) {
                 }
             }
         }
+    };
+    if o.blackout {
+        // Black-out wins over every overlay: nothing but black reaches the wall.
+        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        return;
+    }
+    if let Some(tile) = o.grid {
+        paint(pixel_grid(s, tile));
+    }
+    if o.test_card {
+        paint(test_card(s));
         for (i, sl) in s.slices.iter().enumerate() {
             if let Some((cx, cy)) = slice_center(sl) {
                 label(
@@ -173,6 +226,77 @@ pub fn identifying(t0: Option<Instant>, now: Instant) -> bool {
 mod tests {
     use super::*;
     use vjc_core::mapping;
+
+    /// Shapes `draw` paints for `o`, through a real egui painter.
+    fn shapes(o: &Overlay) -> usize {
+        let ctx = egui::Context::default();
+        let mut n = 0;
+        // A first empty pass loads the fonts the text overlays need.
+        ctx.begin_pass(Default::default());
+        ctx.end_pass().textures_delta.clear();
+        ctx.begin_pass(Default::default());
+        let p = ctx.layer_painter(egui::LayerId::background());
+        draw(
+            &p,
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(960.0, 540.0)),
+            o,
+        );
+        let mut out = ctx.end_pass();
+        out.textures_delta.clear();
+        n += out.shapes.len();
+        n
+    }
+
+    #[test]
+    fn black_out_hides_grid_test_card_and_identify() {
+        let s = screen();
+        let mut o = Overlay {
+            screen: &s,
+            test_card: true,
+            blackout: true,
+            grid: Some((128, 128)),
+            identify: Some(1),
+            fps: Some(60.0),
+        };
+        assert_eq!(shapes(&o), 1, "only the black fill");
+        // Negative control: without black-out the overlays do paint.
+        o.blackout = false;
+        assert!(shapes(&o) > 1);
+    }
+
+    #[test]
+    fn pixel_grid_lines_sit_on_tile_multiples_and_skip_the_edges() {
+        let mut s = screen();
+        s.width = 384;
+        s.height = 256;
+        let items = pixel_grid(&s, (128, 128));
+        // x = 128, 256 ; y = 128 : three lines, none on 0 or the canvas limit.
+        assert_eq!(items.len(), 3);
+        assert!(items.contains(&Item::Fill([128.0, 0.0, 129.0, 256.0], theme::PIXEL_GRID)));
+        assert!(items.contains(&Item::Fill([0.0, 128.0, 384.0, 129.0], theme::PIXEL_GRID)));
+        // Odd LED size: the last partial tile gets no line past the edge.
+        s.width = 300;
+        let xs = pixel_grid(&s, (128, 128)).len();
+        assert_eq!(xs, 2 + 1);
+        // Negative control: a tile equal to the canvas draws nothing; tiny tiles are clamped.
+        assert!(pixel_grid(&s, (300, 256)).is_empty());
+        assert_eq!(
+            pixel_grid(&s, (0, 0)).len(),
+            pixel_grid(&s, (MIN_TILE, MIN_TILE)).len()
+        );
+    }
+
+    #[test]
+    fn blackout_toggle_blacks_all_then_restores_all() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let none = std::collections::HashSet::new();
+        let on = toggle_blackout(&none, &[a, b]);
+        assert!(on.contains(&a) && on.contains(&b));
+        // Negative control: with one screen already black the key restores, not extends.
+        let one = std::collections::HashSet::from([a]);
+        assert!(toggle_blackout(&one, &[a, b]).is_empty());
+        assert!(toggle_blackout(&none, &[]).is_empty());
+    }
 
     fn screen() -> Screen {
         let mut s = mapping::new_screen("Wall", 1920, 1080);

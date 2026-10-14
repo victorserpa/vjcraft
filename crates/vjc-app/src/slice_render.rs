@@ -19,6 +19,7 @@ struct VO {
 struct U {
     edge: vec4<f32>,            // left, right, top, bottom
     misc: vec4<f32>,            // gamma, mask point count, screen w, screen h
+    gain: vec4<f32>,            // rgb multiplier
     pts: array<vec4<f32>, 16>,  // two mask points per entry
 };
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -62,12 +63,12 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     let lin = ramp(in.st.x, u.edge.x) * ramp(1.0 - in.st.x, u.edge.y)
         * ramp(in.st.y, u.edge.z) * ramp(1.0 - in.st.y, u.edge.w);
     let c = textureSample(src, smp, in.uv);
-    return vec4(c.rgb * pow(lin, u.misc.x), c.a);
+    return vec4(c.rgb * pow(lin, u.misc.x) * u.gain.rgb, c.a);
 }
 "#;
 
-/// Uniform block size: 2 vec4 + 16 vec4 mask points.
-const UNIFORM_FLOATS: usize = 8 + 4 * (mapping::MAX_MASK_POINTS / 2);
+/// Uniform block size: 3 vec4 + 16 vec4 mask points.
+const UNIFORM_FLOATS: usize = 12 + 4 * (mapping::MAX_MASK_POINTS / 2);
 
 /// Packs the per-slice uniform (see `U` in the shader).
 fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
@@ -81,12 +82,14 @@ fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
     if let Some(m) = s.mask.as_ref().filter(|m| mapping::mask_valid(m)) {
         u[5] = m.len() as f32;
         for (i, p) in m.iter().enumerate() {
-            u[8 + 2 * i] = p.0;
-            u[9 + 2 * i] = p.1;
+            u[12 + 2 * i] = p.0;
+            u[13 + 2 * i] = p.1;
         }
     }
     u[6] = screen.width.max(1) as f32;
     u[7] = screen.height.max(1) as f32;
+    u[8..11].copy_from_slice(&mapping::slice_gain(&s.color));
+    u[11] = 1.0;
     u
 }
 
@@ -432,6 +435,31 @@ mod tests {
         assert_eq!(px(&img, 4, 3, 3), [0, 0, 0, 255]);
         assert_eq!(px(&img, 4, 2, 0)[0], 255, "x+y<1 kept");
         assert_eq!(px(&img, 4, 3, 1)[0], 0, "x+y>1 cut");
+    }
+
+    /// Gains scale the channels; the identity keeps them (negative control). Prints when skipped.
+    #[test]
+    fn gpu_slice_color_scales_channels() {
+        let mut screen = mapping::new_screen("t", 1, 1);
+        let mut sl = mapping::new_slice(1, 1);
+        sl.color = vjc_model::SliceColor {
+            brightness: 0.5,
+            r: 1.0,
+            g: 0.5,
+            b: 0.0,
+        };
+        screen.slices.push(sl);
+        let Some(img) = render_rgba(&screen, [200, 200, 200, 255]) else {
+            eprintln!("gpu_slice_color_scales_channels: SKIPPED (no adapter)");
+            return;
+        };
+        let got = px(&img, 1, 0, 0);
+        assert!((got[0] as i32 - 100).abs() <= 1, "{got:?}");
+        assert!((got[1] as i32 - 50).abs() <= 1, "{got:?}");
+        assert_eq!(got[2], 0);
+        screen.slices[0].color = Default::default();
+        let id = render_rgba(&screen, [200, 200, 200, 255]).unwrap();
+        assert_eq!(px(&id, 1, 0, 0), [200, 200, 200, 255]);
     }
 
     /// Soft edge left 0.25 darkens the left border only.

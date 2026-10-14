@@ -863,6 +863,29 @@ pub struct Slice {
     /// field and load as the whole composition.
     #[serde(default)]
     pub source: SliceSource,
+    /// Per-slice brightness and white balance, to match panels of different batches.
+    #[serde(default)]
+    pub color: SliceColor,
+}
+
+/// Multipliers applied to the slice's RGB after the soft edge: 1.0 = unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SliceColor {
+    pub brightness: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+}
+
+impl Default for SliceColor {
+    fn default() -> Self {
+        SliceColor {
+            brightness: 1.0,
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+        }
+    }
 }
 
 /// Where a slice takes its picture from (before the master chain).
@@ -1326,6 +1349,20 @@ impl std::fmt::Display for Timecode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_slice_without_color_loads_as_identity() {
+        let s = r#"{"id":"00000000-0000-0000-0000-000000000001","input":[],"output_mesh":[],"mesh_cols":2,"mask":null,"soft_edge":null}"#;
+        let sl: Slice = serde_json::from_str(s).unwrap();
+        assert_eq!(sl.color, SliceColor::default());
+        // Negative control: a stored colour is not overwritten by the default.
+        let s2 = s.replace(
+            "\"soft_edge\":null",
+            "\"soft_edge\":null,\"color\":{\"brightness\":0.5,\"r\":1.0,\"g\":1.0,\"b\":0.9}",
+        );
+        let sl: Slice = serde_json::from_str(&s2).unwrap();
+        assert_eq!(sl.color.brightness, 0.5);
+    }
+
     #[test]
     fn autopilot_from_an_older_file_defaults_to_loops_and_new_fields_roundtrip() {
         let old: Autopilot = serde_json::from_str(r#"{"mode":"Next","every_loops":3}"#).unwrap();

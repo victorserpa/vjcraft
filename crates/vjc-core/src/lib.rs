@@ -346,6 +346,12 @@ pub enum Command {
         slice: Uuid,
         soft_edge: Option<vjc_model::SoftEdge>,
     },
+    /// Brightness and RGB gains (each clamped to 0..=2). Coalesces.
+    SetSliceColor {
+        screen: Uuid,
+        slice: Uuid,
+        color: vjc_model::SliceColor,
+    },
     /// Whole mesh plus its column count (rows = len / cols).
     SetSliceMesh {
         screen: Uuid,
@@ -728,6 +734,7 @@ enum Target {
     /// different points are separate steps.
     SliceMask(Uuid, usize, usize),
     SliceSoftEdge(Uuid),
+    SliceColor(Uuid),
     SliceInput(Uuid, Uuid),
     ScreenSize(Uuid),
     /// Screen and device kind: switching type is its own undo step, editing the IP is not.
@@ -767,6 +774,7 @@ impl Command {
                 0,
             )),
             Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),
+            Command::SetSliceColor { slice, .. } => Some(Target::SliceColor(*slice)),
             Command::SetSliceInput { screen, slice, .. } => {
                 Some(Target::SliceInput(*screen, *slice))
             }
@@ -2140,6 +2148,23 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     screen,
                     slice,
                     soft_edge: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceColor {
+            screen,
+            slice,
+            color,
+        } => {
+            let color = mapping::clamp_color(&color).ok_or(Error::InvalidValue)?;
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.color, color);
+            undoable(
+                Command::SetSliceColor {
+                    screen,
+                    slice,
+                    color: prev,
                 },
                 vec![],
             )
@@ -6471,6 +6496,33 @@ mod tests {
             };
             h.exec(&mut p, c, now).unwrap();
         }
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn slice_color_clamps_validates_and_undoes() {
+        let (mut p, sid, lid) = one_screen_slice();
+        let before = p.clone();
+        let mut h = History::new();
+        let now = Instant::now();
+        let cmd = |brightness, r| Command::SetSliceColor {
+            screen: sid,
+            slice: lid,
+            color: vjc_model::SliceColor {
+                brightness,
+                r,
+                g: 1.0,
+                b: 1.0,
+            },
+        };
+        assert!(h.exec(&mut p, cmd(f32::NAN, 1.0), now).is_err());
+        assert_eq!(p, before, "rejected edit changes nothing");
+        h.exec(&mut p, cmd(5.0, -1.0), now).unwrap();
+        let c = p.output.screens[0].slices[0].color;
+        assert_eq!((c.brightness, c.r), (2.0, 0.0));
+        h.exec(&mut p, cmd(0.5, 0.9), now).unwrap();
+        // A drag coalesces into one undo step.
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(p, before);
     }

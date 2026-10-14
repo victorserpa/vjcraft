@@ -41,6 +41,7 @@ pub fn new_slice(w: u32, h: u32) -> Slice {
         mask: None,
         soft_edge: None,
         source: Default::default(),
+        color: Default::default(),
     }
 }
 
@@ -318,13 +319,38 @@ pub fn clamp_soft_edge(s: &vjc_model::SoftEdge) -> Option<vjc_model::SoftEdge> {
     })
 }
 
+/// Largest brightness / channel gain.
+pub const MAX_GAIN: f32 = 2.0;
+
+/// Colour with every factor clamped to 0..=2; `None` if any is not finite.
+pub fn clamp_color(c: &vjc_model::SliceColor) -> Option<vjc_model::SliceColor> {
+    let all = [c.brightness, c.r, c.g, c.b];
+    if !all.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let g = |v: f32| v.clamp(0.0, MAX_GAIN);
+    Some(vjc_model::SliceColor {
+        brightness: g(c.brightness),
+        r: g(c.r),
+        g: g(c.g),
+        b: g(c.b),
+    })
+}
+
+/// Final RGB multiplier of a slice: brightness times each channel gain. CPU twin of the
+/// shader's `gain.rgb`.
+pub fn slice_gain(c: &vjc_model::SliceColor) -> [f32; 3] {
+    [c.brightness * c.r, c.brightness * c.g, c.brightness * c.b]
+}
+
 /// Repairs masks and soft edges read from disk so later edits and their undo never fail:
 /// an invalid mask is dropped, points are clamped to 0..1, soft edge values are clamped (or
 /// dropped when not finite). Returns how many slices changed.
 pub fn sanitize_slice_effects(out: &mut vjc_model::OutputSetup) -> usize {
     let mut changed = 0;
     for sl in out.screens.iter_mut().flat_map(|s| &mut s.slices) {
-        let before = (sl.mask.clone(), sl.soft_edge.clone());
+        let before = (sl.mask.clone(), sl.soft_edge.clone(), sl.color);
+        sl.color = clamp_color(&sl.color).unwrap_or_default();
         if sl.mask.as_ref().is_some_and(|m| !mask_valid(m)) {
             sl.mask = None;
         }
@@ -334,7 +360,7 @@ pub fn sanitize_slice_effects(out: &mut vjc_model::OutputSetup) -> usize {
                 .collect()
         });
         sl.soft_edge = sl.soft_edge.as_ref().and_then(clamp_soft_edge);
-        changed += usize::from(before != (sl.mask.clone(), sl.soft_edge.clone()));
+        changed += usize::from(before != (sl.mask.clone(), sl.soft_edge.clone(), sl.color));
     }
     changed
 }
@@ -391,6 +417,35 @@ pub fn edge_ramp(e: &vjc_model::SoftEdge, s: f32, t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_gain_multiplies_brightness_into_each_channel() {
+        let c = vjc_model::SliceColor {
+            brightness: 0.5,
+            r: 1.0,
+            g: 0.8,
+            b: 2.0,
+        };
+        assert_eq!(slice_gain(&c), [0.5, 0.4, 1.0]);
+        assert_eq!(
+            slice_gain(&Default::default()),
+            [1.0; 3],
+            "default is identity"
+        );
+        // Negative control: the clamp is what keeps a wild value in range.
+        let wild = vjc_model::SliceColor {
+            brightness: 9.0,
+            ..c
+        };
+        assert_eq!(clamp_color(&wild).unwrap().brightness, MAX_GAIN);
+        assert!(
+            clamp_color(&vjc_model::SliceColor {
+                r: f32::INFINITY,
+                ..c
+            })
+            .is_none()
+        );
+    }
 
     #[test]
     fn unscaled_slice_detection() {
