@@ -1690,12 +1690,19 @@ fn missing_media_warns_and_triggering_that_clip_does_not_panic() {
         h.state()
             .warnings
             .iter()
-            .any(|w| w.contains("Missing media")),
+            .any(|w| w.contains("Missing media") && w.contains("gone.mov")),
         "{:?}",
         h.state().warnings
     );
     let deck = h.state().project.composition.current_deck;
     let layer = h.state().project.composition.layers[0].id;
+    // The clip stays in the project with its path, so relinking later still works.
+    let kept = vjc_core::clip_in(&h.state().project, deck, layer, 0).expect("clip kept");
+    assert!(
+        matches!(&kept.source, vjc_model::Source::File { path } if path.ends_with("gone.mov")),
+        "{:?}",
+        kept.source
+    );
     h.state_mut().exec(Command::TriggerClip {
         deck,
         layer,
@@ -1705,6 +1712,9 @@ fn missing_media_warns_and_triggering_that_clip_does_not_panic() {
     for _ in 0..5 {
         h.step();
     }
+    // Nothing plays on that layer: no decoder, no generator, and the app is still alive.
+    let st = h.state();
+    assert_eq!(active_of(&st.players, &st.gens, layer), None);
 }
 
 // F02-H1
@@ -1783,7 +1793,7 @@ fn saving_leaves_no_temp_file_next_to_the_project() {
 
 /// Soak base for fixes.md item 1. Renders the UI and decodes a looping clip for
 /// `VJC_SOAK_MINUTES` (default 1) and fails if the decoder stops delivering frames or
-/// memory (RSS, via `ps`) grows by more than `VJC_SOAK_MAX_RSS_MB` (default 300).
+/// memory (RSS, via `ps` or getrusage) grows by more than `VJC_SOAK_MAX_RSS_MB` (default 300).
 /// Run: `VJC_SOAK_MINUTES=360 cargo test -p vjc-app soak -- --ignored --nocapture`
 #[test]
 #[ignore = "long-running; set VJC_SOAK_MINUTES"]
@@ -1794,18 +1804,35 @@ fn soak_render_and_decode_loop() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     }
+    /// Current RSS from `ps`; without `ps` the peak RSS from getrusage (bytes on macOS,
+    /// KB elsewhere). Never silently 0: the growth check would pass vacuously.
     fn rss_mb() -> f64 {
-        let out = std::process::Command::new("ps")
+        let ps = std::process::Command::new("ps")
             .args(["-o", "rss=", "-p", &std::process::id().to_string()])
             .output()
-            .ok();
-        out.and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<f64>()
-                .ok()
-        })
-        .map_or(0.0, |kb| kb / 1024.0)
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+            })
+            .map(|kb| kb / 1024.0);
+        if let Some(mb) = ps {
+            return mb;
+        }
+        // SAFETY: getrusage only writes into the zeroed struct we pass.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        assert_eq!(rc, 0, "cannot read RSS: no ps and getrusage failed");
+        let unit = if cfg!(target_os = "macos") {
+            1024.0 * 1024.0
+        } else {
+            1024.0
+        };
+        let mb = ru.ru_maxrss as f64 / unit;
+        assert!(mb > 0.0, "RSS reads as 0: the soak check would be vacuous");
+        mb
     }
     let minutes = env_f64("VJC_SOAK_MINUTES", 1.0);
     let max_growth = env_f64("VJC_SOAK_MAX_RSS_MB", 300.0);
@@ -2166,6 +2193,119 @@ fn arrow_keys_move_the_slice_one_pixel_and_ten_with_shift() {
     assert_eq!((r.x, r.y, r.w, r.h), (101.0, 210.0, 480.0, 270.0));
 }
 
+fn out_xs(h: &Harness<'_, State>) -> Vec<f32> {
+    let scr = &h.state().project.output.screens[0];
+    scr.slices
+        .iter()
+        .map(|s| vjc_core::slice_geom::bbox(&s.output_mesh).unwrap().x)
+        .collect()
+}
+
+/// Two slices selected together (Duplicate selects the copy; shift-click adds the first).
+fn two_slices_selected(h: &mut Harness<'_, State>) {
+    click(h, "Duplicate slice");
+    let scr = h.state().project.output.screens[0].clone();
+    h.state_mut().click_slice(&scr, scr.slices[0].id, true);
+    settle(h);
+    assert_eq!(h.state().sel_slices.len(), 2);
+}
+
+#[test]
+fn multi_selected_slices_move_together_as_one_undo_step() {
+    let mut h = precise_slice_setup();
+    two_slices_selected(&mut h);
+    let o = out_canvas_origin(&h);
+    h.hover_at(o + egui::vec2(170.0, 90.0));
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowRight);
+    settle(&mut h);
+    assert_eq!(out_xs(&h), vec![101.0, 101.0], "both slices moved");
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(out_xs(&h), vec![100.0, 100.0], "one undo reverts both");
+    // Remove deletes every selected slice in one step.
+    click(&mut h, "Remove slices");
+    assert!(h.state().project.output.screens[0].slices.is_empty());
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 2);
+}
+
+#[test]
+fn selection_changes_only_after_add_or_move_slice_succeed() {
+    let mut h = precise_slice_setup();
+    let scr = h.state().project.output.screens[0].clone();
+    h.state_mut().sel_slice = Some(scr.slices[0].id);
+    let ghost = uuid::Uuid::new_v4();
+    let extra = vjc_core::mapping::new_slice(1920, 1080);
+    let extra_id = extra.id;
+    // Rejected: unknown screen. Selection stays on the old slice.
+    h.state_mut().run_output_cmds(vec![Command::AddSlice {
+        screen: ghost,
+        slice: extra.clone(),
+        index: 0,
+    }]);
+    assert_eq!(h.state().sel_slice, Some(scr.slices[0].id));
+    // Rejected: a slice cannot move to the screen it is on.
+    let other = vjc_core::mapping::new_screen("B", 640, 480);
+    let other_id = other.id;
+    h.state_mut().exec(Command::AddScreen {
+        screen: other,
+        index: 1,
+    });
+    h.state_mut().run_output_cmds(vec![Command::MoveSlice {
+        from: scr.id,
+        to: scr.id,
+        slice: scr.slices[0].id,
+        index: 0,
+    }]);
+    assert_ne!(h.state().sel_screen, Some(other_id));
+    // Accepted: the new slice is selected.
+    h.state_mut().run_output_cmds(vec![Command::AddSlice {
+        screen: scr.id,
+        slice: extra,
+        index: 1,
+    }]);
+    assert_eq!(h.state().sel_slice, Some(extra_id));
+}
+
+#[test]
+fn dragging_the_slice_body_snaps_to_the_screen_edge() {
+    let mut h = precise_slice_setup();
+    let o = out_canvas_origin(&h);
+    let k = 340.0 / 1920.0;
+    // Inside the slice (100..580 x 200..470 px), away from its corners.
+    let from = o + egui::vec2(340.0 * k, 335.0 * k);
+    // About 100 px left: the left edge ends within a few px of the screen edge.
+    drag(&mut h, from, from - egui::vec2(98.0 * k, 0.0));
+    assert_eq!(out_xs(&h), vec![0.0], "snapped onto the screen edge");
+    assert!((out_rect(&h).y - 200.0).abs() < 0.01, "no vertical move");
+}
+
+#[test]
+fn arrow_nudge_stops_on_a_guide_instead_of_crossing_it() {
+    let mut h = precise_slice_setup();
+    let scr = h.state().project.output.screens[0].clone();
+    let c = &h.state().project.composition;
+    let cmd = vjc_core::slice_geom::edit(
+        &scr,
+        &scr.slices[0],
+        vjc_core::slice_geom::Side::Output,
+        (c.width, c.height),
+        vjc_core::slice_geom::Op::Nudge(-97.0, 0.0),
+    )
+    .unwrap();
+    h.state_mut().exec(cmd);
+    settle(&mut h);
+    assert_eq!(out_rect(&h).x, 3.0);
+    let o = out_canvas_origin(&h);
+    h.hover_at(o + egui::vec2(60.0, 90.0));
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowLeft);
+    settle(&mut h);
+    assert_eq!(out_rect(&h).x, 0.0, "stopped on the screen edge, not -7");
+}
+
 /// Drags the output handle of the top-left corner (100, 200) to canvas offset `to_x`,
 /// holding `mods`; returns the resulting x in pixels.
 fn drag_corner_to(h: &mut Harness<'_, State>, to_x: f32, mods: egui::Modifiers) -> f32 {
@@ -2240,6 +2380,27 @@ fn presets_tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("vjc-ui-presets-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
+}
+
+#[test]
+fn removing_a_screen_prunes_its_test_card_fps_and_closed_state() {
+    let mut h = precise_slice_setup();
+    let id = h.state().project.output.screens[0].id;
+    {
+        let st = h.state_mut();
+        st.test_cards.insert(id);
+        st.closed_screens.insert(id);
+        st.out_fps.insert(id, Default::default());
+    }
+    settle(&mut h);
+    assert!(
+        h.state().test_cards.contains(&id),
+        "kept while the screen exists"
+    );
+    h.state_mut().exec(Command::RemoveScreen { screen: id });
+    settle(&mut h);
+    let st = h.state();
+    assert!(st.test_cards.is_empty() && st.closed_screens.is_empty() && st.out_fps.is_empty());
 }
 
 #[test]

@@ -4,8 +4,7 @@
 <dict>
   <key>com.apple.security.device.camera</key><true/>
   <key>com.apple.security.device.audio-input</key><true/>
-  <key>com.apple.security.network.client</key><true/>
-  <key>com.apple.security.network.server</key><true/>
+  <!-- No network entitlements: those only matter inside the App Sandbox, which this app does not use. -->
   <!-- NDI runtime (libndi) is loaded at run time from the user's install and is signed by another team. -->
   <key>com.apple.security.cs.disable-library-validation</key><true/>
 </dict>

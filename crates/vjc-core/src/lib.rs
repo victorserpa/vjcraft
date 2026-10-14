@@ -291,6 +291,11 @@ pub enum Command {
         slice: Uuid,
         source: vjc_model::SliceSource,
     },
+    /// Several commands as one undo step (e.g. an edit of every selected slice). All or
+    /// nothing: if one is rejected the project is left untouched. An empty batch is invalid.
+    Batch {
+        commands: Vec<Command>,
+    },
     /// Moves a slice to another screen, inserted at `index` (clamped). The mesh keeps its
     /// pixel positions. Undoable.
     MoveSlice {
@@ -1741,6 +1746,30 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::Batch { commands } => {
+            if commands.is_empty() {
+                return Err(Error::InvalidValue);
+            }
+            let before = p.clone();
+            let (mut inverses, mut events) = (vec![], vec![]);
+            for c in commands {
+                match apply(p, c) {
+                    Ok(a) => {
+                        inverses.extend(a.inverse);
+                        events.extend(a.events);
+                    }
+                    Err(e) => {
+                        *p = before;
+                        return Err(e);
+                    }
+                }
+            }
+            inverses.reverse();
+            Ok(Applied {
+                inverse: (!inverses.is_empty()).then_some(Command::Batch { commands: inverses }),
+                events,
+            })
+        }
         Command::MoveSlice {
             from,
             to,
@@ -2108,7 +2137,8 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             direction,
         } => {
             let t = transport_mut(p, deck, layer, column)?;
-            let prev = std::mem::replace(&mut t.direction, direction);
+            let prev = t.direction;
+            t.set_direction(direction);
             undoable(
                 Command::SetDirection {
                     deck,
@@ -2160,11 +2190,6 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             )
         }
         Command::SetPaused { clips, paused } => {
-            let (from, to) = if paused {
-                (Direction::Forward, Direction::Pause)
-            } else {
-                (Direction::Pause, Direction::Forward)
-            };
             // Validate every target first so a missing clip changes nothing.
             for &(deck, layer, column) in &clips {
                 transport_mut(p, deck, layer, column)?;
@@ -2172,15 +2197,19 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let mut prev = vec![];
             for (deck, layer, column) in clips {
                 let t = transport_mut(p, deck, layer, column)?;
-                // Pausing stops any direction; a resume only leaves Pause, back to Forward.
+                // Pausing stops any direction; a resume only leaves Pause, back to the saved one.
                 let hit = if paused {
                     t.direction != Direction::Pause
                 } else {
-                    t.direction == from
+                    t.direction == Direction::Pause
                 };
                 if hit {
                     prev.push((deck, layer, column, t.direction));
-                    t.direction = to;
+                    if paused {
+                        t.set_direction(Direction::Pause);
+                    } else {
+                        t.set_direction(t.resumed_direction());
+                    }
                 }
             }
             if prev.is_empty() {
@@ -2195,12 +2224,11 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let mut prev = vec![];
             for (deck, layer, column, direction) in items {
                 let t = transport_mut(p, deck, layer, column)?;
-                prev.push((
-                    deck,
-                    layer,
-                    column,
-                    std::mem::replace(&mut t.direction, direction),
-                ));
+                prev.push((deck, layer, column, {
+                    let before = t.direction;
+                    t.set_direction(direction);
+                    before
+                }));
             }
             undoable(Command::RestoreDirections { items: prev }, vec![])
         }
@@ -3038,7 +3066,8 @@ mod tests {
                 },
             );
         }
-        for direction in [Direction::Backward, Direction::Pause, Direction::Random] {
+        // Pause last: leaving Pause by hand overwrites the remembered direction.
+        for direction in [Direction::Backward, Direction::Random, Direction::Pause] {
             roundtrip(
                 &mut p,
                 Command::SetDirection {
@@ -3388,6 +3417,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn resume_restores_the_direction_before_the_pause() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let dir = |p: &Project| clip(p, l).unwrap().transport.direction;
+        for d in [Direction::Backward, Direction::Random] {
+            let set = Command::SetDirection {
+                deck: A,
+                layer: l,
+                column: 0,
+                direction: d,
+            };
+            h.exec(&mut p, set, t).unwrap();
+            let cmd = |paused| Command::SetPaused {
+                clips: vec![(A, l, 0)],
+                paused,
+            };
+            h.exec(&mut p, cmd(true), t).unwrap();
+            assert_eq!(dir(&p), Direction::Pause);
+            h.exec(&mut p, cmd(false), t).unwrap();
+            assert_eq!(dir(&p), d);
+        }
     }
 
     #[test]
@@ -5164,6 +5219,53 @@ mod tests {
             source: SliceSource::Preview,
         };
         assert!(h.exec(&mut p, bad, now).is_err());
+    }
+
+    #[test]
+    fn batch_edits_many_slices_as_one_undo_step_and_is_all_or_nothing() {
+        let (mut p, _) = setup();
+        let mut scr = mapping::new_screen("A", 1920, 1080);
+        let (s1, s2) = (
+            mapping::new_slice(1920, 1080),
+            mapping::new_slice(1920, 1080),
+        );
+        let (id1, id2) = (s1.id, s2.id);
+        scr.slices = vec![s1, s2];
+        let sid = scr.id;
+        p.output.screens = vec![scr];
+        let before = p.clone();
+        let shift = |slice, dx: f32| Command::SetSliceMesh {
+            screen: sid,
+            slice,
+            mesh: before.output.screens[0].slices[0]
+                .output_mesh
+                .iter()
+                .map(|q| (q.0 + dx, q.1))
+                .collect(),
+            cols: before.output.screens[0].slices[0].mesh_cols,
+        };
+        let batch = Command::Batch {
+            commands: vec![shift(id1, 10.0), shift(id2, 20.0)],
+        };
+        let mut h = History::new();
+        h.exec(&mut p, batch, Instant::now()).unwrap();
+        let x = |p: &Project, i: usize| p.output.screens[0].slices[i].output_mesh[0].0;
+        assert_eq!((x(&p, 0), x(&p, 1)), (10.0, 20.0));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before, "one undo reverts every slice");
+        h.redo(&mut p).unwrap().unwrap();
+        assert_eq!(x(&p, 1), 20.0);
+        // A rejected member leaves the project untouched; an empty batch is invalid.
+        let mut q = before.clone();
+        let bad = Command::Batch {
+            commands: vec![shift(id1, 10.0), shift(Uuid::new_v4(), 5.0)],
+        };
+        assert!(apply(&mut q, bad).is_err());
+        assert_eq!(q, before);
+        assert_eq!(
+            apply(&mut q, Command::Batch { commands: vec![] }),
+            Err(Error::InvalidValue)
+        );
     }
 
     #[test]

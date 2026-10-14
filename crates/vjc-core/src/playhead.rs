@@ -205,6 +205,22 @@ mod tests {
     }
 
     #[test]
+    fn retarget_to_an_empty_region_never_produces_nan() {
+        for new in [(0.5, 0.5), (0.7, 0.2)] {
+            let mut h = Playhead::new(Direction::Forward, 1);
+            h.seek(0.5);
+            h.retarget((0.0, 1.0), new);
+            assert!(h.x.is_finite() && (0.0..=1.0).contains(&h.x), "{}", h.x);
+            h.retarget(new, (0.0, 1.0));
+            assert!(h.x.is_finite(), "{}", h.x);
+            let mut b = Playhead::new(Direction::Forward, 1);
+            b.x = 1.5;
+            b.retarget((0.0, 1.0), new);
+            assert!(b.x.is_finite(), "{}", b.x);
+        }
+    }
+
+    #[test]
     fn beat_sync_paces_the_playhead_to_the_beats() {
         // 4 s clip over 2 beats at 120 bpm = 1 s: half way after 0.5 s of wall time.
         assert!((synced(120.0, 2.0, 4.0, 0.5) - 0.5).abs() < 1e-3);

@@ -120,6 +120,8 @@ fn sync_parent(path: &Path) {
 pub fn save(project: &Project, path: &Path) -> Result<(), Error> {
     let mut p = project.clone();
     p.format_version = CURRENT_VERSION;
+    // Pause is live state: a saved project never opens paused.
+    p.resume_paused();
     if let Some(dir) = path.parent() {
         for m in media_paths(&mut p) {
             if let Ok(rel) = m.strip_prefix(dir) {
@@ -206,6 +208,7 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
             "{n} screen(s) shared a monitor with another screen and were set to a window"
         ));
     }
+    project.resume_paused();
     let n = project.normalize_groups();
     if n > 0 {
         warnings.push(format!(
@@ -477,6 +480,39 @@ mod tests {
         assert!(matches!(open(&f), Err(Error::Json(_))));
         std::fs::write(&f, b"").unwrap();
         assert!(open(&f).is_err());
+    }
+
+    #[test]
+    fn pause_is_not_saved_and_old_paused_files_open_playing() {
+        use vjc_model::Direction;
+        let d = tmp("pause");
+        let f = d.join("p.vjc");
+        let mut p = with_media(PathBuf::from("x.mp4"));
+        let t = &mut p.composition.decks[0].clips[0].clip.transport;
+        t.set_direction(Direction::Backward);
+        t.set_direction(Direction::Pause);
+        save(&p, &f).unwrap();
+        let (q, _) = open(&f).unwrap();
+        assert_eq!(
+            q.composition.decks[0].clips[0].clip.transport.direction,
+            Direction::Backward
+        );
+        // The live project keeps its pause.
+        assert_eq!(
+            p.composition.decks[0].clips[0].clip.transport.direction,
+            Direction::Pause
+        );
+        // A file with Pause and no resume_direction (older format) opens Forward.
+        let mut raw: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        let tr = &mut raw["composition"]["decks"][0]["clips"][0]["clip"]["transport"];
+        tr["direction"] = "Pause".into();
+        tr.as_object_mut().unwrap().remove("resume_direction");
+        std::fs::write(&f, raw.to_string()).unwrap();
+        let (q, _) = open(&f).unwrap();
+        assert_eq!(
+            q.composition.decks[0].clips[0].clip.transport.direction,
+            Direction::Forward
+        );
     }
 
     #[test]

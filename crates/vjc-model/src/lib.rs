@@ -215,11 +215,19 @@ pub enum NetProtocol {
     Ndi,
 }
 
+fn forward() -> Direction {
+    Direction::Forward
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transport {
     pub play_mode: PlayMode,
     pub trigger_mode: TriggerMode,
     pub direction: Direction,
+    /// Direction to return to when a paused clip resumes (never `Pause`). Projects saved
+    /// before it existed open with Forward.
+    #[serde(default = "forward")]
+    pub resume_direction: Direction,
     pub speed: f64,
     /// When set, clip length is stretched to this many beats.
     pub beat_sync: Option<f64>,
@@ -862,6 +870,7 @@ impl Default for Transport {
             play_mode: PlayMode::Loop,
             trigger_mode: TriggerMode::Restart,
             direction: Direction::Forward,
+            resume_direction: Direction::Forward,
             speed: 1.0,
             beat_sync: None,
             cue_points: vec![],
@@ -872,7 +881,46 @@ impl Default for Transport {
     }
 }
 
+impl Transport {
+    /// Direction a clip takes when it leaves Pause.
+    pub fn resumed_direction(&self) -> Direction {
+        match self.resume_direction {
+            Direction::Pause => Direction::Forward,
+            d => d,
+        }
+    }
+
+    /// Sets `direction`, remembering the one left when entering Pause so a resume restores it.
+    pub fn set_direction(&mut self, direction: Direction) {
+        if direction != Direction::Pause {
+            self.resume_direction = direction;
+        } else if self.direction != Direction::Pause {
+            self.resume_direction = self.direction;
+        }
+        self.direction = direction;
+    }
+}
+
 impl Project {
+    /// Pause is a live state, not project data: every paused clip goes back to the direction
+    /// it had before. Returns how many clips changed.
+    pub fn resume_paused(&mut self) -> usize {
+        let mut n = 0;
+        for k in self
+            .composition
+            .decks
+            .iter_mut()
+            .flat_map(|d| d.clips.iter_mut())
+        {
+            let t = &mut k.clip.transport;
+            if t.direction == Direction::Pause {
+                t.direction = t.resumed_direction();
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Enforces one monitor per screen: a screen that names a monitor an earlier screen
     /// already uses falls back to a window. Returns how many screens were changed.
     pub fn normalize_screens(&mut self) -> usize {

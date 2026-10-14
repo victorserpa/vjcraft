@@ -116,7 +116,11 @@ pub fn to_actual(local: f64, region: (f64, f64)) -> f64 {
 
 /// Playhead position local to the region for a position inside the file.
 pub fn to_local(pos: f64, region: (f64, f64)) -> f64 {
-    ((pos - region.0) / (region.1 - region.0)).clamp(0.0, 1.0)
+    let w = region.1 - region.0;
+    if !(w > 0.0 && w.is_finite()) {
+        return 0.0;
+    }
+    ((pos - region.0) / w).clamp(0.0, 1.0)
 }
 
 /// Seconds the in..out region lasts at clip speed `speed` (infinite when paused by speed 0).

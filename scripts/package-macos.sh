@@ -2,7 +2,12 @@
 # Builds target/dist/VJCraft.app and VJCraft-<version>-macos.dmg, self-contained
 # (non-system dylibs bundled by scripts/bundle-dylibs.sh), signed with Developer ID
 # + hardened runtime, notarized and stapled.
-# Env: SIGN_ID, NOTARY_PROFILE. Flags: --no-notarize (local build, still signed).
+# Env (both have machine-specific defaults, set your own elsewhere):
+#   SIGN_ID         codesign identity, e.g. "Developer ID Application: Name (TEAMID)";
+#                   list yours with `security find-identity -v -p codesigning`.
+#   NOTARY_PROFILE  notarytool keychain profile, created once with
+#                   `xcrun notarytool store-credentials <name>`.
+# Flags: --no-notarize (local build, still signed).
 # --adhoc: sign ad hoc (no Developer ID), implies --no-notarize.
 set -euo pipefail
 SIGN_ID="${SIGN_ID:-Developer ID Application: SCHMUCKER DESENVOLVIMENTOS E SONORIZACAO LTDA (LHUJ4D96V2)}"

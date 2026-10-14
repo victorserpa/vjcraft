@@ -175,6 +175,8 @@ struct State {
     output_setup_open: bool,
     sel_screen: Option<Uuid>,
     sel_slice: Option<Uuid>,
+    /// Slices selected together (shift / cmd click); empty means only `sel_slice`.
+    sel_slices: Vec<Uuid>,
     sel_pt_in: Option<usize>,
     sel_pt_out: Option<usize>,
     snap: bool,
@@ -994,6 +996,7 @@ impl State {
             output_setup_open: false,
             sel_screen: None,
             sel_slice: None,
+            sel_slices: vec![],
             sel_pt_in: None,
             sel_pt_out: None,
             snap: false,
@@ -3300,6 +3303,7 @@ impl State {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        self.prune_screen_state();
         self.ui_body(ui);
         // The help bar is drawn before the widgets, so it shows last frame's hover. If this
         // frame's hover differs (also when the pointer left a control), draw once more.
@@ -5571,6 +5575,17 @@ impl State {
         });
     }
 
+    /// Drops the per-screen UI state of screens that no longer exist (removed, or replaced by
+    /// a preset), so the maps do not grow over a long session.
+    fn prune_screen_state(&mut self) {
+        let screens = &self.project.output.screens;
+        // The legacy single output is keyed by the nil id.
+        let alive = |id: &Uuid| id.is_nil() || screens.iter().any(|s| s.id == *id);
+        self.test_cards.retain(alive);
+        self.closed_screens.retain(alive);
+        self.out_fps.retain(|id, _| alive(id));
+    }
+
     /// Re-reads the monitor list about once a second; closes the output if its monitor vanished.
     fn poll_monitors(&mut self) {
         let due = self
@@ -5598,17 +5613,24 @@ impl State {
     /// or the whole composition when it has no slices.
     fn output_window(&mut self, ctx: &egui::Context) {
         let Some(comp_id) = self.comp_tex else { return };
-        let mut wins: Vec<(Uuid, usize, egui::TextureId, Option<Screen>)> = vec![];
+        let comp_size = self.comp.as_ref().map_or((1, 1), |c| c.size);
+        type Win = (Uuid, usize, egui::TextureId, Option<Screen>, (u32, u32));
+        let mut wins: Vec<Win> = vec![];
         if self.project.output.screens.is_empty() {
             if let Some(mon) = self
                 .output
                 .and_then(|id| monitors::find(&self.monitors, id))
             {
-                wins.push((Uuid::nil(), mon, comp_id, None));
+                wins.push((Uuid::nil(), mon, comp_id, None, comp_size));
             }
         } else {
             for (id, mon) in self.open_screens() {
-                let tex = self.screen_rt.get(&id).map_or(comp_id, |t| t.id);
+                // Before the screen's own target exists (first frame) the composition is shown,
+                // and pixel-perfect must size by that texture, not by the screen.
+                let (tex, tex_size) = monitors::pick_canvas(
+                    self.screen_rt.get(&id).map(|t| (t.id, t.size)),
+                    (comp_id, comp_size),
+                );
                 let info = self
                     .project
                     .output
@@ -5616,10 +5638,10 @@ impl State {
                     .iter()
                     .find(|s| s.id == id)
                     .cloned();
-                wins.push((id, mon, tex, info));
+                wins.push((id, mon, tex, info, tex_size));
             }
         }
-        for (sid, mon, tex, info) in wins {
+        for (sid, mon, tex, info, tex_size) in wins {
             // The list can change between pick and use (hotplug): skip a stale index.
             let Some(mid) = monitors::id_at(&self.monitors, mon) else {
                 continue;
@@ -5656,7 +5678,7 @@ impl State {
                         Some(s) => monitors::present_rect(
                             full.size(),
                             ctx.pixels_per_point(),
-                            (s.width, s.height),
+                            tex_size,
                             s.pixel_perfect,
                         )
                         .translate(full.min.to_vec2()),

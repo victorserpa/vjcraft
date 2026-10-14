@@ -11,7 +11,7 @@ use vjc_core::slice_geom::{self, Field, Op, Side};
 use vjc_model::{Screen, Slice, SliceSource};
 
 /// Distance, in canvas pixels, at which a dragged point jumps to a guide.
-const GUIDE_PX: f32 = 8.0;
+pub(crate) const GUIDE_PX: f32 = 8.0;
 
 /// Text of a pixel value: whole numbers without decimals.
 fn show(v: f32) -> String {
@@ -86,8 +86,19 @@ pub(crate) fn snap_dragged(
 }
 
 impl State {
-    /// Moves the whole side of the selected slice by arrow keys (pixels).
-    pub(crate) fn nudge_slice(
+    /// Ids of the slices an edit applies to: the multi-selection of this screen, or just
+    /// `sl` (the primary one, always included).
+    pub(crate) fn selected_slices(&self, scr: &Screen, sl: &Slice) -> Vec<uuid::Uuid> {
+        scr.slices
+            .iter()
+            .filter(|s| s.id == sl.id || self.sel_slices.contains(&s.id))
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// Moves the given side of every selected slice by `by` pixels: one command for one
+    /// slice, a `Batch` (one undo step) for several.
+    pub(crate) fn nudge_selected(
         &self,
         scr: &Screen,
         sl: &Slice,
@@ -95,7 +106,94 @@ impl State {
         by: (f32, f32),
     ) -> Option<Command> {
         let c = &self.project.composition;
-        slice_geom::edit(scr, sl, side, (c.width, c.height), Op::Nudge(by.0, by.1))
+        let ids = self.selected_slices(scr, sl);
+        let mut cmds: Vec<Command> = scr
+            .slices
+            .iter()
+            .filter(|s| ids.contains(&s.id))
+            .filter_map(|s| {
+                slice_geom::edit(scr, s, side, (c.width, c.height), Op::Nudge(by.0, by.1))
+            })
+            .collect();
+        match cmds.len() {
+            0 => None,
+            1 => cmds.pop(),
+            _ => Some(Command::Batch { commands: cmds }),
+        }
+    }
+
+    /// Guide lines in pixels of `side`: the screen / composition edges and centres plus the
+    /// bounding boxes of the slices that are not being moved.
+    fn side_guides(&self, scr: &Screen, moving: &[uuid::Uuid], side: Side) -> (Vec<f32>, Vec<f32>) {
+        let c = &self.project.composition;
+        let comp = (c.width, c.height);
+        let space = match side {
+            Side::Input => (comp.0 as f32, comp.1 as f32),
+            Side::Output => (scr.width as f32, scr.height as f32),
+        };
+        let others: Vec<_> = scr
+            .slices
+            .iter()
+            .filter(|s| !moving.contains(&s.id))
+            .filter_map(|s| slice_geom::bbox(&slice_geom::side_points(s, side, comp)))
+            .collect();
+        slice_geom::guides(space, &others)
+    }
+
+    /// Arrow-key move of the selected slices; it stops on a guide it would cross (Alt = free).
+    pub(crate) fn arrow_nudge(
+        &self,
+        ui: &egui::Ui,
+        scr: &Screen,
+        sl: &Slice,
+        side: Side,
+        by: (f32, f32),
+    ) -> Option<Command> {
+        let c = &self.project.composition;
+        let mut by = by;
+        if !ui.input(|i| i.modifiers.alt)
+            && let Some(b) =
+                slice_geom::bbox(&slice_geom::side_points(sl, side, (c.width, c.height)))
+        {
+            let ids = self.selected_slices(scr, sl);
+            let (xs, ys) = self.side_guides(scr, &ids, side);
+            by = slice_geom::stop_at_guides(b, by, &xs, &ys);
+        }
+        self.nudge_selected(scr, sl, side, by)
+    }
+
+    /// Body drag of the selected slices: `start` is the primary slice's rectangle when the
+    /// drag began and `acc` the pointer offset since, in pixels of `side`. Snaps the
+    /// rectangle's edges and centre to guides within `thr` pixels unless Alt is held.
+    pub(crate) fn drag_body(
+        &self,
+        ui: &egui::Ui,
+        scr: &Screen,
+        sl: &Slice,
+        side: Side,
+        (start, acc): (slice_geom::Rect, (f32, f32)),
+        thr: f32,
+    ) -> Option<Command> {
+        let c = &self.project.composition;
+        let want = slice_geom::Rect {
+            x: start.x + acc.0,
+            y: start.y + acc.1,
+            ..start
+        };
+        let sh = if ui.input(|i| i.modifiers.alt) {
+            (0.0, 0.0)
+        } else {
+            let ids = self.selected_slices(scr, sl);
+            let (xs, ys) = self.side_guides(scr, &ids, side);
+            slice_geom::snap_rect(want, &xs, &ys, thr)
+        };
+        let cur = slice_geom::bbox(&slice_geom::side_points(sl, side, (c.width, c.height)))?;
+        self.nudge_selected(
+            scr,
+            sl,
+            side,
+            (want.x + sh.0 - cur.x, want.y + sh.1 - cur.y),
+        )
     }
 
     /// Dropdown of what the slice shows: composition, preview, one layer or one group.
@@ -232,7 +330,6 @@ impl State {
                     .iter()
                     .position(|s| s.id == sl.id)
                     .map_or(scr.slices.len(), |i| i + 1);
-                self.sel_slice = Some(copy.id);
                 cmds.push(Command::AddSlice {
                     screen: scr.id,
                     slice: copy,
@@ -253,8 +350,6 @@ impl State {
                     .show_ui(ui, |ui| {
                         for (id, name, n) in &others {
                             if ui.selectable_label(false, name).clicked() {
-                                self.sel_screen = Some(*id);
-                                self.sel_slice = Some(sl.id);
                                 cmds.push(Command::MoveSlice {
                                     from: scr.id,
                                     to: *id,

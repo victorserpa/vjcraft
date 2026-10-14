@@ -67,6 +67,7 @@ impl State {
         if self.exec_ok(Command::SetOutputSetup { screens }) {
             self.sel_screen = first;
             self.sel_slice = None;
+            self.sel_slices.clear();
             self.sel_pt_in = None;
             self.sel_pt_out = None;
             self.sel_mask_pt = None;

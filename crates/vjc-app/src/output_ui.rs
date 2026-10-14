@@ -2,7 +2,7 @@
 
 use crate::State;
 use crate::artnet_out;
-use crate::slice_inspector::{arrow_move, snap_dragged};
+use crate::slice_inspector::{GUIDE_PX, arrow_move, snap_dragged};
 use eframe::egui;
 use vjc_core::slice_geom::{self, Side};
 use vjc_core::{Command, dmx, mapping};
@@ -11,8 +11,27 @@ use vjc_model::{ChannelOrder, Fixture, OutputDevice, PixelFormat, Screen};
 const HANDLE_R: f32 = 6.0;
 const SNAP_PX: f32 = 10.0;
 
+/// Behaviour switches of `handles`: grid `snap` (0 = off), arrow-key nudging of the
+/// selected point, and the slice rectangle that a drag off every handle moves.
+struct Opts {
+    snap: f32,
+    keys: bool,
+    body: Option<slice_geom::Rect>,
+}
+
+/// What a canvas drag produced this frame.
+#[derive(Default)]
+struct Drag {
+    /// A point moved to a new position `(index, position)`.
+    moved: Option<(usize, (f32, f32))>,
+    /// The slice body is being dragged: its rectangle when the drag began, and the offset
+    /// since then (both in the canvas space units).
+    body: Option<(slice_geom::Rect, (f32, f32))>,
+}
+
 /// Draggable handles for `pts` (in `space` units) over `rect`. Returns the moved point as
-/// `(index, new position)`. Arrow keys nudge the selected point 1 unit (10 with Shift) when
+/// `(index, new position)`; a drag that starts off every handle but inside `body` drags the
+/// whole slice. Arrow keys nudge the selected point 1 unit (10 with Shift) when
 /// `keys` is set and the pointer is over the canvas.
 fn handles(
     ui: &mut egui::Ui,
@@ -20,9 +39,8 @@ fn handles(
     (rect, space): (egui::Rect, (f32, f32)),
     pts: &[(f32, f32)],
     sel: &mut Option<usize>,
-    snap: f32,
-    keys: bool,
-) -> Option<(usize, (f32, f32))> {
+    Opts { snap, keys, body }: Opts,
+) -> Drag {
     let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
     let to_px = |p: (f32, f32)| {
         egui::pos2(
@@ -38,13 +56,24 @@ fn handles(
     };
     let radius = HANDLE_R * 1.5 * space.0 / rect.width();
     let drag_id = id.with("drag");
+    let body_id = id.with("body");
     let mut moved = None;
+    let mut body_drag = None;
     if let Some(q) = resp.interact_pointer_pos() {
         let hit = mapping::hit_test(pts, to_unit(q), radius);
         if resp.drag_started() {
             ui.data_mut(|d| d.insert_temp(drag_id, hit));
             if hit.is_some() {
                 *sel = hit;
+            } else if let Some(r) = body {
+                let u = to_unit(q);
+                let inside = u.0 >= r.x && u.0 <= r.x + r.w && u.1 >= r.y && u.1 <= r.y + r.h;
+                ui.data_mut(|d| {
+                    d.insert_temp::<Option<(slice_geom::Rect, (f32, f32))>>(
+                        body_id,
+                        inside.then_some((r, (0.0, 0.0))),
+                    )
+                });
             }
         } else if resp.clicked() {
             *sel = hit;
@@ -58,8 +87,26 @@ fn handles(
             moved = Some((i, (c(u.0, space.0), c(u.1, space.1))));
         }
     }
+    if resp.dragged()
+        && let Some((r, acc)) = ui
+            .data(|d| d.get_temp::<Option<(slice_geom::Rect, (f32, f32))>>(body_id))
+            .flatten()
+    {
+        let dd = resp.drag_delta();
+        let acc = (
+            acc.0 + dd.x / rect.width() * space.0,
+            acc.1 + dd.y / rect.height() * space.1,
+        );
+        ui.data_mut(|d| {
+            d.insert_temp::<Option<(slice_geom::Rect, (f32, f32))>>(body_id, Some((r, acc)))
+        });
+        body_drag = Some((r, acc));
+    }
     if resp.drag_stopped() {
-        ui.data_mut(|d| d.insert_temp::<Option<usize>>(drag_id, None));
+        ui.data_mut(|d| {
+            d.insert_temp::<Option<usize>>(drag_id, None);
+            d.insert_temp::<Option<(slice_geom::Rect, (f32, f32))>>(body_id, None);
+        });
     }
     if keys
         && resp.hovered()
@@ -101,7 +148,10 @@ fn handles(
             egui::Stroke::new(1.5, if on_it { v.selection.stroke.color } else { off }),
         );
     }
-    moved
+    Drag {
+        moved,
+        body: body_drag,
+    }
 }
 
 fn canvas_rect(ui: &mut egui::Ui, w: f32, aspect: f32) -> egui::Rect {
@@ -194,7 +244,33 @@ impl State {
                     ..
                 }
             );
+            // Selection follows a slice only once the command was accepted.
+            let select = match &c {
+                Command::AddSlice { slice, .. } => Some((None, slice.id)),
+                Command::MoveSlice { to, slice, .. } => Some((Some(*to), *slice)),
+                _ => None,
+            };
+            let removes = match &c {
+                Command::RemoveSlice { .. } => true,
+                Command::Batch { commands } => commands
+                    .iter()
+                    .any(|c| matches!(c, Command::RemoveSlice { .. })),
+                _ => false,
+            };
             let ok = self.exec_ok(c);
+            if ok {
+                if let Some((screen, slice)) = select {
+                    if let Some(screen) = screen {
+                        self.sel_screen = Some(screen);
+                    }
+                    self.sel_slice = Some(slice);
+                    self.sel_slices.clear();
+                }
+                if removes {
+                    self.sel_slice = None;
+                    self.sel_slices.clear();
+                }
+            }
             match reopen {
                 // Only the edited screen reopens, and only if the change took effect.
                 Some(screen) if ok => {
@@ -222,6 +298,7 @@ impl State {
             if crate::help::help(ui.selectable_label(on, &s.name), "out-screens").clicked() {
                 self.sel_screen = Some(s.id);
                 self.sel_slice = None;
+                self.sel_slices.clear();
             }
         }
         ui.horizontal(|ui| {
@@ -496,21 +573,53 @@ impl State {
         ui.checkbox(&mut f.serpentine, "Serpentine (odd rows reversed)");
     }
 
+    /// Click on a slice number: plain selects only it; shift / cmd toggles it in the
+    /// multi-selection (the clicked slice becomes the primary one when added).
+    pub(crate) fn click_slice(&mut self, scr: &Screen, id: uuid::Uuid, multi: bool) {
+        if !multi {
+            self.sel_slice = Some(id);
+            self.sel_slices.clear();
+            return;
+        }
+        let first = scr.slices.first().map(|s| s.id);
+        let primary = self.sel_slice.or(first);
+        let mut set: Vec<uuid::Uuid> = scr
+            .slices
+            .iter()
+            .filter(|s| Some(s.id) == primary || self.sel_slices.contains(&s.id))
+            .map(|s| s.id)
+            .collect();
+        if let Some(i) = set.iter().position(|x| *x == id) {
+            if set.len() > 1 {
+                set.remove(i);
+                if primary == Some(id) {
+                    self.sel_slice = set.first().copied();
+                }
+            }
+        } else {
+            set.push(id);
+            self.sel_slice = Some(id);
+        }
+        self.sel_slices = if set.len() > 1 { set } else { vec![] };
+    }
+
     fn slice_editor(&mut self, ui: &mut egui::Ui, scr: &Screen, cmds: &mut Vec<Command>) {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.strong("Slices");
                 for (i, s) in scr.slices.iter().enumerate() {
-                    let on = self.sel_slice == Some(s.id) || (self.sel_slice.is_none() && i == 0);
+                    let primary =
+                        self.sel_slice == Some(s.id) || (self.sel_slice.is_none() && i == 0);
+                    let on = primary || self.sel_slices.contains(&s.id);
                     if ui.selectable_label(on, format!("{}", i + 1)).clicked() {
-                        self.sel_slice = Some(s.id);
+                        let multi = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                        self.click_slice(scr, s.id, multi);
                         self.sel_pt_in = None;
                         self.sel_pt_out = None;
                     }
                 }
                 if crate::help::help(ui.button("Add slice"), "out-add-slice").clicked() {
                     let s = mapping::new_slice(scr.width, scr.height);
-                    self.sel_slice = Some(s.id);
                     cmds.push(Command::AddSlice {
                         screen: scr.id,
                         slice: s,
@@ -528,11 +637,24 @@ impl State {
                 return;
             };
             ui.horizontal(|ui| {
-                if crate::help::help(ui.button("Remove slice"), "out-remove-slice").clicked() {
-                    self.sel_slice = None;
-                    cmds.push(Command::RemoveSlice {
-                        screen: scr.id,
-                        slice: sl.id,
+                let label = if self.selected_slices(scr, sl).len() > 1 {
+                    "Remove slices"
+                } else {
+                    "Remove slice"
+                };
+                if crate::help::help(ui.button(label), "out-remove-slice").clicked() {
+                    let mut rm: Vec<Command> = self
+                        .selected_slices(scr, sl)
+                        .into_iter()
+                        .map(|slice| Command::RemoveSlice {
+                            screen: scr.id,
+                            slice,
+                        })
+                        .collect();
+                    cmds.push(if rm.len() == 1 {
+                        rm.remove(0)
+                    } else {
+                        Command::Batch { commands: rm }
                     });
                 }
                 ui.checkbox(&mut self.snap, "Snap");
@@ -695,9 +817,36 @@ impl State {
         let id = egui::Id::new(("slice-in", sl.id));
         let snap = 0.0;
         let mut sel = self.sel_pt_in;
-        let moved = handles(ui, id, (rect, (1.0, 1.0)), &sl.input, &mut sel, snap, false);
+        let comp = (c.width, c.height);
+        let body = slice_geom::bbox(&sl.input);
+        let drag = handles(
+            ui,
+            id,
+            (rect, (1.0, 1.0)),
+            &sl.input,
+            &mut sel,
+            Opts {
+                snap,
+                keys: false,
+                body,
+            },
+        );
         self.sel_pt_in = sel;
-        if let Some((i, q)) = moved {
+        if let Some((start, acc)) = drag.body {
+            // Normalized canvas units -> composition pixels, where Nudge works.
+            let (cw, ch) = (comp.0.max(1) as f32, comp.1.max(1) as f32);
+            let start = slice_geom::Rect {
+                x: start.x * cw,
+                y: start.y * ch,
+                w: start.w * cw,
+                h: start.h * ch,
+            };
+            let acc = (acc.0 * cw, acc.1 * ch);
+            let thr = GUIDE_PX * cw / rect.width();
+            if let Some(cmd) = self.drag_body(ui, scr, sl, Side::Input, (start, acc), thr) {
+                cmds.push(cmd);
+            }
+        } else if let Some((i, q)) = drag.moved {
             let others: Vec<_> = scr
                 .slices
                 .iter()
@@ -714,7 +863,7 @@ impl State {
             });
         } else if sel.is_none()
             && let Some(by) = arrow_move(ui, rect)
-            && let Some(cmd) = self.nudge_slice(scr, sl, Side::Input, by)
+            && let Some(cmd) = self.arrow_nudge(ui, scr, sl, Side::Input, by)
         {
             cmds.push(cmd);
         }
@@ -765,9 +914,26 @@ impl State {
         let snap = if self.snap { SNAP_PX } else { 0.0 };
         let space = (scr.width as f32, scr.height as f32);
         let mut sel = self.sel_pt_out;
-        let moved = handles(ui, id, (rect, space), &sl.output_mesh, &mut sel, snap, true);
+        let body = slice_geom::bbox(&sl.output_mesh);
+        let drag = handles(
+            ui,
+            id,
+            (rect, space),
+            &sl.output_mesh,
+            &mut sel,
+            Opts {
+                snap,
+                keys: true,
+                body,
+            },
+        );
         self.sel_pt_out = sel;
-        if let Some((i, q)) = moved {
+        if let Some((start, acc)) = drag.body {
+            let thr = GUIDE_PX * space.0 / rect.width();
+            if let Some(cmd) = self.drag_body(ui, scr, sl, Side::Output, (start, acc), thr) {
+                cmds.push(cmd);
+            }
+        } else if let Some((i, q)) = drag.moved {
             let others: Vec<_> = scr
                 .slices
                 .iter()
@@ -785,7 +951,7 @@ impl State {
             });
         } else if sel.is_none()
             && let Some(by) = arrow_move(ui, rect)
-            && let Some(cmd) = self.nudge_slice(scr, sl, Side::Output, by)
+            && let Some(cmd) = self.arrow_nudge(ui, scr, sl, Side::Output, by)
         {
             // No point selected: the arrows move the whole slice.
             cmds.push(cmd);
@@ -815,7 +981,19 @@ impl State {
         let id = egui::Id::new(("slice-mask", sl.id));
         // The selection may come from another slice's mask: drop it if out of range.
         let mut sel = self.sel_mask_pt.filter(|&i| i < m.len());
-        let moved = handles(ui, id, (rect, (1.0, 1.0)), m, &mut sel, 0.0, true);
+        let moved = handles(
+            ui,
+            id,
+            (rect, (1.0, 1.0)),
+            m,
+            &mut sel,
+            Opts {
+                snap: 0.0,
+                keys: true,
+                body: None,
+            },
+        )
+        .moved;
         let set = |mask: Vec<(f32, f32)>| Command::SetSliceMask {
             screen: scr.id,
             slice: sl.id,

@@ -149,6 +149,45 @@ pub fn snap_to_guides(p: Pt, xs: &[f32], ys: &[f32], thr: f32) -> Pt {
     (near(p.0, xs), near(p.1, ys))
 }
 
+/// Shift `(dx, dy)` that puts the nearest edge / centre of `r` on a guide, per axis, when one
+/// is within `thr`; zero on an axis with no guide close enough. For dragging a whole slice.
+pub fn snap_rect(r: Rect, xs: &[f32], ys: &[f32], thr: f32) -> Pt {
+    let best = |marks: [f32; 3], g: &[f32]| {
+        marks
+            .iter()
+            .flat_map(|m| g.iter().map(move |l| l - m))
+            .filter(|d| d.abs() <= thr)
+            .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(0.0)
+    };
+    (
+        best([r.x, r.x + r.w / 2.0, r.x + r.w], xs),
+        best([r.y, r.y + r.h / 2.0, r.y + r.h], ys),
+    )
+}
+
+/// Arrow-key move of `r` by `by` that stops on a guide it would cross or reach (an edge or
+/// centre of `r` landing in the step). Never pulls back: leaving a guide takes one step.
+pub fn stop_at_guides(r: Rect, by: Pt, xs: &[f32], ys: &[f32]) -> Pt {
+    let axis = |marks: [f32; 3], d: f32, g: &[f32]| {
+        if d == 0.0 {
+            return 0.0;
+        }
+        marks
+            .iter()
+            .flat_map(|m| g.iter().map(move |l| l - m))
+            // Strictly ahead of the start (so a slice resting on a guide can leave it) and
+            // not beyond the step.
+            .filter(|t| t.abs() > 1e-4 && t.signum() == d.signum() && t.abs() <= d.abs() + 1e-4)
+            .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(d)
+    };
+    (
+        axis([r.x, r.x + r.w / 2.0, r.x + r.w], by.0, xs),
+        axis([r.y, r.y + r.h / 2.0, r.y + r.h], by.1, ys),
+    )
+}
+
 /// Guide lines (edges and centres) of the screen and of `others`, as `(xs, ys)`.
 pub fn guides(screen: (f32, f32), others: &[Rect]) -> (Vec<f32>, Vec<f32>) {
     let mut xs = vec![0.0, screen.0 / 2.0, screen.0];
@@ -285,7 +324,7 @@ pub enum Op {
 }
 
 /// The side's points in pixels and the two points that give its rotation.
-fn side_points(sl: &Slice, side: Side, comp: (u32, u32)) -> Vec<Pt> {
+pub fn side_points(sl: &Slice, side: Side, comp: (u32, u32)) -> Vec<Pt> {
     let (cw, ch) = (comp.0.max(1) as f32, comp.1.max(1) as f32);
     match side {
         Side::Input => sl.input.iter().map(|p| (p.0 * cw, p.1 * ch)).collect(),
@@ -387,6 +426,41 @@ mod tests {
             && a.iter()
                 .zip(b)
                 .all(|(p, q)| (p.0 - q.0).abs() < 1e-3 && (p.1 - q.1).abs() < 1e-3)
+    }
+
+    #[test]
+    fn dragging_a_slice_body_snaps_its_edges_and_centre_to_guides() {
+        let r = Rect {
+            x: 4.0,
+            y: 300.0,
+            w: 100.0,
+            h: 50.0,
+        };
+        let (xs, ys) = guides((1920.0, 1080.0), &[]);
+        // Left edge 4 px from the screen edge: pulled onto it; y has nothing near.
+        assert_eq!(snap_rect(r, &xs, &ys, 8.0), (-4.0, 0.0));
+        let near = Rect { x: 3.0, ..r };
+        assert_eq!(snap_rect(near, &xs, &ys, 8.0).0, -3.0);
+        assert_eq!(snap_rect(r, &xs, &ys, 2.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn arrow_steps_stop_on_a_guide_without_trapping_the_slice() {
+        let (xs, ys) = guides((1920.0, 1080.0), &[]);
+        let r = Rect {
+            x: 3.0,
+            y: 300.0,
+            w: 100.0,
+            h: 50.0,
+        };
+        // Shift+arrow (10 px) left would cross the screen edge: it stops on it.
+        assert_eq!(stop_at_guides(r, (-10.0, 0.0), &xs, &ys), (-3.0, 0.0));
+        // Resting on the guide, the next step leaves it by the full amount.
+        let on = Rect { x: 0.0, ..r };
+        assert_eq!(stop_at_guides(on, (1.0, 0.0), &xs, &ys), (1.0, 0.0));
+        assert_eq!(stop_at_guides(on, (-10.0, 0.0), &xs, &ys), (-10.0, 0.0));
+        // A guide behind the move does not matter.
+        assert_eq!(stop_at_guides(r, (10.0, 0.0), &xs, &ys), (10.0, 0.0));
     }
 
     const QUAD: [Pt; 4] = [(10.0, 20.0), (110.0, 20.0), (110.0, 70.0), (10.0, 70.0)];

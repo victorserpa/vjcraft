@@ -98,6 +98,13 @@ pub fn find(monitors: &[MonitorInfo], id: u32) -> Option<usize> {
     monitors.iter().position(|m| m.id == id)
 }
 
+/// The texture an output window shows and its size: the screen's own target once it exists,
+/// else the composition (first frame). Texture and size always come from the same side, so
+/// the pixel-perfect rectangle matches what is drawn.
+pub fn pick_canvas<T>(own: Option<(T, (u32, u32))>, comp: (T, (u32, u32))) -> (T, (u32, u32)) {
+    own.unwrap_or(comp)
+}
+
 /// Where a `tex` (w, h in pixels) canvas is drawn inside a window of `avail` points at
 /// `ppp` pixels per point (the scale factor: 2.0 on Retina). Not `exact`: it fills the
 /// window. `exact` (pixel-perfect screens): one texel per physical pixel, centered on a
@@ -137,6 +144,15 @@ pub fn main_size_points() -> Option<(f32, f32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_frame_canvas_is_sized_by_the_composition_not_the_screen() {
+        // Screen 1920x1080 not rendered yet: the composition (1280x720) is what is shown.
+        let (id, size) = super::pick_canvas(None, ("comp", (1280, 720)));
+        assert_eq!((id, size), ("comp", (1280, 720)));
+        let (id, size) = super::pick_canvas(Some(("own", (1920, 1080))), ("comp", (1280, 720)));
+        assert_eq!((id, size), ("own", (1920, 1080)));
+    }
+
     #[test]
     fn empty_list_does_not_close_output() {
         let one = vec![super::MonitorInfo {
