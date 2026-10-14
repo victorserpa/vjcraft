@@ -322,9 +322,9 @@ fn slider_inner(
                 egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text.clone())
             });
             let stroke = if r.hovered() {
-                egui::Stroke::new(1.0, crate::theme::ACCENT)
-            } else {
                 egui::Stroke::new(1.0, crate::theme::BORDER_INPUT)
+            } else {
+                egui::Stroke::NONE
             };
             let p = ui.painter();
             p.rect_filled(rect, 3.0, crate::theme::BG);

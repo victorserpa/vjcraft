@@ -49,9 +49,9 @@ pub fn with(ui: &mut egui::Ui, b: Button<'_>, label: &str) -> Response {
     name(r, label, None)
 }
 
-/// Square icon button of side `side` (layer header, effect rows).
-pub fn square(ui: &mut egui::Ui, icon: &str, label: &str, side: f32, on: Option<bool>) -> Response {
-    let b = Button::new(glyph(icon))
+/// Compact letter button (effect rows: B / P / ×); `label` is the tooltip and accessible name.
+pub fn letter(ui: &mut egui::Ui, text: &str, label: &str, side: f32, on: Option<bool>) -> Response {
+    let b = Button::new(RichText::new(text).font(theme::bold_font(ui.ctx(), theme::FS_SM)))
         .min_size(egui::vec2(side, side))
         .selected(on == Some(true));
     let r = ui.add(b);

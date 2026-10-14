@@ -4071,7 +4071,8 @@ impl State {
         }
         let help_shown = self.help_shown.and_then(help::text).unwrap_or(help::IDLE);
         let help_on = self.prefs.layouts.help;
-        if lay.browser {
+        let browser_below = lay.browser && (lay.params || lay.monitors);
+        if lay.browser && !browser_below {
             let mut p = egui::Panel::right("browser").default_size(lay.browser_w);
             if force {
                 p = p.exact_size(lay.browser_w);
@@ -4111,6 +4112,7 @@ impl State {
             self.help_bar(ui);
         }
         // 40 px for the deck tabs + add buttons, 40 for the status line and separator.
+        let lay_n = self.project.composition.layers.len().max(1);
         let room = ui.available_height().min(win_h) - GRID_MIN - 80.0;
         if lay.params || lay.monitors {
             let max = (room - self.topbars_h - self.transport_h).max(40.0);
@@ -4119,7 +4121,18 @@ impl State {
             } else {
                 lay.params_h
             };
-            let h = want.min(max);
+            // Grid height fits its layers: the bottom panels take the rest.
+            let grid_need = lay_n as f32 * theme::LAYER_ROW_H
+                + 2.0 * theme::COLUMN_HEAD_H
+                + theme::DECK_TABS_H
+                + 56.0;
+            let fit = (ui.available_height() - self.transport_h - grid_need).clamp(40.0, max);
+            let h = if force && !self.persist {
+                want
+            } else {
+                want.max(fit)
+            }
+            .min(max);
             let mut p = egui::Panel::bottom("params")
                 .default_size(h)
                 .resizable(true)
@@ -4128,6 +4141,40 @@ impl State {
                 p = p.exact_size(h);
             }
             let r = p.show(ui, |ui| {
+                if browser_below {
+                    let mut bp = egui::Panel::right("browser")
+                        .resizable(true)
+                        .default_size(lay.browser_w)
+                        .size_range(160.0..=(ui.available_width() * 0.4).max(160.0));
+                    if force {
+                        bp = bp.exact_size(lay.browser_w);
+                    }
+                    let r = bp.show(ui, |ui| {
+                        if help_on {
+                            egui::Panel::bottom("help_box")
+                                .resizable(false)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Help")
+                                            .font(theme::bold_font(ui.ctx(), theme::FS_SM)),
+                                    );
+                                    ui.add(egui::Label::new(help_shown).wrap());
+                                });
+                        }
+                        self.browser
+                            .set_recording(self.capture.as_ref().map(|c| c.path()));
+                        let (o, changed) = self.browser.show(ui, fxs, &mut self.prefs.general);
+                        opened = o;
+                        if changed {
+                            self.prefs_dirty = true;
+                        }
+                    });
+                    self.track_size(
+                        |l| &mut l.browser_w,
+                        r.response.rect.width(),
+                        resizing("browser"),
+                    );
+                }
                 if lay.monitors {
                     egui::Panel::left("monitor_col")
                         .resizable(true)
@@ -5074,10 +5121,12 @@ impl State {
             // reachable in a compact strip.
             self.grid_rect = egui::Rect::NOTHING;
             let strip_h = 2.0 * theme::COLUMN_HEAD_H;
-            let (hrect, _) = ui.allocate_exact_size(
-                egui::vec2(theme::LAYER_HEAD_W, strip_h),
+            let (row, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), strip_h),
                 egui::Sense::hover(),
             );
+            let hrect =
+                egui::Rect::from_min_size(row.min, egui::vec2(theme::LAYER_HEAD_W, strip_h));
             self.master_rect = Some(hrect);
             grid_ui::composition_header(
                 ui,
@@ -5092,9 +5141,9 @@ impl State {
                 &mut cmds,
                 &mut self.targets,
             );
-            let (tabs_area, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), theme::DECK_TABS_H),
-                egui::Sense::hover(),
+            let tabs_area = egui::Rect::from_min_max(
+                egui::pos2(hrect.max.x, row.min.y),
+                egui::pos2(row.max.x, row.min.y + theme::DECK_TABS_H),
             );
             let mut tabs_ui = ui.new_child(egui::UiBuilder::new().max_rect(tabs_area));
             tabs_ui.set_clip_rect(tabs_area.intersect(ui.clip_rect()));
@@ -5103,7 +5152,7 @@ impl State {
                 .painter()
                 .rect_filled(tabs_area, 0.0, theme::DECK_BAR_BG);
             self.deck_tabs(&mut tabs_ui, &mut cmds, cf_pos);
-            self.topbars_h = strip_h + theme::DECK_TABS_H;
+            self.topbars_h = strip_h;
         }
         self.cells = cells;
         if let Some(l) = remove_layer_req {
@@ -6511,9 +6560,9 @@ impl State {
                                 .inner
                             })
                             .inner;
-                        let by = icons::square(
+                        let by = icons::letter(
                             ui,
-                            icons::i::POWER,
+                            "B",
                             "Bypass effect",
                             theme::FX_BTN.y,
                             Some(e.bypass),
@@ -6526,16 +6575,16 @@ impl State {
                                 bypass: !e.bypass,
                             });
                         }
-                        let pr = icons::square(
+                        let pr = icons::letter(
                             ui,
-                            icons::i::SLIDERS_HORIZONTAL,
+                            "P",
                             "Effect parameters",
                             theme::FX_BTN.y,
                             Some(open),
                         );
                         toggle_open = pr.clicked();
                         let rm =
-                            icons::square(ui, icons::i::X, "Remove effect", theme::FX_BTN.y, None);
+                            icons::letter(ui, "\u{00d7}", "Remove effect", theme::FX_BTN.y, None);
                         if rm.clicked() {
                             cmds.push(Command::RemoveEffect {
                                 target,
