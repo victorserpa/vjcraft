@@ -64,6 +64,18 @@ pub struct Tempo {
     pub bpm: f64,
     pub link_enabled: bool,
     pub metronome: bool,
+    /// Transport of the tempo clock. Old files lack it and play.
+    #[serde(default)]
+    pub play_state: PlayState,
+}
+
+/// Play/Pause/Stop of the tempo clock: Pause freezes the phase, Stop zeroes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlayState {
+    #[default]
+    Play,
+    Pause,
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,15 +256,23 @@ pub enum FitMode {
     Fill,
     /// Frame fully covered, aspect ignored.
     Stretch,
+    /// Native size in px, centred (cropped if larger than the frame).
+    Original,
 }
 
 impl FitMode {
-    pub const ALL: [FitMode; 3] = [FitMode::Fit, FitMode::Fill, FitMode::Stretch];
+    pub const ALL: [FitMode; 4] = [
+        FitMode::Fit,
+        FitMode::Fill,
+        FitMode::Stretch,
+        FitMode::Original,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             FitMode::Fit => "Fit",
             FitMode::Fill => "Fill",
             FitMode::Stretch => "Stretch",
+            FitMode::Original => "Original",
         }
     }
 }
@@ -1243,6 +1263,7 @@ impl Project {
                     bpm: 120.0,
                     link_enabled: false,
                     metronome: false,
+                    play_state: PlayState::Play,
                 },
                 layers: vec![],
                 columns: vec![],
@@ -1462,6 +1483,18 @@ mod tests {
         };
         let back: Autopilot = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
         assert_eq!(back, new);
+    }
+
+    #[test]
+    fn play_state_defaults_to_play_and_roundtrips() {
+        let old: Tempo =
+            serde_json::from_str(r#"{"bpm":120.0,"link_enabled":false,"metronome":false}"#)
+                .unwrap();
+        assert_eq!(old.play_state, PlayState::Play);
+        let mut t = old;
+        t.play_state = PlayState::Pause;
+        let back: Tempo = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
     }
 
     #[test]

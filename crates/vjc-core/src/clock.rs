@@ -23,6 +23,8 @@ pub struct Clock {
     anchor_phase: f64,
     anchor: Instant,
     nudge: i8,
+    /// Phase is frozen at `anchor_phase` (Pause/Stop).
+    paused: bool,
     taps: VecDeque<Instant>,
     /// Last beat index already reported by `tick`.
     last_beat: i64,
@@ -35,6 +37,7 @@ impl Clock {
             anchor_phase: 0.0,
             anchor: now,
             nudge: 0,
+            paused: false,
             taps: VecDeque::new(),
             last_beat: -1,
         }
@@ -50,6 +53,9 @@ impl Clock {
 
     /// Phase in beats at `now` (never before the anchor).
     pub fn phase(&self, now: Instant) -> f64 {
+        if self.paused {
+            return self.anchor_phase;
+        }
         let dt = now.saturating_duration_since(self.anchor).as_secs_f64();
         self.anchor_phase + dt * self.beats_per_sec()
     }
@@ -57,6 +63,34 @@ impl Clock {
     fn reanchor(&mut self, now: Instant) {
         self.anchor_phase = self.phase(now);
         self.anchor = now;
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Freezes the phase where it is. No-op when already paused.
+    pub fn pause(&mut self, now: Instant) {
+        if !self.paused {
+            self.reanchor(now);
+            self.paused = true;
+        }
+    }
+
+    /// Resumes from the frozen phase. No-op when running.
+    pub fn play(&mut self, now: Instant) {
+        if self.paused {
+            self.anchor = now;
+            self.paused = false;
+        }
+    }
+
+    /// Freezes the clock on beat 0; `play` then starts from the downbeat.
+    pub fn stop(&mut self, now: Instant) {
+        self.anchor_phase = 0.0;
+        self.anchor = now;
+        self.last_beat = -1;
+        self.paused = true;
     }
 
     /// Changes tempo keeping the phase continuous.
@@ -113,6 +147,10 @@ impl Clock {
     pub fn tick(&mut self, now: Instant) -> Tick {
         let phase = self.phase(now);
         let beat = phase.floor() as i64;
+        // A paused or stopped clock crosses no beat (no click, no beat-driven action).
+        if self.paused {
+            return Tick { phase, beat: None };
+        }
         let crossed = (beat > self.last_beat).then_some(beat);
         self.last_beat = self.last_beat.max(beat);
         Tick {
@@ -384,6 +422,37 @@ mod tests {
 
     fn ms(t0: Instant, n: u64) -> Instant {
         t0 + Duration::from_millis(n)
+    }
+
+    #[test]
+    fn pause_freezes_phase_and_play_resumes() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0); // 2 beats/s
+        c.pause(ms(t0, 500));
+        assert!((c.phase(ms(t0, 500)) - 1.0).abs() < 1e-9);
+        assert!((c.phase(ms(t0, 5000)) - 1.0).abs() < 1e-9);
+        // Paused: no beat is reported; the beat it froze on fires once on resume.
+        assert_eq!(c.tick(ms(t0, 6000)).beat, None);
+        c.play(ms(t0, 10_000));
+        assert_eq!(c.tick(ms(t0, 10_000)).beat, Some(1));
+        assert!((c.phase(ms(t0, 10_500)) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn running_clock_is_not_frozen() {
+        let t0 = Instant::now();
+        let c = Clock::new(120.0, t0);
+        assert!((c.phase(ms(t0, 1000)) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stop_zeroes_phase_and_play_starts_from_downbeat() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        c.stop(ms(t0, 1000));
+        assert_eq!(c.phase(ms(t0, 3000)), 0.0);
+        c.play(ms(t0, 4000));
+        assert!((c.phase(ms(t0, 4500)) - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -726,5 +795,23 @@ mod tests {
         // Within a bar ahead it still waits.
         let mut p = vec![(4.0, 'd')];
         assert!(take_due(&mut p, 0.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    #[test]
+    fn stop_never_reports_a_beat_until_play() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        let _ = c.tick(t0 + std::time::Duration::from_millis(1600));
+        let t1 = t0 + std::time::Duration::from_secs(2);
+        for k in 0..5 {
+            c.stop(t1);
+            assert_eq!(c.tick(t1 + std::time::Duration::from_millis(k)).beat, None);
+        }
+        c.play(t1);
+        assert_eq!(c.tick(t1).beat, Some(0), "play starts on the downbeat");
     }
 }

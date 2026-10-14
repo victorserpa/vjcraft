@@ -26,8 +26,18 @@ pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) 
         FitMode::Stretch => return (1.0, 1.0),
         FitMode::Fit => rw.min(rh),
         FitMode::Fill => rw.max(rh),
+        FitMode::Original => 1.0,
     };
     (sw * k / dw, sh * k / dh)
+}
+
+/// Centred rect (x, y, w, h) in destination px that `src` occupies under `mode`.
+#[cfg(test)]
+fn fit_rect(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32, f32, f32) {
+    let (sx, sy) = fit_scale(src, dst, mode);
+    let (dw, dh) = (dst.0.max(1) as f32, dst.1.max(1) as f32);
+    let (w, h) = (sx * dw, sy * dh);
+    ((dw - w) / 2.0, (dh - h) / 2.0, w, h)
 }
 
 const SHADER: &str = r#"
@@ -1905,6 +1915,20 @@ mod tests {
         assert!(near(fit_scale(src, dst, FitMode::Stretch), (1.0, 1.0)));
         // Same aspect: all modes cover the frame.
         assert!(near(fit_scale((1920, 1080), dst, FitMode::Fit), (1.0, 1.0)));
+    }
+
+    #[test]
+    fn original_rect_is_native_size_and_centred() {
+        let (src, dst) = ((400, 300), (1920, 1080));
+        let (x, y, w, h) = fit_rect(src, dst, FitMode::Original);
+        assert!((w - 400.0).abs() < 1e-2 && (h - 300.0).abs() < 1e-2);
+        assert!((x - 760.0).abs() < 1e-2 && (y - 390.0).abs() < 1e-2);
+        // Larger than the frame: native size still, overflow cropped by the frame.
+        let (_, _, w, _) = fit_rect((3840, 2160), dst, FitMode::Original);
+        assert!((w - 3840.0).abs() < 1e-1);
+        // Control: Fit does not give the native size.
+        let (_, _, w, h) = fit_rect(src, dst, FitMode::Fit);
+        assert!((w - 400.0).abs() > 1.0 && (h - 300.0).abs() > 1.0);
     }
 
     /// Renders every composition mode on the GPU and compares one pixel to the Rust reference.

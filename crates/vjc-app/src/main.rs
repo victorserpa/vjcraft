@@ -745,6 +745,11 @@ fn prune_resume(
     resume.retain(|k, (id, _)| vjc_core::clip_in(p, k.0, k.1, k.2).is_some_and(|c| c.id == *id));
 }
 
+/// Time between repaints of live video: the composition fps is the ceiling (max 60).
+fn repaint_interval(fps: impl Into<f64>) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(1.0 / repaint_fps(fps))
+}
+
 /// Repaint rate for live video: the composition fps, kept to 1..=60 (NaN or junk = 60).
 fn repaint_fps(fps: impl Into<f64>) -> f64 {
     let f = fps.into();
@@ -753,6 +758,19 @@ fn repaint_fps(fps: impl Into<f64>) -> f64 {
     } else {
         60.0
     }
+}
+
+#[test]
+fn repaint_interval_is_capped_by_composition_fps() {
+    let ms = |f: f32| repaint_interval(f).as_secs_f64() * 1000.0;
+    // Lower composition fps: slower repaint (the cap is respected).
+    assert!((ms(30.0) - 1000.0 / 30.0).abs() < 1e-6);
+    assert!(ms(30.0) > ms(60.0));
+    // Default stays 60, and nothing repaints faster than 60 fps.
+    assert!((ms(60.0) - 1000.0 / 60.0).abs() < 1e-6);
+    assert!((ms(240.0) - 1000.0 / 60.0).abs() < 1e-6);
+    // Control: a bad value falls back to 60, never panics.
+    assert!((ms(f32::NAN) - 1000.0 / 60.0).abs() < 1e-6);
 }
 
 #[test]
@@ -2876,6 +2894,16 @@ impl State {
             &mut self.clock,
             now,
         );
+        // Transport of the tempo clock follows the saved play state.
+        match self.project.composition.tempo.play_state {
+            vjc_model::PlayState::Play => self.clock.play(now),
+            vjc_model::PlayState::Pause => self.clock.pause(now),
+            vjc_model::PlayState::Stop => {
+                if !self.clock.is_paused() || self.clock.phase(now) != 0.0 {
+                    self.clock.stop(now);
+                }
+            }
+        }
         // Effective tempo (may come from the Link session, runtime only).
         let bpm = self.clock.bpm();
         let t = self.clock.tick(now);
@@ -4454,6 +4482,25 @@ impl State {
             self.targets.push((tap.rect, "/comp/tempo/tap".into()));
             if tap.clicked() {
                 cmds.push(Command::Tap { at: now });
+            }
+            for (state, icon, tip) in [
+                (vjc_model::PlayState::Play, icons::i::PLAY, "Play tempo clock"),
+                (vjc_model::PlayState::Pause, icons::i::PAUSE, "Pause tempo clock"),
+                (vjc_model::PlayState::Stop, icons::i::STOP, "Stop tempo clock"),
+            ] {
+                let on = self.project.composition.tempo.play_state == state;
+                let b = icons::with(
+                    ui,
+                    egui::Button::new(icons::glyph(icon))
+                        .min_size(tbtn)
+                        .selected(on),
+                    tip,
+                );
+                // Transport, not an edit: no undo step (like TAP), but the project is saved.
+                if b.clicked() && self.project.composition.tempo.play_state != state {
+                    self.project.composition.tempo.play_state = state;
+                    self.dirty = true;
+                }
             }
             let minus = help(
                 icons::button(ui, icons::i::CARET_DOUBLE_LEFT, "Nudge slower (hold)"),
@@ -8140,8 +8187,7 @@ impl eframe::App for State {
         // at a low rate (input events still repaint at once).
         if self.is_live() {
             // Paced at the composition rate; input events still repaint at once.
-            let fps = repaint_fps(self.project.composition.fps);
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(1.0 / fps));
+            ctx.request_repaint_after(repaint_interval(self.project.composition.fps));
         } else {
             ctx.request_repaint_after(IDLE_REPAINT);
         }
