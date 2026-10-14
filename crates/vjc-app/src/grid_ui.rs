@@ -6,7 +6,8 @@ use eframe::egui::{self, Align2, FontId, Sense, StrokeKind, TextureId};
 /// What fills the picture area of a cell.
 pub enum Tile<'a> {
     Empty,
-    Thumb(TextureId),
+    /// Texture and its width/height ratio; the picture is cover-cropped to the cell.
+    Thumb(TextureId, f32),
     /// Generator or source without a frame: colored tile with the kind's name.
     Color(&'a str),
     /// Thumbnail still decoding.
@@ -18,6 +19,21 @@ pub enum Tile<'a> {
 pub struct CellState {
     pub playing: bool,
     pub selected: bool,
+}
+
+/// UV rectangle that fills a box of ratio `box_aspect` with an image of ratio `img_aspect`
+/// without stretching: the longer axis is cropped around the centre.
+pub fn cover_uv(img_aspect: f32, box_aspect: f32) -> egui::Rect {
+    let (mut u, mut v) = (1.0_f32, 1.0_f32);
+    if img_aspect > box_aspect {
+        u = (box_aspect / img_aspect).clamp(0.0, 1.0);
+    } else if img_aspect > 0.0 {
+        v = (img_aspect / box_aspect).clamp(0.0, 1.0);
+    }
+    egui::Rect::from_min_max(
+        egui::pos2((1.0 - u) / 2.0, (1.0 - v) / 2.0),
+        egui::pos2((1.0 + u) / 2.0, (1.0 + v) / 2.0),
+    )
 }
 
 /// A clip cell: picture on top, name strip below. `label` is the accessible name.
@@ -42,13 +58,12 @@ pub fn cell(
         Tile::Pending => {
             p.rect_filled(pic, round, theme::CELL_PENDING);
         }
-        Tile::Thumb(id) => {
+        Tile::Thumb(id, aspect) => {
             p.rect_filled(pic, round, theme::MONITOR_BG);
-            // Letterbox to keep the aspect: thumbnails are at most THUMB_MAX_SIDE long.
             p.image(
                 id,
                 pic,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                cover_uv(aspect, pic.aspect_ratio()),
                 egui::Color32::WHITE,
             );
         }
@@ -119,4 +134,19 @@ pub fn cell(
         p.rect_stroke(rect, round, stroke, kind);
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cover_uv;
+
+    #[test]
+    fn cover_crops_the_longer_axis() {
+        let wide = cover_uv(2.0, 1.0);
+        assert!((wide.width() - 0.5).abs() < 1e-6 && (wide.height() - 1.0).abs() < 1e-6);
+        let tall = cover_uv(0.5, 1.0);
+        assert!((tall.height() - 0.5).abs() < 1e-6 && (tall.width() - 1.0).abs() < 1e-6);
+        let same = cover_uv(1.5, 1.5);
+        assert!((same.width() - 1.0).abs() < 1e-6 && (same.height() - 1.0).abs() < 1e-6);
+    }
 }

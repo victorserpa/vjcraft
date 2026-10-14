@@ -419,47 +419,46 @@ fn group_header(
 ) {
     let (sel_group, panel_tab, targets) = ui_state;
     let gid = g.id;
-    let name = ui.add(
-        egui::Button::new(icons::with_text(ui, icons::i::CARET_DOWN, &g.name))
-            .selected(*sel_group == Some(gid)),
-    );
-    name.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::Button,
-            true,
-            *sel_group == Some(gid),
-            g.name.clone(),
-        )
-    });
-    if name.clicked() || name.secondary_clicked() {
-        *sel_group = Some(gid);
-        *panel_tab = PanelTab::Group;
-    }
-    name.context_menu(|ui| {
-        if ui.button("Ungroup").clicked() {
-            cmds.push(Command::Ungroup { group: gid });
-            ui.close();
-        }
-        ui.separator();
-        add_effect_menu(ui, EffectTarget::Group(gid), cmds);
-    });
-    let mut op = match g.track.opacity.value {
-        Value::Number(n) => n as f32,
-        _ => 1.0,
-    };
-    let r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
-    if let Some(a) = vjc_core::shortcuts::group_address(project, gid, "opacity") {
-        targets.push((r.rect, a));
-    }
-    if r.changed() {
-        cmds.push(Command::SetGroupOpacity {
-            group: gid,
-            value: op as f64,
+    ui.vertical(|ui| {
+        let name = ui.add(
+            egui::Button::new(icons::with_text(ui, icons::i::CARET_DOWN, &g.name))
+                .selected(*sel_group == Some(gid)),
+        );
+        name.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                true,
+                *sel_group == Some(gid),
+                g.name.clone(),
+            )
         });
-    }
-    for _ in 0..ncols {
-        ui.label("");
-    }
+        if name.clicked() || name.secondary_clicked() {
+            *sel_group = Some(gid);
+            *panel_tab = PanelTab::Group;
+        }
+        name.context_menu(|ui| {
+            if ui.button("Ungroup").clicked() {
+                cmds.push(Command::Ungroup { group: gid });
+                ui.close();
+            }
+            ui.separator();
+            add_effect_menu(ui, EffectTarget::Group(gid), cmds);
+        });
+        let mut op = match g.track.opacity.value {
+            Value::Number(n) => n as f32,
+            _ => 1.0,
+        };
+        let r = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).fixed_decimals(2));
+        if let Some(a) = vjc_core::shortcuts::group_address(project, gid, "opacity") {
+            targets.push((r.rect, a));
+        }
+        if r.changed() {
+            cmds.push(Command::SetGroupOpacity {
+                group: gid,
+                value: op as f64,
+            });
+        }
+    });
     let (mut bypass, mut solo) = (g.bypass, g.solo);
     ui.horizontal(|ui| {
         let b = icons::toggle(ui, &mut bypass, icons::i::POWER, "Group bypass");
@@ -494,8 +493,8 @@ fn group_header(
                 }
             }
         });
-    if ui.button("Ungroup").clicked() {
-        cmds.push(Command::Ungroup { group: gid });
+    for _ in 0..ncols.saturating_sub(2) {
+        ui.label("");
     }
     ui.end_row();
 }
@@ -721,31 +720,29 @@ fn open_network(protocol: vjc_net::Protocol, name: String) -> Player {
     Player::open_external(&label, move |sink| vjc_net::receive(protocol, &name, sink))
 }
 
-/// Browser label: the browser list is flat, so the category goes in front of the name
-/// ("Color / Posterize"). Sorting by label then groups the categories.
-fn browser_label(id: &str, src: &str) -> String {
-    match vjc_fx::parse(src)
-        .ok()
-        .and_then(|i| i.categories.first().cloned())
-    {
-        Some(cat) => format!("{cat} / {}", fx_label(id)),
-        None => fx_label(id),
-    }
-}
-
-/// Effects and generators offered by the browser.
-fn browser_fx() -> Vec<(String, browser::Item)> {
-    let fx = vjc_fx::BUILTIN.iter().map(|(id, src)| {
-        (
-            browser_label(id, src),
-            browser::Item::Effect(id.to_string()),
-        )
-    });
-    // Generators are already their own group in the browser; no prefix.
-    let gens = vjc_fx::GENERATORS
-        .iter()
-        .map(|(id, _)| (fx_label(id), browser::Item::Generator(id.to_string())));
-    fx.chain(gens).collect()
+/// Effects and generators offered by the browser. Parsed once: the list is read every
+/// frame, so it must not touch the ISF JSON again.
+fn browser_fx() -> &'static [browser::FxEntry] {
+    static CACHE: std::sync::OnceLock<Vec<browser::FxEntry>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let fx = vjc_fx::BUILTIN.iter().map(|(id, src)| browser::FxEntry {
+            name: fx_label(id),
+            category: Some(
+                vjc_fx::parse(src)
+                    .ok()
+                    .and_then(|i| i.categories.first().cloned())
+                    .unwrap_or_else(|| "Other".into()),
+            ),
+            item: browser::Item::Effect(id.to_string()),
+        });
+        // Generators are already their own tab; no category.
+        let gens = vjc_fx::GENERATORS.iter().map(|(id, _)| browser::FxEntry {
+            name: fx_label(id),
+            category: None,
+            item: browser::Item::Generator(id.to_string()),
+        });
+        fx.chain(gens).collect()
+    })
 }
 
 fn project_dirs() -> Option<directories::ProjectDirs> {
@@ -850,10 +847,10 @@ fn fresh_project(prefs: &Prefs) -> Project {
     c.height = prefs.video.height;
     c.fps = prefs.video.fps;
     // Layers are listed top to bottom; the bottom one is "Layer 1".
-    for i in (1..=2).rev() {
+    for i in (1..=3).rev() {
         c.layers.push(new_layer(i));
     }
-    for i in 1..=4 {
+    for i in 1..=9 {
         c.columns.push(Column {
             id: Uuid::new_v4(),
             name: format!("{i}"),
@@ -3466,7 +3463,7 @@ impl State {
                             ui.add(egui::Label::new(help_shown).wrap());
                         });
                 }
-                let (o, changed) = self.browser.show(ui, &fxs, &mut self.prefs.general);
+                let (o, changed) = self.browser.show(ui, fxs, &mut self.prefs.general);
                 opened = o;
                 if changed {
                     self.prefs_dirty = true;
@@ -3748,7 +3745,7 @@ impl State {
                             ui.vertical(|ui| {
                                 ui.set_min_width(theme::LAYER_HEAD_W);
                                 ui.set_max_width(theme::LAYER_HEAD_W);
-                                ui.set_height(theme::THUMB_H + theme::NAME_H);
+                                ui.set_min_height(theme::THUMB_H + theme::NAME_H);
                                 ui.spacing_mut().item_spacing =
                                     egui::vec2(theme::SP_1, theme::SP_1);
                                 ui.spacing_mut().slider_width = theme::LAYER_FADER_W;
@@ -3846,7 +3843,7 @@ impl State {
                                             false,
                                         ),
                                     ] {
-                                        let b = icons::square(ui, icon, tip, sq.x, Some(!on));
+                                        let b = icons::square(ui, icon, tip, sq.x, Some(on));
                                         if b.clicked() {
                                             cmds.push(if video {
                                                 Command::SetLayerVideo {
@@ -3947,7 +3944,7 @@ impl State {
                                     None => grid_ui::Tile::Empty,
                                     Some((id, vjc_model::Source::File { path })) => {
                                         match self.thumbs.texture(id, path) {
-                                            Some(t) => grid_ui::Tile::Thumb(t),
+                                            Some((t, a)) => grid_ui::Tile::Thumb(t, a),
                                             None => grid_ui::Tile::Pending,
                                         }
                                     }
@@ -4660,7 +4657,10 @@ impl State {
         let Some((layer, column, k)) =
             sel.and_then(|(l, c)| Some((l, c, vjc_core::clip_in(&self.project, deck, l, c)?)))
         else {
-            ui.label("Select a cell with a clip.");
+            ui.label("No clip selected.");
+            ui.weak("Click a filled cell to edit its transport, opacity and effects.");
+            ui.add_space(theme::SP_2);
+            ui.weak("Drop a video file on a cell, or right-click it to import a file or add a generator.");
             return;
         };
         let k = k.clone();
@@ -4901,7 +4901,7 @@ impl State {
                             index: i,
                         });
                     }
-                    if ui.small_button("x").on_hover_text("Remove cue").clicked() {
+                    if icons::button(ui, icons::i::X, "Remove cue").clicked() {
                         cmds.push(Command::RemoveCue {
                             deck,
                             layer,

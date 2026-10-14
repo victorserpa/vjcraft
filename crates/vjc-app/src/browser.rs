@@ -79,6 +79,43 @@ pub fn dir_key(p: &Path) -> String {
     format!("dir:{}", p.display())
 }
 
+/// One effect or generator offered by the Effects / Generators tabs.
+#[derive(Clone, Debug)]
+pub struct FxEntry {
+    pub name: String,
+    /// Group of the Effects tab; `None` for generators.
+    pub category: Option<String>,
+    pub item: Item,
+}
+
+/// Groups shown first and in this order; any other category follows alphabetically.
+const FX_CATEGORY_ORDER: [&str; 6] = ["Color", "Blur", "Distort", "Stylize", "Time", "Keying"];
+
+/// Splits row indices by the category of the entry each row came from. Rows without a
+/// category land in "Other". Order: `FX_CATEGORY_ORDER`, then the rest alphabetically.
+pub fn group_rows(rows: &[Row], fx: &[FxEntry]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = vec![];
+    for (i, row) in rows.iter().enumerate() {
+        let cat = fx
+            .iter()
+            .find(|e| e.name == row.name)
+            .and_then(|e| e.category.clone())
+            .unwrap_or_else(|| "Other".into());
+        match groups.iter_mut().find(|(c, _)| *c == cat) {
+            Some((_, v)) => v.push(i),
+            None => groups.push((cat, vec![i])),
+        }
+    }
+    let rank = |c: &str| {
+        FX_CATEGORY_ORDER
+            .iter()
+            .position(|k| *k == c)
+            .unwrap_or(FX_CATEGORY_ORDER.len())
+    };
+    groups.sort_by(|a, b| rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0)));
+    groups
+}
+
 pub fn fx_key(name: &str) -> String {
     format!("fx:{name}")
 }
@@ -430,7 +467,7 @@ impl Browser {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        fx: &[(String, Item)],
+        fx: &[FxEntry],
         general: &mut vjc_io::prefs::General,
     ) -> (Option<Opened>, bool) {
         let ctx = ui.ctx().clone();
@@ -628,16 +665,16 @@ impl Browser {
                 let want_gen = self.tab == Tab::Generators;
                 rows = fx
                     .iter()
-                    .filter(|(name, item)| {
-                        matches!(item, Item::Generator(_)) == want_gen && matches(name)
+                    .filter(|e| {
+                        matches!(e.item, Item::Generator(_)) == want_gen && matches(&e.name)
                     })
-                    .map(|(name, item)| Row {
-                        name: name.clone(),
+                    .map(|e| Row {
+                        name: e.name.clone(),
                         path: None,
                         mtime: None,
                         kind: RowKind::Effect,
-                        fav: Some(fx_key(name)),
-                        item: Some(item.clone()),
+                        fav: Some(fx_key(&e.name)),
+                        item: Some(e.item.clone()),
                     })
                     .collect();
             }
@@ -646,7 +683,13 @@ impl Browser {
         if self.tab != Tab::Network {
             favorites_first(&mut rows, general);
             let mut enter = None;
-            for ev in self.draw_rows(ui, &ctx, &rows, general) {
+            let evs = if self.tab == Tab::Effects {
+                let groups = group_rows(&rows, fx);
+                self.draw_groups(ui, &ctx, &rows, &groups, general)
+            } else {
+                self.draw_rows(ui, &ctx, &rows, general)
+            };
+            for ev in evs {
                 match ev {
                     Ev::Click(i) if rows[i].kind == RowKind::Dir => {
                         enter = rows[i].path.clone();
@@ -745,6 +788,53 @@ impl Browser {
 
     /// Draws `rows` as a list or a grid of thumbnails (only visible rows request
     /// thumbnails). Heart on rows that can be favourites.
+    /// Effects tab: one collapsible group per category.
+    fn draw_groups(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rows: &[Row],
+        groups: &[(String, Vec<usize>)],
+        general: &vjc_io::prefs::General,
+    ) -> Vec<Ev> {
+        let grid = general.browser_grid;
+        // Rows sit inside a collapsing header, indented by one step.
+        let avail = ui.available_width() - ui.spacing().indent - 2.0;
+        let cols = grid_cols(avail, grid);
+        let cell_w = if grid { avail / cols as f32 } else { avail };
+        let cell_h = if grid { GRID_CELL_H } else { LIST_ROW_H };
+        let mut evs = vec![];
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (cat, idx) in groups {
+                    egui::CollapsingHeader::new(format!("{cat} ({})", idx.len()))
+                        .id_salt(("fx-cat", cat))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for line in idx.chunks(cols) {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    for &i in line {
+                                        self.draw_cell(
+                                            ui,
+                                            ctx,
+                                            &rows[i],
+                                            i,
+                                            (cell_w, cell_h),
+                                            grid,
+                                            general,
+                                            &mut evs,
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                }
+            });
+        evs
+    }
+
     fn draw_rows(
         &mut self,
         ui: &mut egui::Ui,
@@ -1085,5 +1175,36 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
         assert_eq!(names, ["new.mp4", "mid.mp4", "old.mp4"]);
         assert!(list_recordings(Path::new("/no/such/dir")).is_empty());
+    }
+
+    #[test]
+    fn effects_group_by_category_in_fixed_order() {
+        let e = |n: &str, c: Option<&str>| FxEntry {
+            name: n.into(),
+            category: c.map(Into::into),
+            item: Item::Effect(n.into()),
+        };
+        let fx = [
+            e("a", Some("Keying")),
+            e("b", Some("Color")),
+            e("c", Some("Zeta")),
+            e("d", None),
+            e("f", Some("Color")),
+        ];
+        let rows: Vec<Row> = fx
+            .iter()
+            .map(|x| Row {
+                name: x.name.clone(),
+                path: None,
+                mtime: None,
+                kind: RowKind::Effect,
+                fav: None,
+                item: Some(x.item.clone()),
+            })
+            .collect();
+        let g = group_rows(&rows, &fx);
+        let names: Vec<&str> = g.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["Color", "Keying", "Other", "Zeta"]);
+        assert_eq!(g[0].1, [1, 4]);
     }
 }

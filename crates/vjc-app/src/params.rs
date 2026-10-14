@@ -255,7 +255,7 @@ fn anim_menu(
                 points.remove(i);
                 changed = true;
             }
-            if ui.small_button("+ point").clicked() {
+            if crate::icons::button(ui, crate::icons::i::PLUS, "Add point").clicked() {
                 points.push((1.0, 0.5));
                 changed = true;
             }

@@ -19,7 +19,7 @@ void main() {
         if (float(i) >= n) { break; }
         float k = float(i) / max(n - 1.0, 1.0);
         float y = 0.2 + 0.6 * k + amplitude * sin(uv.x * frequency * (1.0 + 0.3 * k) + TIME * speed * (1.0 + k) + float(i) * 1.7);
-        float m = smoothstep(y + 0.004, y - 0.004, uv.y);
+        float m = (1.0 - smoothstep(y - 0.004, y + 0.004, uv.y));
         vec3 tone = mix(ribbon.rgb, ribbon_far.rgb, k) * (0.35 + 0.65 * (1.0 - k));
         col = mix(col, tone, m);
     }

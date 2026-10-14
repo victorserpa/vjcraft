@@ -16,7 +16,7 @@ void main() {
     vec2 uv = isf_FragNormCoord;
     float row = floor(uv.y * RENDERSIZE.y);
     float tick = floor(TIME * 25.0);
-    float band = smoothstep(0.03, 0.0, abs(fract(uv.y * 0.5 - TIME * 0.2) - 0.5) - 0.45) * tracking;
+    float band = (1.0 - smoothstep(0.0, 0.03, abs(fract(uv.y * 0.5 - TIME * 0.2) - 0.5) - 0.45)) * tracking;
     float jx = (hash(vec2(row, tick)) - 0.5) * wobble * (1.0 + 6.0 * band);
     uv.x += jx;
     float r = IMG_NORM_PIXEL(inputImage, uv + vec2(bleed, 0.0)).r;

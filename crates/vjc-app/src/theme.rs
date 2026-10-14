@@ -128,7 +128,6 @@ fn style_dark(s: &mut egui::Style) {
     v.window_corner_radius = CornerRadius::same(6);
     v.menu_corner_radius = CornerRadius::same(6);
     v.selection.bg_fill = ACCENT.gamma_multiply(0.45);
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
     v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
     v.popup_shadow = egui::epaint::Shadow {
         offset: [0, 4],

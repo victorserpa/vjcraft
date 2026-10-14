@@ -73,10 +73,15 @@ impl ClipThumbs {
     }
 
     /// Texture of the clip, or None while it is still being decoded (or cannot be).
-    pub fn texture(&mut self, id: ClipId, path: &std::path::Path) -> Option<egui::TextureId> {
+    pub fn texture(
+        &mut self,
+        id: ClipId,
+        path: &std::path::Path,
+    ) -> Option<(egui::TextureId, f32)> {
         if let Some((p, t)) = self.textures.get(&id) {
             if p == path {
-                return Some(t.id());
+                let sz = t.size_vec2();
+                return Some((t.id(), sz.x / sz.y.max(1.0)));
             }
             self.textures.remove(&id);
         }

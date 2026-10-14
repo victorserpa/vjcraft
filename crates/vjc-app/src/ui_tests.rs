@@ -53,8 +53,16 @@ fn app_with(state: State, size: egui::Vec2) -> Harness<'static, State> {
     h
 }
 
+/// Most tests were written for a small grid: 2 layers x 4 columns.
+fn small_grid(mut st: State) -> State {
+    let c = &mut st.project.composition;
+    c.layers.remove(0);
+    c.columns.truncate(4);
+    st
+}
+
 fn app_sized(w: f32, h: f32) -> Harness<'static, State> {
-    app_with(State::headless(prefs()), egui::vec2(w, h))
+    app_with(small_grid(State::headless(prefs())), egui::vec2(w, h))
 }
 
 fn app() -> Harness<'static, State> {
@@ -205,16 +213,15 @@ fn tmp_vjc(name: &str) -> PathBuf {
 // 1
 #[test]
 fn opens_empty_app_with_bar_grid_and_browser() {
-    let mut h = app();
+    let mut h = app_with(State::headless(prefs()), egui::vec2(1280.0, 800.0));
     for l in ["BPM", "Tap", "Resync", "Master", "Add layer", "Add column"] {
         assert!(exists(&h, l) || has_text(&h, l), "missing {l}");
     }
     for l in ["Files", "Effects", "Generators", "Network"] {
         assert!(exists(&h, l), "browser tab {l}");
     }
-    assert_eq!(layers_cols(&h), (2, 4));
-    assert_eq!(all(&h, "(drop / right-click)"), 8, "2x4 empty cells");
-    assert_eq!(h.state().cells.len(), 8);
+    assert_eq!(layers_cols(&h), (3, 9));
+    assert_eq!(h.state().cells.len(), 27);
     snap(&mut h, "01-empty-app");
 }
 
@@ -376,8 +383,8 @@ fn effect_dropped_on_clip_and_param_edit() {
     let mut h = app();
     let lid = drop_video_on_cell(&mut h, 1, 0, &video);
     let (_, pos) = cell_center(&h, 1, 0);
-    let (fx_id, fx_src) = vjc_fx::BUILTIN[0];
-    let label = browser_label(fx_id, fx_src);
+    let fx_id = vjc_fx::BUILTIN[0].0;
+    let label = fx_label(fx_id);
     browser_drag(&mut h, "Effects", &label, pos);
     let deck = h.state().project.composition.current_deck;
     let effects = |h: &Harness<'_, State>| {
@@ -430,8 +437,8 @@ fn effect_dry_wet_slider_changes_chain() {
     let mut h = app();
     let lid = drop_video_on_cell(&mut h, 1, 0, &video);
     let (_, pos) = cell_center(&h, 1, 0);
-    let (fx_id, fx_src) = vjc_fx::BUILTIN[0];
-    browser_drag(&mut h, "Effects", &browser_label(fx_id, fx_src), pos);
+    let fx_id = vjc_fx::BUILTIN[0].0;
+    browser_drag(&mut h, "Effects", &fx_label(fx_id), pos);
     let deck = h.state().project.composition.current_deck;
     let dry_wet = |h: &Harness<'_, State>| {
         vjc_core::clip_in(&h.state().project, deck, lid, 0)
@@ -946,7 +953,7 @@ fn panel_tabs_switch() {
     assert!(has_text(&h, "Blend"));
     snap(&mut h, "11-layer-tab");
     // The Clip is its own panel: always there, no tab switch.
-    assert!(has_text(&h, "Select a cell with a clip."));
+    assert!(has_text(&h, "No clip selected."));
     assert!(matches!(h.state().panel_tab, PanelTab::Layer));
     snap(&mut h, "11-clip-panel");
     click(&mut h, "Composition");
@@ -1121,8 +1128,8 @@ fn group_two_layers_and_change_group_opacity() {
     let y = h.get_by_label("Group 1").rect().center().y;
     let slider = slider_rects(&h)
         .into_iter()
-        .find(|r| (r.center().y - y).abs() < 6.0)
-        .expect("group opacity slider on the header row");
+        .find(|r| r.center().y > y && r.center().y - y < 40.0)
+        .expect("group opacity slider under the group name");
     drag_to_slider_pct(&mut h, slider, 0.25);
     let c = &h.state().project.composition;
     let Value::Number(op) = c.groups[0].track.opacity.value else {
@@ -2389,9 +2396,13 @@ fn browser_grid_toggle_and_favorite_heart_persist_in_prefs() {
     assert!(!h.state().prefs.general.browser_grid);
     // Heart on the first effect row.
     click(&mut h, "Effects");
-    let grid = h.get_by_label("Grid").rect();
     // The panel's right edge is the window's, less its margin; heart sits at the cell's right.
-    let at = egui::pos2(1280.0 - 16.0 - 11.0, grid.max.y + 18.0);
+    let first = browser_fx()
+        .iter()
+        .find(|e| e.category.as_deref() == Some("Color"))
+        .unwrap();
+    let row_y = h.get_by_label(&first.name).rect().center().y;
+    let at = egui::pos2(h.get_by_label(&first.name).rect().max.x - 11.0, row_y);
     h.hover_at(at);
     h.step();
     for pressed in [true, false] {

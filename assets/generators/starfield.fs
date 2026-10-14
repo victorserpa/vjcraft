@@ -27,7 +27,7 @@ void main() {
         vec2 d = f - o * 0.7;
         d.y *= 1.0 / (1.0 + streak * 6.0 * z);
         float r = star_size * (0.4 + z);
-        float b = smoothstep(r, 0.0, length(d)) * hash(id + 3.0) * smoothstep(0.0, 0.15, z) * smoothstep(1.0, 0.8, z);
+        float b = (1.0 - smoothstep(0.0, r, length(d))) * hash(id + 3.0) * smoothstep(0.0, 0.15, z) * (1.0 - smoothstep(0.8, 1.0, z));
         col += starlight.rgb * b;
     }
     gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
