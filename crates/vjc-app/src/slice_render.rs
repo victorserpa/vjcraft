@@ -351,8 +351,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 pub struct Stamper {
     pipe: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
-    /// Uploaded overlay and the pixels it holds, to skip re-uploading an unchanged card.
-    cache: Option<((u32, u32), Vec<u8>, wgpu::TextureView)>,
+    /// Per screen: size, geometry hash and uploaded card texture.
+    cache: std::collections::HashMap<uuid::Uuid, ((u32, u32), u64, wgpu::TextureView)>,
 }
 
 impl Stamper {
@@ -407,25 +407,38 @@ impl Stamper {
         Self {
             pipe,
             bgl,
-            cache: None,
+            cache: Default::default(),
         }
     }
 
-    /// Draws `rgba` (`size` = target size, straight alpha) over `target`.
-    pub fn stamp(
+    /// Drops cached cards of screens that no longer show one.
+    pub fn retain_cards(&mut self, keep: impl Fn(&uuid::Uuid) -> bool) {
+        self.cache.retain(|id, _| keep(id));
+    }
+
+    /// Draws the test card of `screen` over `target`. The card is static, so its texture
+    /// is cached per screen and rebuilt (rasterize + upload) only when the size or the
+    /// geometry hash changes.
+    pub fn stamp_card(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         target: &wgpu::TextureView,
+        screen: &vjc_model::Screen,
         size: (u32, u32),
-        rgba: &[u8],
     ) {
         use wgpu::util::DeviceExt;
+        let key = crate::output_overlay::card_key(screen);
         if self
             .cache
-            .as_ref()
-            .is_none_or(|(s, px, _)| *s != size || px != rgba)
+            .get(&screen.id)
+            .is_none_or(|(s, k, _)| *s != size || *k != key)
         {
+            let rgba = crate::output_overlay::rasterize(
+                &crate::output_overlay::test_card(screen),
+                size.0,
+                size.1,
+            );
             let t = device.create_texture_with_data(
                 queue,
                 &wgpu::TextureDescriptor {
@@ -443,11 +456,12 @@ impl Stamper {
                     view_formats: &[],
                 },
                 wgpu::util::TextureDataOrder::LayerMajor,
-                rgba,
+                &rgba,
             );
-            self.cache = Some((size, rgba.to_vec(), t.create_view(&Default::default())));
+            self.cache
+                .insert(screen.id, (size, key, t.create_view(&Default::default())));
         }
-        let Some((_, _, view)) = &self.cache else {
+        let Some((_, _, view)) = self.cache.get(&screen.id) else {
             return;
         };
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -602,9 +616,7 @@ mod tests {
         let (dst, dst_v) = make_screen_target(&device, w, h);
         SliceRenderer::new(&device).render(&device, &queue, screen, &|_| (&src_v, (1, 1)), &dst_v);
         if card {
-            let px =
-                crate::output_overlay::rasterize(&crate::output_overlay::test_card(screen), w, h);
-            Stamper::new(&device).stamp(&device, &queue, &dst_v, (w, h), &px);
+            Stamper::new(&device).stamp_card(&device, &queue, &dst_v, screen, (w, h));
         }
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -646,6 +658,81 @@ mod tests {
     fn px(img: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
         let i = (y * w + x) * 4;
         [img[i], img[i + 1], img[i + 2], img[i + 3]]
+    }
+
+    fn readback(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        h: u32,
+    ) -> Vec<u8> {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: 64,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let d = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        d
+    }
+
+    /// A second frame with the same screen does not rasterize again and draws the same
+    /// pixels as the first; a size change (negative control) invalidates the cache.
+    #[test]
+    fn card_cache_skips_rasterize_and_matches() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let calls = || crate::output_overlay::RASTERIZE_CALLS.with(|c| c.get());
+        let mut screen = mapping::new_screen("t", 64, 64);
+        screen.slices.push(mapping::new_slice(64, 64));
+        let mut st = Stamper::new(&device);
+        let (t1, v1) = make_screen_target(&device, 64, 64);
+        let (t2, v2) = make_screen_target(&device, 64, 64);
+        let c0 = calls();
+        st.stamp_card(&device, &queue, &v1, &screen, (64, 64));
+        assert_eq!(calls(), c0 + 1);
+        st.stamp_card(&device, &queue, &v2, &screen, (64, 64));
+        assert_eq!(calls(), c0 + 1, "unchanged card: no rasterize");
+        let (a, b) = (
+            readback(&device, &queue, &t1, 64),
+            readback(&device, &queue, &t2, 64),
+        );
+        assert!(
+            a.chunks(4).any(|p| p[3] != 0 && p[..3] != [0, 0, 0]),
+            "card drawn"
+        );
+        assert_eq!(a, b, "cached frame equals fresh frame");
+        screen.slices[0].output_mesh[0].0 += 3.0;
+        st.stamp_card(&device, &queue, &v1, &screen, (64, 64));
+        assert_eq!(calls(), c0 + 2, "geometry change invalidates");
+        screen.width = 32;
+        let (_t3, v3) = make_screen_target(&device, 32, 64);
+        st.stamp_card(&device, &queue, &v3, &screen, (32, 64));
+        assert_eq!(calls(), c0 + 3, "size change invalidates");
     }
 
     /// The frame Art-Net / NDI / Syphon read back carries the test card; without it, an

@@ -4281,6 +4281,11 @@ impl State {
         let Some(comp) = self.comp.as_ref() else {
             return;
         };
+        // Cards of screens whose card is off (or that were deleted) free their texture.
+        if let Some(st) = &mut self.stamper {
+            let on = &self.test_cards;
+            st.retain_cards(|id| on.contains(id));
+        }
         for id in open {
             let Some(scr) = self.project.output.screens.iter().find(|s| s.id == id) else {
                 continue;
@@ -4354,10 +4359,9 @@ impl State {
             // The test card goes into the screen target itself, so Art-Net, Syphon and NDI
             // see it too. Black-out and a disabled screen stay black.
             if self.test_cards.contains(&id) && !self.blackouts.contains(&id) && scr.enabled {
-                let px = output_overlay::rasterize(&output_overlay::test_card(scr), size.0, size.1);
                 self.stamper
                     .get_or_insert_with(|| slice_render::Stamper::new(&rs.device))
-                    .stamp(&rs.device, &rs.queue, target_view, size, &px);
+                    .stamp_card(&rs.device, &rs.queue, target_view, scr, size);
             }
             if let Some((live, _)) = &t.live {
                 t.ring

@@ -54,10 +54,30 @@ pub fn test_card(screen: &Screen) -> Vec<Item> {
     v
 }
 
+/// Hash of everything `test_card` depends on besides the size: canvas size and slice
+/// outline meshes. The card has no animated part, so this is the whole cache key.
+pub fn card_key(screen: &Screen) -> u64 {
+    use std::hash::{Hash, Hasher};
+    // The whole screen (every field `test_card` might read): any edit invalidates the card.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(screen)
+        .unwrap_or_default()
+        .hash(&mut h);
+    h.finish()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls to `rasterize` on this thread (tests assert the cache avoids them).
+    pub static RASTERIZE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Rasterizes test card items into straight-alpha RGBA (`w` x `h`, transparent where
 /// nothing is drawn). Later items win. Twin of what `draw` paints over the output window,
 /// minus the text, so the card can also be stamped on the GPU screen target.
 pub fn rasterize(items: &[Item], w: u32, h: u32) -> Vec<u8> {
+    #[cfg(test)]
+    RASTERIZE_CALLS.with(|c| c.set(c.get() + 1));
     let mut img = vec![0u8; (w as usize) * (h as usize) * 4];
     let mut put = |x: i64, y: i64, c: Color32| {
         if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
