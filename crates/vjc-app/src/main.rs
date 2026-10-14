@@ -101,6 +101,8 @@ struct State {
     /// Texture-memory limit in bytes (`VJC_VRAM_LIMIT_MB`).
     vram_limit: u64,
     frame_ms: frame_stats::FrameStats,
+    /// Status-bar frame-time text, rebuilt every 500 ms so its galley stays cached.
+    frame_label: (Option<std::time::Instant>, String),
     /// Decoders opened ahead for the deck the user is about to switch to.
     preload: preload::Preload,
     frames: u64,
@@ -1225,6 +1227,7 @@ impl State {
             vram_dog: vram::Watchdog::default(),
             vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
+            frame_label: (None, String::new()),
             preload: preload::Preload::default(),
             frames: 0,
             players: HashMap::new(),
@@ -4813,7 +4816,14 @@ impl State {
                         );
                         if self.frame_ms.len() > 0 {
                             ui.separator();
-                            ui.weak(self.frame_ms.label())
+                            let stale = self.frame_label.0.is_none_or(|t| {
+                                t.elapsed() >= std::time::Duration::from_millis(500)
+                            });
+                            if stale {
+                                self.frame_label =
+                                    (Some(std::time::Instant::now()), self.frame_ms.label());
+                            }
+                            ui.weak(egui::RichText::new(&self.frame_label.1).monospace())
                                 .on_hover_text("Frame time (CPU, last 240 frames)");
                         }
                     });
