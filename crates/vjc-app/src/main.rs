@@ -7,6 +7,7 @@ mod compositor;
 mod dmx_io;
 mod frame_stats;
 mod fx;
+mod fx_thumbs;
 mod grid_ui;
 mod help;
 mod icons;
@@ -5797,6 +5798,11 @@ impl eframe::App for State {
         self.poll_monitors();
         self.tick_clock();
         self.compose(frame);
+        if let Some(rs) = frame.wgpu_render_state() {
+            self.browser
+                .fx_thumbs
+                .attach(rs.device.clone(), rs.queue.clone(), ui.ctx().clone());
+        }
         State::ui(self, ui);
         let ctx = ui.ctx().clone();
         self.output_window(&ctx);

@@ -211,7 +211,7 @@ fn uniform_words(base: [u32; 8], xf: &Affine, size: (u32, u32)) -> [u32; 16] {
 }
 
 /// Vertex stage shared by all effect fragment shaders. `uv` is ISF-style (origin bottom-left).
-const FX_VS: &str = r#"
+pub(crate) const FX_VS: &str = r#"
 struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> VO {
@@ -223,7 +223,7 @@ fn vs(@builtin(vertex_index) i: u32) -> VO {
 }
 "#;
 
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub(crate) const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// One active (non-bypassed) effect with its uniform block for this frame.
 #[derive(Clone)]
@@ -747,6 +747,35 @@ fn make_base(
     (t, bind)
 }
 
+/// Bind group layout of every effect / generator pass (also used by the browser thumbnails).
+pub(crate) fn fx_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let mut e: Vec<wgpu::BindGroupLayoutEntry> = vec![];
+    for binding in 0..5u32 {
+        e.push(wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: match binding {
+                0 => wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                2 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                _ => wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+            },
+            count: None,
+        });
+    }
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("fx_bgl"),
+        entries: &e,
+    })
+}
+
 impl Compositor {
     pub fn new(device: &wgpu::Device, w: u32, h: u32) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -785,33 +814,7 @@ impl Compositor {
             ],
         });
         // Effect passes: the layer bindings plus the ML mask texture.
-        let fx_bgl = {
-            let mut e: Vec<wgpu::BindGroupLayoutEntry> = vec![];
-            for binding in 0..5u32 {
-                e.push(wgpu::BindGroupLayoutEntry {
-                    binding,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: match binding {
-                        0 => wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        2 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        _ => wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                    },
-                    count: None,
-                });
-            }
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("fx_bgl"),
-                entries: &e,
-            })
-        };
+        let fx_bgl = fx_bind_layout(device);
         let base_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compositor_base_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {

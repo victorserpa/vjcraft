@@ -497,6 +497,7 @@ pub struct Browser {
     dir: PathBuf,
     entries: Vec<Entry>,
     thumbs: Thumbs,
+    pub fx_thumbs: crate::fx_thumbs::FxThumbs,
     net: NetListing,
     net_rx: Option<Receiver<NetListing>>,
     net_at: Option<std::time::Instant>,
@@ -516,6 +517,7 @@ impl Browser {
             dir: start,
             entries,
             thumbs: Thumbs::new(),
+            fx_thumbs: crate::fx_thumbs::FxThumbs::new(),
             net: NetListing::default(),
             net_rx: None,
             net_at: None,
@@ -554,6 +556,7 @@ impl Browser {
     ) -> (Option<Opened>, bool) {
         let ctx = ui.ctx().clone();
         self.thumbs.poll();
+        self.fx_thumbs.step(&ctx);
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             crate::help::help(
@@ -988,6 +991,10 @@ impl Browser {
         } else {
             egui::Rect::from_min_size(rect.min, egui::vec2(64.0, 36.0))
         };
+        let fx_id = match &row.item {
+            Some(Item::Effect(id) | Item::Generator(id)) => Some(id.as_str()),
+            _ => None,
+        };
         let text = match row.kind {
             RowKind::Dir => {
                 ui.painter()
@@ -1001,6 +1008,21 @@ impl Browser {
                 {
                     Some(id) => ui.painter().image(
                         id,
+                        th,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    ),
+                    None => ui
+                        .painter()
+                        .rect_filled(th, 2.0, ui.visuals().extreme_bg_color),
+                };
+                row.name.clone()
+            }
+            RowKind::Effect if fx_id.is_some() => {
+                let id = fx_id.unwrap_or_default();
+                match self.fx_thumbs.texture(id) {
+                    Some(tex) => ui.painter().image(
+                        tex,
                         th,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
