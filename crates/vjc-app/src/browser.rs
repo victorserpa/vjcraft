@@ -148,9 +148,84 @@ const GRID_CELL_W: f32 = 84.0;
 const GRID_CELL_H: f32 = 74.0;
 const LIST_ROW_H: f32 = 40.0;
 
-/// Videos in `dir` (the app's recordings), newest first. Missing folder = empty.
-pub fn list_recordings(dir: &Path) -> Vec<Entry> {
-    let mut out: Vec<Entry> = list_dir(dir).into_iter().filter(|e| !e.is_dir).collect();
+/// Answers "is this a folder / file?" for favourites and recent projects without touching
+/// the disk on the UI thread (an unmounted network volume can block for many seconds). A
+/// path not yet checked counts as present; the answer is refreshed every few seconds.
+pub struct PathChecks {
+    known: HashMap<(PathBuf, bool), (bool, std::time::Instant)>,
+    pending: HashSet<(PathBuf, bool)>,
+    tx: Sender<((PathBuf, bool), bool)>,
+    rx: Receiver<((PathBuf, bool), bool)>,
+}
+
+impl Default for PathChecks {
+    fn default() -> Self {
+        let (tx, rx) = channel();
+        PathChecks {
+            known: HashMap::new(),
+            pending: HashSet::new(),
+            tx,
+            rx,
+        }
+    }
+}
+
+impl PathChecks {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn exists(&mut self, ctx: &egui::Context, path: &Path, dir: bool) -> bool {
+        while let Ok((k, ok)) = self.rx.try_recv() {
+            self.pending.remove(&k);
+            self.known.insert(k, (ok, std::time::Instant::now()));
+        }
+        let key = (path.to_path_buf(), dir);
+        let cached = self.known.get(&key).copied();
+        if cached.is_none_or(|(_, at)| at.elapsed() > Self::TTL) && self.pending.insert(key.clone())
+        {
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let ok = if key.1 {
+                    key.0.is_dir()
+                } else {
+                    key.0.is_file()
+                };
+                let _ = tx.send((key, ok));
+                ctx.request_repaint();
+            });
+        }
+        cached.is_none_or(|(ok, _)| ok)
+    }
+}
+
+/// Search on the Effects / Generators tabs: the name or the category contains `q`
+/// (lowercase; empty matches everything).
+pub fn fx_matches(e: &FxEntry, q: &str) -> bool {
+    q.is_empty()
+        || e.name.to_lowercase().contains(q)
+        || e.category
+            .as_deref()
+            .is_some_and(|c| c.to_lowercase().contains(q))
+}
+
+/// Width of one cell given the width really available to the rows (after the scrollbar).
+pub fn cell_width(avail: f32, cols: usize, grid: bool) -> f32 {
+    if grid { avail / cols as f32 } else { avail }
+}
+
+/// A recording touched this recently is still being written.
+const REC_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Videos in `dir` (the app's recordings), newest first, without the file still being
+/// written at `now`. Missing folder = empty.
+pub fn list_recordings(dir: &Path, now: SystemTime) -> Vec<Entry> {
+    let mut out: Vec<Entry> = list_dir(dir)
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .filter(|e| {
+            e.mtime
+                .is_none_or(|t| now.duration_since(t).is_ok_and(|age| age >= REC_SETTLE))
+        })
+        .collect();
     out.sort_by(|a, b| {
         b.mtime
             .cmp(&a.mtime)
@@ -429,6 +504,7 @@ pub struct Browser {
     rec: Vec<Entry>,
     rec_dir: PathBuf,
     rec_at: Option<std::time::Instant>,
+    checks: PathChecks,
 }
 
 impl Browser {
@@ -446,6 +522,7 @@ impl Browser {
             rec: vec![],
             rec_dir: crate::capture::recordings_dir(),
             rec_at: None,
+            checks: PathChecks::default(),
         }
     }
 
@@ -535,7 +612,7 @@ impl Browser {
                 .rec_at
                 .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3));
             if stale {
-                self.rec = list_recordings(&self.rec_dir);
+                self.rec = list_recordings(&self.rec_dir, SystemTime::now());
                 self.rec_at = Some(std::time::Instant::now());
             }
             ui.ctx()
@@ -578,7 +655,7 @@ impl Browser {
                     .favorites
                     .iter()
                     .filter_map(|k| k.strip_prefix("dir:").map(PathBuf::from))
-                    .filter(|p| p.is_dir())
+                    .filter(|p| self.checks.exists(ui.ctx(), p, true))
                     .collect();
                 if !favs.is_empty() {
                     ui.horizontal_wrapped(|ui| {
@@ -625,7 +702,7 @@ impl Browser {
                 rows = general
                     .recent_projects
                     .iter()
-                    .filter(|p| p.is_file())
+                    .filter(|p| self.checks.exists(ui.ctx(), p, false))
                     .filter_map(|p| {
                         let name = p.file_stem()?.to_string_lossy().into_owned();
                         matches(&name).then(|| Row {
@@ -671,7 +748,7 @@ impl Browser {
                 rows = fx
                     .iter()
                     .filter(|e| {
-                        matches!(e.item, Item::Generator(_)) == want_gen && matches(&e.name)
+                        matches!(e.item, Item::Generator(_)) == want_gen && fx_matches(e, &q)
                     })
                     .map(|e| Row {
                         name: e.name.clone(),
@@ -791,8 +868,6 @@ impl Browser {
         (opened, changed)
     }
 
-    /// Draws `rows` as a list or a grid of thumbnails (only visible rows request
-    /// thumbnails). Heart on rows that can be favourites.
     /// Effects tab: one collapsible group per category.
     fn draw_groups(
         &mut self,
@@ -804,9 +879,10 @@ impl Browser {
     ) -> Vec<Ev> {
         let grid = general.browser_grid;
         // Rows sit inside a collapsing header, indented by one step.
-        let avail = ui.available_width() - ui.spacing().indent - 2.0;
+        let bar = ui.spacing().scroll.allocated_width();
+        let avail = ui.available_width() - bar - ui.spacing().indent - 2.0;
         let cols = grid_cols(avail, grid);
-        let cell_w = if grid { avail / cols as f32 } else { avail };
+        let cell_w = cell_width(avail, cols, grid);
         let cell_h = if grid { GRID_CELL_H } else { LIST_ROW_H };
         let mut evs = vec![];
         egui::ScrollArea::vertical()
@@ -840,6 +916,8 @@ impl Browser {
         evs
     }
 
+    /// Draws `rows` as a list or a grid of thumbnails (only visible rows request
+    /// thumbnails). Heart on rows that can be favourites.
     fn draw_rows(
         &mut self,
         ui: &mut egui::Ui,
@@ -848,19 +926,18 @@ impl Browser {
         general: &vjc_io::prefs::General,
     ) -> Vec<Ev> {
         let grid = general.browser_grid;
-        let cols = grid_cols(ui.available_width(), grid);
-        let cell_w = if grid {
-            ui.available_width() / cols as f32
-        } else {
-            ui.available_width()
-        };
         let cell_h = if grid { GRID_CELL_H } else { LIST_ROW_H };
         let mut evs = vec![];
+        // The row count needs the column count, which depends on the width left after a
+        // solid scrollbar: measure inside the scroll area's own width.
+        let bar = ui.spacing().scroll.allocated_width();
+        let cols = grid_cols(ui.available_width() - bar, grid);
         egui::ScrollArea::vertical().show_rows(
             ui,
             cell_h,
             rows.len().div_ceil(cols),
             |ui, range| {
+                let cell_w = cell_width(ui.available_width(), cols, grid);
                 for line in range {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1176,17 +1253,61 @@ mod tests {
         let d = std::env::temp_dir().join(format!("vjc-rec-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        for (name, age) in [("old.mp4", 0), ("new.mp4", 100), ("mid.mp4", 50)] {
+        let now = t0 + std::time::Duration::from_secs(1000);
+        for (name, age) in [
+            ("old.mp4", 0),
+            ("new.mp4", 100),
+            ("mid.mp4", 50),
+            // Touched a second ago: still being recorded.
+            ("live.mp4", 999),
+        ] {
             let f = std::fs::File::create(d.join(name)).unwrap();
             f.set_modified(t0 + std::time::Duration::from_secs(age))
                 .unwrap();
         }
         std::fs::write(d.join("notes.txt"), b"").unwrap();
         std::fs::create_dir_all(d.join("sub")).unwrap();
-        let names: Vec<String> = list_recordings(&d).into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = list_recordings(&d, now)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         std::fs::remove_dir_all(&d).ok();
         assert_eq!(names, ["new.mp4", "mid.mp4", "old.mp4"]);
-        assert!(list_recordings(Path::new("/no/such/dir")).is_empty());
+        assert!(list_recordings(Path::new("/no/such/dir"), now).is_empty());
+    }
+
+    #[test]
+    fn path_checks_answer_present_first_then_the_real_result() {
+        let ctx = egui::Context::default();
+        let mut c = PathChecks::default();
+        let p = Path::new("/no/such/vjc-folder");
+        assert!(c.exists(&ctx, p, true), "unknown counts as present");
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if !c.exists(&ctx, p, true) {
+                return;
+            }
+        }
+        panic!("check never landed");
+    }
+
+    #[test]
+    fn effect_search_matches_the_category_too() {
+        let e = FxEntry {
+            name: "Gaussian".into(),
+            category: Some("Blur".into()),
+            item: Item::Effect("Gaussian".into()),
+        };
+        assert!(fx_matches(&e, "gauss"));
+        assert!(fx_matches(&e, "blur"));
+        assert!(fx_matches(&e, ""));
+        assert!(!fx_matches(&e, "color"));
+    }
+
+    #[test]
+    fn cell_width_fits_the_space_left_by_the_scrollbar() {
+        assert_eq!(cell_width(300.0, 3, true), 100.0);
+        assert_eq!(cell_width(300.0, 1, false), 300.0);
     }
 
     #[test]

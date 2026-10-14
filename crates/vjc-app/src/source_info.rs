@@ -4,11 +4,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 use vjc_media::SourceInfo;
 
 pub struct SourceInfos {
     known: HashMap<PathBuf, Option<SourceInfo>>,
     pending: HashSet<PathBuf>,
+    /// When each failed probe may be tried again (the file may appear or become readable).
+    retry_at: HashMap<PathBuf, Instant>,
+    retry_after: Duration,
     tx: Sender<(PathBuf, Option<SourceInfo>)>,
     rx: Receiver<(PathBuf, Option<SourceInfo>)>,
 }
@@ -19,6 +23,8 @@ impl Default for SourceInfos {
         SourceInfos {
             known: HashMap::new(),
             pending: HashSet::new(),
+            retry_at: HashMap::new(),
+            retry_after: Duration::from_secs(3),
             tx,
             rx,
         }
@@ -31,16 +37,36 @@ impl SourceInfos {
     pub fn get(&mut self, path: &Path) -> Option<Option<&SourceInfo>> {
         while let Ok((p, info)) = self.rx.try_recv() {
             self.pending.remove(&p);
+            if info.is_none() {
+                self.retry_at
+                    .insert(p.clone(), Instant::now() + self.retry_after);
+            }
             self.known.insert(p, info);
         }
-        if !self.known.contains_key(path) && self.pending.insert(path.to_path_buf()) {
+        if self
+            .retry_at
+            .get(path)
+            .is_some_and(|t| Instant::now() >= *t)
+        {
+            // Keep showing the old answer while the new probe runs.
+            self.retry_at.remove(path);
+            self.pending.remove(path);
+            self.spawn(path);
+        }
+        if !self.known.contains_key(path) {
+            self.spawn(path);
+        }
+        self.known.get(path).map(Option::as_ref)
+    }
+
+    fn spawn(&mut self, path: &Path) {
+        if self.pending.insert(path.to_path_buf()) {
             let (tx, p) = (self.tx.clone(), path.to_path_buf());
             std::thread::spawn(move || {
                 let info = vjc_media::probe(&p);
                 let _ = tx.send((p, info));
             });
         }
-        self.known.get(path).map(Option::as_ref)
     }
 
     /// Test hook: pretends the probe of `path` already returned `info`.
@@ -100,6 +126,25 @@ mod tests {
         assert_eq!(describe(p, Some(Some(&i))), "clip.mov  hap");
         assert_eq!(describe(p, None), "clip.mov  reading...");
         assert_eq!(describe(p, Some(None)), "clip.mov  no video info");
+    }
+
+    #[test]
+    fn failed_probe_is_tried_again() {
+        let mut s = SourceInfos {
+            retry_after: Duration::ZERO,
+            ..Default::default()
+        };
+        let p = Path::new("/definitely/not/here.mov");
+        s.get(p);
+        // The failure lands, then every later ask starts a new probe.
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(10));
+            s.get(p);
+            if s.known.contains_key(p) && s.pending.contains(p) {
+                return;
+            }
+        }
+        panic!("failed probe never retried");
     }
 
     #[test]

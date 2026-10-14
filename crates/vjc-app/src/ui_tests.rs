@@ -1124,6 +1124,8 @@ fn group_two_layers_and_change_group_opacity() {
         assert!(c.layers.iter().all(|l| l.group == Some(c.groups[0].id)));
     }
     assert!(exists(&h, "Group 1"));
+    // The header carries its own Ungroup button (the Group tab is not open yet).
+    assert!(exists(&h, "Ungroup"), "visible Ungroup in the group header");
     // The header row has its own opacity slider: the one on the same row as the header.
     let y = h.get_by_label("Group 1").rect().center().y;
     let slider = slider_rects(&h)

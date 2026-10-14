@@ -79,6 +79,19 @@ impl Playhead {
         }
     }
 
+    /// The in..out region changed from `old` to `new` while playing: keep the place in the
+    /// file instead of the place in the region, so dragging a marker never jumps the picture.
+    pub fn retarget(&mut self, old: (f64, f64), new: (f64, f64)) {
+        use crate::playback::{to_actual, to_local};
+        let remap = |u: f64| to_local(to_actual(u, old), new);
+        // Bounce stores the way back as 1..2 (mirrored).
+        self.x = if self.x > 1.0 {
+            2.0 - remap(2.0 - self.x)
+        } else {
+            remap(self.x)
+        };
+    }
+
     /// Jumps to a normalised position (cue point / beat loop).
     pub fn seek(&mut self, pos: f64) {
         self.x = pos.clamp(0.0, 1.0);
@@ -168,6 +181,27 @@ mod tests {
                 .position;
         }
         pos
+    }
+
+    #[test]
+    fn retarget_keeps_the_file_position_when_the_region_changes() {
+        use crate::playback::to_actual;
+        let (old, new) = ((0.0, 1.0), (0.4, 1.0));
+        let mut h = Playhead::new(Direction::Forward, 1);
+        h.seek(0.5);
+        h.retarget(old, new);
+        let t = h.tick(0.0, PlayMode::Loop, Direction::Forward, 1.0, 1.0);
+        assert!((to_actual(t.position, new) - 0.5).abs() < 1e-9, "{t:?}");
+        // Marker moved past the head: it clamps to the new in point.
+        h.retarget(new, (0.8, 1.0));
+        let t = h.tick(0.0, PlayMode::Loop, Direction::Forward, 1.0, 1.0);
+        assert_eq!(t.position, 0.0);
+        // Bounce on its way back keeps the place too.
+        let mut b = Playhead::new(Direction::Forward, 1);
+        b.seek(1.0);
+        b.x = 1.5; // back half, local 0.5
+        b.retarget((0.0, 1.0), (0.0, 0.5));
+        assert!((b.x - 1.0).abs() < 1e-9, "{}", b.x);
     }
 
     #[test]

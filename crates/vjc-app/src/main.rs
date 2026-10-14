@@ -237,6 +237,21 @@ struct State {
     help_shown: Option<&'static str>,
 }
 
+/// Caption of the preview monitor. A layer with its video off is not drawn, so the monitor
+/// would be a bare black frame; say why.
+fn preview_note(layer_selected: bool, video_off: bool) -> &'static str {
+    match (layer_selected, video_off) {
+        (true, true) => "Selected layer: video is off",
+        (true, false) => "Selected layer",
+        (false, _) => "Composition (no layer selected)",
+    }
+}
+
+/// Channel mask of a clip's picture (all on without a clip).
+fn channels_of(clip: Option<&vjc_model::Clip>) -> vjc_model::Channels {
+    clip.map_or_else(Default::default, |k| k.channels)
+}
+
 /// Smallest height the clip grid keeps when panels are enlarged.
 const GRID_MIN: f32 = 80.0;
 
@@ -258,6 +273,8 @@ struct Flow {
     beat_loops: HashMap<LayerId, (f64, (f64, f64))>,
     /// Last playhead position per layer.
     pos: HashMap<LayerId, f64>,
+    /// In..out region each layer's playhead last ran over.
+    regions: HashMap<LayerId, (f64, f64)>,
     /// Autopilot on generators: (last bar seen, bars completed) per layer.
     gen_bars: HashMap<LayerId, (i64, u32)>,
 }
@@ -475,6 +492,13 @@ fn group_header(
         }
         if s.changed() {
             cmds.push(Command::SetGroupSolo { group: gid, solo });
+        }
+        if ui
+            .small_button("Ungroup")
+            .on_hover_text("Dissolve the group, keep its layers")
+            .clicked()
+        {
+            cmds.push(Command::Ungroup { group: gid });
         }
     });
     let label = vjc_core::blend::COMPOSITION_MODES
@@ -1605,6 +1629,7 @@ impl State {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(1, |d| d.as_nanos() as u64);
                         self.heads.insert(layer, Playhead::new(dir, seed));
+                        self.flow.regions.remove(&layer);
                     } else {
                         self.status = format!("File not found: {}", path.display());
                     }
@@ -1938,6 +1963,11 @@ impl State {
                 // The playhead runs over the in..out region only; `position` below is the
                 // matching place in the file.
                 let reg = vjc_core::playback::region(tr);
+                if let Some(old) = self.flow.regions.insert(*layer, reg)
+                    && old != reg
+                {
+                    head.retarget(old, reg);
+                }
                 let d = file_d * (reg.1 - reg.0);
                 // Timecode clips: position = timecode - start (random access, muted); without
                 // signal they freeze or run free from where they were, per the prefs.
@@ -2382,7 +2412,7 @@ impl State {
                     generator: None,
                     transition: Some((kind.shader_id(), prog, true)),
                     transform: layer_xf,
-                    channels: Default::default(),
+                    channels: channels_of(o.clip.as_ref()),
                     frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
                 });
             }
@@ -2396,7 +2426,7 @@ impl State {
                 effects,
                 generator,
                 transform: xf,
-                channels: clip.map_or_else(Default::default, |k| k.channels),
+                channels: channels_of(clip),
                 frame: f
                     .as_ref()
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
@@ -4144,11 +4174,11 @@ impl State {
                 }
             }
             if i == 1 {
-                let note = if preview_tex.is_some() {
-                    "Selected layer"
-                } else {
-                    "Composition (no layer selected)"
-                };
+                let video_off = self
+                    .selected
+                    .and_then(|(l, _)| self.project.composition.layers.iter().find(|x| x.id == l))
+                    .is_some_and(|l| !l.video);
+                let note = preview_note(preview_tex.is_some(), video_off);
                 painter.text(
                     rect.left_top() + egui::vec2(4.0, 2.0),
                     egui::Align2::LEFT_TOP,
@@ -5839,6 +5869,32 @@ fn window_grew(prev: egui::Vec2, now: egui::Vec2) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_warns_when_selected_layer_video_is_off() {
+        assert_eq!(preview_note(true, false), "Selected layer");
+        assert!(preview_note(true, true).contains("video is off"));
+        assert!(preview_note(false, false).starts_with("Composition"));
+    }
+
+    #[test]
+    fn outgoing_transition_keeps_the_clip_channel_mask() {
+        let mut k = vjc_model::Clip {
+            id: Uuid::new_v4(),
+            name: "c".into(),
+            source: vjc_model::Source::File {
+                path: "a.mov".into(),
+            },
+            transport: Default::default(),
+            track: vjc_model::Track::new(vjc_model::BlendMode::Normal),
+            blend_override: None,
+            fit: Default::default(),
+            channels: Default::default(),
+        };
+        k.channels.g = false;
+        assert!(!channels_of(Some(&k)).g);
+        assert_eq!(channels_of(None), Default::default());
+    }
+
     #[test]
     fn window_growth_reforces_panels() {
         let v = egui::vec2;
