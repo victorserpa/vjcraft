@@ -296,9 +296,14 @@ impl Renderer {
     /// the whole job (submit and readback included) are caught here instead of reaching
     /// the device's uncaptured handler, which panics.
     fn render(&self, id: &str) -> Result<Vec<u8>, String> {
+        self.render_variant(id, Extreme::Default, 1.0)
+    }
+
+    /// Like `render`, with every float parameter at its default, minimum or maximum.
+    fn render_variant(&self, id: &str, which: Extreme, time: f32) -> Result<Vec<u8>, String> {
         let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let res = self.render_job(id);
+        let res = self.render_job(id, which, time);
         // Pop both scopes before returning, so a failed render leaves none on the stack.
         let v = pollster::block_on(validation.pop());
         let o = pollster::block_on(oom.pop());
@@ -308,7 +313,7 @@ impl Renderer {
         res
     }
 
-    fn render_job(&self, id: &str) -> Result<Vec<u8>, String> {
+    fn render_job(&self, id: &str, which: Extreme, time: f32) -> Result<Vec<u8>, String> {
         let src = vjc_fx::builtin_source(id).ok_or("unknown effect")?;
         let isf = vjc_fx::parse(src).map_err(|e| e.to_string())?;
         let wgsl = vjc_fx::translate(&isf).map_err(|e| e.to_string())?;
@@ -346,7 +351,17 @@ impl Renderer {
         if let Some(e) = pollster::block_on(scope.pop()) {
             return Err(e.to_string());
         }
-        let uniforms = isf.pack(&isf.default_params(), 1.0, (W, H));
+        let mut params = isf.default_params();
+        for p in &mut params {
+            if let (Some((lo, hi)), vjc_model::Value::Number(_)) = (p.range, &p.value) {
+                match which {
+                    Extreme::Default => {}
+                    Extreme::Min => p.value = vjc_model::Value::Number(lo),
+                    Extreme::Max => p.value = vjc_model::Value::Number(hi),
+                }
+            }
+        }
+        let uniforms = isf.pack(&params, time, (W, H));
         let buf = d.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fx_thumb_u"),
             size: std::mem::size_of::<vjc_fx::Uniforms>() as u64,
@@ -385,6 +400,16 @@ impl Renderer {
         rb.unmap();
         Ok(px)
     }
+}
+
+/// Which end of its range the smoke renders put each float parameter at.
+#[derive(Clone, Copy)]
+enum Extreme {
+    Default,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Min,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Max,
 }
 
 fn make_tex(device: &wgpu::Device, label: &str) -> wgpu::Texture {
@@ -671,5 +696,67 @@ mod tests {
             .filter_map(|(id, _)| r.render(id).err().map(|e| format!("{id}: {e}")))
             .collect();
         assert!(failed.is_empty(), "shaders failed to render: {failed:?}");
+    }
+
+    /// Pixels fully transparent black: what NaN or inf in a shader becomes after the
+    /// Rgba8 target clamps it (the test pattern and every bundled effect are opaque).
+    fn nan_pixels(px: &[u8]) -> usize {
+        px.chunks(4).filter(|a| a[3] == 0).count()
+    }
+
+    #[test]
+    fn nan_detector_sees_transparent_black_only() {
+        let mut px = test_pattern();
+        assert_eq!(nan_pixels(&px), 0);
+        px[3] = 0;
+        assert_eq!(nan_pixels(&px), 1, "negative control: one hole is counted");
+    }
+
+    /// Effects that clear alpha on purpose (keyers; remove_bg without a mask).
+    const KEYERS: [&str; 3] = ["chroma_key", "luma_key", "remove_bg"];
+
+    /// Every bundled shader at default, minimum and maximum parameters and at several
+    /// times: no transparent-black holes (NaN) outside the keyers; at defaults, not a fully
+    /// black frame (strobe is black half of its cycle). Skipped
+    /// without a GPU.
+    #[test]
+    fn gpu_no_bundled_shader_outputs_nan_or_black() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let r = Renderer::new(&device, &queue);
+        let mut bad = vec![];
+        for (id, _) in vjc_fx::BUILTIN.iter().chain(vjc_fx::GENERATORS) {
+            for (which, name) in [
+                (Extreme::Default, "default"),
+                (Extreme::Min, "min"),
+                (Extreme::Max, "max"),
+            ] {
+                for time in [0.0, 1.7, 1000.0] {
+                    let Ok(px) = r.render_variant(id, which, time) else {
+                        bad.push(format!("{id} {name} t={time}: render failed"));
+                        continue;
+                    };
+                    let holes = nan_pixels(&px);
+                    if holes > 0 && !KEYERS.contains(id) {
+                        bad.push(format!("{id} {name} t={time}: {holes} NaN-like pixels"));
+                    } else if matches!(which, Extreme::Default)
+                        && *id != "strobe"
+                        && px.chunks(4).all(|a| a[..3] == [0, 0, 0])
+                    {
+                        bad.push(format!("{id} {name} t={time}: black frame"));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "bad shader output:\n{}", bad.join("\n"));
     }
 }

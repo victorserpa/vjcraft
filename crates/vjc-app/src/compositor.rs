@@ -294,6 +294,20 @@ struct Fx {
     ml: MlStore,
     /// Previous output of each persistent effect instance.
     persist: PersistStore<(wgpu::Texture, wgpu::TextureView)>,
+    /// Mixed into the persist key: 0 for the composition, one value per routed output, so
+    /// an effect drawn in several outputs in one frame keeps one history for each.
+    persist_scope: u128,
+}
+
+/// Key part that separates the persistent histories of the outputs (see `persist_scope`).
+fn persist_scope(route: SliceSource) -> u128 {
+    const MIX: u128 = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835;
+    match route {
+        SliceSource::Composition => 0,
+        SliceSource::Layer(id) => id.as_u128().wrapping_mul(MIX) | 1,
+        SliceSource::Group(id) => id.as_u128().wrapping_mul(MIX).rotate_left(7) | 2,
+        SliceSource::Preview => MIX,
+    }
 }
 
 fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
@@ -514,8 +528,9 @@ impl Fx {
             // Persistent effect: its previous output is bound as PREV_PIXEL, and this
             // frame's result is copied back after the pass.
             let hist = e.persistent.map(|id| {
+                let key = uuid::Uuid::from_u128(id.as_u128() ^ self.persist_scope);
                 self.persist
-                    .acquire(id, size, || make_history(device, size))
+                    .acquire(key, size, || make_history(device, size))
                     .0
             });
             draw_pass(
@@ -1012,6 +1027,7 @@ impl Compositor {
             mix_bufs: vec![],
             mix_next: 0,
             persist: PersistStore::default(),
+            persist_scope: 0,
         };
         let (target, target_view) = make_target(device, w, h);
         let (base, base_bind) = make_base(device, &base_bgl, w, h);
@@ -1797,6 +1813,7 @@ impl Compositor {
             occlusion_query_set: None,
             multiview_mask: None,
         }));
+        self.fx.persist_scope = persist_scope(route);
         match content {
             SliceSource::Layer(id) => {
                 if let Some(l) = layers.iter().find(|l| l.id == id) {
@@ -1816,6 +1833,7 @@ impl Compositor {
             }
             SliceSource::Composition | SliceSource::Preview => {}
         }
+        self.fx.persist_scope = 0;
         if fade {
             self.fade_pass(enc, extent);
         }
@@ -2560,6 +2578,62 @@ mod tests {
         assert_eq!(run(None)[0], 0);
     }
 
+    /// A persistent effect drawn in the composition and again in a routed output keeps one
+    /// history per output: both show the same decayed trail, and the buffers are freed
+    /// once the routes go away. Skipped without a GPU.
+    #[test]
+    fn gpu_persistent_effect_has_own_history_per_route_and_frees_all() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("trails").unwrap()).unwrap();
+        let lid = uuid::Uuid::from_u128(1);
+        let fx = EffectDraw {
+            kind: "trails".into(),
+            uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
+            dry_wet: 1.0,
+            ml: None,
+            persistent: Some(uuid::Uuid::from_u128(7)),
+        };
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.add_effect(&device, "trails", &wgsl).unwrap();
+        let routes = [SliceSource::Layer(lid)];
+        let (mut main_px, mut routed_px) = ([0u8; 4], [0u8; 4]);
+        for (serial, px) in [[255u8; 4], [0, 0, 0, 255]].iter().enumerate() {
+            let layer = [LayerDraw {
+                id: lid,
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![fx.clone()],
+                frame: Some((1, 1, px, serial as u64 + 1)),
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+            }];
+            comp.render_routed(&device, &queue, (&layer, &[]), (&[], 1.0), &routes);
+            main_px = read_px(&device, &queue, &comp);
+            let v = comp.routed.get(&routes[0]).unwrap();
+            let t = std::mem::replace(&mut comp.target, v.0.clone());
+            routed_px = read_px(&device, &queue, &comp);
+            comp.target = t;
+        }
+        assert!(main_px[0].abs_diff(217) <= 3, "{main_px:?}");
+        assert!(routed_px[0].abs_diff(217) <= 3, "{routed_px:?}");
+        assert_eq!(comp.fx.persist.len(), 2);
+        comp.render_routed(&device, &queue, (&[], &[]), (&[], 1.0), &[]);
+        assert_eq!(comp.fx.persist.len(), 0, "histories freed with the layer");
+    }
+
     fn read_px(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor) -> [u8; 4] {
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -3296,7 +3370,7 @@ mod tests {
         assert!(all[0] < 150, "half alpha over black darkens {all:?}");
     }
 
-    /// Measures ms/frame of N 1080p layers with one effect each (CPU submit + GPU wait):
+    /// Measures ms/frame of N 1080p layers with two effects each (CPU submit + GPU wait):
     /// `VJC_BENCH_LAYERS=8 cargo test -p vjc-app --release bench_layers -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -3318,6 +3392,23 @@ mod tests {
         let (w, h) = (1920u32, 1080u32);
         let data = vec![128u8; (w * h * 4) as usize];
         let mut comp = Compositor::new(&device, w, h);
+        // Two effects per layer (one with a blend mix) so the scratch Pool, the uniform
+        // buffers and the per-pass bind groups are exercised, like a real show.
+        let kinds = ["brightness_contrast", "hue_shift"];
+        let fxs: Vec<EffectDraw> = kinds
+            .iter()
+            .map(|k| {
+                let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(k).unwrap()).unwrap();
+                comp.add_effect(&device, k, &wgsl).unwrap();
+                EffectDraw {
+                    kind: (*k).into(),
+                    uniforms: isf.pack(&isf.default_params(), 0.0, (w, h)),
+                    dry_wet: 0.7,
+                    ml: None,
+                    persistent: None,
+                }
+            })
+            .collect();
         let mut stats = crate::frame_stats::FrameStats::new();
         for i in 0..130 {
             let layers: Vec<LayerDraw> = (0..n)
@@ -3326,7 +3417,7 @@ mod tests {
                     opacity: 0.8,
                     blend: BlendMode::Normal,
                     fit: FitMode::Fit,
-                    effects: vec![],
+                    effects: fxs.clone(),
                     frame: Some((w, h, &data, i as u64 + 1)),
                     generator: None,
                     transition: None,

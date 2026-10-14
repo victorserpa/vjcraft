@@ -709,11 +709,16 @@ fn generator_params(p: &Node) -> Vec<Param> {
     out
 }
 
+/// Shortest timeline duration taken as real (ms).
+const MIN_TIMELINE_MS: f64 = 50.0;
+
 /// Animation of a ParamRange: envelope (BehaviourDouble) wins, then dashboard link, then
 /// timeline. Sources that were turned into an `Animation` are recorded so they do not warn.
 fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
     let beats_of = |n: &Node| {
         n.child("Beats_d")
+            // Mode 0 (or absent) counts manual beats; other modes are not understood.
+            .filter(|b| b.num("mode").is_none_or(|m| m == 0.0))
             .and_then(|b| b.num("numManualBeats"))
             .filter(|b| *b > 0.0)
     };
@@ -747,7 +752,11 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
         });
     }
     if let Some(t) = sp.child("PhaseSourceTimeline") {
-        let ms = t.num("defaultMillisecondsDuration").filter(|m| *m > 0.0);
+        // The owner's Example.avc files carry 5 ms on timelines nobody set (a rotation
+        // would spin at 200 Hz): too short to be intended, so treat as unset.
+        let ms = t
+            .num("defaultMillisecondsDuration")
+            .filter(|m| *m >= MIN_TIMELINE_MS);
         let anim = match (ms, beats_of(t)) {
             (Some(ms), _) => Animation::Timeline {
                 duration_secs: ms / 1000.0,
@@ -858,6 +867,33 @@ mod tests {
                 curve: Curve::Linear
             })
         );
+    }
+
+    #[test]
+    fn degenerate_timeline_duration_falls_back_to_beats() {
+        // Shape found in the real Example.avc: 5 ms plus a Beats_d.
+        let (_, a) = anim_of(
+            r#"<PhaseSourceTimeline defaultMillisecondsDuration="5"><Beats_d mode="0" numManualBeats="4"/></PhaseSourceTimeline>"#,
+        );
+        assert_eq!(
+            a,
+            Some(Animation::Beats {
+                beats: 4.0,
+                curve: Curve::Linear
+            })
+        );
+        // Negative control: a real duration still wins.
+        let (_, a) = anim_of(
+            r#"<PhaseSourceTimeline defaultMillisecondsDuration="500"><Beats_d mode="0" numManualBeats="4"/></PhaseSourceTimeline>"#,
+        );
+        assert!(
+            matches!(a, Some(Animation::Timeline { duration_secs, .. }) if duration_secs == 0.5)
+        );
+        // Unknown beat mode is not read as manual beats.
+        let (_, a) = anim_of(
+            r#"<PhaseSourceTimeline><Beats_d mode="2" numManualBeats="4"/></PhaseSourceTimeline>"#,
+        );
+        assert_eq!(a, None);
     }
 
     #[test]
@@ -991,6 +1027,10 @@ mod tests {
             }
         } else if let Some(t) = a.get("Timeline") {
             assert!(pos(&t["duration_secs"]), "{what}: {t}");
+            assert!(
+                t["duration_secs"].as_f64().unwrap() >= MIN_TIMELINE_MS / 1000.0,
+                "{what}: degenerate timeline {t}"
+            );
         } else if let Some(b) = a.get("Beats") {
             assert!(pos(&b["beats"]), "{what}: {b}");
         }
