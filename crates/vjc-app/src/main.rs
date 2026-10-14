@@ -2810,17 +2810,26 @@ impl State {
         let bar = ui.horizontal(|ui| {
             ui.label("Master");
             let mut bypass = self.master_bypass;
-            let by = help(ui.toggle_value(&mut bypass, "Bypass"), "master-bypass");
+            let by = help(
+                icons::toggle(ui, &mut bypass, icons::i::POWER, "Bypass"),
+                "master-bypass",
+            );
             self.targets.push((by.rect, "/comp/master/bypass".into()));
             if by.changed() {
                 cmds.push(Command::SetMasterBypass { bypass });
             }
-            if help(ui.button("Clear All"), "clear-all").clicked() {
+            if help(icons::button(ui, icons::i::BROOM, "Clear All"), "clear-all").clicked() {
                 cmds.push(Command::ClearAll);
             }
             let recording = self.capture.is_some();
             let label = if recording { "Stop rec" } else { "Record" };
-            if help(ui.selectable_label(recording, label), "record").clicked() {
+            let mut rec_on = recording;
+            if help(
+                icons::toggle(ui, &mut rec_on, icons::i::RECORD, label),
+                "record",
+            )
+            .clicked()
+            {
                 cmds.push(if recording {
                     Command::StopRecording
                 } else {
@@ -3768,14 +3777,24 @@ impl State {
         ui.separator();
 
         ui.horizontal(|ui| {
-            if help(ui.button("Add layer"), "add-layer").clicked() {
+            if help(
+                icons::button(ui, icons::i::STACK_PLUS, "Add layer"),
+                "add-layer",
+            )
+            .clicked()
+            {
                 let n = self.project.composition.layers.len() + 1;
                 self.exec(Command::AddLayer {
                     layer: new_layer(n),
                     index: 0,
                 });
             }
-            if help(ui.button("Add column"), "add-column").clicked() {
+            if help(
+                icons::button(ui, icons::i::COLUMNS_PLUS_RIGHT, "Add column"),
+                "add-column",
+            )
+            .clicked()
+            {
                 let n = self.project.composition.columns.len() + 1;
                 self.exec(Command::AddColumn {
                     column: Column {

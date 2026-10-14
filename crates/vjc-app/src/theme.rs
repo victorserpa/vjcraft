@@ -173,9 +173,9 @@ fn style_dark(s: &mut egui::Style) {
 }
 
 /// Clip cell: thumbnail area plus a name strip below it.
-pub const CELL_W: f32 = 112.0;
-pub const THUMB_H: f32 = 63.0;
-pub const NAME_H: f32 = 16.0;
+pub const CELL_W: f32 = 92.0;
+pub const THUMB_H: f32 = 52.0;
+pub const NAME_H: f32 = 14.0;
 pub const CELL_ROUNDING: f32 = 3.0;
 pub const THUMB_MAX_SIDE: u32 = 160;
 
@@ -191,8 +191,8 @@ pub const CELL_PENDING: Color32 = Color32::from_rgb(44, 48, 56);
 pub const ACCENT: Color32 = Color32::from_rgb(169, 139, 255);
 
 /// Layer header block (left of the cells).
-pub const LAYER_HEAD_W: f32 = 170.0;
-pub const LAYER_FADER_W: f32 = 150.0;
+pub const LAYER_HEAD_W: f32 = 150.0;
+pub const LAYER_FADER_W: f32 = 130.0;
 pub const LAYER_BTN: f32 = 20.0;
 
 /// Column header trigger.
