@@ -1829,6 +1829,42 @@ fn triggering_a_column_starts_every_layer_that_has_a_clip() {
     }
 }
 
+// Toggle style: the second trigger ejects
+#[test]
+fn toggle_ejects_on_second_trigger() {
+    let mut h = app();
+    let (gen_id, _) = vjc_fx::GENERATORS[0];
+    let (_, pos) = cell_center(&h, 0, 1);
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    let deck = h.state().project.composition.current_deck;
+    let layer = h.state().project.composition.layers[0].id;
+    let on = |h: &Harness<State>, l| {
+        let st = h.state();
+        active_of(&st.players, &st.gens, l).is_some()
+    };
+    let trig = Command::TriggerClip {
+        deck,
+        layer,
+        column: 1,
+    };
+    // Toggle.
+    h.state_mut().exec(Command::SetClipTriggerStyle {
+        deck,
+        layer,
+        column: 1,
+        style: vjc_model::TriggerStyle::Toggle,
+    });
+    h.state_mut().exec(Command::ClearLayer { layer });
+    settle(&mut h);
+    assert!(!on(&h, layer));
+    h.state_mut().exec(trig.clone());
+    settle(&mut h);
+    assert!(on(&h, layer));
+    h.state_mut().exec(trig.clone());
+    settle(&mut h);
+    assert!(!on(&h, layer), "second trigger ejects");
+}
+
 // F02-N1: a column past the end is rejected, nothing plays
 #[test]
 fn triggering_a_column_out_of_range_changes_nothing() {

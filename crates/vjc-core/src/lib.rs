@@ -428,6 +428,22 @@ pub enum Command {
         layer: LayerId,
         mode: vjc_model::TriggerMode,
     },
+    /// Trigger style of the composition (clips with `Composition` follow it). Undoable.
+    SetCompTriggerStyle {
+        style: vjc_model::TriggerStyle,
+    },
+    /// Column triggers skip this layer. Undoable.
+    SetLayerIgnoreColumn {
+        layer: LayerId,
+        ignore: bool,
+    },
+    /// Trigger style override of one clip (`Composition` = follow). Undoable.
+    SetClipTriggerStyle {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        style: vjc_model::TriggerStyle,
+    },
     /// Blend mode a clip uses while it plays (None = the layer's). Undoable.
     SetBlendOverride {
         deck: DeckId,
@@ -1159,6 +1175,7 @@ pub fn clip_from_path(path: PathBuf) -> Clip {
         transport: Transport::default(),
         track: Track::new(BlendMode::Normal),
         blend_override: None,
+        trigger_style: Default::default(),
         channels: Default::default(),
         fit: FitMode::default(),
     }
@@ -1332,13 +1349,69 @@ fn trigger_event(
     }
 }
 
+/// What is live right now: runtime state the pure project does not hold.
+#[derive(Debug, Clone, Default)]
+pub struct TriggerCtx {
+    /// Clips in the air: (layer, deck, column).
+    pub playing: Vec<(LayerId, DeckId, ColumnIdx)>,
+}
+
+/// Effective trigger style of the clip in a cell (Normal when the cell is empty).
+pub fn trigger_style_of(
+    p: &Project,
+    deck: DeckId,
+    layer: LayerId,
+    column: ColumnIdx,
+) -> vjc_model::TriggerStyle {
+    clip_in(p, deck, layer, column).map_or(vjc_model::TriggerStyle::Normal, |k| {
+        k.trigger_style.resolve(p.composition.trigger_style)
+    })
+}
+
+/// Turns a user's `TriggerClip` on a Toggle clip that is already playing into an eject of
+/// its layer. Everything else passes through. The eject is immediate: it does not wait
+/// for the beat snap (only the triggers that start a clip do).
+pub fn resolve_trigger(p: &Project, ctx: &TriggerCtx, cmd: Command) -> Command {
+    if let Command::TriggerClip {
+        deck,
+        layer,
+        column,
+    } = cmd
+        && trigger_style_of(p, deck, layer, column) == vjc_model::TriggerStyle::Toggle
+        && ctx.playing.contains(&(layer, deck, column))
+    {
+        return Command::ClearLayer { layer };
+    }
+    cmd
+}
+
+fn clip_mut(
+    p: &mut Project,
+    deck: DeckId,
+    layer: LayerId,
+    column: ColumnIdx,
+) -> Result<&mut Clip, Error> {
+    check_cell(p, layer, column)?;
+    deck_mut(p, deck)?
+        .clips
+        .iter_mut()
+        .find(|k| k.layer == layer && k.column == column)
+        .map(|k| &mut k.clip)
+        .ok_or(Error::NoClip)
+}
+
 fn trigger_column(p: &Project, deck: DeckId, column: ColumnIdx) -> Result<Applied, Error> {
     if (column as usize) >= p.composition.columns.len() {
         return Err(Error::NoColumn);
     }
     deck_idx(p, deck)?;
     let mut events = vec![];
-    for l in &p.composition.layers {
+    for l in p
+        .composition
+        .layers
+        .iter()
+        .filter(|l| !l.ignore_column_trigger)
+    {
         match trigger_event(p, deck, l.id, column) {
             Ok(e) => events.push(e),
             Err(Error::NoClip) => events.push(Event::LayerCleared { layer: l.id }),
@@ -2360,6 +2433,40 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.layers[i].trigger_mode, mode);
             undoable(Command::SetLayerTriggerMode { layer, mode: prev }, vec![])
         }
+        Command::SetCompTriggerStyle { style } => {
+            let prev = std::mem::replace(&mut p.composition.trigger_style, style);
+            undoable(Command::SetCompTriggerStyle { style: prev }, vec![])
+        }
+        Command::SetLayerIgnoreColumn { layer, ignore } => {
+            let i = layer_idx(p, layer)?;
+            let prev =
+                std::mem::replace(&mut p.composition.layers[i].ignore_column_trigger, ignore);
+            undoable(
+                Command::SetLayerIgnoreColumn {
+                    layer,
+                    ignore: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetClipTriggerStyle {
+            deck,
+            layer,
+            column,
+            style,
+        } => {
+            let k = clip_mut(p, deck, layer, column)?;
+            let prev = std::mem::replace(&mut k.trigger_style, style);
+            undoable(
+                Command::SetClipTriggerStyle {
+                    deck,
+                    layer,
+                    column,
+                    style: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetBlendOverride {
             deck,
             layer,
@@ -3329,6 +3436,7 @@ mod tests {
             audio: true,
             video: true,
             trigger_mode: vjc_model::TriggerMode::Restart,
+            ignore_column_trigger: false,
             group: None,
         }
     }
@@ -7156,6 +7264,126 @@ mod tests {
         }
         h.undo(&mut p).unwrap().unwrap();
         assert_eq!(number(&p.composition.layers[0].track.dials[0].value), 0.0);
+    }
+
+    fn gen_cell(p: &mut Project, layer: LayerId, column: u32) {
+        apply(
+            p,
+            Command::SetGenerator {
+                deck: A,
+                layer,
+                column,
+                kind: "solid_color".into(),
+                name: "Solid".into(),
+                params: vec![],
+            },
+        )
+        .unwrap();
+    }
+
+    fn three_layers() -> (Project, [LayerId; 3]) {
+        let (mut p, l1) = setup();
+        let (b, c) = (layer(2), layer(3));
+        let ids = [l1, b.id, c.id];
+        p.composition.layers.extend([b, c]);
+        (p, ids)
+    }
+
+    fn trig(layer: LayerId) -> Command {
+        Command::TriggerClip {
+            deck: A,
+            layer,
+            column: 0,
+        }
+    }
+
+    #[test]
+    fn toggle_second_trigger_ejects_and_normal_does_not() {
+        let (mut p, [l1, ..]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        p.composition.trigger_style = vjc_model::TriggerStyle::Toggle;
+        let mut ctx = TriggerCtx::default();
+        // Nothing playing: the first trigger plays.
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), trig(l1));
+        ctx.playing.push((l1, A, 0));
+        assert_eq!(
+            resolve_trigger(&p, &ctx, trig(l1)),
+            Command::ClearLayer { layer: l1 }
+        );
+        // Control: a Normal clip (own override beats the composition) plays again.
+        p.composition.decks[0].clips[0].clip.trigger_style = vjc_model::TriggerStyle::Normal;
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), trig(l1));
+    }
+
+    #[test]
+    fn resolving_a_trigger_never_touches_the_project() {
+        let (mut p, [l1, ..]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        let before = p.clone();
+        let _ = resolve_trigger(&p, &TriggerCtx::default(), trig(l1));
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn ignore_column_trigger_skips_the_layer() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        gen_cell(&mut p, l2, 0);
+        p.composition.layers[1].ignore_column_trigger = true;
+        let ev = apply(&mut p, Command::TriggerColumn { deck: A, column: 0 })
+            .unwrap()
+            .events;
+        let touches = |l| {
+            ev.iter().any(|e| {
+                matches!(e, Event::GeneratorStarted { layer, .. }
+                    | Event::LayerCleared { layer }
+                    | Event::Skipped { layer, .. } if *layer == l)
+            })
+        };
+        assert!(touches(l1));
+        assert!(!touches(l2));
+        // Control: without the flag the layer is triggered.
+        p.composition.layers[1].ignore_column_trigger = false;
+        let ev2 = apply(&mut p, Command::TriggerColumn { deck: A, column: 0 })
+            .unwrap()
+            .events;
+        assert!(
+            ev2.iter()
+                .any(|e| matches!(e, Event::GeneratorStarted { layer, .. } if *layer == l2))
+        );
+    }
+
+    #[test]
+    fn trigger_settings_commands_undo() {
+        let (mut p, [l1, ..]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        let mut h = History::new();
+        let t = Instant::now();
+        let cmds = [
+            Command::SetCompTriggerStyle {
+                style: vjc_model::TriggerStyle::Toggle,
+            },
+            Command::SetLayerIgnoreColumn {
+                layer: l1,
+                ignore: true,
+            },
+            Command::SetClipTriggerStyle {
+                deck: A,
+                layer: l1,
+                column: 0,
+                style: vjc_model::TriggerStyle::Toggle,
+            },
+        ];
+        let before = p.clone();
+        for (i, c) in cmds.into_iter().enumerate() {
+            h.exec(&mut p, c, t + Duration::from_secs(i as u64 + 1))
+                .unwrap();
+        }
+        assert_ne!(p, before);
+        for _ in 0..3 {
+            h.undo(&mut p).unwrap().unwrap();
+        }
+        assert_eq!(p, before);
     }
 }
 

@@ -54,6 +54,9 @@ pub struct Composition {
     /// Timecode cues, fired when the external timecode crosses them.
     #[serde(default)]
     pub timecode_cues: Vec<TimecodeCue>,
+    /// Default trigger style of clips that defer to the composition.
+    #[serde(default)]
+    pub trigger_style: TriggerStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +87,9 @@ pub struct Layer {
     /// Trigger mode of clips that defer to the layer (never `Layer` itself).
     #[serde(default = "restart")]
     pub trigger_mode: TriggerMode,
+    /// A column trigger skips this layer (its playing clip is left alone).
+    #[serde(default)]
+    pub ignore_column_trigger: bool,
 }
 
 fn restart() -> TriggerMode {
@@ -153,6 +159,48 @@ pub struct Clip {
     /// Colour channels of the picture that are drawn.
     #[serde(default)]
     pub channels: Channels,
+    /// Normal / toggle; `Composition` defers to the composition's style.
+    #[serde(default)]
+    pub trigger_style: TriggerStyle,
+}
+
+/// How a trigger behaves over time (not where the clip starts: see `TriggerMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TriggerStyle {
+    /// Use the composition's style (for a composition itself: Normal).
+    #[default]
+    Composition,
+    /// Plays until something else replaces it.
+    Normal,
+    /// A second trigger of the clip that is playing ejects the layer.
+    Toggle,
+    #[serde(other)]
+    Unknown,
+}
+
+impl TriggerStyle {
+    pub const CHOICES: [TriggerStyle; 2] = [TriggerStyle::Normal, TriggerStyle::Toggle];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TriggerStyle::Composition => "Composition",
+            TriggerStyle::Normal | TriggerStyle::Unknown => "Normal",
+            TriggerStyle::Toggle => "Toggle",
+        }
+    }
+
+    /// The style that applies: the clip's own, or the composition's when it defers.
+    pub fn resolve(self, comp: TriggerStyle) -> TriggerStyle {
+        let m = if self == TriggerStyle::Composition {
+            comp
+        } else {
+            self
+        };
+        match m {
+            TriggerStyle::Toggle => m,
+            _ => TriggerStyle::Normal,
+        }
+    }
 }
 
 /// R/G/B/A visibility of a clip's picture. A channel that is off is zeroed (R, G, B) or
@@ -1206,6 +1254,7 @@ impl Project {
                 crossfader: None,
                 dashboard: vec![],
                 timecode_cues: vec![],
+                trigger_style: Default::default(),
             },
             output: OutputSetup { screens: vec![] },
             shortcuts: vec![],
@@ -1443,6 +1492,7 @@ mod tests {
             audio: true,
             video: true,
             trigger_mode: TriggerMode::Restart,
+            ignore_column_trigger: false,
             transition: Transition {
                 kind: "cut".into(),
                 duration_beats: None,
@@ -1496,6 +1546,7 @@ mod tests {
             audio: true,
             video: true,
             trigger_mode: TriggerMode::Restart,
+            ignore_column_trigger: false,
             group: None,
         });
         p.composition.decks[0].set_clip(
@@ -1511,6 +1562,7 @@ mod tests {
                 track: Track::new(BlendMode::Normal),
                 fit: FitMode::default(),
                 blend_override: None,
+                trigger_style: Default::default(),
                 channels: Default::default(),
             },
         );
@@ -1601,6 +1653,7 @@ mod tests {
             audio: true,
             video: true,
             trigger_mode: TriggerMode::Restart,
+            ignore_column_trigger: false,
             transition: Transition {
                 kind: "cut".into(),
                 duration_beats: None,
@@ -1624,6 +1677,7 @@ mod tests {
             transport: Transport::default(),
             track: Track::new(BlendMode::Normal),
             blend_override: None,
+            trigger_style: Default::default(),
             fit: FitMode::Fit,
             channels: Channels::default(),
         };
@@ -1724,5 +1778,44 @@ mod tests {
         assert_eq!(s.slices[0].color.brightness, 0.5);
         let back: Screen = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn trigger_style_roundtrip_and_old_projects_default() {
+        let mut p = Project::new("t");
+        p.composition.trigger_style = TriggerStyle::Toggle;
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.composition.trigger_style, TriggerStyle::Toggle);
+        // An old file has no such key and opens with the old behaviour.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["composition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("trigger_style");
+        let old: Project = serde_json::from_value(v).unwrap();
+        assert_eq!(old.composition.trigger_style, TriggerStyle::Composition);
+        assert_eq!(
+            TriggerStyle::Composition.resolve(old.composition.trigger_style),
+            TriggerStyle::Normal
+        );
+    }
+
+    #[test]
+    fn layer_ignore_column_trigger_roundtrips_and_defaults_when_absent() {
+        let mut l = fixture().layers.remove(0);
+        l.ignore_column_trigger = true;
+        let mut v = serde_json::to_value(&l).unwrap();
+        assert!(
+            serde_json::from_value::<Layer>(v.clone())
+                .unwrap()
+                .ignore_column_trigger
+        );
+        v.as_object_mut().unwrap().remove("ignore_column_trigger");
+        assert!(
+            !serde_json::from_value::<Layer>(v)
+                .unwrap()
+                .ignore_column_trigger
+        );
     }
 }

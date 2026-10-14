@@ -874,6 +874,7 @@ mod tests {
             },
             autopilot: Default::default(),
             crossfader_bus: None,
+            ignore_column_trigger: false,
             audio: true,
             video: true,
             trigger_mode: vjc_model::TriggerMode::Restart,

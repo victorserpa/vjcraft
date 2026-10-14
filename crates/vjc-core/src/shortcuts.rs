@@ -959,6 +959,7 @@ mod effect_id_tests {
             audio: true,
             video: true,
             trigger_mode: vjc_model::TriggerMode::Restart,
+            ignore_column_trigger: false,
             group: None,
         });
         let ctx = Ctx::new(None, false);

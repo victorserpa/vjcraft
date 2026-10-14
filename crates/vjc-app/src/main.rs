@@ -1167,6 +1167,7 @@ fn new_layer(n: usize) -> Layer {
         },
         autopilot: Default::default(),
         crossfader_bus: None,
+        ignore_column_trigger: false,
         audio: true,
         video: true,
         trigger_mode: vjc_model::TriggerMode::Restart,
@@ -2103,9 +2104,23 @@ impl State {
     /// Sends a command through the bus and reacts to the resulting events.
     /// Runs a command; a rejection is reported in the status line.
     fn exec(&mut self, cmd: Command) {
+        let cmd = self.resolve_trigger(cmd);
         if let Some(cmd) = self.snap_defer(cmd) {
             self.exec_ok(cmd);
         }
+    }
+
+    /// A user trigger on a Toggle clip that is playing becomes an eject of its layer.
+    fn resolve_trigger(&self, cmd: Command) -> Command {
+        let ctx = vjc_core::TriggerCtx {
+            playing: self
+                .players
+                .iter()
+                .map(|(l, v)| (*l, v.0, v.1))
+                .chain(self.gens.iter().map(|(l, v)| (*l, v.0, v.1)))
+                .collect(),
+        };
+        vjc_core::resolve_trigger(&self.project, &ctx, cmd)
     }
 
     /// With beat snap on, a clip or column trigger that arrives off the grid waits in
@@ -6280,6 +6295,21 @@ impl State {
         {
             cmds.push(Command::SetMasterSpeed { value });
         }
+        if params::section(ui, "sec-comp-trigger", "Clip trigger") {
+            let styles: Vec<(vjc_model::TriggerStyle, String)> = vjc_model::TriggerStyle::CHOICES
+                .into_iter()
+                .map(|m| (m, m.label().to_string()))
+                .collect();
+            if let Some(style) = params::combo(
+                ui,
+                "ctstyle",
+                "Trigger style",
+                &c.trigger_style.resolve(vjc_model::TriggerStyle::Normal),
+                &styles,
+            ) {
+                cmds.push(Command::SetCompTriggerStyle { style });
+            }
+        }
         if params::section(ui, "sec-crossfader", "Crossfader") {
             let (cf_val, cf_anim, cf_curve) = match &c.crossfader {
                 Some(x) => (
@@ -6503,6 +6533,14 @@ impl State {
             if let Some(mode) = params::combo(ui, ("ltm", lid), "Start at", &l.trigger_mode, &trig)
             {
                 cmds.push(Command::SetLayerTriggerMode { layer: lid, mode });
+            }
+            let mut ignore = l.ignore_column_trigger;
+            if ui
+                .checkbox(&mut ignore, "Ignore column trigger")
+                .on_hover_text("Triggering a column leaves this layer as it is")
+                .changed()
+            {
+                cmds.push(Command::SetLayerIgnoreColumn { layer: lid, ignore });
             }
             let (mut solo, mut bypass) = (l.solo, l.bypass);
             ui.horizontal(|ui| {
@@ -6772,6 +6810,7 @@ impl State {
         }));
         let actx = self.anim_ctx(&dials);
         let t = &k.transport;
+        let clip_style = k.trigger_style;
         if let Some(name) = params::text_field(ui, ("kname", layer, column), "Name", &k.name) {
             cmds.push(Command::RenameClip {
                 deck,
@@ -6887,6 +6926,21 @@ impl State {
                     layer,
                     column,
                     mode,
+                });
+            }
+            let styles: Vec<(vjc_model::TriggerStyle, String)> =
+                [vjc_model::TriggerStyle::Composition]
+                    .into_iter()
+                    .chain(vjc_model::TriggerStyle::CHOICES)
+                    .map(|m| (m, m.label().to_string()))
+                    .collect();
+            if let Some(style) = params::combo(ui, "tstyle", "Trigger style", &clip_style, &styles)
+            {
+                cmds.push(Command::SetClipTriggerStyle {
+                    deck,
+                    layer,
+                    column,
+                    style,
                 });
             }
             let dirs = labeled(&[
@@ -8320,6 +8374,7 @@ mod tests {
             transport: Default::default(),
             track: vjc_model::Track::new(vjc_model::BlendMode::Normal),
             blend_override: None,
+            trigger_style: Default::default(),
             fit: Default::default(),
             channels: Default::default(),
         };

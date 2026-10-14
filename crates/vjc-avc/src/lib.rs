@@ -252,6 +252,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
             audio: true,
             video: true,
             trigger_mode: vjc_model::TriggerMode::Restart,
+            ignore_column_trigger: false,
             group: None,
         });
     }
@@ -599,6 +600,7 @@ fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
         transport,
         track,
         blend_override: None,
+        trigger_style: Default::default(),
         channels: Default::default(),
         fit: Default::default(),
     })
