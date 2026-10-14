@@ -2,7 +2,8 @@
 
 use crate::theme::{
     ACCENT, DANGER, DIALOG_W, FIELD_W_LG, FIELD_W_MD, FIELD_W_SM, FS_SM, FS_XS, ON_ACCENT,
-    RADIUS_SM, SP_4, STROKE_W, SURFACE_RAISED, TEXT, TEXT_MUTED, bold_font,
+    RADIUS_SM, SP_1, SP_2, SP_4, STATUS_H, STROKE_W, SURFACE_RAISED, TEXT, TEXT_MUTED, TOAST_TTL_S,
+    TOAST_W, WARN, bold_font,
 };
 use eframe::egui::{self, RichText, Stroke};
 
@@ -186,11 +187,146 @@ pub fn dialog(
     esc_cancels && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
 }
 
+/// Panel tab: the selected one is bold on BG, the others muted on the header.
+pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let font = if selected {
+        bold_font(ui.ctx(), FS_SM)
+    } else {
+        egui::FontId::proportional(FS_SM)
+    };
+    let text = RichText::new(label)
+        .font(font)
+        .color(if selected { TEXT } else { TEXT_MUTED });
+    let r = ui.add(
+        egui::Button::new(text)
+            .corner_radius(0.0)
+            .fill(if selected {
+                crate::theme::BG
+            } else {
+                crate::theme::HEADER_BG
+            })
+            .min_size(egui::vec2(0.0, crate::theme::PANEL_HEAD_H)),
+    );
+    r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label));
+    r
+}
+
+/// Small tag pill.
+pub fn chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    egui::Frame::new()
+        .fill(SURFACE_RAISED)
+        .stroke(Stroke::new(STROKE_W, crate::theme::BORDER))
+        .corner_radius(RADIUS_SM)
+        .inner_margin(egui::Margin::symmetric(SP_4 as i8, SP_1 as i8))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(FS_XS).color(TEXT_MUTED))
+        })
+        .response
+}
+
+/// Toast severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    #[allow(dead_code, reason = "part of the scale; no caller yet")]
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone)]
+struct ToastItem {
+    msg: String,
+    level: Level,
+    born: f64,
+}
+
+/// Most toasts on screen at once.
+const TOAST_MAX: usize = 3;
+
+fn toast_queue_id() -> egui::Id {
+    egui::Id::new("vjc-toast-queue")
+}
+
+/// Queues a toast; `toasts_show` draws it.
+pub fn toast(ctx: &egui::Context, msg: &str, level: Level) {
+    let born = ctx.input(|i| i.time);
+    ctx.data_mut(|d| {
+        let q = d.get_temp_mut_or_default::<Vec<ToastItem>>(toast_queue_id());
+        // Same message again: refresh it instead of stacking a copy.
+        q.retain(|t| t.msg != msg);
+        q.push(ToastItem {
+            msg: msg.to_owned(),
+            level,
+            born,
+        });
+        // A burst never covers the panels: keep only the newest few.
+        let extra = q.len().saturating_sub(TOAST_MAX);
+        q.drain(..extra);
+    });
+    ctx.request_repaint();
+}
+
+/// Draws the queue stacked at the bottom right above the status bar. Info and Warn expire
+/// after `TOAST_TTL_S`; Error stays until clicked. Call once per frame.
+pub fn toasts_show(ctx: &egui::Context) {
+    let now = ctx.input(|i| i.time);
+    let mut q = ctx
+        .data(|d| d.get_temp::<Vec<ToastItem>>(toast_queue_id()))
+        .unwrap_or_default();
+    q.retain(|t| t.level == Level::Error || now - t.born < TOAST_TTL_S);
+    if !q.is_empty() {
+        let mut dismissed = None;
+        egui::Area::new(egui::Id::new("vjc-toasts"))
+            .order(egui::Order::Foreground)
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                egui::vec2(-SP_4, -(STATUS_H + SP_4)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(TOAST_W);
+                for (i, t) in q.iter().enumerate() {
+                    let edge = match t.level {
+                        Level::Info => ACCENT,
+                        Level::Warn => WARN,
+                        Level::Error => DANGER,
+                    };
+                    let r = egui::Frame::new()
+                        .fill(crate::theme::SURFACE)
+                        .stroke(Stroke::new(STROKE_W, edge))
+                        .corner_radius(RADIUS_SM)
+                        .inner_margin(egui::Margin::same(SP_4 as i8))
+                        .show(ui, |ui| {
+                            ui.set_width(TOAST_W - 2.0 * SP_4);
+                            ui.label(RichText::new(&t.msg).size(FS_SM).color(TEXT))
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+                    if r.clicked() {
+                        dismissed = Some(i);
+                    }
+                    ui.add_space(SP_2);
+                }
+            });
+        if let Some(i) = dismissed {
+            q.remove(i);
+        }
+        let next = q
+            .iter()
+            .filter(|t| t.level != Level::Error)
+            .map(|t| t.born + TOAST_TTL_S - now)
+            .fold(f64::INFINITY, f64::min);
+        if next.is_finite() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(next.max(0.0) + 0.05));
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(toast_queue_id(), q));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     #[test]
     fn every_button_kind_renders() {
@@ -207,6 +343,57 @@ mod tests {
         for l in ["Go", "Plain", "Erase"] {
             h.get_by_label(l);
         }
+    }
+
+    #[test]
+    fn selected_tab_is_marked() {
+        let mut h = Harness::new_ui(|ui| {
+            tab(ui, true, "One");
+            tab(ui, false, "Two");
+        });
+        h.run();
+        assert!(
+            h.get_by_label("One").accesskit_node().toggled()
+                == Some(egui::accesskit::Toggled::True)
+        );
+        assert!(
+            h.get_by_label("Two").accesskit_node().toggled()
+                != Some(egui::accesskit::Toggled::True)
+        );
+    }
+
+    fn toast_harness(level: Level) -> Harness<'static> {
+        let mut first = true;
+        Harness::new_ui(move |ui| {
+            let ctx = ui.ctx().clone();
+            if std::mem::take(&mut first) {
+                toast(&ctx, "Hello toast", level);
+            }
+            toasts_show(&ctx);
+        })
+    }
+
+    #[test]
+    fn info_toast_expires() {
+        let mut h = toast_harness(Level::Info);
+        h.run();
+        h.get_by_label("Hello toast");
+        for _ in 0..40 {
+            h.step();
+        }
+        assert!(h.query_by_label("Hello toast").is_none());
+    }
+
+    #[test]
+    fn error_toast_persists_until_clicked() {
+        let mut h = toast_harness(Level::Error);
+        h.run();
+        for _ in 0..80 {
+            h.step();
+        }
+        h.get_by_label("Hello toast").click();
+        h.run();
+        assert!(h.query_by_label("Hello toast").is_none());
     }
 
     #[test]
@@ -293,5 +480,21 @@ mod tests {
         h.get_by_label("Restore").click();
         h.run();
         assert_eq!(*h.state(), 1, "dialog button must still receive the click");
+    }
+
+    #[test]
+    fn toast_burst_is_deduped_and_capped() {
+        let ctx = egui::Context::default();
+        for _ in 0..5 {
+            toast(&ctx, "Save failed", Level::Error);
+        }
+        for k in 0..5 {
+            toast(&ctx, &format!("w{k}"), Level::Warn);
+        }
+        let q = ctx
+            .data(|d| d.get_temp::<Vec<ToastItem>>(toast_queue_id()))
+            .unwrap();
+        assert_eq!(q.len(), TOAST_MAX);
+        assert_eq!(q.iter().filter(|t| t.msg == "Save failed").count(), 0);
     }
 }

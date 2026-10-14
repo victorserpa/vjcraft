@@ -38,6 +38,22 @@ pub const COMBO_W_SM: f32 = 40.0;
 
 /// Stroke widths: hairline (borders), handle outline, canvas outline.
 pub const STROKE_W: f32 = 1.0;
+
+/// Warning role (toast outline, warn text).
+pub const WARN: Color32 = Color32::from_rgb(240, 200, 60);
+
+/// Toast: width, lifetime in seconds of the non-error ones, gap above the status bar.
+pub const TOAST_W: f32 = 280.0;
+pub const TOAST_TTL_S: f64 = 3.0;
+
+/// Browser grid cell, list row height, and the search box: room kept for the buttons beside
+/// it, narrowest and widest.
+pub const BROWSER_GRID_CELL_W: f32 = 84.0;
+pub const BROWSER_GRID_CELL_H: f32 = 74.0;
+pub const BROWSER_LIST_ROW_H: f32 = 40.0;
+pub const BROWSER_SEARCH_RESERVE: f32 = 52.0;
+pub const BROWSER_SEARCH_MIN_W: f32 = 40.0;
+pub const BROWSER_SEARCH_MAX_W: f32 = 200.0;
 pub const STROKE_HANDLE: f32 = 1.5;
 pub const STROKE_CANVAS: f32 = 2.0;
 

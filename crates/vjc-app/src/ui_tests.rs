@@ -1760,6 +1760,11 @@ fn opening_a_corrupt_project_reports_and_keeps_the_current_one() {
     );
     assert_eq!(h.state().project, before);
     assert!(h.state().file.is_none());
+    h.run();
+    assert!(
+        h.query_all_by_label_contains("Open failed").count() >= 2,
+        "status bar and toast"
+    );
 }
 
 // F08-N2

@@ -144,9 +144,10 @@ pub fn chunk_lines(idx: &[usize], cols: usize) -> std::slice::Chunks<'_, usize> 
     idx.chunks(cols.max(1))
 }
 
-const GRID_CELL_W: f32 = 84.0;
-const GRID_CELL_H: f32 = 74.0;
-const LIST_ROW_H: f32 = 40.0;
+use crate::theme::{
+    BROWSER_GRID_CELL_H as GRID_CELL_H, BROWSER_GRID_CELL_W as GRID_CELL_W,
+    BROWSER_LIST_ROW_H as LIST_ROW_H,
+};
 
 /// Answers "is this a folder / file?" for favourites and recent projects without touching
 /// the disk on the UI thread (an unmounted network volume can block for many seconds). A
@@ -601,27 +602,7 @@ impl Browser {
                             Tab::Network => "Net",
                             _ => label,
                         };
-                        let text = egui::RichText::new(shown)
-                            .font(if on {
-                                crate::theme::bold_font(&ctx, crate::theme::FS_SM)
-                            } else {
-                                egui::FontId::proportional(crate::theme::FS_SM)
-                            })
-                            .color(if on {
-                                crate::theme::TEXT
-                            } else {
-                                crate::theme::TEXT_MUTED
-                            });
-                        let r = ui.add(
-                            egui::Button::new(text)
-                                .corner_radius(0.0)
-                                .fill(if on {
-                                    crate::theme::BG
-                                } else {
-                                    crate::theme::HEADER_BG
-                                })
-                                .min_size(egui::vec2(0.0, crate::theme::PANEL_HEAD_H)),
-                        );
+                        let r = crate::widgets::tab(ui, on, shown);
                         let r = if shown == label {
                             r
                         } else {
@@ -675,7 +656,10 @@ impl Browser {
                 .request_repaint_after(std::time::Duration::from_secs(3));
         }
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 52.0).clamp(40.0, 200.0);
+            let w = (ui.available_width() - crate::theme::BROWSER_SEARCH_RESERVE).clamp(
+                crate::theme::BROWSER_SEARCH_MIN_W,
+                crate::theme::BROWSER_SEARCH_MAX_W,
+            );
             ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .hint_text("Search")
@@ -884,11 +868,16 @@ impl Browser {
                             vjc_model::NetProtocol::Ndi => "NDI",
                             vjc_model::NetProtocol::Spout => "Spout",
                         };
-                        let r = ui.add(
-                            egui::Button::new(format!("[{tag}] {name}"))
-                                .min_size(egui::vec2(ui.available_width(), 24.0))
-                                .sense(egui::Sense::click_and_drag()),
-                        );
+                        let r = ui
+                            .horizontal(|ui| {
+                                crate::widgets::chip(ui, tag);
+                                ui.add(
+                                    egui::Button::new(name)
+                                        .min_size(egui::vec2(ui.available_width(), 24.0))
+                                        .sense(egui::Sense::click_and_drag()),
+                                )
+                            })
+                            .inner;
                         if r.drag_started() {
                             egui::DragAndDrop::set_payload(
                                 &ctx,

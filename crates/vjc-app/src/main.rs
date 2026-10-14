@@ -238,6 +238,8 @@ struct State {
     recovery_offer: Option<PathBuf>,
     /// Relink dialog is showing.
     relink_open: bool,
+    /// Toasts raised outside a frame; queued on the next one.
+    toasts: Vec<(widgets::Level, String)>,
     output_setup_open: bool,
     sel_screen: Option<Uuid>,
     sel_slice: Option<Uuid>,
@@ -1338,6 +1340,7 @@ impl State {
             prefs_open: false,
             recovery_offer: None,
             relink_open: false,
+            toasts: Vec::new(),
             output_setup_open: false,
             sel_screen: None,
             sel_slice: None,
@@ -1838,10 +1841,16 @@ impl State {
                 true
             }
             Err(e) => {
-                self.status = format!("Open failed: {e}");
+                self.notify(widgets::Level::Error, format!("Open failed: {e}"));
                 false
             }
         }
+    }
+
+    /// Status bar text plus a toast (drawn next frame).
+    fn notify(&mut self, level: widgets::Level, msg: String) {
+        self.status.clone_from(&msg);
+        self.toasts.push((level, msg));
     }
 
     /// File > Relink missing media: asks for a folder, then applies `relink_from`.
@@ -2042,7 +2051,7 @@ impl State {
                 true
             }
             Err(e) => {
-                self.status = format!("Save failed: {e}");
+                self.notify(widgets::Level::Error, format!("Save failed: {e}"));
                 false
             }
         }
@@ -2397,7 +2406,10 @@ impl State {
                             self.seek(layer, start);
                         }
                     } else {
-                        self.status = format!("File not found: {}", path.display());
+                        self.notify(
+                            widgets::Level::Warn,
+                            format!("File not found: {}", path.display()),
+                        );
                     }
                 }
                 Event::CaptureStarted {
@@ -4640,6 +4652,10 @@ impl State {
         if self.thumbs.poll(&ctx) || self.thumbs.is_pending() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        for (level, msg) in self.toasts.drain(..) {
+            widgets::toast(&ctx, &msg, level);
+        }
+        widgets::toasts_show(&ctx);
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui
