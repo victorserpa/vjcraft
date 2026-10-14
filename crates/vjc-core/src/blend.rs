@@ -28,6 +28,11 @@ pub const COMPOSITION_MODES: &[(BlendMode, &str)] = &[
 ];
 
 /// Mode id used by the shader; modes without a composition formula map to 0 (Normal).
+/// Blend a clip is drawn with: its own override when set, else the layer's.
+pub fn effective_blend(layer: &BlendMode, clip_override: Option<&BlendMode>) -> BlendMode {
+    clip_override.unwrap_or(layer).clone()
+}
+
 pub fn shader_id(mode: &BlendMode) -> u32 {
     COMPOSITION_MODES
         .iter()
@@ -148,6 +153,19 @@ mod tests {
 
     const B: [f32; 4] = [0.8, 0.5, 0.2, 1.0];
     const S: [f32; 4] = [0.4, 0.5, 0.9, 1.0];
+
+    #[test]
+    fn clip_override_wins_over_layer_blend() {
+        assert_eq!(
+            effective_blend(&BlendMode::Multiply, Some(&BlendMode::Add)),
+            BlendMode::Add
+        );
+        // Negative control: no override keeps the layer's blend.
+        assert_eq!(
+            effective_blend(&BlendMode::Multiply, None),
+            BlendMode::Multiply
+        );
+    }
 
     fn run(m: BlendMode, b: [f32; 4], s: [f32; 4], op: f32) -> [f32; 4] {
         blend_pixel(&m, b, s, op)

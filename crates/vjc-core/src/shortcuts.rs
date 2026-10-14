@@ -878,6 +878,7 @@ mod effect_id_tests {
             crossfader_bus: None,
             audio: true,
             video: true,
+            trigger_mode: vjc_model::TriggerMode::Restart,
             group: None,
         });
         let ctx = Ctx::new(None, false);

@@ -251,6 +251,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
             crossfader_bus: None,
             audio: true,
             video: true,
+            trigger_mode: vjc_model::TriggerMode::Restart,
             group: None,
         });
     }

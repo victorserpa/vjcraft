@@ -26,6 +26,7 @@ mod params;
 mod persist;
 mod pool;
 mod prefs_ui;
+mod preload;
 mod slice_inspector;
 mod slice_render;
 mod source_info;
@@ -51,7 +52,7 @@ use vjc_media::{Frame, Player};
 use vjc_model::Screen;
 use vjc_model::{
     Autopilot, AutopilotMode, BlendMode, Column, Deck, DeckId, Direction, FitMode, Layer, LayerId,
-    OutputDevice, PlayMode, Project, Track, TransformField, Transition, Value,
+    OutputDevice, PlayMode, Project, Track, TransformField, Transition, TriggerMode, Value,
 };
 
 /// Seconds a duration -/+ click moves the region length.
@@ -73,6 +74,8 @@ struct State {
     warnings: Vec<String>,
     status: String,
     frame_ms: frame_stats::FrameStats,
+    /// Decoders opened ahead for the deck the user is about to switch to.
+    preload: preload::Preload,
     frames: u64,
     /// Playing clip per layer: (deck it was triggered from, column, player). One clip per
     /// layer. Lookups of the playing clip use this deck, never `current_deck`.
@@ -353,6 +356,9 @@ struct Flow {
     beat_loops: HashMap<LayerId, (f64, (f64, f64))>,
     /// Last playhead position per layer.
     pos: HashMap<LayerId, f64>,
+    /// File position each clip had when it was replaced (for the Continue trigger mode).
+    /// Keyed by cell and holding the clip id, so a replaced clip does not inherit it.
+    resume: HashMap<(DeckId, LayerId, u32), (vjc_model::ClipId, f64)>,
     /// In..out region each layer's playhead last ran over.
     regions: HashMap<LayerId, (f64, f64)>,
     /// Autopilot on generators: (last bar seen, bars completed) per layer.
@@ -631,6 +637,25 @@ const IDLE_REPAINT: std::time::Duration = std::time::Duration::from_millis(100);
 type Gens = HashMap<LayerId, (DeckId, u32, f64)>;
 
 /// Deck and column of the clip playing on a layer (video or generator).
+/// Position a Continue trigger resumes at: only when the cell still holds the clip it was
+/// noted for.
+fn resume_pos(
+    p: &vjc_model::Project,
+    resume: &HashMap<(DeckId, LayerId, u32), (vjc_model::ClipId, f64)>,
+    key: (DeckId, LayerId, u32),
+) -> Option<f64> {
+    let (id, pos) = resume.get(&key)?;
+    (vjc_core::clip_in(p, key.0, key.1, key.2)?.id == *id).then_some(*pos)
+}
+
+/// Drops resume entries of cells that no longer exist or now hold another clip.
+fn prune_resume(
+    p: &vjc_model::Project,
+    resume: &mut HashMap<(DeckId, LayerId, u32), (vjc_model::ClipId, f64)>,
+) {
+    resume.retain(|k, (id, _)| vjc_core::clip_in(p, k.0, k.1, k.2).is_some_and(|c| c.id == *id));
+}
+
 fn active_of(
     players: &HashMap<LayerId, (DeckId, u32, Player)>,
     gens: &Gens,
@@ -979,6 +1004,7 @@ fn new_layer(n: usize) -> Layer {
         crossfader_bus: None,
         audio: true,
         video: true,
+        trigger_mode: vjc_model::TriggerMode::Restart,
         group: None,
     }
 }
@@ -1033,6 +1059,7 @@ impl State {
             warnings: vec![],
             status: "Drop video files on the grid cells.".into(),
             frame_ms: frame_stats::FrameStats::new(),
+            preload: preload::Preload::default(),
             frames: 0,
             players: HashMap::new(),
             audio: None,
@@ -1206,6 +1233,7 @@ impl State {
 
     fn reset_players(&mut self) {
         self.flow = Flow::default();
+        self.preload.clear();
         self.players.clear();
         self.gens.clear();
         self.history.clear();
@@ -1786,6 +1814,8 @@ impl State {
                 }
                 if deck_switch {
                     self.col_sel = None;
+                    let cur = self.project.composition.current_deck;
+                    self.preload_deck(cur);
                 }
                 self.prune_col_sel();
                 if !runtime {
@@ -1872,6 +1902,7 @@ impl State {
 
     fn handle(&mut self, events: Vec<Event>) {
         self.prune_sel_slices();
+        prune_resume(&self.project, &mut self.flow.resume);
         for e in events {
             match e {
                 Event::ClipStarted {
@@ -1881,11 +1912,16 @@ impl State {
                     path,
                 } => {
                     if path.exists() {
+                        let prev_local = self.layer_fraction(layer);
+                        self.remember_pos(layer);
                         self.gens.remove(&layer);
                         self.flow.loops.remove(&layer);
                         self.flow.beat_loops.remove(&layer);
                         self.cross_from_old(layer);
-                        let mut player = Player::open_scrub(&path);
+                        let mut player = self
+                            .preload
+                            .take(deck, layer, column, &path)
+                            .unwrap_or_else(|| Player::open_scrub(&path));
                         if let Some(engine) = self.audio_engine() {
                             player.attach_audio(&engine);
                         }
@@ -1897,6 +1933,18 @@ impl State {
                             .map_or(1, |d| d.as_nanos() as u64);
                         self.heads.insert(layer, Playhead::new(dir, seed));
                         self.flow.regions.remove(&layer);
+                        let own_last =
+                            resume_pos(&self.project, &self.flow.resume, (deck, layer, column));
+                        if let Some(start) = vjc_core::trigger_start(
+                            &self.project,
+                            deck,
+                            layer,
+                            column,
+                            own_last,
+                            prev_local,
+                        ) {
+                            self.seek(layer, start);
+                        }
                     } else {
                         self.status = format!("File not found: {}", path.display());
                     }
@@ -1970,6 +2018,7 @@ impl State {
                     }
                 }
                 Event::LayerCleared { layer } => {
+                    self.remember_pos(layer);
                     self.flow.outgoing.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
                     self.flow.regions.remove(&layer);
@@ -2190,6 +2239,35 @@ impl State {
             if let Some(h) = head {
                 self.heads.insert(to.0, h);
             }
+        }
+    }
+
+    /// Opens (in the background) the decoders of the clips `deck` would play first.
+    fn preload_deck(&mut self, deck: DeckId) {
+        let cells = preload::candidates(&self.project, deck, preload::MAX_PRELOAD, |l, c| {
+            self.players
+                .get(&l)
+                .is_some_and(|(d, col, _)| *d == deck && *col == c)
+        });
+        if self.preload.is_warm(deck, &cells) {
+            return;
+        }
+        self.preload.warm(deck, cells, |p| Player::open_scrub(p));
+    }
+
+    /// How far the layer's playing clip is inside its region (0..=1), if one plays.
+    fn layer_fraction(&self, layer: LayerId) -> Option<f64> {
+        self.players.contains_key(&layer).then_some(())?;
+        let pos = *self.flow.pos.get(&layer)?;
+        Some(vjc_core::playback::to_local(pos, self.region_of(layer)))
+    }
+
+    /// Notes where the layer's playing clip is, so a Continue trigger can resume it.
+    fn remember_pos(&mut self, layer: LayerId) {
+        if let (Some((d, c)), Some(p)) = (self.active(layer), self.flow.pos.get(&layer))
+            && let Some(k) = vjc_core::clip_in(&self.project, d, layer, c)
+        {
+            self.flow.resume.insert((d, layer, c), (k.id, *p));
         }
     }
 
@@ -2894,10 +2972,13 @@ impl State {
                     l.crossfader_bus.as_ref(),
                     cf_pos,
                 )) as f32;
-            let blend = vjc_core::crossfader::layer_blend(
-                c.crossfader.as_ref(),
-                l.crossfader_bus.as_ref(),
-                &l.track.blend,
+            let blend = vjc_core::blend::effective_blend(
+                &vjc_core::crossfader::layer_blend(
+                    c.crossfader.as_ref(),
+                    l.crossfader_bus.as_ref(),
+                    &l.track.blend,
+                ),
+                clip.and_then(|k| k.blend_override.as_ref()),
             );
             if let Some((o, (kind, prog), of)) = cross {
                 let fx = draw_chain(
@@ -5679,6 +5760,14 @@ impl State {
             if let Some(blend) = params::combo(ui, ("lbl", lid), "Blend", &l.track.blend, &modes) {
                 cmds.push(Command::SetBlend { layer: lid, blend });
             }
+            let trig: Vec<(TriggerMode, String)> = TriggerMode::LAYER_CHOICES
+                .into_iter()
+                .map(|m| (m, m.label().to_string()))
+                .collect();
+            if let Some(mode) = params::combo(ui, ("ltm", lid), "Start at", &l.trigger_mode, &trig)
+            {
+                cmds.push(Command::SetLayerTriggerMode { layer: lid, mode });
+            }
             let (mut solo, mut bypass) = (l.solo, l.bypass);
             ui.horizontal(|ui| {
                 if icons::toggle(ui, &mut solo, icons::i::HEADPHONES, "Solo").changed() {
@@ -6001,6 +6090,19 @@ impl State {
                     mode,
                 });
             }
+            let trig: Vec<(TriggerMode, String)> = [TriggerMode::Layer]
+                .into_iter()
+                .chain(TriggerMode::LAYER_CHOICES)
+                .map(|m| (m, m.label().to_string()))
+                .collect();
+            if let Some(mode) = params::combo(ui, "trig", "Start at", &t.trigger_mode, &trig) {
+                cmds.push(Command::SetTriggerMode {
+                    deck,
+                    layer,
+                    column,
+                    mode,
+                });
+            }
             let dirs = labeled(&[
                 (Direction::Forward, "Forward"),
                 (Direction::Backward, "Backward"),
@@ -6170,6 +6272,21 @@ impl State {
                     layer,
                     column,
                     fit,
+                });
+            }
+            let mut blends: Vec<(Option<BlendMode>, String)> =
+                vec![(None, "Layer determined".to_string())];
+            blends.extend(
+                vjc_core::blend::COMPOSITION_MODES
+                    .iter()
+                    .map(|(m, n)| (Some(m.clone()), n.to_string())),
+            );
+            if let Some(blend) = params::combo(ui, "bov", "Blend", &k.blend_override, &blends) {
+                cmds.push(Command::SetBlendOverride {
+                    deck,
+                    layer,
+                    column,
+                    blend,
                 });
             }
             ui.horizontal(|ui| {
@@ -6747,6 +6864,9 @@ impl State {
                     egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, name.clone())
                 });
                 let r = help(r, "deck-tab");
+                if r.hovered() && *id != cur {
+                    self.preload_deck(*id);
+                }
                 if r.double_clicked() {
                     self.renaming = Some((*id, name.clone()));
                 } else if r.clicked() && *id != cur {
@@ -7209,6 +7329,33 @@ fn window_grew(prev: egui::Vec2, now: egui::Vec2) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resume_ignores_a_replaced_clip_and_is_pruned() {
+        let mut p = vjc_model::Project::new("t");
+        let l = new_layer(0);
+        let lid = l.id;
+        p.composition.layers.push(l);
+        let deck = p.composition.decks[0].id;
+        p.composition.decks[0].clips.push(vjc_model::CellClip {
+            layer: lid,
+            column: 0,
+            clip: vjc_core::clip_from_path("/nope/a.mp4".into()),
+        });
+        let key = (deck, lid, 0);
+        let id = p.composition.decks[0].clips[0].clip.id;
+        let mut r = std::collections::HashMap::from([(key, (id, 0.4))]);
+        assert_eq!(super::resume_pos(&p, &r, key), Some(0.4));
+        // Negative control: the cell now holds another file/clip.
+        p.composition.decks[0].clips[0].clip = vjc_core::clip_from_path("/nope/b.mp4".into());
+        assert_eq!(super::resume_pos(&p, &r, key), None);
+        super::prune_resume(&p, &mut r);
+        assert!(r.is_empty());
+        // A deleted cell is pruned too.
+        r.insert(key, (id, 0.4));
+        p.composition.decks[0].clips.clear();
+        super::prune_resume(&p, &mut r);
+        assert!(r.is_empty());
+    }
     #[test]
     fn autoplay_whole_value_is_one_path_when_it_is_a_file() {
         let d = std::env::temp_dir().join(format!("vjc-ap-{}", std::process::id()));

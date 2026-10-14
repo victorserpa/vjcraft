@@ -81,6 +81,13 @@ pub struct Layer {
     /// The layer's picture is drawn (off = hidden, audio unaffected).
     #[serde(default = "yes")]
     pub video: bool,
+    /// Trigger mode of clips that defer to the layer (never `Layer` itself).
+    #[serde(default = "restart")]
+    pub trigger_mode: TriggerMode,
+}
+
+fn restart() -> TriggerMode {
+    TriggerMode::Restart
 }
 
 /// Adjacent layers composed together first, then blended into the stack as one layer.
@@ -137,7 +144,8 @@ pub struct Clip {
     pub source: Source,
     pub transport: Transport,
     pub track: Track,
-    /// Overrides the layer blend when set.
+    /// Overrides the layer blend when set (None = layer determined).
+    #[serde(default)]
     pub blend_override: Option<BlendMode>,
     /// How the video is fitted to the composition frame.
     #[serde(default)]
@@ -224,6 +232,7 @@ fn forward() -> Direction {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transport {
     pub play_mode: PlayMode,
+    #[serde(default)]
     pub trigger_mode: TriggerMode,
     pub direction: Direction,
     /// Direction to return to when a paused clip resumes (never `Pause`). Projects saved
@@ -311,13 +320,53 @@ pub enum PlayMode {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Where a clip starts when it is triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TriggerMode {
+    /// Start from the in-point.
     Restart,
+    /// Resume where the clip left off.
     Continue,
+    /// Start at the same fraction of the region the layer's previous clip had reached.
     Relative,
+    /// Use the layer's default (`Layer::trigger_mode`).
+    #[default]
+    Layer,
     #[serde(other)]
     Unknown,
+}
+
+impl TriggerMode {
+    /// Modes a clip can pick (the layer default cannot itself be `Layer`).
+    pub const LAYER_CHOICES: [TriggerMode; 3] = [
+        TriggerMode::Restart,
+        TriggerMode::Continue,
+        TriggerMode::Relative,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TriggerMode::Restart => "Restart",
+            TriggerMode::Continue => "Continue",
+            TriggerMode::Relative => "Relative",
+            TriggerMode::Layer => "Layer default",
+            TriggerMode::Unknown => "Restart",
+        }
+    }
+
+    /// The mode that applies: the clip's own, or the layer's when the clip defers.
+    /// `Layer` and unknown values fall back to Restart.
+    pub fn resolve(self, layer_default: TriggerMode) -> TriggerMode {
+        let m = if self == TriggerMode::Layer {
+            layer_default
+        } else {
+            self
+        };
+        match m {
+            TriggerMode::Restart | TriggerMode::Continue | TriggerMode::Relative => m,
+            _ => TriggerMode::Restart,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,7 +919,7 @@ impl Default for Transport {
     fn default() -> Self {
         Transport {
             play_mode: PlayMode::Loop,
-            trigger_mode: TriggerMode::Restart,
+            trigger_mode: TriggerMode::Layer,
             direction: Direction::Forward,
             resume_direction: Direction::Forward,
             speed: 1.0,
@@ -1177,6 +1226,7 @@ mod tests {
             crossfader_bus: None,
             audio: true,
             video: true,
+            trigger_mode: TriggerMode::Restart,
             transition: Transition {
                 kind: "cut".into(),
                 duration_beats: None,
@@ -1229,6 +1279,7 @@ mod tests {
             crossfader_bus: None,
             audio: true,
             video: true,
+            trigger_mode: TriggerMode::Restart,
             group: None,
         });
         p.composition.decks[0].set_clip(
@@ -1257,6 +1308,25 @@ mod tests {
     fn unknown_blend_tolerated() {
         let b: BlendMode = serde_json::from_str("\"Future\"").unwrap();
         assert_eq!(b, BlendMode::Unknown);
+    }
+
+    #[test]
+    fn trigger_mode_resolves_and_old_files_load() {
+        use TriggerMode as T;
+        assert_eq!(T::Layer.resolve(T::Continue), T::Continue);
+        // Negative control: an explicit clip mode beats the layer default.
+        assert_eq!(T::Relative.resolve(T::Continue), T::Relative);
+        assert_eq!(T::Layer.resolve(T::Layer), T::Restart);
+        assert_eq!(T::Unknown.resolve(T::Continue), T::Restart);
+        // Files saved before the field existed.
+        let mut v = serde_json::to_value(Transport::default()).unwrap();
+        v.as_object_mut().unwrap().remove("trigger_mode");
+        let t: Transport = serde_json::from_value(v).unwrap();
+        assert_eq!(t.trigger_mode, T::Layer);
+        let mut v = serde_json::to_value(Transport::default()).unwrap();
+        v["trigger_mode"] = "FromTheFuture".into();
+        let t: Transport = serde_json::from_value(v).unwrap();
+        assert_eq!(t.trigger_mode, T::Unknown);
     }
 
     #[test]

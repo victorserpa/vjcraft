@@ -109,6 +109,36 @@ pub fn region(t: &vjc_model::Transport) -> (f64, f64) {
     }
 }
 
+/// Closeness to the out-point (normalised) that counts as having ended (about one frame).
+const END_EPS: f64 = 1e-3;
+
+/// Normalised file position a clip starts at when triggered.
+/// `own_last`: where this clip stopped (file position); `prev_local`: how far the layer's
+/// previous clip had got inside its region (0..=1). Missing data falls back to the in-point.
+pub fn start_position(
+    mode: vjc_model::TriggerMode,
+    region: (f64, f64),
+    own_last: Option<f64>,
+    prev_local: Option<f64>,
+) -> f64 {
+    use vjc_model::TriggerMode as T;
+    match mode {
+        T::Continue => own_last.filter(|p| p.is_finite()).map_or(region.0, |p| {
+            // A clip that ended sits at the out-point: resuming there would end it
+            // again at once, so start over.
+            if p >= region.1 - END_EPS {
+                region.0
+            } else {
+                p.clamp(region.0, region.1)
+            }
+        }),
+        T::Relative => prev_local
+            .filter(|p| p.is_finite())
+            .map_or(region.0, |f| to_actual(f, region)),
+        _ => region.0,
+    }
+}
+
 /// Position inside the file for a playhead position local to the region (0..=1).
 pub fn to_actual(local: f64, region: (f64, f64)) -> f64 {
     region.0 + local.clamp(0.0, 1.0) * (region.1 - region.0)
@@ -236,6 +266,35 @@ impl TransportMode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_position_per_trigger_mode() {
+        use vjc_model::TriggerMode as T;
+        let r = (0.2, 0.6);
+        // Restart ignores everything else.
+        assert_eq!(
+            super::start_position(T::Restart, r, Some(0.5), Some(0.9)),
+            0.2
+        );
+        // Continue resumes, clamped into the region.
+        assert_eq!(
+            super::start_position(T::Continue, r, Some(0.5), Some(0.9)),
+            0.5
+        );
+        assert_eq!(super::start_position(T::Continue, r, Some(0.9), None), 0.2);
+        // A clip that ended at the out-point restarts from the in-point.
+        assert_eq!(super::start_position(T::Continue, r, Some(0.6), None), 0.2);
+        assert_eq!(super::start_position(T::Continue, r, Some(0.5), None), 0.5);
+        assert_eq!(super::start_position(T::Continue, r, None, Some(0.9)), 0.2);
+        // Relative maps the previous fraction onto this region (0.5 of 0.2..0.6 = 0.4).
+        let rel = super::start_position(T::Relative, r, Some(0.5), Some(0.5));
+        assert!((rel - 0.4).abs() < 1e-9);
+        assert_eq!(super::start_position(T::Relative, r, Some(0.5), None), 0.2);
+        assert_eq!(
+            super::start_position(T::Relative, r, None, Some(f64::NAN)),
+            0.2
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -381,6 +381,25 @@ pub enum Command {
         column: ColumnIdx,
         fit: FitMode,
     },
+    /// Where the clip starts when triggered (`Layer` = the layer's default). Undoable.
+    SetTriggerMode {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        mode: vjc_model::TriggerMode,
+    },
+    /// Default trigger mode of the layer's clips; `Layer` is stored as Restart. Undoable.
+    SetLayerTriggerMode {
+        layer: LayerId,
+        mode: vjc_model::TriggerMode,
+    },
+    /// Blend mode a clip uses while it plays (None = the layer's). Undoable.
+    SetBlendOverride {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        blend: Option<BlendMode>,
+    },
     /// Groups adjacent, ungrouped layers under `group` (any order; at least one).
     CreateGroup {
         group: vjc_model::LayerGroup,
@@ -979,6 +998,31 @@ pub fn clip_in(p: &Project, deck: DeckId, layer: LayerId, column: ColumnIdx) -> 
         .iter()
         .find(|d| d.id == deck)?
         .clip_at(layer, column)
+}
+
+/// Where a freshly triggered clip must start, or None to start at the beginning as usual
+/// (Restart). Resolves the clip's trigger mode against its layer's default.
+/// `own_last`: file position the clip stopped at; `prev_local`: fraction of its region the
+/// layer's previous clip had reached.
+pub fn trigger_start(
+    p: &Project,
+    deck: DeckId,
+    layer: LayerId,
+    column: ColumnIdx,
+    own_last: Option<f64>,
+    prev_local: Option<f64>,
+) -> Option<f64> {
+    let k = clip_in(p, deck, layer, column)?;
+    let default = p
+        .composition
+        .layers
+        .iter()
+        .find(|l| l.id == layer)
+        .map_or(vjc_model::TriggerMode::Restart, |l| l.trigger_mode);
+    let mode = k.transport.trigger_mode.resolve(default);
+    (mode != vjc_model::TriggerMode::Restart).then(|| {
+        playback::start_position(mode, playback::region(&k.transport), own_last, prev_local)
+    })
 }
 
 fn deck_idx(p: &Project, id: DeckId) -> Result<usize, Error> {
@@ -2133,6 +2177,55 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetTriggerMode {
+            deck,
+            layer,
+            column,
+            mode,
+        } => {
+            let prev = std::mem::replace(
+                &mut transport_mut(p, deck, layer, column)?.trigger_mode,
+                mode,
+            );
+            undoable(
+                Command::SetTriggerMode {
+                    deck,
+                    layer,
+                    column,
+                    mode: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetLayerTriggerMode { layer, mode } => {
+            let i = layer_idx(p, layer)?;
+            let mode = mode.resolve(vjc_model::TriggerMode::Restart);
+            let prev = std::mem::replace(&mut p.composition.layers[i].trigger_mode, mode);
+            undoable(Command::SetLayerTriggerMode { layer, mode: prev }, vec![])
+        }
+        Command::SetBlendOverride {
+            deck,
+            layer,
+            column,
+            blend,
+        } => {
+            check_cell(p, layer, column)?;
+            let k = deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .ok_or(Error::NoClip)?;
+            let prev = std::mem::replace(&mut k.clip.blend_override, blend);
+            undoable(
+                Command::SetBlendOverride {
+                    deck,
+                    layer,
+                    column,
+                    blend: prev,
+                },
+                vec![],
+            )
+        }
         Command::AddLayer { layer, index } => {
             let id = layer.id;
             let ls = &mut p.composition.layers;
@@ -3011,6 +3104,7 @@ mod tests {
             crossfader_bus: None,
             audio: true,
             video: true,
+            trigger_mode: vjc_model::TriggerMode::Restart,
             group: None,
         }
     }
@@ -3374,6 +3468,89 @@ mod tests {
                 column: 0,
                 fit: FitMode::Fill,
             },
+        );
+    }
+
+    #[test]
+    fn trigger_start_follows_clip_mode_then_layer_default() {
+        use vjc_model::TriggerMode as T;
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let go = |p: &Project| trigger_start(p, A, l, 0, Some(0.7), Some(0.25));
+        // Clip defers, layer default is Restart: start at the beginning (None).
+        assert_eq!(go(&p), None);
+        p.composition.layers[0].trigger_mode = T::Continue;
+        assert_eq!(go(&p), Some(0.7));
+        p.composition.layers[0].trigger_mode = T::Relative;
+        assert_eq!(go(&p), Some(0.25));
+        // Negative control: the clip's own mode beats the layer default.
+        p.composition.decks[0].clips[0].clip.transport.trigger_mode = T::Restart;
+        assert_eq!(go(&p), None);
+        // Region applies to Relative: 0.5 of 0.0..0.5 is 0.25.
+        let t = &mut p.composition.decks[0].clips[0].clip.transport;
+        t.trigger_mode = T::Relative;
+        t.out_point = 0.5;
+        assert_eq!(trigger_start(&p, A, l, 0, None, Some(0.5)), Some(0.25));
+        assert_eq!(trigger_start(&p, A, l, 3, None, Some(0.5)), None);
+    }
+
+    #[test]
+    fn trigger_mode_and_blend_override_roundtrip() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        import(&mut p, &mut h, l, Instant::now());
+        let clip = |p: &Project| p.composition.decks[0].clips[0].clip.clone();
+        assert_eq!(
+            clip(&p).transport.trigger_mode,
+            vjc_model::TriggerMode::Layer
+        );
+        roundtrip(
+            &mut p,
+            Command::SetTriggerMode {
+                deck: A,
+                layer: l,
+                column: 0,
+                mode: vjc_model::TriggerMode::Continue,
+            },
+        );
+        assert_eq!(
+            clip(&p).transport.trigger_mode,
+            vjc_model::TriggerMode::Continue
+        );
+        roundtrip(
+            &mut p,
+            Command::SetBlendOverride {
+                deck: A,
+                layer: l,
+                column: 0,
+                blend: Some(BlendMode::Add),
+            },
+        );
+        assert_eq!(clip(&p).blend_override, Some(BlendMode::Add));
+        roundtrip(
+            &mut p,
+            Command::SetLayerTriggerMode {
+                layer: l,
+                mode: vjc_model::TriggerMode::Relative,
+            },
+        );
+        assert_eq!(
+            p.composition.layers[0].trigger_mode,
+            vjc_model::TriggerMode::Relative
+        );
+        // Negative control: a missing clip is an error, not a silent no-op.
+        assert!(
+            apply(
+                &mut p,
+                Command::SetBlendOverride {
+                    deck: A,
+                    layer: l,
+                    column: 5,
+                    blend: None,
+                },
+            )
+            .is_err()
         );
     }
 

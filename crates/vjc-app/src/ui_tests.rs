@@ -800,6 +800,41 @@ fn transport_mode_dropdown_drives_beat_sync_and_timecode() {
 }
 
 #[test]
+fn clip_panel_trigger_mode_and_blend_override_dropdowns_undo() {
+    let mut h = app();
+    let (lid, deck) = file_clip(&mut h);
+    let clip = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, lid, 0)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        clip(&h).transport.trigger_mode,
+        vjc_model::TriggerMode::Layer
+    );
+    pick(&mut h, "Layer default", "Continue");
+    assert_eq!(
+        clip(&h).transport.trigger_mode,
+        vjc_model::TriggerMode::Continue
+    );
+    assert_eq!(clip(&h).blend_override, None);
+    pick(&mut h, "Layer determined", "Add");
+    assert_eq!(clip(&h).blend_override, Some(vjc_model::BlendMode::Add));
+    // Negative control: the layer's own blend is untouched.
+    assert_eq!(
+        h.state().project.composition.layers[0].track.blend,
+        vjc_model::BlendMode::Normal
+    );
+    h.state_mut().undo();
+    assert_eq!(clip(&h).blend_override, None);
+    h.state_mut().undo();
+    assert_eq!(
+        clip(&h).transport.trigger_mode,
+        vjc_model::TriggerMode::Layer
+    );
+}
+
+#[test]
 fn pause_button_toggles_selected_layer_and_undoes() {
     let mut h = app();
     let lid = playing_generator(&mut h);
