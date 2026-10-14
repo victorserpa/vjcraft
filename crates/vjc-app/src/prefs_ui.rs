@@ -1,6 +1,7 @@
 //! Preferences window (File > Preferences..., Cmd+,). Edits apply live;
 //! the file is written when the window closes.
 
+use crate::widgets::{Kind, Width, btn, field_text, help, section};
 use crate::{PrefsTab, State, api_io};
 use eframe::egui;
 use vjc_model::FitMode;
@@ -59,17 +60,17 @@ impl State {
                                 .as_ref()
                                 .map(|d| d.display().to_string())
                                 .unwrap_or_default();
-                            if ui.text_edit_singleline(&mut t).changed() {
+                            if field_text(ui, &mut t, Width::Lg, None).changed() {
                                 p.general.browser_folder =
                                     (!t.trim().is_empty()).then(|| t.trim().into());
                             }
-                            if ui.button("Choose...").clicked()
+                            if btn(ui, "Choose...", Kind::Secondary).clicked()
                                 && let Some(d) = rfd::FileDialog::new().pick_folder()
                             {
                                 p.general.browser_folder = Some(d);
                             }
                         });
-                        ui.weak("Empty = project folder, else ~/Movies. Applies on next launch.");
+                        help(ui, "Empty = project folder, else ~/Movies. Applies on next launch.");
                         ui.horizontal(|ui| {
                             ui.label("ML models folder");
                             let mut t = p
@@ -78,17 +79,18 @@ impl State {
                                 .as_ref()
                                 .map(|d| d.display().to_string())
                                 .unwrap_or_default();
-                            if ui.text_edit_singleline(&mut t).changed() {
+                            if field_text(ui, &mut t, Width::Lg, None).changed() {
                                 p.general.models_folder =
                                     (!t.trim().is_empty()).then(|| t.trim().into());
                             }
-                            if ui.button("Choose...").clicked()
+                            if btn(ui, "Choose...", Kind::Secondary).clicked()
                                 && let Some(d) = rfd::FileDialog::new().pick_folder()
                             {
                                 p.general.models_folder = Some(d);
                             }
                         });
-                        ui.weak(
+                        help(
+                            ui,
                             "Where Depth and Remove Background look for their .onnx files \
                              (empty = the app data folder, models/). See docs/ml.md.",
                         );
@@ -105,7 +107,7 @@ impl State {
                             let mut t = ui
                                 .data(|d| d.get_temp::<String>(id))
                                 .unwrap_or_else(|| saved.clone());
-                            let r = ui.text_edit_singleline(&mut t);
+                            let r = field_text(ui, &mut t, Width::Lg, None);
                             if r.lost_focus() {
                                 p.general.record_folder = crate::capture::absolute_folder(&t);
                                 ui.data_mut(|d| d.remove_temp::<String>(id));
@@ -114,13 +116,13 @@ impl State {
                             } else {
                                 ui.data_mut(|d| d.remove_temp::<String>(id));
                             }
-                            if ui.button("Choose...").clicked()
+                            if btn(ui, "Choose...", Kind::Secondary).clicked()
                                 && let Some(d) = rfd::FileDialog::new().pick_folder()
                             {
                                 p.general.record_folder = Some(d);
                             }
                         });
-                        ui.weak("Empty = ~/Movies/VJCraft. Recordings have no audio yet.");
+                        help(ui, "Empty = ~/Movies/VJCraft. Recordings have no audio yet.");
                     }
                     PrefsTab::Audio => {
                         let outputs = self
@@ -135,10 +137,10 @@ impl State {
                                     ui.selectable_value(&mut p.audio.output_device, Some(n.clone()), n);
                                 }
                             });
-                        if ui.button("Refresh devices").clicked() {
+                        if btn(ui, "Refresh devices", Kind::Secondary).clicked() {
                             self.audio_outputs = None;
                         }
-                        ui.weak("Applies to clips started after the change.");
+                        help(ui, "Applies to clips started after the change.");
                     }
                     PrefsTab::Video => {
                         ui.label("New composition");
@@ -180,7 +182,7 @@ impl State {
                                 ui.selectable_value(&mut p.control.beat_snap, m, l);
                             }
                         });
-                        ui.weak("Clip triggers and beat loops wait for the next beat or bar.");
+                        help(ui, "Clip triggers and beat loops wait for the next beat or bar.");
                     }
                     PrefsTab::Midi => {
                         let (ins, outs) = self.midi_ports.get_or_insert_with(|| {
@@ -189,31 +191,32 @@ impl State {
                                 crate::midi_io::output_ports(),
                             )
                         });
-                        ui.strong("Inputs");
-                        if ins.is_empty() {
-                            ui.weak("No MIDI input ports found.");
-                        }
-                        for n in ins.iter() {
-                            let mut on = p.midi.input_enabled(n);
-                            if ui.checkbox(&mut on, n).changed() {
-                                p.midi.set_input(n, on);
+                        section(ui, "Inputs", |ui| {
+                            if ins.is_empty() {
+                                help(ui, "No MIDI input ports found.");
                             }
-                        }
-                        ui.separator();
-                        ui.strong("Outputs");
-                        if outs.is_empty() {
-                            ui.weak("No MIDI output ports found.");
-                        }
-                        for n in outs.iter() {
-                            let mut on = p.midi.output_enabled(n);
-                            if ui.checkbox(&mut on, n).changed() {
-                                p.midi.set_output(n, on);
+                            for n in ins.iter() {
+                                let mut on = p.midi.input_enabled(n);
+                                if ui.checkbox(&mut on, n).changed() {
+                                    p.midi.set_input(n, on);
+                                }
                             }
-                        }
-                        if ui.button("Refresh ports").clicked() {
+                        });
+                        section(ui, "Outputs", |ui| {
+                            if outs.is_empty() {
+                                help(ui, "No MIDI output ports found.");
+                            }
+                            for n in outs.iter() {
+                                let mut on = p.midi.output_enabled(n);
+                                if ui.checkbox(&mut on, n).changed() {
+                                    p.midi.set_output(n, on);
+                                }
+                            }
+                        });
+                        if btn(ui, "Refresh ports", Kind::Secondary).clicked() {
                             self.midi_ports = None;
                         }
-                        ui.weak("Disabled inputs are ignored; disabled outputs get no LED feedback.");
+                        help(ui, "Disabled inputs are ignored; disabled outputs get no LED feedback.");
                     }
                     PrefsTab::Osc => {
                         let o = &mut p.osc;
@@ -233,12 +236,12 @@ impl State {
                         ui.add_enabled_ui(o.out_enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Host");
-                                ui.text_edit_singleline(&mut o.out_host);
+                                field_text(ui, &mut o.out_host, Width::Md, None);
                                 ui.label("Port");
                                 ui.add(egui::DragValue::new(&mut o.out_port).range(1..=65535));
                             });
                         });
-                        ui.weak("Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
+                        help(ui, "Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
                     }
                     PrefsTab::Dmx => {
                         let d = &mut p.dmx;
@@ -246,9 +249,7 @@ impl State {
                         ui.add_enabled_ui(d.enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Interface IP");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut d.interface).desired_width(110.0),
-                                );
+                                field_text(ui, &mut d.interface, Width::Md, None);
                                 ui.label("Port");
                                 ui.add(egui::DragValue::new(&mut d.port).range(1..=65535));
                             });
@@ -262,17 +263,17 @@ impl State {
                         if d.enabled {
                             match self.dmx.status() {
                                 crate::dmx_io::Status::Listening(addr) => {
-                                    ui.weak(format!("Listening on {addr}"));
+                                    help(ui, &format!("Listening on {addr}"));
                                 }
                                 crate::dmx_io::Status::Failed(e) => {
                                     ui.colored_label(ui.visuals().error_fg_color, e);
                                 }
                                 crate::dmx_io::Status::Off => {
-                                    ui.weak("Starting...");
+                                    help(ui, "Starting...");
                                 }
                             }
                         }
-                        ui.weak("127.0.0.1 = this computer only; 0.0.0.0 = every interface (anyone on the network can then send). Channels map to shortcuts in Shortcuts > Edit MIDI (move a fader to learn), value 0..255 = range.");
+                        help(ui, "127.0.0.1 = this computer only; 0.0.0.0 = every interface (anyone on the network can then send). Channels map to shortcuts in Shortcuts > Edit MIDI (move a fader to learn), value 0..255 = range.");
                         ui.separator();
                         ui.label(format!("Saved fixtures: {}", d.fixtures.len()));
                         let mut gone = None;
@@ -282,7 +283,7 @@ impl State {
                                     "{} ({}x{}, {:?})",
                                     f.name, f.width, f.height, f.format
                                 ));
-                                if ui.small_button("Remove").clicked() {
+                                if btn(ui, "Remove", Kind::Danger).clicked() {
                                     gone = Some(i);
                                 }
                             });
@@ -290,7 +291,7 @@ impl State {
                         if let Some(i) = gone {
                             d.fixtures.remove(i);
                         }
-                        ui.weak("Add fixtures from Output > Setup (device Art-Net).");
+                        help(ui, "Add fixtures from Output > Setup (device Art-Net).");
                     }
                     PrefsTab::Timecode => {
                         use vjc_io::prefs::{OnLoss, TcSource};
@@ -365,7 +366,7 @@ impl State {
                                 });
                             }
                         }
-                        if ui.button("Refresh devices").clicked() {
+                        if btn(ui, "Refresh devices", Kind::Secondary).clicked() {
                             self.tc_devices = None;
                         }
                         ui.horizontal(|ui| {
@@ -381,7 +382,7 @@ impl State {
                             ui.selectable_value(&mut t.on_loss, OnLoss::Freeze, "Freeze");
                             ui.selectable_value(&mut t.on_loss, OnLoss::FreeRun, "Run free");
                         });
-                        ui.weak("Clips with Timecode sync (Clip tab) and cues (Composition tab) follow this source.");
+                        help(ui, "Clips with Timecode sync (Clip tab) and cues (Composition tab) follow this source.");
                     }
                     PrefsTab::Api => {
                         let a = &mut p.api;
@@ -390,7 +391,7 @@ impl State {
                             ui.horizontal(|ui| {
                                 ui.label("Port");
                                 ui.add(egui::DragValue::new(&mut a.port).range(1..=65534));
-                                ui.weak(format!("WebSocket: {}", u32::from(a.port) + 1));
+                                help(ui, &format!("WebSocket: {}", u32::from(a.port) + 1));
                             });
                             ui.checkbox(
                                 &mut a.expose_network,
@@ -406,21 +407,21 @@ impl State {
                         if a.enabled {
                             match self.api.status() {
                                 api_io::Status::Listening(addr) => {
-                                    ui.weak(format!("Listening on {addr}"));
+                                    help(ui, &format!("Listening on {addr}"));
                                 }
                                 api_io::Status::Failed(e) => {
                                     ui.colored_label(ui.visuals().error_fg_color, e);
                                 }
                                 api_io::Status::Off => {
-                                    ui.weak("Starting...");
+                                    help(ui, "Starting...");
                                 }
                             }
                         }
-                        ui.weak("See docs/api.md. Applies immediately.");
+                        help(ui, "See docs/api.md. Applies immediately.");
                     }
                 }
                 ui.separator();
-                if ui.button("Close").clicked() {
+                if btn(ui, "Close", Kind::Primary).clicked() {
                     done = true;
                 }
             });

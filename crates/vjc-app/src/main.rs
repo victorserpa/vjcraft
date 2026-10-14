@@ -35,6 +35,7 @@ mod theme;
 mod timecode_io;
 mod vram;
 mod wake;
+mod widgets;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
@@ -231,6 +232,10 @@ struct State {
     last_autosave: std::time::Instant,
     prefs: Prefs,
     prefs_open: bool,
+    /// Autosaved project waiting for a Restore/Discard answer.
+    recovery_offer: Option<PathBuf>,
+    /// Relink dialog is showing.
+    relink_open: bool,
     output_setup_open: bool,
     sel_screen: Option<Uuid>,
     sel_slice: Option<Uuid>,
@@ -1035,25 +1040,83 @@ fn offer_recovery(s: &mut State) {
     if !r.exists() {
         return;
     }
-    let ask = rfd::MessageDialog::new()
-        .set_title("Recover project")
-        .set_description("VJCraft found an autosaved project from a previous session. Restore it?")
-        .set_buttons(rfd::MessageButtons::OkCancelCustom(
-            "Restore".into(),
-            "Discard".into(),
-        ))
-        .show();
-    let restore = matches!(ask, rfd::MessageDialogResult::Custom(ref l) if l == "Restore");
-    if restore && s.load(r.clone()) {
-        s.file = None;
-        s.dirty = true;
-        // Restored state now lives in memory (and is re-autosaved while dirty).
-        clear_recovery(Some(r));
-    } else if restore {
-        // Unreadable: do not offer it again, but do not destroy the user's work either.
-        quarantine_recovery(&r);
-    } else {
-        clear_recovery(Some(r));
+    s.recovery_offer = Some(r);
+}
+
+impl State {
+    /// Restore/Discard dialog for `recovery_offer`.
+    fn recovery_window(&mut self, ctx: &egui::Context) {
+        let Some(r) = self.recovery_offer.clone() else {
+            return;
+        };
+        let mut restore = None;
+        widgets::dialog(ctx, "Recover project", |ui| {
+            ui.label("VJCraft found an autosaved project from a previous session. Restore it?");
+            ui.add_space(theme::SP_4);
+            ui.horizontal(|ui| {
+                if widgets::btn(ui, "Restore", widgets::Kind::Primary).clicked() {
+                    restore = Some(true);
+                }
+                if widgets::btn(ui, "Discard", widgets::Kind::Danger).clicked() {
+                    restore = Some(false);
+                }
+            });
+        });
+        let Some(restore) = restore else { return };
+        self.recovery_offer = None;
+        if restore && self.load(r.clone()) {
+            self.file = None;
+            self.dirty = true;
+            // Restored state now lives in memory (and is re-autosaved while dirty).
+            clear_recovery(Some(r));
+        } else if restore {
+            // Unreadable: do not offer it again, but do not destroy the user's work either.
+            quarantine_recovery(&r);
+        } else {
+            clear_recovery(Some(r));
+        }
+        if self.file.is_none()
+            && !self.dirty
+            && self.prefs.general.open_last_project
+            && let Some(p) = self
+                .prefs
+                .general
+                .last_project
+                .clone()
+                .filter(|p| p.is_file())
+        {
+            self.load(p);
+        }
+    }
+
+    /// Relink dialog: explains, then asks for the folder and applies `relink_from`.
+    fn relink_window(&mut self, ctx: &egui::Context) {
+        if !self.relink_open {
+            return;
+        }
+        let n = vjc_io::media::missing(&self.project).len();
+        let mut go = false;
+        let mut cancel = false;
+        widgets::dialog(ctx, "Relink missing media", |ui| {
+            ui.label(format!(
+                "{n} file(s) are missing. Pick a folder to search for them by name."
+            ));
+            ui.add_space(theme::SP_4);
+            ui.horizontal(|ui| {
+                go = widgets::btn(ui, "Choose folder...", widgets::Kind::Primary).clicked();
+                cancel = widgets::btn(ui, "Cancel", widgets::Kind::Secondary).clicked();
+            });
+        });
+        if go || cancel {
+            self.relink_open = false;
+        }
+        if go
+            && let Some(root) = rfd::FileDialog::new()
+                .set_title("Folder to search for missing media")
+                .pick_folder()
+        {
+            self.relink_from(&root);
+        }
     }
 }
 
@@ -1233,6 +1296,8 @@ impl State {
             dirty: false,
             last_autosave: std::time::Instant::now(),
             prefs_open: false,
+            recovery_offer: None,
+            relink_open: false,
             output_setup_open: false,
             sel_screen: None,
             sel_slice: None,
@@ -1745,13 +1810,7 @@ impl State {
             self.status = "No missing media".into();
             return;
         }
-        let Some(root) = rfd::FileDialog::new()
-            .set_title("Folder to search for missing media")
-            .pick_folder()
-        else {
-            return;
-        };
-        self.relink_from(&root);
+        self.relink_open = true;
     }
 
     /// Relinks every missing file found by name under `root` in one undoable command and
@@ -1958,7 +2017,9 @@ impl State {
     /// `autosave` with an explicit recovery file (`None` = nowhere to write).
     fn autosave_to(&mut self, path: Option<PathBuf>) {
         let every = std::time::Duration::from_secs(self.prefs.general.autosave_secs.into());
+        // While the recovery offer is open, the file on disk is the user's only copy.
         if self.rehearsal
+            || self.recovery_offer.is_some()
             || !self.prefs.general.autosave
             || !self.dirty
             || self.last_autosave.elapsed() < every
@@ -4938,6 +4999,8 @@ impl State {
             self.prefs_open = true;
         }
         self.prefs_window(&ctx);
+        self.recovery_window(&ctx);
+        self.relink_window(&ctx);
         self.save_layout_window(&ctx);
         self.overwrite_layout_window(&ctx);
         self.remove_layer_modal(&ctx);
@@ -8057,6 +8120,7 @@ fn main() -> eframe::Result {
             offer_recovery(&mut s);
             if s.file.is_none()
                 && !s.dirty
+                && s.recovery_offer.is_none()
                 && s.prefs.general.open_last_project
                 && let Some(p) = s.prefs.general.last_project.clone().filter(|p| p.is_file())
             {

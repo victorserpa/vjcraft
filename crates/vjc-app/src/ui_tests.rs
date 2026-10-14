@@ -3344,8 +3344,16 @@ fn dirty_project_autosaves_a_recoverable_file_after_the_interval() {
     st.last_autosave = old;
     st.autosave_to(Some(file.clone()));
     assert!(!file.exists(), "autosave off");
-    // The real case.
     st.prefs.general.autosave = true;
+    st.recovery_offer = Some(file.clone());
+    st.last_autosave = old;
+    st.autosave_to(Some(file.clone()));
+    assert!(
+        !file.exists(),
+        "open recovery offer must not be overwritten"
+    );
+    st.recovery_offer = None;
+    // The real case.
     st.last_autosave = old;
     st.autosave_to(Some(file.clone()));
     assert!(file.exists(), "recovery file written");
@@ -4540,4 +4548,14 @@ fn blackout_chord_shows_badge_and_does_not_collide_with_cmd_b() {
     chord(&mut h, k, m);
     assert!(h.state().blackouts.is_empty());
     assert!(!exists(&h, "BLACK-OUT"));
+}
+
+/// Preferences window (General tab) snapshot, for the design review.
+#[test]
+fn prefs_window_snapshot() {
+    let mut h = app();
+    h.state_mut().prefs_open = true;
+    settle(&mut h);
+    assert!(exists(&h, "Close") && exists(&h, "Choose..."));
+    snap(&mut h, "prefs");
 }

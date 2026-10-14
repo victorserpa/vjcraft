@@ -15,6 +15,7 @@ pub const BORDER_INPUT: Color32 = Color32::from_rgb(0x7a, 0x83, 0x94);
 pub const TEXT: Color32 = Color32::from_rgb(0xd6, 0xda, 0xe2);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x96, 0xa0, 0xb2);
 pub const ON_ACCENT: Color32 = Color32::from_rgb(0x10, 0x12, 0x16);
+pub const SCRIM: Color32 = Color32::from_black_alpha(140);
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x80, 0x80);
 
 /// Spacing scale (token `space`).
@@ -22,6 +23,16 @@ pub const SP_1: f32 = 2.0;
 pub const SP_2: f32 = 4.0;
 pub const SP_3: f32 = 6.0;
 pub const SP_4: f32 = 8.0;
+
+/// Focus ring width and small corner radius (token `radius`).
+pub const FOCUS_W: f32 = 2.0;
+pub const RADIUS_SM: u8 = 3;
+
+/// Text field widths (`Width::{Sm,Md,Lg}` in widgets.rs) and modal dialog width.
+pub const FIELD_W_SM: f32 = 60.0;
+pub const FIELD_W_MD: f32 = 110.0;
+pub const FIELD_W_LG: f32 = 240.0;
+pub const DIALOG_W: f32 = 360.0;
 
 /// Type scale (token `type`): xs 10, sm 12, base 13, lg 16.
 pub const FS_XS: f32 = 10.0;
@@ -135,7 +146,7 @@ fn style_dark(s: &mut egui::Style) {
         spread: 0,
         color: Color32::from_black_alpha(128),
     };
-    let r = CornerRadius::same(3);
+    let r = CornerRadius::same(RADIUS_SM);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = BG;
     w.noninteractive.weak_bg_fill = BG;
@@ -168,8 +179,8 @@ fn style_dark(s: &mut egui::Style) {
         x.corner_radius = r;
         x.expansion = 0.0;
     }
-    // Keyboard focus: 2 px ring (token `selected`, >= 3:1 on bg).
-    v.selection.stroke = Stroke::new(2.0, CELL_SELECTED);
+    // Keyboard focus: visible ring in ACCENT on every interactive widget (>= 3:1 on bg).
+    v.selection.stroke = Stroke::new(FOCUS_W, ACCENT);
 }
 
 /// Clip cell: thumbnail area plus a name strip below it.
