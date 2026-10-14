@@ -743,6 +743,24 @@ fn prune_resume(
     resume.retain(|k, (id, _)| vjc_core::clip_in(p, k.0, k.1, k.2).is_some_and(|c| c.id == *id));
 }
 
+/// Repaint rate for live video: the composition fps, kept to 1..=60 (NaN or junk = 60).
+fn repaint_fps(fps: impl Into<f64>) -> f64 {
+    let f = fps.into();
+    if f.is_finite() {
+        f.clamp(1.0, 60.0)
+    } else {
+        60.0
+    }
+}
+
+#[test]
+fn repaint_fps_never_panics_on_bad_project_values() {
+    assert_eq!(repaint_fps(f64::NAN), 60.0);
+    assert_eq!(repaint_fps(f64::INFINITY), 60.0);
+    assert_eq!(repaint_fps(0.0), 1.0);
+    assert_eq!(repaint_fps(30.0), 30.0);
+}
+
 fn active_of(
     players: &HashMap<LayerId, (DeckId, u32, Player)>,
     gens: &Gens,
@@ -8057,7 +8075,9 @@ impl eframe::App for State {
         // Video is live: keep repainting. With nothing playing or published, wake up
         // at a low rate (input events still repaint at once).
         if self.is_live() {
-            ctx.request_repaint();
+            // Paced at the composition rate; input events still repaint at once.
+            let fps = repaint_fps(self.project.composition.fps);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(1.0 / fps));
         } else {
             ctx.request_repaint_after(IDLE_REPAINT);
         }

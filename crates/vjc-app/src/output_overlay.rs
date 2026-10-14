@@ -117,6 +117,40 @@ pub struct Overlay<'a> {
     pub fps: Option<f32>,
 }
 
+type GalleyKey = (String, u32, u32, Color32);
+
+thread_local! {
+    /// Laid-out labels, so the test card does not re-shape its text every frame.
+    static GALLEYS: std::cell::RefCell<std::collections::HashMap<GalleyKey, std::sync::Arc<egui::Galley>>> =
+        Default::default();
+}
+
+fn cached_galley(
+    painter: &egui::Painter,
+    text: String,
+    size: f32,
+    color: Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let key = (
+        text,
+        size.to_bits(),
+        painter.ctx().pixels_per_point().to_bits(),
+        color,
+    );
+    GALLEYS.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(g) = m.get(&key) {
+            return g.clone();
+        }
+        if m.len() > 64 {
+            m.clear();
+        }
+        let g = painter.layout_no_wrap(key.0.clone(), egui::FontId::proportional(size), color);
+        m.insert(key, g.clone());
+        g
+    })
+}
+
 /// Draws the overlays on `painter`; `rect` is where the canvas is presented.
 pub fn draw(painter: &egui::Painter, rect: Rect, o: &Overlay) {
     let s = o.screen;
@@ -124,8 +158,7 @@ pub fn draw(painter: &egui::Painter, rect: Rect, o: &Overlay) {
     let (kx, ky) = (rect.width() / w, rect.height() / h);
     let at = |x: f32, y: f32| pos2(rect.min.x + x * kx, rect.min.y + y * ky);
     let label = |p: Pos2, align: egui::Align2, text: String, size: f32, color: Color32| {
-        let font = egui::FontId::proportional(size);
-        let g = painter.layout_no_wrap(text, font, color);
+        let g = cached_galley(painter, text, size, color);
         let r = align.anchor_size(p, g.size()).expand(size * 0.2);
         painter.rect_filled(r, 2.0, theme::TESTCARD_TEXT_BG);
         painter.galley(r.center() - g.size() / 2.0, g, color);
