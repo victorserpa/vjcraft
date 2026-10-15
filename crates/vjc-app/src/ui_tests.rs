@@ -5792,3 +5792,97 @@ fn hold_that_fired_then_drags_moves_nothing_and_release_ejects() {
         "release ejected it"
     );
 }
+
+fn trig(deck: DeckId, layer: LayerId) -> Command {
+    Command::TriggerClip {
+        deck,
+        layer,
+        column: 1,
+    }
+}
+
+#[test]
+fn repeated_hold_shortcut_keeps_a_single_run() {
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    let id = Uuid::new_v4();
+    for _ in 0..3 {
+        h.state_mut().run_shortcut(id, trig(deck, top));
+    }
+    settle(&mut h);
+    assert_eq!(h.state().holds.len(), 1);
+    h.state_mut().hold_release(hold::Src::Binding(id));
+    assert!(h.state().holds.is_empty());
+}
+
+#[test]
+fn key_up_releases_a_hold_whose_shortcut_was_removed_meanwhile() {
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    let id = Uuid::new_v4();
+    h.state_mut().run_key_shortcut(id, trig(deck, top), "Q");
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)));
+    // The shortcut is gone (not in the list) while the key is still down.
+    assert!(h.state().project.shortcuts.iter().all(|s| s.id != id));
+    h.state_mut().key_up("Q");
+    settle(&mut h);
+    assert!(h.state().holds.is_empty());
+    assert_eq!(air_of(&h, top), None, "released");
+}
+
+#[test]
+fn osc_hold_without_argument_is_a_plain_trigger() {
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    let id = Uuid::new_v4();
+    h.state_mut().osc_shortcut(id, trig(deck, top), false);
+    h.state_mut().osc_shortcut(id, trig(deck, top), false);
+    settle(&mut h);
+    assert!(h.state().holds.is_empty(), "no run to pile up");
+    assert_eq!(air_of(&h, top), Some((deck, 1)), "it still plays");
+    // Control: with an argument it is a Hold run.
+    h.state_mut().osc_shortcut(id, trig(deck, top), true);
+    assert_eq!(h.state().holds.len(), 1);
+}
+
+/// #193: Tab walks the Preferences fields in the order they are drawn (top to bottom, left
+/// to right), so keyboard users are not sent around the dialog.
+#[test]
+fn prefs_tab_moves_focus_forward_in_visual_order() {
+    use PrefsTab::*;
+    for tab in [
+        General, Audio, Video, Control, Osc, Dmx, Api, Timecode, Midi,
+    ] {
+        let mut h = app();
+        h.state_mut().prefs_open = true;
+        h.state_mut().prefs_tab = tab;
+        settle(&mut h);
+        let mut seen: Vec<egui::Rect> = vec![];
+        for _ in 0..12 {
+            h.key_press(egui::Key::Tab);
+            settle(&mut h);
+            if let Some(id) = h.ctx.memory(|m| m.focused())
+                && let Some(r) = h.ctx.read_response(id)
+            {
+                seen.push(r.rect);
+            }
+        }
+        eprintln!("{:?}: {} stops", tab as u8, seen.len());
+        assert!(!seen.is_empty(), "tab {}: nothing took focus", tab as u8);
+        // Tab cycles: allow the one wrap-around, every other step goes down or right.
+        let backwards = seen
+            .windows(2)
+            .filter(|w| {
+                let (a, b) = (w[0], w[1]);
+                let same_row = (a.center().y - b.center().y).abs() < 4.0;
+                !(b.center().y > a.center().y || (same_row && b.center().x > a.center().x))
+            })
+            .count();
+        assert!(
+            backwards <= 1,
+            "tab {}: focus jumped backwards {backwards} times: {seen:?}",
+            tab as u8
+        );
+    }
+}

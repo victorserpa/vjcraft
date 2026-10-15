@@ -5,6 +5,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use vjc_media::Frame;
 use vjc_model::ClipId;
@@ -42,17 +43,24 @@ pub struct ClipThumbs {
     failures: HashMap<ClipId, u32>,
     req: Sender<(ClipId, PathBuf)>,
     done: Receiver<(ClipId, PathBuf, Option<Frame>)>,
+    /// Set by `poll`; the worker repaints through it when a result lands.
+    repaint: Arc<Mutex<Option<egui::Context>>>,
 }
 
 impl ClipThumbs {
     pub fn new() -> Self {
         let (req, rx) = channel::<(ClipId, PathBuf)>();
         let (tx, done) = channel();
+        let repaint: Arc<Mutex<Option<egui::Context>>> = Arc::default();
+        let rp = repaint.clone();
         std::thread::spawn(move || {
             while let Ok((id, path)) = rx.recv() {
                 let f = vjc_media::thumbnail(&path, crate::theme::THUMB_MAX_SIDE).ok();
                 if tx.send((id, path, f)).is_err() {
                     break;
+                }
+                if let Some(c) = rp.lock().unwrap().as_ref() {
+                    c.request_repaint();
                 }
             }
         });
@@ -67,12 +75,19 @@ impl ClipThumbs {
             failures: HashMap::new(),
             req,
             done,
+            repaint,
         }
     }
 
     /// Uploads finished thumbnails. Returns true if any arrived (caller repaints).
     pub fn poll(&mut self, ctx: &egui::Context) -> bool {
         let mut any = false;
+        {
+            let mut slot = self.repaint.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(ctx.clone());
+            }
+        }
         self.frame_floor = Some(self.frame_start);
         self.frame_start = self.tick;
         while let Ok((id, path, f)) = self.done.try_recv() {
@@ -127,6 +142,10 @@ impl ClipThumbs {
             p == path && at.elapsed() < retry_delay(self.failures.get(&id).copied().unwrap_or(1))
         });
         if !busy && !failed {
+            // A different path starts over: it does not inherit the old file's failures.
+            if self.failed.get(&id).is_some_and(|(p, _)| p != path) {
+                self.failures.remove(&id);
+            }
             self.failed.remove(&id);
             if self.req.send((id, path.to_path_buf())).is_ok() {
                 self.pending
@@ -238,6 +257,23 @@ mod tests {
         assert!(t.failed.contains_key(&c));
         t.texture(c, Path::new("/nonexistent/b.mp4"));
         assert_eq!(t.pending[&c].0, Path::new("/nonexistent/b.mp4"));
+    }
+
+    #[test]
+    fn path_change_resets_failure_count() {
+        let mut t = ClipThumbs::new();
+        let c = id();
+        let a = Path::new("/nonexistent/a.mp4");
+        for _ in 0..2 {
+            t.texture(c, a);
+            wait_done(&mut t);
+            t.failed.get_mut(&c).unwrap().1 =
+                Instant::now() - RETRY_AFTER * 4 - Duration::from_secs(1);
+        }
+        assert_eq!(t.failures[&c], 2);
+        t.texture(c, Path::new("/nonexistent/b.mp4"));
+        wait_done(&mut t);
+        assert_eq!(t.failures[&c], 1);
     }
 
     #[test]

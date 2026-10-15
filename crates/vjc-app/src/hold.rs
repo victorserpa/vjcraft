@@ -70,6 +70,9 @@ pub struct Run {
     pub token: u64,
     /// The trigger already ran (false while it waits for its beat).
     pub onair: bool,
+    /// Name of the key that started it (key shortcuts): the key-up releases by this name,
+    /// whatever the shortcut list says by then.
+    pub key: Option<String>,
 }
 
 #[cfg(test)]

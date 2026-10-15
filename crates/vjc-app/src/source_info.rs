@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use vjc_media::SourceInfo;
 
@@ -26,6 +27,8 @@ pub struct SourceInfos {
     fails: HashMap<PathBuf, u32>,
     tx: Sender<(PathBuf, Option<SourceInfo>)>,
     rx: Receiver<(PathBuf, Option<SourceInfo>)>,
+    /// Repainted by the probe thread when an answer lands.
+    repaint: Arc<Mutex<Option<eframe::egui::Context>>>,
 }
 
 impl Default for SourceInfos {
@@ -39,6 +42,7 @@ impl Default for SourceInfos {
             fails: HashMap::new(),
             tx,
             rx,
+            repaint: Arc::default(),
         }
     }
 }
@@ -75,12 +79,24 @@ impl SourceInfos {
         self.known.get(path).map(Option::as_ref)
     }
 
+    /// Lets the probe threads wake the UI when an answer arrives.
+    pub fn set_ctx(&mut self, ctx: &eframe::egui::Context) {
+        let mut slot = self.repaint.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(ctx.clone());
+        }
+    }
+
     fn spawn(&mut self, path: &Path) {
         if self.pending.insert(path.to_path_buf()) {
             let (tx, p) = (self.tx.clone(), path.to_path_buf());
+            let rp = self.repaint.clone();
             std::thread::spawn(move || {
                 let info = vjc_media::probe(&p);
                 let _ = tx.send((p, info));
+                if let Some(c) = rp.lock().unwrap().as_ref() {
+                    c.request_repaint();
+                }
             });
         }
     }

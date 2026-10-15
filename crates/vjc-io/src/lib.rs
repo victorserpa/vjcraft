@@ -229,7 +229,18 @@ pub fn open(path: &Path) -> Result<(Project, Vec<String>), Error> {
             "{n} composition value(s) (size, fps, tempo) were out of range and were clamped"
         ));
     }
-    vjc_core::shortcuts::bind_legacy(&mut project);
+    let r = vjc_core::shortcuts::bind_legacy(&mut project);
+    if r.bound > 0 || !r.unresolved.is_empty() {
+        let mut m = format!("Shortcuts: {} migrated to follow their effect", r.bound);
+        if !r.unresolved.is_empty() {
+            m.push_str(&format!(
+                "; {} point at an effect that does not exist ({})",
+                r.unresolved.len(),
+                r.unresolved.join(", ")
+            ));
+        }
+        warnings.push(m);
+    }
     for m in media_paths(&mut project) {
         let joined = dir.join(&*m);
         if joined.exists() {
@@ -283,8 +294,31 @@ mod tests {
         ));
         let f = d.join("p.vjc");
         save(&p, &f).unwrap();
-        let (q, _) = open(&f).unwrap();
+        let (q, warns) = open(&f).unwrap();
         assert_eq!(q.shortcuts[0].effect, Some(e.id));
+        assert!(
+            warns.iter().any(|w| w.starts_with("Shortcuts: 1 migrated")),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn open_warns_about_legacy_shortcut_without_effect() {
+        let d = tmp("legacyfx-gone");
+        let mut p = Project::new("T");
+        p.shortcuts.push(vjc_core::shortcuts::key_shortcut(
+            "Q",
+            "/comp/effect/4/drywet",
+            vjc_model::ShortcutMode::Toggle,
+            (0.0, 1.0),
+        ));
+        let f = d.join("p.vjc");
+        save(&p, &f).unwrap();
+        let (_, warns) = open(&f).unwrap();
+        assert!(
+            warns.iter().any(|w| w.contains("/comp/effect/4/drywet")),
+            "{warns:?}"
+        );
     }
 
     #[test]

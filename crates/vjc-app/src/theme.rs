@@ -24,6 +24,10 @@ pub const SP_2: f32 = 4.0;
 pub const SP_3: f32 = 6.0;
 pub const SP_4: f32 = 8.0;
 
+/// Opacity of everything inside a disabled `Ui` (buttons, fields, labels): clearly dimmer
+/// than the enabled look, still readable.
+pub const DISABLED_ALPHA: f32 = 0.4;
+
 /// Focus ring width and small corner radius (token `radius`).
 pub const FOCUS_W: f32 = 2.0;
 pub const RADIUS_SM: u8 = 3;
@@ -161,6 +165,7 @@ fn style_dark(s: &mut egui::Style) {
     let v = &mut s.visuals;
     v.dark_mode = true;
     v.override_text_color = None;
+    v.disabled_alpha = DISABLED_ALPHA;
     v.weak_text_color = Some(TEXT_MUTED);
     v.panel_fill = BG;
     v.window_fill = SURFACE_RAISED;
@@ -364,6 +369,7 @@ mod tests {
         let s = ctx.style_of(egui::Theme::Dark);
         assert_eq!(s.visuals.widgets.hovered.bg_stroke.color, ACCENT);
         assert_eq!(s.text_styles[&TextStyle::Body].size, FS_SM);
+        assert_eq!(s.visuals.disabled_alpha, DISABLED_ALPHA);
     }
 
     /// replica/design/tokens.json must say what this file does.

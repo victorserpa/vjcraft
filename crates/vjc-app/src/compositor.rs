@@ -487,6 +487,21 @@ fn persist_scope(route: SliceSource) -> u128 {
     }
 }
 
+/// Key of one effect instance's history in one output: a hash of both parts, so two
+/// (instance, output) pairs only share a key by a 128-bit collision (an XOR collides
+/// whenever `a ^ b == c ^ d`).
+fn persist_key(id: uuid::Uuid, scope: u128) -> uuid::Uuid {
+    use std::hash::{Hash, Hasher};
+    let half = |seed: u8| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut h);
+        id.as_u128().hash(&mut h);
+        scope.hash(&mut h);
+        u128::from(h.finish())
+    };
+    uuid::Uuid::from_u128(half(0) << 64 | half(1))
+}
+
 fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
     let mk = || {
         let t = device.create_texture(&wgpu::TextureDescriptor {
@@ -699,7 +714,7 @@ impl Fx {
             // Persistent effect: its previous output is bound as PREV_PIXEL, and this
             // frame's result is copied back after the pass.
             let hist = e.persistent.map(|id| {
-                let key = uuid::Uuid::from_u128(id.as_u128() ^ self.persist_scope);
+                let key = persist_key(id, self.persist_scope);
                 let (tex, how) = self
                     .persist
                     .acquire(key, size, || make_history(device, size));
@@ -3074,6 +3089,28 @@ mod tests {
         data
     }
 
+    /// Effects whose output on a flat frame is legitimately partly black.
+    const PARTIAL_BLACK_OK: &[&str] = &["vignette", "crt"];
+
+    #[test]
+    fn partial_black_ok_lists_only_bundled_effects() {
+        for id in PARTIAL_BLACK_OK {
+            assert!(
+                vjc_fx::BUILTIN.iter().any(|(b, _)| b == id),
+                "{id} is not a bundled effect"
+            );
+        }
+    }
+
+    #[test]
+    fn persist_key_does_not_collide_where_xor_does() {
+        let (a, b) = (uuid::Uuid::from_u128(0b01), uuid::Uuid::from_u128(0b10));
+        // a ^ 2 == b ^ 1 == 3: the old key was the same for both pairs.
+        assert_ne!(persist_key(a, 2), persist_key(b, 1));
+        assert_eq!(persist_key(a, 2), persist_key(a, 2), "stable");
+        assert_ne!(persist_key(a, 0), persist_key(a, 1));
+    }
+
     /// Every bundled effect and generator renders with default params to something that is
     /// not entirely black (a NaN/inf in the shader ends up black in the Unorm target).
     /// `MAY_BE_DARK` lists the ones where black is a legitimate result. Skipped without
@@ -3081,8 +3118,6 @@ mod tests {
     #[test]
     fn gpu_every_bundled_effect_and_generator_renders_visible_output() {
         const MAY_BE_DARK: &[&str] = &[];
-        /// Effects whose output on a flat frame is legitimately partly black.
-        const PARTIAL_BLACK_OK: &[&str] = &["vignette", "crt"];
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no wgpu adapter: skipped");

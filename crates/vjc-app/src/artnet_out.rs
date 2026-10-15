@@ -138,6 +138,17 @@ fn send_frame(
     Ok(packets.len())
 }
 
+/// Stores `msg` unless the same error is already there (a per-frame failure reports once).
+/// Returns true if it was new.
+fn record_error(slot: &Mutex<Option<String>>, msg: String) -> bool {
+    let mut g = slot.lock().unwrap();
+    if g.as_deref() == Some(msg.as_str()) {
+        return false;
+    }
+    *g = Some(msg);
+    true
+}
+
 struct Pub {
     want: Want,
     tx: Option<SyncSender<Frame>>,
@@ -167,7 +178,9 @@ impl Pub {
         let worker = std::thread::Builder::new()
             .name("vjc-artnet".into())
             .spawn(move || {
-                let fail = |m: String| *e2.lock().unwrap() = Some(format!("Art-Net output: {m}"));
+                let fail = |m: String| {
+                    record_error(&e2, format!("Art-Net output: {m}"));
+                };
                 let Some(target) = parse_target(&w.ip) else {
                     return fail(format!("cannot resolve '{}'", w.ip));
                 };
@@ -446,6 +459,14 @@ mod tests {
     use super::*;
     use vjc_core::dmx::{Packet, decode};
     use vjc_model::{ChannelOrder, PixelFormat};
+
+    #[test]
+    fn same_error_is_recorded_once() {
+        let slot = Mutex::new(None);
+        assert!(record_error(&slot, "a".into()));
+        assert!(!record_error(&slot, "a".into()));
+        assert!(record_error(&slot, "b".into()));
+    }
 
     #[test]
     fn stale_size_buffers_are_never_reused() {

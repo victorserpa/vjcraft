@@ -619,6 +619,8 @@ pub enum Command {
         slices: Vec<(Uuid, Uuid, vjc_model::SliceSource)>,
         /// (position, cue) of timecode cues aimed at the layer.
         cues: Vec<(usize, vjc_model::TimecodeCue)>,
+        /// (position, shortcut) of shortcuts aimed at the layer's number.
+        shortcuts: Vec<(usize, vjc_model::Shortcut)>,
     },
     AddColumn {
         column: Column,
@@ -1818,6 +1820,7 @@ pub fn duplicate_layer_command(p: &Project, layer: LayerId) -> Option<Command> {
         clips,
         slices: vec![],
         cues: vec![],
+        shortcuts: vec![],
     })
 }
 
@@ -3208,6 +3211,25 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 }
                 k += 1;
             }
+            // Shortcuts address layers by number: drop the ones aimed at this layer and
+            // renumber the layers above it.
+            let n = p.composition.layers.len() - i;
+            let mut shortcuts = vec![];
+            let mut at = 0;
+            let mut k = 0;
+            while at < p.shortcuts.len() {
+                match shortcuts::layer_number(&p.shortcuts[at]) {
+                    Some(m) if m == n => {
+                        shortcuts.push((k, p.shortcuts.remove(at)));
+                    }
+                    Some(m) if m > n => {
+                        shortcuts::set_layer_number(&mut p.shortcuts[at], m - 1);
+                        at += 1;
+                    }
+                    _ => at += 1,
+                }
+                k += 1;
+            }
             let removed = p.composition.layers.remove(i);
             undoable(
                 Command::RestoreLayer {
@@ -3216,6 +3238,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     clips,
                     slices,
                     cues,
+                    shortcuts,
                 },
                 vec![Event::LayerCleared { layer }],
             )
@@ -3226,6 +3249,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             clips,
             slices,
             cues,
+            shortcuts: removed_shortcuts,
         } => {
             let id = layer.id;
             // Check everything first so a failure leaves the project untouched.
@@ -3236,7 +3260,19 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 return Err(Error::NoDeck);
             }
             let ls = &mut p.composition.layers;
-            ls.insert(index.min(ls.len()), layer);
+            let at = index.min(ls.len());
+            ls.insert(at, layer);
+            let n = ls.len() - at;
+            for s in &mut p.shortcuts {
+                if let Some(m) = shortcuts::layer_number(s)
+                    && m >= n
+                {
+                    shortcuts::set_layer_number(s, m + 1);
+                }
+            }
+            for (at, s) in removed_shortcuts {
+                p.shortcuts.insert(at.min(p.shortcuts.len()), s);
+            }
             // Ascending positions per deck rebuild the original order.
             for (deck, at, clip) in clips {
                 if let Some(d) = p.composition.decks.iter_mut().find(|d| d.id == deck) {
@@ -5177,6 +5213,45 @@ mod tests {
     }
 
     #[test]
+    fn remove_layer_drops_its_shortcuts_renumbers_others_and_undo_restores() {
+        use vjc_model::{ControlSource, Shortcut, ShortcutMode};
+        let (mut p, l, other) = two_layer_project();
+        let sc = |t: &str| Shortcut {
+            id: Uuid::new_v4(),
+            source: ControlSource::Key { code: "A".into() },
+            target: t.into(),
+            mode: ShortcutMode::Toggle,
+            range: (0.0, 1.0),
+            invert: false,
+            effect: None,
+        };
+        let _ = other;
+        let la = shortcuts::layer_address(&p, l, "opacity").unwrap();
+        let oa = shortcuts::layer_address(&p, other, "opacity").unwrap();
+        p.shortcuts = vec![sc(&la), sc(&oa)];
+        let before = p.clone();
+        let mut h = History::new();
+        h.exec(
+            &mut p,
+            Command::RemoveLayerWithClips { layer: l },
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.shortcuts.len(),
+            1,
+            "shortcut of the removed layer is gone"
+        );
+        assert_eq!(
+            p.shortcuts[0].target,
+            shortcuts::layer_address(&p, other, "opacity").unwrap(),
+            "the other layer's shortcut follows its layer"
+        );
+        assert!(h.undo(&mut p).is_some());
+        assert_eq!(p.shortcuts, before.shortcuts);
+    }
+
+    #[test]
     fn remove_layer_resets_slices_and_drops_cues_and_undo_brings_them_back() {
         use vjc_model::SliceSource;
         let (mut p, l, other) = two_layer_project();
@@ -5250,6 +5325,7 @@ mod tests {
             clips: vec![(deck, 0, clip.clone())],
             slices: vec![],
             cues: vec![],
+            shortcuts: vec![],
         };
         assert_eq!(apply(&mut p, cmd(Uuid::new_v4())), Err(Error::NoDeck));
         assert_eq!(p, before);

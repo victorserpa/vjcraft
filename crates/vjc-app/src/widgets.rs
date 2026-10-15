@@ -328,6 +328,61 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT, Queryable};
 
+    /// Alpha of the text colors drawn by a button and a text field in one frame.
+    fn text_opacities(enabled: bool) -> Vec<f32> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<f32>) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    // Painted glyph colors: the opacity is baked into the row meshes.
+                    for row in &t.galley.rows {
+                        if let Some(v) = row.visuals.mesh.vertices.first() {
+                            let c = if v.color == egui::Color32::PLACEHOLDER {
+                                t.fallback_color
+                            } else {
+                                v.color
+                            };
+                            out.push(f32::from(c.a()) / 255.0);
+                        }
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        crate::theme::apply_style(&ctx);
+        let mut text = String::from("abc");
+        let mut run = || {
+            ctx.run_ui(Default::default(), |ui| {
+                ui.add_enabled_ui(enabled, |ui| {
+                    btn(ui, "Go", Kind::Secondary);
+                    field_text(ui, &mut text, Width::Md, None);
+                });
+            })
+        };
+        run().textures_delta.clear();
+        let mut out = run();
+        out.textures_delta.clear();
+        let mut v = vec![];
+        for c in &out.shapes {
+            walk(&c.shape, &mut v);
+        }
+        v
+    }
+
+    #[test]
+    fn disabled_buttons_and_fields_are_dimmed_by_the_token() {
+        let on = text_opacities(true);
+        let off = text_opacities(false);
+        assert!(on.len() >= 2 && on.len() == off.len(), "{on:?} {off:?}");
+        assert!(on.iter().all(|o| *o == 1.0), "enabled stays opaque: {on:?}");
+        assert!(
+            off.iter()
+                .all(|o| (*o - crate::theme::DISABLED_ALPHA).abs() < 1e-3),
+            "disabled uses DISABLED_ALPHA: {off:?}"
+        );
+    }
+
     #[test]
     fn every_button_kind_renders() {
         let mut h = Harness::new_ui(|ui| {

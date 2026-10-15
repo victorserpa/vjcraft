@@ -366,11 +366,18 @@ pub fn rebind(p: &mut Project) {
     }
 }
 
+/// What `bind_legacy` did: how many shortcuts it attached to their effect, and the targets
+/// of the ones it could not (the effect they point at does not exist).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LegacyReport {
+    pub bound: usize,
+    pub unresolved: Vec<String>,
+}
+
 /// Load-time migration: shortcuts saved before `effect` existed are still positional; bind
 /// each effect address to the effect it points at now, so later reorders keep it attached.
-/// Returns how many were bound.
-pub fn bind_legacy(p: &mut Project) -> usize {
-    let mut n = 0;
+pub fn bind_legacy(p: &mut Project) -> LegacyReport {
+    let mut r = LegacyReport::default();
     for i in 0..p.shortcuts.len() {
         let s = &p.shortcuts[i];
         if s.effect.is_some() || split_fx_target(&s.target).is_none() {
@@ -378,10 +385,35 @@ pub fn bind_legacy(p: &mut Project) -> usize {
         }
         if let Some(id) = effect_of_target(p, &s.target) {
             p.shortcuts[i].effect = Some(id);
-            n += 1;
+            r.bound += 1;
+        } else {
+            r.unresolved.push(s.target.clone());
         }
     }
-    n
+    r
+}
+
+/// Layer number of a positional "/comp/layer/N/..." shortcut. Effect shortcuts are skipped:
+/// `rebind` keeps those attached through their effect id.
+pub fn layer_number(s: &vjc_model::Shortcut) -> Option<usize> {
+    if s.effect.is_some() {
+        return None;
+    }
+    s.target
+        .strip_prefix("/comp/layer/")?
+        .split('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Rewrites the layer number of a target `layer_number` accepted.
+pub fn set_layer_number(s: &mut vjc_model::Shortcut, n: usize) {
+    if let Some(rest) = s.target.strip_prefix("/comp/layer/")
+        && let Some((_, tail)) = rest.split_once('/')
+    {
+        s.target = format!("/comp/layer/{n}/{tail}");
+    }
 }
 
 /// True for targets a knob sweeps (opacity and effect params / dry-wet) rather than flips.
@@ -947,10 +979,20 @@ mod effect_id_tests {
     }
 
     #[test]
+    fn bind_legacy_reports_unresolved_targets() {
+        let (mut p, _h, _a, _b) = setup();
+        p.shortcuts[0].effect = None;
+        p.shortcuts[0].target = "/comp/effect/9/drywet".into();
+        let r = bind_legacy(&mut p);
+        assert_eq!(r.bound, 0);
+        assert_eq!(r.unresolved, vec!["/comp/effect/9/drywet".to_string()]);
+    }
+
+    #[test]
     fn bind_legacy_fills_effect_from_positional_address() {
         let (mut p, mut h, _a, b) = setup();
         p.shortcuts[0].effect = None; // as saved by an older version
-        assert_eq!(bind_legacy(&mut p), 1);
+        assert_eq!(bind_legacy(&mut p).bound, 1);
         assert_eq!(p.shortcuts[0].effect, Some(b.id));
         let mv = Command::MoveEffect {
             target: EffectTarget::Master,

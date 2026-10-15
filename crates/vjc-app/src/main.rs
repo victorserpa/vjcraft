@@ -1022,18 +1022,23 @@ fn cells_on_air(
     layer: LayerId,
     on_air: impl Fn(LayerId) -> Option<(DeckId, u32)>,
 ) -> Vec<(DeckId, u32)> {
+    // The layer's own cell comes first (the API reports it as `active_column`); the
+    // redirects follow in order.
     let mut out = Vec::new();
     if !origin.contains_key(&layer)
         && let Some(a) = on_air(layer)
     {
         out.push(a);
     }
+    let mut redirects = Vec::new();
     for (dest, (d, l, c)) in origin {
         if *l == layer && on_air(*dest) == Some((*d, *c)) && !out.contains(&(*d, *c)) {
-            out.push((*d, *c));
+            redirects.push((*d, *c));
         }
     }
-    out.sort();
+    redirects.sort();
+    redirects.dedup();
+    out.extend(redirects);
     out
 }
 
@@ -2200,6 +2205,10 @@ impl State {
                 vjc_core::mapping::normalize_output(&mut project.output);
                 self.project = project;
                 self.link_sync.note_project_replaced();
+                // Shortcut migration is shown once, as a toast.
+                if let Some(w) = warnings.iter().find(|w| w.starts_with("Shortcuts: ")) {
+                    self.toasts.push((widgets::Level::Warn, w.clone()));
+                }
                 self.warnings = warnings;
                 self.status = format!("Opened {}", path.display());
                 self.prefs.general.last_project = Some(path.clone());
@@ -4769,6 +4778,7 @@ impl State {
             },
             token: self.hold_token,
             onair: false,
+            key: None,
         };
         // Queued first, so a trigger that runs later (beat snap) finds its Hold.
         if let Some(cmd) = self.snap_defer_tagged(resolved, run.token) {
@@ -4791,6 +4801,49 @@ impl State {
                 self.hold_fire(hold::Src::Binding(id), deck, layer, column);
             }
             c => self.exec(c),
+        }
+    }
+
+    /// `run_shortcut` for a key shortcut: the run remembers the key that holds it.
+    fn run_key_shortcut(&mut self, id: Uuid, c: Command, key: &str) {
+        self.run_shortcut(id, c);
+        if let Some(r) = self
+            .holds
+            .iter_mut()
+            .find(|r| r.src == hold::Src::Binding(id) && r.key.is_none())
+        {
+            r.key = Some(key.to_string());
+        }
+    }
+
+    /// Key up: lets go of every Hold that key started, even if its shortcut was removed or
+    /// rebound while the key was down, and of those of the shortcuts bound to it now.
+    fn key_up(&mut self, key: &str) {
+        let mut srcs: Vec<hold::Src> = self
+            .holds
+            .iter()
+            .filter(|r| r.key.as_deref() == Some(key))
+            .map(|r| r.src)
+            .collect();
+        srcs.extend(
+            self.project
+                .shortcuts
+                .iter()
+                .filter(|s| vjc_core::shortcuts::key_of(s) == Some(key))
+                .map(|s| hold::Src::Binding(s.id)),
+        );
+        for src in srcs {
+            self.hold_release(src);
+        }
+    }
+
+    /// An OSC shortcut fired. A message without an argument has no release to wait for, so
+    /// it is a plain trigger, never a Hold run.
+    fn osc_shortcut(&mut self, id: Uuid, c: Command, has_arg: bool) {
+        if has_arg {
+            self.run_shortcut(id, c);
+        } else {
+            self.exec(c);
         }
     }
 
@@ -4873,16 +4926,7 @@ impl State {
                 .collect()
         });
         for key in up {
-            let ids: Vec<Uuid> = self
-                .project
-                .shortcuts
-                .iter()
-                .filter(|s| vjc_core::shortcuts::key_of(s) == Some(key.name()))
-                .map(|s| s.id)
-                .collect();
-            for id in ids {
-                self.hold_release(hold::Src::Binding(id));
-            }
+            self.key_up(key.name());
         }
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -4947,7 +4991,7 @@ impl State {
                 .filter_map(|s| Some((s.id, vjc_core::shortcuts::activate(&self.project, &rt, s)?)))
                 .collect();
             for (id, c) in cmds {
-                self.run_shortcut(id, c);
+                self.run_key_shortcut(id, c, name);
             }
         }
     }
@@ -5064,8 +5108,9 @@ impl State {
             for c in direct {
                 self.exec(c);
             }
+            let has_arg = ev.value.is_some();
             for (id, c) in bound {
-                self.run_shortcut(id, c);
+                self.osc_shortcut(id, c, has_arg);
             }
         }
         if !self.prefs.osc.out_enabled {
@@ -7827,6 +7872,7 @@ impl State {
                 name,
             });
         }
+        self.src_info.set_ctx(ui.ctx());
         // Length of the file, once its probe has landed.
         let file_secs = match &k.source {
             vjc_model::Source::File { path } => self
@@ -9444,7 +9490,8 @@ mod tests {
         let own = |l: LayerId| if l == a { Some((deck, 2)) } else { air(l) };
         assert_eq!(
             super::cells_on_air(&origin, a, own),
-            vec![(deck, 0), (deck, 1), (deck, 2)]
+            vec![(deck, 2), (deck, 0), (deck, 1)],
+            "own column first, so `active_column` is not the lowest redirect"
         );
     }
 
