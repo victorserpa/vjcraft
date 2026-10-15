@@ -19,6 +19,9 @@ pub struct Ctx {
     pub now: Instant,
     /// Clip playing on each layer; "/comp/layer/N/clip/effect/..." addresses follow it.
     pub active: Vec<(LayerId, DeckId, ColumnIdx)>,
+    /// Redirected clips: (layer it plays on, layer of the cell it lives in). Addresses name
+    /// the first; the clip's own state (cues, dials, effects) belongs to the second.
+    pub origin: Vec<(LayerId, LayerId)>,
 }
 
 impl Ctx {
@@ -28,7 +31,25 @@ impl Ctx {
             master_bypass,
             now: Instant::now(),
             active: vec![],
+            origin: vec![],
         }
+    }
+
+    pub fn with_origin(mut self, origin: Vec<(LayerId, LayerId)>) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Cell (deck, layer, column) of the clip playing on `layer`: its own layer unless the
+    /// clip was redirected there.
+    pub fn cell(&self, layer: LayerId) -> Option<(DeckId, LayerId, ColumnIdx)> {
+        let &(_, deck, column) = self.active.iter().find(|a| a.0 == layer)?;
+        let src = self
+            .origin
+            .iter()
+            .find(|o| o.0 == layer)
+            .map_or(layer, |o| o.1);
+        Some((deck, src, column))
     }
 
     pub fn with_active(mut self, active: Vec<(LayerId, DeckId, ColumnIdx)>) -> Self {
@@ -101,11 +122,11 @@ fn parse_tf(
             number_of(n)
                 .and_then(|n| layer_by_number(p, n))
                 .and_then(|layer| {
-                    let (_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+                    let (deck, layer, column) = ctx.cell(layer)?;
                     Some(EffectTarget::Clip {
-                        deck: *deck,
+                        deck,
                         layer,
-                        column: *column,
+                        column,
                     })
                 }),
             f,
@@ -149,11 +170,11 @@ fn parse_fx<'a>(
             number_of(n)
                 .and_then(|n| layer_by_number(p, n))
                 .and_then(|layer| {
-                    let (_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+                    let (deck, layer, column) = ctx.cell(layer)?;
                     Some(EffectTarget::Clip {
-                        deck: *deck,
+                        deck,
                         layer,
-                        column: *column,
+                        column,
                     })
                 }),
             k,
@@ -460,8 +481,7 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
             Some(dial_value(&l.track.dials, dial_of(m)?))
         }
         ["comp", "layer", n, "clip", "dashboard", m] => {
-            let layer = layer_by_number(p, number_of(n)?)?;
-            let &(_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+            let (deck, layer, column) = ctx.cell(layer_by_number(p, number_of(n)?)?)?;
             let k = super::clip_in(p, deck, layer, column)?;
             Some(dial_value(&k.track.dials, dial_of(m)?))
         }
@@ -538,9 +558,8 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
             })
         }
         ["comp", "layer", n, "clip", "cue", m] => {
-            let layer = layer_by_number(p, number_of(n)?)?;
             let index = number_of(m)?.checked_sub(1)?;
-            let &(_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+            let (deck, layer, column) = ctx.cell(layer_by_number(p, number_of(n)?)?)?;
             let k = super::clip_in(p, deck, layer, column)?;
             // A cue that does not exist resolves to nothing, so a stray message is inert.
             (fire && index < k.transport.cue_points.len()).then_some(Command::JumpToCue {
@@ -556,8 +575,7 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
             value: value.clamp(0.0, 1.0),
         }),
         ["comp", "layer", n, "clip", "dashboard", m] => {
-            let layer = layer_by_number(p, number_of(n)?)?;
-            let &(_, deck, column) = ctx.active.iter().find(|a| a.0 == layer)?;
+            let (deck, layer, column) = ctx.cell(layer_by_number(p, number_of(n)?)?)?;
             Some(Command::SetClipDial {
                 deck,
                 layer,
@@ -597,9 +615,9 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
         }),
         ["comp", "layer", n, "pause"] => {
             let layer = layer_by_number(p, number_of(n)?)?;
-            fire.then(|| toggle_pause(p, &ctx.active, Some(layer)))?
+            fire.then(|| toggle_pause(p, &ctx.active, &ctx.origin, Some(layer)))?
         }
-        ["comp", "pause"] => fire.then(|| toggle_pause(p, &ctx.active, None))?,
+        ["comp", "pause"] => fire.then(|| toggle_pause(p, &ctx.active, &ctx.origin, None))?,
         ["comp", "column", "next"] => fire.then_some(Command::StepColumn {
             deck,
             from: ctx.col_sel,
@@ -657,12 +675,16 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
 pub fn toggle_pause(
     p: &Project,
     active: &[(LayerId, DeckId, ColumnIdx)],
+    origin: &[(LayerId, LayerId)],
     layer: Option<LayerId>,
 ) -> Option<Command> {
     let clips: Vec<_> = active
         .iter()
         .filter(|a| layer.is_none_or(|l| a.0 == l))
-        .map(|&(l, d, c)| (d, l, c))
+        .map(|&(l, d, c)| {
+            let src = origin.iter().find(|o| o.0 == l).map_or(l, |o| o.1);
+            (d, src, c)
+        })
         .collect();
     let paused = |&(d, l, c): &(DeckId, LayerId, ColumnIdx)| {
         p.composition

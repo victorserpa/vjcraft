@@ -172,6 +172,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "keystone",
         include_str!("../../../assets/effects/keystone.fs"),
     ),
+    ("freeze", include_str!("../../../assets/effects/freeze.fs")),
     (
         "zoom_blur",
         include_str!("../../../assets/effects/zoom_blur.fs"),
@@ -323,6 +324,11 @@ pub struct Isf {
     /// The effect keeps a per-instance buffer with its previous output (`PREV_PIXEL`):
     /// trails, echo, feedback. Header: `"PERSISTENT": true`.
     pub persistent: bool,
+    /// Name of the float input that is the capture rate in ticks per second, for a
+    /// persistent effect that grabs a new frame per tick (freeze). Header:
+    /// `"TICK_INPUT": "fps"`. The runtime then tells the shader, per instance, whether
+    /// this frame starts a new tick (`NEW_TICK`).
+    pub tick_input: Option<String>,
     /// GLSL after the header.
     pub body: String,
 }
@@ -461,8 +467,18 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
         .get("PERSISTENT")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let tick_input = json
+        .get("TICK_INPUT")
+        .and_then(|v| v.as_str())
+        .filter(|n| {
+            inputs
+                .iter()
+                .any(|i| i.name == *n && matches!(i.kind, InputKind::Float { .. }))
+        })
+        .map(str::to_string);
     Ok(Isf {
         persistent,
+        tick_input,
         description: str_of("DESCRIPTION"),
         categories,
         inputs,
@@ -476,6 +492,7 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
 /// declares, and GLSL keywords/types (which cannot be variable names) are rejected.
 const RESERVED: &[&str] = &[
     "TIME",
+    "NEW_TICK",
     "RENDERSIZE",
     "PASSINDEX",
     "FRAMEINDEX",
@@ -723,12 +740,25 @@ impl Isf {
             .collect()
     }
 
-    /// Fills the uniform block: slot 0 = (TIME, width, height, 0), then one slot per input.
+    /// Fills the uniform block: slot 0 = (TIME, width, height, tick rate), then one slot per
+    /// input. The tick rate (0 when the effect has no `TICK_INPUT`) is read by the runtime,
+    /// which replaces it with the `NEW_TICK` flag (see `tick_flag`) before the draw.
     /// Params are matched by name; missing or mistyped ones fall back to the default.
     pub fn pack(&self, params: &[Param], time: f32, size: (u32, u32)) -> Uniforms {
         let mut u = [[0.0; 4]; MAX_SLOTS];
         u[0] = [time, size.0 as f32, size.1 as f32, 0.0];
         let defaults = self.default_params();
+        if let Some(name) = &self.tick_input
+            && let Some(Value::Number(r)) = params
+                .iter()
+                .find(|p| p.name == *name)
+                .map(|p| &p.value)
+                .or_else(|| defaults.iter().find(|p| p.name == *name).map(|p| &p.value))
+            && r.is_finite()
+            && *r > 0.0
+        {
+            u[0][3] = *r as f32;
+        }
         for ((inp, def), n) in self.inputs.iter().zip(&defaults).zip(self.first_slots()) {
             let v = params
                 .iter()
@@ -761,6 +791,21 @@ impl Isf {
         }
         u
     }
+}
+
+/// Value of `NEW_TICK` for one draw of a ticking instance: `time * rate` floored is the
+/// tick; `last` is the tick of the previous draw of the same instance (None = it has no
+/// history yet). 2.0 = first draw, grab whatever the state; 1.0 = the tick changed, grab
+/// unless held; 0.0 = same tick, keep. Any change counts, however many ticks passed (time
+/// can skip an even number), and a clock that went back counts too.
+pub fn tick_flag(time: f32, rate: f32, last: Option<i64>) -> (f32, i64) {
+    let tick = (f64::from(time) * f64::from(rate)).floor() as i64;
+    let flag = match last {
+        None => 2.0,
+        Some(l) if l != tick => 1.0,
+        Some(_) => 0.0,
+    };
+    (flag, tick)
 }
 
 fn pack_default(v: &Value) -> [f32; 4] {
@@ -799,6 +844,7 @@ pub fn glsl_source(isf: &Isf) -> String {
          #define PREV_THIS_PIXEL PREV_PIXEL(isf_FragNormCoord)\n\
          #define gl_FragColor isf_FragColor\n\
          #define TIME isf_u.p[0].x\n\
+         #define NEW_TICK isf_u.p[0].w\n\
          #define RENDERSIZE isf_u.p[0].yz\n\
          #define IMG_NORM_PIXEL(img, uv) textureLod(sampler2D(img, isf_smp), vec2((uv).x, 1.0 - (uv).y), 0.0)\n\
          #define IMG_THIS_PIXEL(img) IMG_NORM_PIXEL(img, isf_FragNormCoord)\n\
@@ -1171,6 +1217,35 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
         // A mistyped value falls back to the default text.
         params[0].value = Value::Number(1.0);
         assert_eq!(isf.pack(&params, 0.0, (64, 64))[1][0], 86.0);
+    }
+
+    #[test]
+    fn tick_flag_sees_any_tick_change_even_an_even_jump() {
+        // Rate 1: ticks are whole seconds.
+        assert_eq!(tick_flag(0.2, 1.0, None), (2.0, 0));
+        assert_eq!(tick_flag(0.7, 1.0, Some(0)), (0.0, 0), "same tick: keep");
+        assert_eq!(tick_flag(1.1, 1.0, Some(0)), (1.0, 1));
+        // TIME jumped two ticks (0 -> 2): the parity of the tick is the same, but it is new.
+        assert_eq!(tick_flag(2.4, 1.0, Some(0)), (1.0, 2));
+        // The clock went back.
+        assert_eq!(tick_flag(0.1, 1.0, Some(5)), (1.0, 0));
+    }
+
+    #[test]
+    fn tick_input_is_packed_as_the_rate_and_must_name_a_float() {
+        let src = r#"/*{"PERSISTENT": true, "TICK_INPUT": "fps", "INPUTS":[{"NAME":"fps","TYPE":"float","MIN":0.5,"MAX":60.0,"DEFAULT":4.0}]}*/ void main(){ gl_FragColor = NEW_TICK > 0.5 ? vec4(1.0) : PREV_THIS_PIXEL; }"#;
+        let isf = parse(src).unwrap();
+        assert_eq!(isf.tick_input.as_deref(), Some("fps"));
+        assert!(translate(&isf).is_ok());
+        assert_eq!(isf.pack(&isf.default_params(), 3.0, (8, 8))[0][3], 4.0);
+        // Control: an effect without the header packs no rate.
+        let plain =
+            parse(r#"/*{"INPUTS":[{"NAME":"fps","TYPE":"float"}]}*/ void main(){}"#).unwrap();
+        assert_eq!(plain.tick_input, None);
+        assert_eq!(plain.pack(&plain.default_params(), 3.0, (8, 8))[0][3], 0.0);
+        // Naming something that is not a float input is ignored.
+        let bad = parse(r#"/*{"TICK_INPUT": "nope"}*/ void main(){}"#).unwrap();
+        assert_eq!(bad.tick_input, None);
     }
 
     #[test]

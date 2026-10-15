@@ -63,6 +63,9 @@ pub struct Composition {
     /// Beat snap of the composition. None (old files): the app preference decides.
     #[serde(default)]
     pub beat_snap: Option<BeatSnap>,
+    /// Default destination layer of clips that defer to the composition.
+    #[serde(default)]
+    pub clip_target: ClipTarget,
 }
 
 /// Which column the composition autopilot plays when its time is up.
@@ -307,12 +310,15 @@ pub struct Clip {
     /// Colour channels of the picture that are drawn.
     #[serde(default)]
     pub channels: Channels,
-    /// Normal / toggle; `Composition` defers to the composition's style.
+    /// Normal / toggle / hold; `Composition` defers to the composition's style.
     #[serde(default)]
     pub trigger_style: TriggerStyle,
     /// Beat snap override of this clip (None = the column's, then the composition's).
     #[serde(default)]
     pub beat_snap: Option<BeatSnap>,
+    /// Which layer the clip plays on; `Composition` defers to the composition's target.
+    #[serde(default)]
+    pub target: ClipTarget,
 }
 
 /// How a trigger behaves over time (not where the clip starts: see `TriggerMode`).
@@ -325,18 +331,25 @@ pub enum TriggerStyle {
     Normal,
     /// A second trigger of the clip that is playing ejects the layer.
     Toggle,
+    /// Plays while the mouse button or key is held; ejects on release.
+    Hold,
     #[serde(other)]
     Unknown,
 }
 
 impl TriggerStyle {
-    pub const CHOICES: [TriggerStyle; 2] = [TriggerStyle::Normal, TriggerStyle::Toggle];
+    pub const CHOICES: [TriggerStyle; 3] = [
+        TriggerStyle::Normal,
+        TriggerStyle::Toggle,
+        TriggerStyle::Hold,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             TriggerStyle::Composition => "Composition",
             TriggerStyle::Normal | TriggerStyle::Unknown => "Normal",
             TriggerStyle::Toggle => "Toggle",
+            TriggerStyle::Hold => "Hold",
         }
     }
 
@@ -348,8 +361,49 @@ impl TriggerStyle {
             self
         };
         match m {
-            TriggerStyle::Toggle => m,
+            TriggerStyle::Toggle | TriggerStyle::Hold => m,
             _ => TriggerStyle::Normal,
+        }
+    }
+}
+
+/// Which layer a triggered clip plays on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ClipTarget {
+    /// Use the composition's target (for a composition itself: Own).
+    #[default]
+    Composition,
+    /// The layer the clip lives in.
+    Own,
+    /// The selected layer.
+    Active,
+    /// The lowest empty layer (the clip's own when none is empty).
+    Free,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ClipTarget {
+    pub const CHOICES: [ClipTarget; 3] = [ClipTarget::Own, ClipTarget::Active, ClipTarget::Free];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ClipTarget::Composition => "Composition",
+            ClipTarget::Own | ClipTarget::Unknown => "Own layer",
+            ClipTarget::Active => "Active layer",
+            ClipTarget::Free => "Free layer",
+        }
+    }
+
+    pub fn resolve(self, comp: ClipTarget) -> ClipTarget {
+        let m = if self == ClipTarget::Composition {
+            comp
+        } else {
+            self
+        };
+        match m {
+            ClipTarget::Active | ClipTarget::Free => m,
+            _ => ClipTarget::Own,
         }
     }
 }
@@ -1614,6 +1668,7 @@ impl Project {
                 dashboard: vec![],
                 timecode_cues: vec![],
                 trigger_style: Default::default(),
+                clip_target: Default::default(),
             },
             output: OutputSetup { screens: vec![] },
             shortcuts: vec![],
@@ -1985,6 +2040,7 @@ mod tests {
                 transition: None,
                 trigger_style: Default::default(),
                 beat_snap: None,
+                target: Default::default(),
                 channels: Default::default(),
             },
         );
@@ -2136,6 +2192,7 @@ mod tests {
             transition: None,
             trigger_style: Default::default(),
             beat_snap: None,
+            target: Default::default(),
             fit: FitMode::Fit,
             channels: Channels::default(),
         };
@@ -2257,6 +2314,7 @@ mod tests {
             }),
             trigger_style: Default::default(),
             beat_snap: None,
+            target: Default::default(),
             fit: FitMode::Fit,
             channels: Channels::default(),
         };
@@ -2271,23 +2329,29 @@ mod tests {
     }
 
     #[test]
-    fn trigger_style_roundtrip_and_old_projects_default() {
+    fn trigger_style_and_target_roundtrip_and_old_projects_default() {
         let mut p = Project::new("t");
-        p.composition.trigger_style = TriggerStyle::Toggle;
+        p.composition.trigger_style = TriggerStyle::Hold;
+        p.composition.clip_target = ClipTarget::Free;
         let json = serde_json::to_string(&p).unwrap();
         let back: Project = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.composition.trigger_style, TriggerStyle::Toggle);
-        // An old file has no such key and opens with the old behaviour.
+        assert_eq!(back.composition.trigger_style, TriggerStyle::Hold);
+        assert_eq!(back.composition.clip_target, ClipTarget::Free);
+        // An old file has none of the new keys and opens with the old behaviour.
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        v["composition"]
-            .as_object_mut()
-            .unwrap()
-            .remove("trigger_style");
+        let c = v["composition"].as_object_mut().unwrap();
+        c.remove("trigger_style");
+        c.remove("clip_target");
         let old: Project = serde_json::from_value(v).unwrap();
         assert_eq!(old.composition.trigger_style, TriggerStyle::Composition);
+        assert_eq!(old.composition.clip_target, ClipTarget::Composition);
         assert_eq!(
             TriggerStyle::Composition.resolve(old.composition.trigger_style),
             TriggerStyle::Normal
+        );
+        assert_eq!(
+            ClipTarget::Composition.resolve(old.composition.clip_target),
+            ClipTarget::Own
         );
     }
 

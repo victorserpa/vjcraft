@@ -5102,3 +5102,485 @@ fn composition_autopilot_respects_beat_snap() {
         Some((deck, 1))
     );
 }
+
+// ---- Hold trigger and clip target ----
+
+/// Generator clips in cells (layer 0, columns 1 and 2) and (layer 1, column 1), nothing on
+/// air. Returns the deck and the two layer ids (top, bottom).
+fn hold_setup() -> (Harness<'static, State>, DeckId, LayerId, LayerId) {
+    let mut h = app();
+    let ids: Vec<(usize, u32)> = vec![(0, 1), (0, 2), (1, 1)];
+    for (i, (layer_idx, col)) in ids.into_iter().enumerate() {
+        let (gen_id, _) = vjc_fx::GENERATORS[i];
+        let (_, pos) = cell_center(&h, layer_idx, col);
+        browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    }
+    h.state_mut().exec(Command::ClearAll);
+    settle(&mut h);
+    let st = h.state();
+    let deck = st.project.composition.current_deck;
+    let (top, bottom) = (
+        st.project.composition.layers[0].id,
+        st.project.composition.layers[1].id,
+    );
+    assert!(st.players.is_empty() && st.gens.is_empty());
+    (h, deck, top, bottom)
+}
+
+/// Holds the primary button down on an empty cell, as the user's finger does while a Hold
+/// plays (the frame loop releases a mouse Hold when the button is up).
+fn mouse_down(h: &mut Harness<'_, State>) {
+    let (_, pos) = cell_center(h, 1, 3);
+    h.hover_at(pos);
+    h.step();
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+}
+
+fn style(
+    h: &mut Harness<'_, State>,
+    deck: DeckId,
+    layer: LayerId,
+    column: u32,
+    s: vjc_model::TriggerStyle,
+) {
+    h.state_mut().exec(Command::SetClipTriggerStyle {
+        deck,
+        layer,
+        column,
+        style: s,
+    });
+}
+
+fn air_of(h: &Harness<'_, State>, layer: LayerId) -> Option<(DeckId, u32)> {
+    active_of(&h.state().players, &h.state().gens, layer)
+}
+
+// Hold (a): a press that turns into a drag never puts the clip on air
+#[test]
+fn hold_press_that_becomes_a_drag_plays_nothing() {
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    settle(&mut h);
+    let (_, pos) = cell_center(&h, 0, 1);
+    // Real UI path: press, then drag out of the click distance inside the same cell.
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.hover_at(pos);
+    h.step();
+    h.event(button(true));
+    h.step();
+    assert!(h.state().hold_arm.is_some(), "the press arms");
+    // A slow machine must not turn the press into a hold before the drag starts.
+    h.state_mut().hold_arm.as_mut().unwrap().at += std::time::Duration::from_secs(60);
+    for i in 1..=4 {
+        h.event(egui::Event::PointerMoved(
+            pos + egui::vec2(4.0 * i as f32, 0.0),
+        ));
+        h.step();
+    }
+    h.event(button(false));
+    settle(&mut h);
+    let st = h.state();
+    assert!(
+        st.players.is_empty() && st.gens.is_empty(),
+        "a drag plays nothing"
+    );
+    assert!(
+        st.hold_arm.is_none() && st.holds.is_empty(),
+        "{:?} {}",
+        st.hold_arm,
+        st.holds.len()
+    );
+}
+
+#[test]
+fn hold_press_that_stays_put_plays_and_release_ejects() {
+    let (mut h, deck, top, _) = hold_setup();
+    mouse_down(&mut h);
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    let (_, pos) = cell_center(&h, 0, 1);
+    let now = std::time::Instant::now();
+    let arm = |at| hold::Arm {
+        deck,
+        layer: top,
+        column: 1,
+        at,
+        pos: Some(pos),
+    };
+    // Too early: still waiting. Dragged: dropped. Neither plays.
+    h.state_mut().hold_arm = Some(arm(now));
+    assert!(h.state_mut().hold_step(now, true, Some(pos)).is_some());
+    h.state_mut().hold_arm = Some(arm(now - hold::ARM * 2));
+    assert!(
+        h.state_mut()
+            .hold_step(now, true, Some(pos + egui::vec2(30.0, 0.0)))
+            .is_none()
+    );
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), None);
+    // Control: the same press, held still past the arm time, plays.
+    h.state_mut().hold_arm = Some(arm(now - hold::ARM * 2));
+    h.state_mut().hold_step(now, true, Some(pos));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)));
+    // Button up ejects it.
+    h.state_mut().hold_step(now, false, Some(pos));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), None);
+}
+
+// Hold (d): release never ejects content that took the layer meanwhile
+#[test]
+fn hold_release_leaves_new_content_alone() {
+    let (mut h, deck, top, _) = hold_setup();
+    mouse_down(&mut h);
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    // Control: untouched, the release ejects.
+    h.state_mut().hold_fire(hold::Src::Mouse, deck, top, 1);
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)));
+    h.state_mut().hold_release(hold::Src::Mouse);
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), None);
+    // Another clip takes the layer while the button is down.
+    h.state_mut().hold_fire(hold::Src::Mouse, deck, top, 1);
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer: top,
+        column: 2,
+    });
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 2)));
+    h.state_mut().hold_release(hold::Src::Mouse);
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 2)), "the new clip stays");
+    assert!(h.state().holds.is_empty());
+}
+
+// Hold (c): with beat snap, letting go before the beat cancels the pending trigger
+#[test]
+fn hold_released_before_the_beat_neither_plays_nor_ejects() {
+    let (mut h, deck, top, _) = hold_setup();
+    mouse_down(&mut h);
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Bar;
+    let mid_bar = || {
+        vjc_core::clock::Clock::new(
+            120.0,
+            std::time::Instant::now() - std::time::Duration::from_millis(100),
+        )
+    };
+    // Something else is on air on that layer: the early release must not touch it.
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Off;
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer: top,
+        column: 2,
+    });
+    settle(&mut h);
+    h.state_mut().prefs.control.beat_snap = vjc_model::BeatSnap::Bar;
+    h.state_mut().clock = mid_bar();
+    h.state_mut().hold_fire(hold::Src::Mouse, deck, top, 1);
+    assert_eq!(h.state().snap_pending.len(), 1, "waits for the bar");
+    h.state_mut().hold_release(hold::Src::Mouse);
+    assert!(
+        h.state().snap_pending.is_empty(),
+        "the pending trigger is taken back"
+    );
+    h.state_mut().run_snapped(4.0, std::time::Instant::now());
+    settle(&mut h);
+    assert_eq!(
+        air_of(&h, top),
+        Some((deck, 2)),
+        "nothing played, nothing ejected"
+    );
+    // Control: held through the bar, it plays; the release then ejects it.
+    h.state_mut().clock = mid_bar();
+    h.state_mut().hold_fire(hold::Src::Mouse, deck, top, 1);
+    assert_eq!(h.state().snap_pending.len(), 1);
+    h.state_mut().run_snapped(4.0, std::time::Instant::now());
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)));
+    h.state_mut().hold_release(hold::Src::Mouse);
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), None);
+}
+
+// Hold (e): a key shortcut plays on key down and lets go on key up
+#[test]
+fn hold_key_down_plays_and_key_up_ejects() {
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    let shortcut = |code: &str, target: &str| vjc_model::Shortcut {
+        id: Uuid::new_v4(),
+        source: vjc_model::ControlSource::Key { code: code.into() },
+        target: target.into(),
+        mode: vjc_model::ShortcutMode::Trigger,
+        range: (0.0, 1.0),
+        invert: false,
+        effect: None,
+    };
+    // Layer 1 is the bottom one; the top of two layers is number 2.
+    let hold_key = shortcut("Q", "/comp/layer/2/clip/2/connect");
+    // Control: a Normal clip on the same kind of shortcut keeps playing after key up.
+    let normal_key = shortcut("W", "/comp/layer/2/clip/3/connect");
+    h.state_mut()
+        .project
+        .shortcuts
+        .extend([hold_key, normal_key]);
+    let key = |key, pressed| egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(key(egui::Key::Q, true));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)), "key down plays");
+    h.event(key(egui::Key::Q, false));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), None, "key up lets go");
+    assert!(h.state().holds.is_empty());
+    // Control: Normal style.
+    style(&mut h, deck, top, 2, vjc_model::TriggerStyle::Normal);
+    h.event(key(egui::Key::W, true));
+    settle(&mut h);
+    h.event(key(egui::Key::W, false));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 2)), "Normal keeps playing");
+}
+
+// Clip target: Own / Active / Free, and the redirected clip keeps its own settings
+#[test]
+fn clip_target_own_active_and_free_play_on_the_right_layer() {
+    let (mut h, deck, top, bottom) = hold_setup();
+    let trig = Command::TriggerClip {
+        deck,
+        layer: top,
+        column: 1,
+    };
+    // Own (default).
+    h.state_mut().exec(trig.clone());
+    settle(&mut h);
+    assert_eq!(
+        (air_of(&h, top), air_of(&h, bottom)),
+        (Some((deck, 1)), None)
+    );
+    // Active: the layer picked by name.
+    h.state_mut().exec(Command::ClearAll);
+    h.state_mut().exec(Command::SetCompClipTarget {
+        target: vjc_model::ClipTarget::Active,
+    });
+    h.state_mut().active_layer = Some(bottom);
+    h.state_mut().exec(trig.clone());
+    settle(&mut h);
+    assert_eq!(
+        (air_of(&h, top), air_of(&h, bottom)),
+        (None, Some((deck, 1)))
+    );
+    assert!(h.state().dest_of(Some(deck), top, 1) == Some(bottom));
+    // Control: selecting a cell is not choosing the active layer, and nothing selected
+    // plays on the clip's own layer.
+    h.state_mut().exec(Command::ClearAll);
+    h.state_mut().active_layer = None;
+    h.state_mut().selected = Some((bottom, 1));
+    h.state_mut().exec(trig.clone());
+    settle(&mut h);
+    assert_eq!(
+        (air_of(&h, top), air_of(&h, bottom)),
+        (Some((deck, 1)), None)
+    );
+    // Free: the lowest empty layer; with the bottom busy, the next one.
+    h.state_mut().exec(Command::ClearAll);
+    h.state_mut().exec(Command::SetCompClipTarget {
+        target: vjc_model::ClipTarget::Free,
+    });
+    h.state_mut().exec(trig.clone());
+    settle(&mut h);
+    assert_eq!(
+        (air_of(&h, top), air_of(&h, bottom)),
+        (None, Some((deck, 1)))
+    );
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer: top,
+        column: 2,
+    });
+    settle(&mut h);
+    assert_eq!(
+        air_of(&h, bottom),
+        Some((deck, 1)),
+        "the busy layer is left alone"
+    );
+    assert_eq!(
+        air_of(&h, top),
+        Some((deck, 2)),
+        "no layer is free: its own"
+    );
+    // The clip's own override beats the composition's target.
+    h.state_mut().exec(Command::ClearAll);
+    h.state_mut().exec(Command::SetClipTarget {
+        deck,
+        layer: top,
+        column: 1,
+        target: vjc_model::ClipTarget::Own,
+    });
+    h.state_mut().exec(trig);
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)));
+}
+
+// Clip target (b): the redirected clip runs with its own cell's speed and in/out
+#[test]
+fn redirected_clip_uses_the_origin_clip_settings() {
+    let (mut h, deck, top, bottom) = hold_setup();
+    {
+        let k = h.state_mut().project.composition.decks[0]
+            .clips
+            .iter_mut()
+            .find(|k| k.layer == top && k.column == 1)
+            .unwrap();
+        k.clip.transport.speed = 2.0;
+        k.clip.transport.in_point = 0.25;
+        k.clip.transport.out_point = 0.75;
+    }
+    let origin_id = vjc_core::clip_in(&h.state().project, deck, top, 1)
+        .unwrap()
+        .id;
+    h.state_mut().exec(Command::SetClipTarget {
+        deck,
+        layer: top,
+        column: 1,
+        target: vjc_model::ClipTarget::Active,
+    });
+    h.state_mut().active_layer = Some(bottom);
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer: top,
+        column: 1,
+    });
+    settle(&mut h);
+    let st = h.state();
+    assert_eq!(air_of(&h, bottom), Some((deck, 1)));
+    // What the old lookup (cell of the layer it plays on) finds: another clip, with the
+    // default speed and region.
+    let wrong =
+        vjc_core::clip_in(&st.project, deck, bottom, 1).expect("bottom cell has its own clip");
+    assert_ne!(wrong.id, origin_id);
+    assert_eq!(wrong.transport.speed, 1.0);
+    // The helper finds the origin clip, with its transport.
+    let k = st
+        .clip_on(bottom)
+        .expect("clip behind the redirected source");
+    assert_eq!(k.id, origin_id);
+    assert_eq!(k.transport.speed, 2.0);
+    assert_eq!(st.region_of(bottom), (0.25, 0.75));
+    assert_eq!(st.transport(deck, top, 1).map(|t| t.speed), Some(2.0));
+    // Negative control: without the origin map the lookup loses the clip.
+    assert_eq!(
+        clip_for(&st.project, &HashMap::new(), bottom, deck, 1).map(|k| k.id),
+        Some(wrong.id)
+    );
+    assert!(clip_for(&st.project, &st.origin, bottom, deck, 1).is_some());
+    // Editing the origin clip is seen by the player that runs elsewhere.
+    h.state_mut().project.composition.decks[0]
+        .clips
+        .iter_mut()
+        .find(|k| k.layer == top && k.column == 1)
+        .unwrap()
+        .clip
+        .transport
+        .out_point = 0.5;
+    assert_eq!(h.state().region_of(bottom), (0.25, 0.5));
+    // Cues of the origin cell act on the layer the clip plays on.
+    h.state_mut().exec(Command::ClearLayer { layer: bottom });
+    settle(&mut h);
+    assert!(h.state().origin.is_empty(), "eject forgets the redirect");
+    assert_eq!(h.state().clip_on(bottom).map(|k| k.id), None);
+}
+
+// Invariant: selecting, loading and dragging never change what is on air
+#[test]
+fn selecting_loading_and_dragging_leave_the_air_alone() {
+    let (mut h, deck, top, bottom) = hold_setup();
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer: bottom,
+        column: 1,
+    });
+    settle(&mut h);
+    let air = |h: &Harness<'_, State>| (air_of(h, top), air_of(h, bottom));
+    let before = air(&h);
+    assert_eq!(before, (None, Some((deck, 1))));
+    // Selecting cells and a layer.
+    let (_, pos) = cell_center(&h, 0, 2);
+    h.hover_at(pos);
+    h.step();
+    h.state_mut().selected = Some((top, 2));
+    h.state_mut().active_layer = Some(top);
+    settle(&mut h);
+    assert_eq!(air(&h), before);
+    // Loading a file into another cell.
+    h.state_mut().load_file(top, 3, "/nope/a.mp4".into());
+    settle(&mut h);
+    assert_eq!(air(&h), before);
+    // Dragging another cell (a Hold one too) onto an empty cell.
+    style(&mut h, deck, top, 2, vjc_model::TriggerStyle::Hold);
+    settle(&mut h);
+    let (_, from) = cell_center(&h, 0, 2);
+    let (_, to) = cell_center(&h, 0, 0);
+    drag(&mut h, from, to);
+    assert_eq!(air(&h), before);
+    assert!(h.state().holds.is_empty());
+}
+
+#[test]
+fn hold_that_fired_then_drags_moves_nothing_and_release_ejects() {
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    settle(&mut h);
+    let (_, pos) = cell_center(&h, 0, 1);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.hover_at(pos);
+    h.step();
+    h.event(button(pos, true));
+    h.step();
+    // Held still long enough: the arm is due on the next frame.
+    h.state_mut().hold_arm.as_mut().unwrap().at -= std::time::Duration::from_secs(1);
+    h.step();
+    assert_eq!(h.state().holds.len(), 1, "the hold fired");
+    let (_, far) = cell_center(&h, 0, 3);
+    for i in 1..=8 {
+        h.event(egui::Event::PointerMoved(
+            pos + (far - pos) * (i as f32 / 8.0),
+        ));
+        h.step();
+    }
+    h.event(button(far, false));
+    settle(&mut h);
+    let st = h.state();
+    assert!(
+        vjc_core::clip_in(&st.project, deck, top, 1).is_some(),
+        "the held cell did not move"
+    );
+    assert!(
+        st.players.is_empty() && st.gens.is_empty(),
+        "release ejected it"
+    );
+}

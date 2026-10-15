@@ -625,6 +625,7 @@ fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
         transition: None,
         trigger_style: Default::default(),
         beat_snap: None,
+        target: Default::default(),
         channels: Default::default(),
         fit: Default::default(),
     })

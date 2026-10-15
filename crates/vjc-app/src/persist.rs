@@ -62,6 +62,10 @@ impl<T> PersistStore<T> {
         before - self.slots.len()
     }
 
+    pub fn contains(&self, id: &Uuid) -> bool {
+        self.slots.contains_key(id)
+    }
+
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.values().map(|(_, v)| v)
     }

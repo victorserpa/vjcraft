@@ -13,6 +13,7 @@ mod fx;
 mod fx_thumbs;
 mod grid_ui;
 mod help;
+mod hold;
 mod icons;
 mod link_io;
 mod midi_io;
@@ -305,6 +306,21 @@ struct State {
     phase: f64,
     /// Triggers and beat loops waiting for their beat or bar (beat snap).
     snap_pending: Vec<(f64, Held)>,
+    /// Layer a redirected clip (clip target Active / Free) lives in, per layer it plays on:
+    /// (deck, layer of the cell, column). Every lookup of the clip behind a playing source
+    /// goes through it (`clip_for`, `cell_of`); a source that plays on its own layer has no
+    /// entry.
+    origin: HashMap<LayerId, (DeckId, LayerId, u32)>,
+    /// (layer it plays on, layer of the cell) of the `TriggerClipOn` being handled.
+    redirect: Option<(LayerId, LayerId)>,
+    /// Layer chosen by clicking its name: where "Active layer" clips play. Selecting a
+    /// cell does not change it.
+    active_layer: Option<LayerId>,
+    /// Hold clips in the air, one per button or key.
+    holds: Vec<hold::Run>,
+    /// A mouse press on a Hold cell that has not become a hold yet.
+    hold_arm: Option<hold::Arm>,
+    hold_token: u64,
     /// Composition autopilot: which column is on air and since when (runtime only).
     comp_ap: vjc_core::comp_autopilot::State,
     nudge_dir: i8,
@@ -420,6 +436,8 @@ enum SnapAct {
 struct Held {
     act: SnapAct,
     at: std::time::Instant,
+    /// Tag of the Hold that queued it (0 = none): releasing the Hold takes it back.
+    token: u64,
 }
 
 /// Longest an action waits for its beat or bar, in bars of wall time.
@@ -929,6 +947,81 @@ fn active_of(
 ) -> Option<(DeckId, u32)> {
     let video = players.get(&layer).map(|(d, c, _)| (*d, *c));
     video.or_else(|| gens.get(&layer).map(|(d, c, _)| (*d, *c)))
+}
+
+/// Layer of the cell behind the source playing on `layer` (deck, column): the origin of a
+/// redirected clip, else the layer itself.
+fn src_layer(
+    origin: &HashMap<LayerId, (DeckId, LayerId, u32)>,
+    layer: LayerId,
+    deck: DeckId,
+    col: u32,
+) -> LayerId {
+    match origin.get(&layer) {
+        Some((d, l, c)) if *d == deck && *c == col => *l,
+        _ => layer,
+    }
+}
+
+/// The clip behind the source playing on `layer` as (deck, col). Every lookup of a
+/// playing clip (transport, speed, in/out, cues, effects) goes through here: a redirected
+/// clip lives in another layer's cell than the one it plays on.
+fn clip_for<'a>(
+    p: &'a vjc_model::Project,
+    origin: &HashMap<LayerId, (DeckId, LayerId, u32)>,
+    layer: LayerId,
+    deck: DeckId,
+    col: u32,
+) -> Option<&'a vjc_model::Clip> {
+    vjc_core::clip_in(p, deck, src_layer(origin, layer, deck, col), col)
+}
+
+/// Layers the clip of cell (`src`, `col`) plays on (`deck` None = any deck): its own
+/// layer when it plays there, and every layer it was redirected to.
+fn dests_in(
+    players: &HashMap<LayerId, (DeckId, u32, Player)>,
+    gens: &Gens,
+    origin: &HashMap<LayerId, (DeckId, LayerId, u32)>,
+    deck: Option<DeckId>,
+    src: LayerId,
+    col: u32,
+) -> Vec<LayerId> {
+    let ok = |d: DeckId| deck.is_none_or(|x| x == d);
+    let mut out: Vec<LayerId> = origin
+        .iter()
+        .filter(|(dest, (d, l, c))| {
+            *l == src && *c == col && ok(*d) && active_of(players, gens, **dest) == Some((*d, *c))
+        })
+        .map(|(dest, _)| *dest)
+        .collect();
+    if !origin.contains_key(&src)
+        && let Some((d, c)) = active_of(players, gens, src)
+        && c == col
+        && ok(d)
+    {
+        out.push(src);
+    }
+    out
+}
+
+/// Cell state for LEDs, OSC and the API: what is on air in the cells of `layer`. A cell
+/// that sends its clip to another layer shows it; the layer that receives it does not
+/// light the cell at the same column.
+fn cell_active_of(
+    players: &HashMap<LayerId, (DeckId, u32, Player)>,
+    gens: &Gens,
+    origin: &HashMap<LayerId, (DeckId, LayerId, u32)>,
+    layer: LayerId,
+) -> Option<(DeckId, u32)> {
+    if !origin.contains_key(&layer)
+        && let Some(a) = active_of(players, gens, layer)
+    {
+        return Some(a);
+    }
+    origin
+        .iter()
+        .find(|(dest, (d, l, c))| *l == layer && active_of(players, gens, **dest) == Some((*d, *c)))
+        .map(|(_, (d, _, c))| (*d, *c))
 }
 
 /// "New generator" submenu: creates the clip in the cell and plays it.
@@ -1635,6 +1728,12 @@ impl State {
             beat: 0,
             phase: 0.0,
             snap_pending: vec![],
+            origin: HashMap::new(),
+            redirect: None,
+            active_layer: None,
+            holds: vec![],
+            hold_arm: None,
+            hold_token: 0,
             comp_ap: Default::default(),
             nudge_dir: 0,
             metronome: false,
@@ -1693,6 +1792,10 @@ impl State {
         self.gens.clear();
         self.history.clear();
         self.snap_pending.clear();
+        self.origin.clear();
+        self.holds.clear();
+        self.hold_arm = None;
+        self.active_layer = None;
         self.comp_ap.reset();
         self.selected = None;
         self.selected_deck = None;
@@ -2393,25 +2496,42 @@ impl State {
         }
     }
 
-    /// A user trigger on a Toggle clip that is playing becomes an eject of its layer.
+    /// What is live now, for toggle / target resolution.
+    fn trigger_ctx(&self) -> vjc_core::TriggerCtx {
+        vjc_core::TriggerCtx {
+            selected: self.active_layer,
+            playing: self.playing(),
+        }
+    }
+
+    /// Clips in the air: (layer they play on, deck, layer of their cell, column).
+    fn playing(&self) -> Vec<(LayerId, DeckId, LayerId, u32)> {
+        let cell = |l: &LayerId, d: DeckId, c: u32| (*l, d, src_layer(&self.origin, *l, d, c), c);
+        self.players
+            .iter()
+            .map(|(l, v)| cell(l, v.0, v.1))
+            .chain(self.gens.iter().map(|(l, v)| cell(l, v.0, v.1)))
+            .collect()
+    }
+
+    /// A user trigger becomes an eject (toggle on the clip in the air) or a redirect (clip
+    /// target); anything else passes through.
     fn resolve_trigger(&self, cmd: Command) -> Command {
-        let ctx = vjc_core::TriggerCtx {
-            playing: self
-                .players
-                .iter()
-                .map(|(l, v)| (*l, v.0, v.1))
-                .chain(self.gens.iter().map(|(l, v)| (*l, v.0, v.1)))
-                .collect(),
-        };
-        vjc_core::resolve_trigger(&self.project, &ctx, cmd)
+        vjc_core::resolve_trigger(&self.project, &self.trigger_ctx(), cmd)
     }
 
     /// With beat snap on, a clip or column trigger that arrives off the grid waits in
     /// `snap_pending` for the next beat or bar; anything else passes through.
     fn snap_defer(&mut self, cmd: Command) -> Option<Command> {
+        self.snap_defer_tagged(cmd, 0)
+    }
+
+    fn snap_defer_tagged(&mut self, cmd: Command, token: u64) -> Option<Command> {
         if !matches!(
             cmd,
-            Command::TriggerClip { .. } | Command::TriggerColumn { .. }
+            Command::TriggerClip { .. }
+                | Command::TriggerClipOn { .. }
+                | Command::TriggerColumn { .. }
         ) {
             return Some(cmd);
         }
@@ -2424,6 +2544,7 @@ impl State {
                 Held {
                     act: SnapAct::Cmd(Box::new(cmd)),
                     at: std::time::Instant::now(),
+                    token,
                 },
             ));
             None
@@ -2438,7 +2559,8 @@ impl State {
         let ncols = c.columns.len() as u32;
         self.snap_pending.retain(|(_, h)| match &h.act {
             SnapAct::Cmd(cmd) => match **cmd {
-                Command::TriggerClip { layer, column, .. } => {
+                Command::TriggerClip { layer, column, .. }
+                | Command::TriggerClipOn { layer, column, .. } => {
                     column < ncols && c.layers.iter().any(|l| l.id == layer)
                 }
                 Command::TriggerColumn { column, .. } => column < ncols,
@@ -2467,7 +2589,12 @@ impl State {
         for h in vjc_core::clock::take_due(&mut self.snap_pending, phase) {
             match h.act {
                 SnapAct::Cmd(c) => {
-                    self.exec_ok(*c);
+                    let ok = self.exec_ok(*c);
+                    if h.token != 0
+                        && let Some(r) = self.holds.iter_mut().find(|r| r.token == h.token)
+                    {
+                        r.onair = ok;
+                    }
                 }
                 SnapAct::BeatLoop(layer, b) => self.start_beat_loop(layer, b),
             }
@@ -2483,6 +2610,7 @@ impl State {
                 | Command::Nudge { .. }
                 | Command::Resync { .. }
                 | Command::TriggerClip { .. }
+                | Command::TriggerClipOn { .. }
                 | Command::ClearLayer { .. }
                 | Command::SelectDeck { .. }
                 | Command::TriggerColumn { .. }
@@ -2496,9 +2624,9 @@ impl State {
         );
         let ncols = self.project.composition.columns.len() as i64;
         let col_after = match &cmd {
-            Command::TriggerColumn { column, .. } | Command::TriggerClip { column, .. } => {
-                Some(*column)
-            }
+            Command::TriggerColumn { column, .. }
+            | Command::TriggerClip { column, .. }
+            | Command::TriggerClipOn { column, .. } => Some(*column),
             Command::StepColumn { from, delta, .. } => Some(from.map_or(0, |c| {
                 (i64::from(c) + i64::from(*delta)).clamp(0, (ncols - 1).max(0)) as u32
             })),
@@ -2507,6 +2635,10 @@ impl State {
         let on_air = match &cmd {
             Command::TriggerColumn { column, .. } => Some(*column),
             Command::StepColumn { .. } => col_after,
+            _ => None,
+        };
+        self.redirect = match &cmd {
+            Command::TriggerClipOn { layer, onto, .. } => Some((*onto, *layer)),
             _ => None,
         };
         let is_step = matches!(cmd, Command::StepClip { .. });
@@ -2551,9 +2683,11 @@ impl State {
                     self.dirty = true;
                 }
                 self.handle(events);
+                self.redirect = None;
                 true
             }
             Err(e) => {
+                self.redirect = None;
                 self.status = format!("Command failed: {e}");
                 false
             }
@@ -2632,6 +2766,9 @@ impl State {
     fn handle(&mut self, events: Vec<Event>) {
         self.prune_sel_slices();
         prune_resume(&self.project, &mut self.flow.resume);
+        // Layer of the cell a started source comes from: its own unless redirected.
+        let redirect = self.redirect;
+        let src_of = move |layer: LayerId| redirect.filter(|r| r.0 == layer).map_or(layer, |r| r.1);
         for e in events {
             match e {
                 Event::ClipStarted {
@@ -2641,22 +2778,24 @@ impl State {
                     path,
                 } => {
                     if path.exists() {
+                        let src = src_of(layer);
                         let prev_local = self.layer_fraction(layer);
                         self.remember_pos(layer);
                         self.gens.remove(&layer);
                         self.flow.loops.remove(&layer);
                         self.flow.auto_time.remove(&layer);
                         self.flow.beat_loops.remove(&layer);
-                        self.cross_from_old(layer, deck, column);
+                        self.cross_from_old(layer, deck, src, column);
                         let mut player = self
                             .preload
-                            .take(deck, layer, column, &path)
+                            .take(deck, src, column, &path)
                             .unwrap_or_else(|| Player::open_scrub(&path));
                         if let Some(engine) = self.audio_engine() {
                             player.attach_audio(&engine);
                         }
                         self.players.insert(layer, (deck, column, player));
-                        let tr = self.transport(deck, layer, column);
+                        self.set_origin(layer, deck, src, column);
+                        let tr = self.transport(deck, src, column);
                         let dir = tr.map_or(Direction::Forward, |t| t.direction);
                         let seed = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2664,11 +2803,11 @@ impl State {
                         self.heads.insert(layer, Playhead::new(dir, seed));
                         self.flow.regions.remove(&layer);
                         let own_last =
-                            resume_pos(&self.project, &self.flow.resume, (deck, layer, column));
+                            resume_pos(&self.project, &self.flow.resume, (deck, src, column));
                         if let Some(start) = vjc_core::trigger_start(
                             &self.project,
                             deck,
-                            layer,
+                            src,
                             column,
                             own_last,
                             prev_local,
@@ -2692,11 +2831,12 @@ impl State {
                     self.flow.loops.remove(&layer);
                     self.flow.auto_time.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
-                    self.cross_from_old(layer, deck, column);
+                    self.cross_from_old(layer, deck, src_of(layer), column);
                     self.flow.regions.remove(&layer);
                     self.flow.pos.remove(&layer);
                     self.players
                         .insert(layer, (deck, column, Player::open_capture(&device)));
+                    self.set_origin(layer, deck, src_of(layer), column);
                     self.heads.remove(&layer);
                 }
                 Event::NetworkStarted {
@@ -2710,13 +2850,14 @@ impl State {
                     self.flow.loops.remove(&layer);
                     self.flow.auto_time.remove(&layer);
                     self.flow.beat_loops.remove(&layer);
-                    self.cross_from_old(layer, deck, column);
+                    self.cross_from_old(layer, deck, src_of(layer), column);
                     self.flow.regions.remove(&layer);
                     self.flow.pos.remove(&layer);
                     match browser::net_backend(&protocol) {
                         Some(p) => {
                             self.players
                                 .insert(layer, (deck, column, open_network(p, name)));
+                            self.set_origin(layer, deck, src_of(layer), column);
                             self.heads.remove(&layer);
                         }
                         None => self.status = "Spout is not available on macOS".into(),
@@ -2736,6 +2877,7 @@ impl State {
                     self.flow.regions.remove(&layer);
                     self.flow.pos.remove(&layer);
                     self.gens.insert(layer, (deck, column, 0.0));
+                    self.set_origin(layer, deck, src_of(layer), column);
                 }
                 Event::Seek {
                     deck,
@@ -2743,7 +2885,8 @@ impl State {
                     column,
                     pos,
                 } => {
-                    if self.active(layer) == Some((deck, column)) {
+                    // `layer` is the cell's; the clip may play on another layer.
+                    for layer in self.dests_of(Some(deck), layer, column) {
                         // A cue jump ends an active beat loop and is not a completed loop.
                         self.flow.beat_loops.remove(&layer);
                         let local = vjc_core::playback::to_local(pos, self.region_of(layer));
@@ -2764,6 +2907,7 @@ impl State {
                     self.flow.auto_time.remove(&layer);
                     self.players.remove(&layer);
                     self.gens.remove(&layer);
+                    self.origin.remove(&layer);
                 }
                 Event::FaderStart { layer } => {
                     // The playing clip restarts from the start of its region, in place.
@@ -2801,9 +2945,10 @@ impl State {
                     layer,
                     column,
                 } => {
-                    if self.active(layer) == Some((deck, column)) {
-                        self.players.remove(&layer);
-                        self.gens.remove(&layer);
+                    for dest in self.dests_of(Some(deck), layer, column) {
+                        self.players.remove(&dest);
+                        self.gens.remove(&dest);
+                        self.origin.remove(&dest);
                     }
                 }
                 Event::ClipsMoved { deck, moves } => self.follow_moves(deck, &moves),
@@ -2814,6 +2959,7 @@ impl State {
                 }
             }
         }
+        self.prune_origin();
     }
 
     /// While a layer name is dragged: the insertion line between the layer rows.
@@ -2912,9 +3058,27 @@ impl State {
         {
             self.preview_target = PreviewTarget::Clip(d, l, c);
         }
-        let playing = |s: &Self, cell: (LayerId, u32)| {
-            active_of(&s.players, &s.gens, cell.0) == Some((deck, cell.1))
-        };
+        // Clips redirected to another layer stay where they play; only their cell moves.
+        let redirected: Vec<(LayerId, (DeckId, LayerId, u32))> = self
+            .origin
+            .iter()
+            .filter(|(_, v)| v.0 == deck)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        for (onto, (d, l, c)) in redirected {
+            if let Some((l2, c2)) = dest((l, c)) {
+                if let Some(p) = self.players.get_mut(&onto) {
+                    p.1 = c2;
+                }
+                if let Some(g) = self.gens.get_mut(&onto) {
+                    g.1 = c2;
+                }
+                self.set_origin(onto, d, l2, c2);
+            }
+        }
+        // Only a clip playing on its own layer travels with its cell's flow state.
+        let playing =
+            |s: &Self, cell: (LayerId, u32)| s.dest_of(Some(deck), cell.0, cell.1) == Some(cell.0);
         /// Per-layer flow state that travels with a clip moved to another layer.
         #[derive(Default)]
         struct Carried {
@@ -3012,22 +3176,19 @@ impl State {
 
     /// Notes where the layer's playing clip is, so a Continue trigger can resume it.
     fn remember_pos(&mut self, layer: LayerId) {
-        if let (Some((d, c)), Some(p)) = (self.active(layer), self.flow.pos.get(&layer))
-            && let Some(k) = vjc_core::clip_in(&self.project, d, layer, c)
+        if let (Some((d, src, c)), Some(p)) = (self.cell_of(layer), self.flow.pos.get(&layer))
+            && let Some(k) = vjc_core::clip_in(&self.project, d, src, c)
         {
-            self.flow.resume.insert((d, layer, c), (k.id, *p));
+            self.flow.resume.insert((d, src, c), (k.id, *p));
         }
     }
 
     /// Moves the playing clip of `layer` (if any) into `flow.outgoing` when the layer's
     /// transition asks for a crossing; otherwise drops it. Joins the old decode thread
     /// only in the second case.
-    fn cross_from_old(&mut self, layer: LayerId, deck: DeckId, column: u32) {
+    fn cross_from_old(&mut self, layer: LayerId, deck: DeckId, src: LayerId, column: u32) {
         self.flow.outgoing.remove(&layer);
-        let old_clip = self
-            .active(layer)
-            .and_then(|(d, c)| vjc_core::clip_in(&self.project, d, layer, c))
-            .cloned();
+        let old_clip = self.clip_on(layer).cloned();
         let fit = old_clip.as_ref().map(|k| k.fit);
         let Some((_, _, old)) = self.players.remove(&layer) else {
             return;
@@ -3040,7 +3201,7 @@ impl State {
             .find(|l| l.id == layer)
             .map_or(vjc_core::transition::State::Idle, |l| {
                 // The incoming clip's own transition, when set, wins over the layer's.
-                let own = vjc_core::clip_in(&self.project, deck, layer, column)
+                let own = vjc_core::clip_in(&self.project, deck, src, column)
                     .and_then(|k| k.transition.as_ref());
                 let seed = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3066,9 +3227,7 @@ impl State {
 
     /// In..out region of the clip playing on the layer (the whole clip when none).
     fn region_of(&self, layer: LayerId) -> (f64, f64) {
-        self.players
-            .get(&layer)
-            .and_then(|(d, c, _)| vjc_core::clip_in(&self.project, *d, layer, *c))
+        self.clip_on(layer)
             .map_or((0.0, 1.0), |k| vjc_core::playback::region(&k.transport))
     }
 
@@ -3107,6 +3266,7 @@ impl State {
                 Held {
                     act: SnapAct::BeatLoop(layer, b),
                     at: std::time::Instant::now(),
+                    token: 0,
                 },
             ));
         } else {
@@ -3138,7 +3298,7 @@ impl State {
                 if *c != col {
                     return None;
                 }
-                let tr = &vjc_core::clip_in(&self.project, *deck, l.id, col)?.transport;
+                let tr = &clip_for(&self.project, &self.origin, l.id, *deck, col)?.transport;
                 let reg = vjc_core::playback::region(tr);
                 let rate = vjc_core::playback_rate(tr.speed, 1.0, comp.master_speed);
                 let secs = player.duration()? * (reg.1 - reg.0) / rate;
@@ -3155,6 +3315,10 @@ impl State {
             .layers
             .iter()
             .find(|l| l.id == layer)?;
+        // A redirected clip does not belong to this layer's columns: no autopilot for it.
+        if self.origin.contains_key(&layer) {
+            return None;
+        }
         let (deck, cur) = self.active(layer)?;
         let n = self.project.composition.columns.len();
         let playable: Vec<bool> = (0..n as u32)
@@ -3178,7 +3342,14 @@ impl State {
             .iter()
             .filter_map(|l| active_of(&self.players, &self.gens, l.id).map(|(d, c)| (l.id, d, c)))
             .collect();
-        vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass).with_active(active)
+        let origin = self
+            .origin
+            .iter()
+            .map(|(dest, (_, src, _))| (*dest, *src))
+            .collect();
+        vjc_core::shortcuts::Ctx::new(self.col_sel, self.master_bypass)
+            .with_active(active)
+            .with_origin(origin)
     }
 
     /// True while something changes every frame: a playing clip or generator, a fade,
@@ -3200,6 +3371,68 @@ impl State {
 
     fn active(&self, layer: LayerId) -> Option<(DeckId, u32)> {
         active_of(&self.players, &self.gens, layer)
+    }
+
+    /// Cell (deck, layer, column) of the clip playing on `layer`.
+    fn cell_of(&self, layer: LayerId) -> Option<(DeckId, LayerId, u32)> {
+        let (d, c) = self.active(layer)?;
+        Some((d, src_layer(&self.origin, layer, d, c), c))
+    }
+
+    /// The clip playing on `layer`, wherever its cell is.
+    fn clip_on(&self, layer: LayerId) -> Option<&vjc_model::Clip> {
+        let (d, c) = self.active(layer)?;
+        clip_for(&self.project, &self.origin, layer, d, c)
+    }
+
+    /// Layers the clip of cell (`src`, `col`) plays on (`deck` None = any deck).
+    fn dests_of(&self, deck: Option<DeckId>, src: LayerId, col: u32) -> Vec<LayerId> {
+        dests_in(&self.players, &self.gens, &self.origin, deck, src, col)
+    }
+
+    fn dest_of(&self, deck: Option<DeckId>, src: LayerId, col: u32) -> Option<LayerId> {
+        self.dests_of(deck, src, col).into_iter().next()
+    }
+
+    /// A clip target as addresses see it: through the layer the clip plays on (its own
+    /// unless redirected), with what is active there. Other targets pass through.
+    fn addressed(&self, target: EffectTarget) -> (EffectTarget, Option<(DeckId, u32)>) {
+        match target {
+            EffectTarget::Clip {
+                deck,
+                layer,
+                column,
+            } => match self.dest_of(Some(deck), layer, column) {
+                Some(dest) => (
+                    EffectTarget::Clip {
+                        deck,
+                        layer: dest,
+                        column,
+                    },
+                    Some((deck, column)),
+                ),
+                None => (target, None),
+            },
+            _ => (target, None),
+        }
+    }
+
+    /// Notes where the clip now playing on `dest` lives.
+    fn set_origin(&mut self, dest: LayerId, deck: DeckId, src: LayerId, col: u32) {
+        if src == dest {
+            self.origin.remove(&dest);
+        } else {
+            self.origin.insert(dest, (deck, src, col));
+        }
+    }
+
+    /// Forgets redirects whose source stopped or whose cell is gone.
+    fn prune_origin(&mut self) {
+        let (players, gens, project) = (&self.players, &self.gens, &self.project);
+        self.origin.retain(|dest, (d, l, c)| {
+            active_of(players, gens, *dest) == Some((*d, *c))
+                && vjc_core::clip_in(project, *d, *l, *c).is_some()
+        });
     }
 
     fn transport(&self, deck: DeckId, layer: LayerId, column: u32) -> Option<vjc_model::Transport> {
@@ -3295,7 +3528,7 @@ impl State {
             }
         }
         for (layer, (deck, col, player)) in &self.players {
-            let Some(clip) = vjc_core::clip_in(&self.project, *deck, *layer, *col) else {
+            let Some(clip) = clip_for(&self.project, &self.origin, *layer, *deck, *col) else {
                 continue;
             };
             let tr = &clip.transport;
@@ -3428,7 +3661,7 @@ impl State {
                 continue;
             };
             // A paused clip does not run the clock.
-            let playing = vjc_core::clip_in(&self.project, deck, layer, col)
+            let playing = clip_for(&self.project, &self.origin, layer, deck, col)
                 .is_some_and(|k| k.transport.direction != Direction::Pause);
             let e = self
                 .flow
@@ -3445,7 +3678,7 @@ impl State {
         // Generator TIME runs on the app clock, scaled by the clip transport.
         for (layer, (deck, col, t)) in self.gens.iter_mut() {
             if let Some(tr) =
-                vjc_core::clip_in(&self.project, *deck, *layer, *col).map(|k| &k.transport)
+                clip_for(&self.project, &self.origin, *layer, *deck, *col).map(|k| &k.transport)
             {
                 let dir = match tr.direction {
                     Direction::Backward => -1.0,
@@ -3609,13 +3842,15 @@ impl State {
     fn drop_cell(&mut self, layer: LayerId, column: u32, path: PathBuf) {
         let deck = self.project.composition.current_deck;
         // A cell already on air must reload, or the wall keeps the old clip.
-        let live = active_of(&self.players, &self.gens, layer) == Some((deck, column));
+        let live = self.dest_of(Some(deck), layer, column);
         self.load_file(layer, column, path);
-        if live {
-            self.exec(Command::TriggerClip {
+        if let Some(onto) = live {
+            // Back where it was playing, whatever the clip target says now.
+            self.exec(Command::TriggerClipOn {
                 deck,
                 layer,
                 column,
+                onto,
             });
         }
         self.selected = Some((layer, column));
@@ -3634,9 +3869,8 @@ impl State {
         let deck = self.project.composition.current_deck;
         // The layer's on-air cell, if the drop replaces it: reload it after the batch.
         let n = files.len() as u32;
-        let live = active_of(&self.players, &self.gens, layer)
-            .filter(|&(d, c)| d == deck && (column..column + n).contains(&c))
-            .map(|(_, c)| c);
+        let live = (column..column + n)
+            .find_map(|c| self.dest_of(Some(deck), layer, c).map(|onto| (c, onto)));
         let have = self.project.composition.columns.len() as u32;
         let mut commands = Vec::new();
         for i in have..column + files.len() as u32 {
@@ -3660,11 +3894,12 @@ impl State {
             });
         }
         self.exec(Command::Batch { commands });
-        if let Some(c) = live {
-            self.exec(Command::TriggerClip {
+        if let Some((c, onto)) = live {
+            self.exec(Command::TriggerClipOn {
                 deck,
                 layer,
                 column: c,
+                onto,
             });
         }
         self.selected = Some((layer, column));
@@ -3863,10 +4098,10 @@ impl State {
             .filter_map(|(id, o)| Some((*id, o.player.latest_frame()?)))
             .collect();
         // Fit comes from the deck the clip was triggered from, not the visible one.
-        let (players, gens) = (&self.players, &self.gens);
+        let (players, gens, origin) = (&self.players, &self.gens, &self.origin);
         let fit_of = |l: &Layer| {
             let (deck, col) = active_of(players, gens, l.id)?;
-            Some(vjc_core::clip_in(&self.project, deck, l.id, col)?.fit)
+            Some(clip_for(&self.project, origin, l.id, deck, col)?.fit)
         };
         // Shaders compile on worker threads; install the ones that finished.
         for done in self.fx.poll() {
@@ -3901,7 +4136,7 @@ impl State {
             // Clip chain first, then the layer chain.
             let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
             let clip = active_of(players, gens, l.id)
-                .and_then(|(d, col)| vjc_core::clip_in(&self.project, d, l.id, col));
+                .and_then(|(d, col)| clip_for(&self.project, origin, l.id, d, col));
             // Layer and clip dashboards: dial animations on this layer's params read them.
             let (layer_dials, clip_dials) = (
                 vjc_core::anim::dial_values(&l.track.dials),
@@ -3934,6 +4169,7 @@ impl State {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 active_of(players, gens, l.id).hash(&mut h);
+                origin.get(&l.id).hash(&mut h);
                 h.finish()
             };
             let mut effects = draw_chain(
@@ -4467,9 +4703,126 @@ impl State {
     }
 
     /// Master row: bypass, Clear All (opacity and speed live in the Composition tab).
+    /// Plays a Hold clip for `src` (a mouse press that stayed put, or a key down). It goes
+    /// through the same target and beat snap resolution as any trigger; the clip it put
+    /// in the air is remembered so the release can eject exactly that one.
+    fn hold_fire(&mut self, src: hold::Src, deck: DeckId, layer: LayerId, column: u32) {
+        if self.holds.iter().any(|r| r.src == src) {
+            return;
+        }
+        let Some(clip) = vjc_core::clip_in(&self.project, deck, layer, column).map(|k| k.id) else {
+            return;
+        };
+        let resolved = self.resolve_trigger(Command::TriggerClip {
+            deck,
+            layer,
+            column,
+        });
+        let onto = match &resolved {
+            Command::TriggerClipOn { onto, .. } => *onto,
+            _ => layer,
+        };
+        self.hold_token += 1;
+        let mut run = hold::Run {
+            src,
+            fired: vjc_core::HoldFired {
+                deck,
+                layer,
+                column,
+                clip,
+                onto,
+            },
+            token: self.hold_token,
+            onair: false,
+        };
+        // Queued first, so a trigger that runs later (beat snap) finds its Hold.
+        if let Some(cmd) = self.snap_defer_tagged(resolved, run.token) {
+            run.onair = self.exec_ok(cmd);
+        }
+        self.holds.push(run);
+    }
+
+    /// The button or key is up. A trigger still waiting for its beat is taken back and
+    /// nothing is ejected; otherwise the layer is ejected only if the clip this Hold
+    /// played is still the one in the air.
+    fn hold_release(&mut self, src: hold::Src) {
+        let Some(i) = self.holds.iter().position(|r| r.src == src) else {
+            return;
+        };
+        let run = self.holds.remove(i);
+        if !run.onair {
+            self.snap_pending.retain(|(_, h)| h.token != run.token);
+            return;
+        }
+        if let Some(cmd) = vjc_core::hold_release(&self.project, &self.playing(), &run.fired) {
+            self.exec_ok(cmd);
+        }
+    }
+
+    /// Mouse side of Hold, once per frame: decides an armed press and releases on button up.
+    fn hold_step(
+        &mut self,
+        now: std::time::Instant,
+        down: bool,
+        pos: Option<egui::Pos2>,
+    ) -> Option<std::time::Duration> {
+        if let Some(arm) = self.hold_arm {
+            match hold::step(&arm, now, down, pos, self.cell_drag.is_some()) {
+                hold::Step::Wait(d) => return Some(d),
+                hold::Step::Cancel => self.hold_arm = None,
+                hold::Step::Fire => {
+                    self.hold_arm = None;
+                    self.hold_fire(hold::Src::Mouse, arm.deck, arm.layer, arm.column);
+                }
+            }
+        }
+        if !down {
+            self.hold_release(hold::Src::Mouse);
+        }
+        None
+    }
+
+    fn hold_tick(&mut self, ctx: &egui::Context) {
+        let (down, pos, focused) = ctx.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.latest_pos(),
+                i.viewport().focused.unwrap_or(true),
+            )
+        });
+        // Losing focus loses the key-up events: let go of everything.
+        if !focused {
+            self.hold_arm = None;
+            for src in self.holds.iter().map(|r| r.src).collect::<Vec<_>>() {
+                self.hold_release(src);
+            }
+            return;
+        }
+        if let Some(wait) = self.hold_step(std::time::Instant::now(), down, pos) {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
     /// Key shortcuts from the project, plus the learn flow. Nothing fires while a widget
     /// has keyboard focus (text field or a focused button), so Space never also presses it.
     fn shortcut_keys(&mut self, ctx: &egui::Context) {
+        // Key up lets go of a Hold, whatever has the focus now.
+        let up: Vec<egui::Key> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: false,
+                        ..
+                    } => Some(*key),
+                    _ => None,
+                })
+                .collect()
+        });
+        for key in up {
+            self.hold_release(hold::Src::Key(key));
+        }
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -4533,7 +4886,18 @@ impl State {
                 .filter_map(|s| vjc_core::shortcuts::activate(&self.project, &rt, s))
                 .collect();
             for c in cmds {
-                self.exec(c);
+                match c {
+                    Command::TriggerClip {
+                        deck,
+                        layer,
+                        column,
+                    } if vjc_core::trigger_style_of(&self.project, deck, layer, column)
+                        == vjc_model::TriggerStyle::Hold =>
+                    {
+                        self.hold_fire(hold::Src::Key(key), deck, layer, column);
+                    }
+                    c => self.exec(c),
+                }
             }
         }
     }
@@ -4585,7 +4949,7 @@ impl State {
             }
         }
         let rt = self.rt_ctx();
-        let active = |l| active_of(&self.players, &self.gens, l);
+        let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
         let next = m::led_states(&self.project, &rt, &active);
         let (sends, sent) =
             m::led_sends(&self.led_prev, next, |d| self.prefs.midi.output_enabled(d));
@@ -4635,7 +4999,7 @@ impl State {
         }
         let now = std::time::Instant::now();
         let rt = self.rt_ctx();
-        let active = |l| active_of(&self.players, &self.gens, l);
+        let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
         let beat = self.clock.phase(now).floor() as i64;
         let next = o::out_states(&self.project, &rt, &active, beat);
         let due = self
@@ -4700,7 +5064,7 @@ impl State {
                 break;
             };
             let rt = self.rt_ctx();
-            let active = |l| active_of(&self.players, &self.gens, l);
+            let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
             let (cmd, reply) = api_io::answer(&self.project, &rt, &active, msg.req);
             if let Some(c) = cmd {
                 self.exec(c);
@@ -4868,11 +5232,14 @@ impl State {
             );
             if help(pause, "transport-pause").clicked() {
                 let layer = self.selected.map(|s| s.0);
-                let active = self.rt_ctx().active;
-                let scoped = layer.filter(|l| active.iter().any(|a| a.0 == *l));
-                if let Some(c) =
-                    vjc_core::shortcuts::toggle_pause(&self.project, &active, scoped)
-                {
+                let rt = self.rt_ctx();
+                let scoped = layer.filter(|l| rt.active.iter().any(|a| a.0 == *l));
+                if let Some(c) = vjc_core::shortcuts::toggle_pause(
+                    &self.project,
+                    &rt.active,
+                    &rt.origin,
+                    scoped,
+                ) {
                     cmds.push(c);
                 }
             }
@@ -5068,6 +5435,7 @@ impl State {
 
     fn ui_body(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.hold_tick(&ctx);
         // Before any panel draws: the panels register their learn targets too.
         self.targets.clear();
         self.help_shown = help::take_hovered(&ctx);
@@ -6008,6 +6376,7 @@ impl State {
                                 let name = help(name.on_hover_text(&layer.name), "layer-name");
                                 self.layer_rects.push((name.rect, lid));
                                 if name.clicked() || name.secondary_clicked() {
+                                    self.active_layer = Some(lid);
                                     self.selected = Some((lid, self.selected.map_or(0, |s| s.1)));
                                     self.selected_deck = Some(cur);
                                     self.preview_target = PreviewTarget::Layer(lid);
@@ -6253,8 +6622,15 @@ impl State {
                             for ci in 0..ncols {
                                 let clip = deck_idx.and_then(|d| comp.decks[d].clip_at(lid, ci));
                                 // Highlight only when playing from the deck being shown.
-                                let on =
-                                    active_of(&self.players, &self.gens, lid) == Some((cur, ci));
+                                let on = !dests_in(
+                                    &self.players,
+                                    &self.gens,
+                                    &self.origin,
+                                    Some(cur),
+                                    lid,
+                                    ci,
+                                )
+                                .is_empty();
                                 let label = clip
                                     .map(|k| k.name.as_str())
                                     .unwrap_or("(drop / right-click)");
@@ -6409,7 +6785,10 @@ impl State {
                                     self.selected = Some((lid, ci));
                                     self.selected_deck = Some(cur);
                                 }
-                                if cell.pic.drag_started() && clip.is_some() {
+                                // A Hold that already fired owns the press: moving the cell under it would leave
+                                // its clip in the air after the release.
+                                let holding = self.holds.iter().any(|r| r.src == hold::Src::Mouse);
+                                if cell.pic.drag_started() && clip.is_some() && !holding {
                                     self.cell_drag = Some((lid, ci));
                                 }
                                 if cell.pic.drag_stopped() && self.cell_drag == Some((lid, ci)) {
@@ -6436,7 +6815,26 @@ impl State {
                                 } else if cell.pic.clicked() && clip.is_some() {
                                     self.preview_target = PreviewTarget::Layer(lid);
                                 }
-                                if cell.pic.clicked() && clip.is_some() {
+                                if clip.is_some()
+                                    && vjc_core::trigger_style_of(&self.project, cur, lid, ci)
+                                        == vjc_model::TriggerStyle::Hold
+                                {
+                                    // Hold: a press only arms (it may be the start of a drag);
+                                    // `hold_tick` plays it once the press has stayed put.
+                                    if cell.pic.hovered()
+                                        && self.hold_arm.is_none()
+                                        && self.cell_drag.is_none()
+                                        && ui.input(|i| i.pointer.primary_pressed())
+                                    {
+                                        self.hold_arm = Some(hold::Arm {
+                                            deck: cur,
+                                            layer: lid,
+                                            column: ci,
+                                            at: std::time::Instant::now(),
+                                            pos: ui.input(|i| i.pointer.latest_pos()),
+                                        });
+                                    }
+                                } else if cell.pic.clicked() && clip.is_some() {
                                     cmds.push(Command::TriggerClip {
                                         deck: cur,
                                         layer: lid,
@@ -6831,6 +7229,19 @@ impl State {
                 &styles,
             ) {
                 cmds.push(Command::SetCompTriggerStyle { style });
+            }
+            let targets: Vec<(vjc_model::ClipTarget, String)> = vjc_model::ClipTarget::CHOICES
+                .into_iter()
+                .map(|m| (m, m.label().to_string()))
+                .collect();
+            if let Some(target) = params::combo(
+                ui,
+                "cttarget",
+                "Plays on",
+                &c.clip_target.resolve(vjc_model::ClipTarget::Own),
+                &targets,
+            ) {
+                cmds.push(Command::SetCompClipTarget { target });
             }
             if let Some(snap) =
                 autopilot_ui::snap_combo(ui, "cbsnap", "Beat snap", c.beat_snap, "App default")
@@ -7295,10 +7706,9 @@ impl State {
         if vjc_core::clip_in(&self.project, cur, layer, column).is_some() {
             return cur;
         }
-        match self.players.get(&layer) {
-            Some((d, c, _)) if *c == column => *d,
-            _ => cur,
-        }
+        self.dest_of(None, layer, column)
+            .and_then(|l| self.active(l))
+            .map_or(cur, |(d, _)| d)
     }
 
     fn clip_tab(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
@@ -7330,7 +7740,7 @@ impl State {
         }));
         let actx = self.anim_ctx(&dials);
         let t = &k.transport;
-        let clip_style = k.trigger_style;
+        let (clip_style, clip_target) = (k.trigger_style, k.target);
         let clip_snap = k.beat_snap;
         if let Some(name) = params::text_field(ui, ("kname", layer, column), "Name", &k.name) {
             cmds.push(Command::RenameClip {
@@ -7400,9 +7810,8 @@ impl State {
             vjc_model::Source::Network { protocol, name } => {
                 ui.label(format!("Source: {protocol:?} {name}"));
                 if let Some((_, _, p)) = self
-                    .players
-                    .get(&layer)
-                    .filter(|(d, c, _)| (*d, *c) == (deck, column))
+                    .dest_of(Some(deck), layer, column)
+                    .and_then(|dest| self.players.get(&dest))
                 {
                     match (p.error(), p.latest_frame()) {
                         (Some(e), _) => {
@@ -7462,6 +7871,20 @@ impl State {
                     layer,
                     column,
                     style,
+                });
+            }
+            let targets: Vec<(vjc_model::ClipTarget, String)> =
+                [vjc_model::ClipTarget::Composition]
+                    .into_iter()
+                    .chain(vjc_model::ClipTarget::CHOICES)
+                    .map(|m| (m, m.label().to_string()))
+                    .collect();
+            if let Some(target) = params::combo(ui, "ttarget", "Plays on", &clip_target, &targets) {
+                cmds.push(Command::SetClipTarget {
+                    deck,
+                    layer,
+                    column,
+                    target,
                 });
             }
             if let Some(snap) =
@@ -7567,8 +7990,12 @@ impl State {
                 }
             }
             ui.separator();
-            let playing = self.active(layer) == Some((deck, column));
-            let pos = self.flow.pos.get(&layer).copied().unwrap_or(0.0);
+            let dest = self.dest_of(Some(deck), layer, column);
+            let playing = dest.is_some();
+            let pos = dest
+                .and_then(|d| self.flow.pos.get(&d))
+                .copied()
+                .unwrap_or(0.0);
             let reg = vjc_core::playback::region(t);
             self.scrub_bar(ui, (deck, layer, column), &k, (playing, pos), cmds);
             if let Some(fs) = file_secs {
@@ -8003,13 +8430,18 @@ impl State {
                 DialOwner::Layer(l) => {
                     vjc_core::shortcuts::dial_address(&self.project, l, None, None, i)
                 }
-                DialOwner::Clip(deck, l, c) => vjc_core::shortcuts::dial_address(
-                    &self.project,
-                    l,
-                    Some((deck, c)),
-                    active_of(&self.players, &self.gens, l),
-                    i,
-                ),
+                DialOwner::Clip(deck, l, c) => {
+                    let (t, active) = self.addressed(EffectTarget::Clip {
+                        deck,
+                        layer: l,
+                        column: c,
+                    });
+                    let at = match t {
+                        EffectTarget::Clip { layer, .. } => layer,
+                        _ => l,
+                    };
+                    vjc_core::shortcuts::dial_address(&self.project, at, Some((deck, c)), active, i)
+                }
             };
             if let Some(a) = addr {
                 self.targets.push((r.response.rect, a));
@@ -8030,10 +8462,7 @@ impl State {
             let c = &self.project.composition;
             (f64::from(c.width), f64::from(c.height))
         };
-        let active = match target {
-            EffectTarget::Clip { layer, .. } => active_of(&self.players, &self.gens, layer),
-            _ => None,
-        };
+        let (addr_target, active) = self.addressed(target);
         for field in TransformField::ALL {
             let prm = tf.field(field);
             let Value::Number(default) = prm.default else {
@@ -8068,7 +8497,7 @@ impl State {
                 });
             }
             if let Some(a) =
-                vjc_core::shortcuts::transform_address(&self.project, target, field, active)
+                vjc_core::shortcuts::transform_address(&self.project, addr_target, field, active)
             {
                 self.targets.push((r.response.rect, a));
             }
@@ -8117,10 +8546,7 @@ impl State {
 
     /// Registers an effect control as a mappable (learn) target.
     fn fx_target(&mut self, rect: egui::Rect, target: EffectTarget, k: usize, tail: &str) {
-        let active = match target {
-            EffectTarget::Clip { layer, .. } => active_of(&self.players, &self.gens, layer),
-            _ => None,
-        };
+        let (target, active) = self.addressed(target);
         if let Some(a) = vjc_core::shortcuts::effect_address(&self.project, target, k, tail, active)
         {
             self.targets.push((rect, a));
@@ -8976,6 +9402,7 @@ mod tests {
             blend_override: None,
             transition: None,
             trigger_style: Default::default(),
+            target: Default::default(),
             beat_snap: None,
             fit: Default::default(),
             channels: Default::default(),

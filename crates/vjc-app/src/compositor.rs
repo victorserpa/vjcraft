@@ -451,6 +451,8 @@ struct Fx {
     ml: MlStore,
     /// Previous output of each persistent effect instance.
     persist: PersistStore<(wgpu::Texture, wgpu::TextureView)>,
+    /// Last tick each ticking persistent instance was drawn at (see `vjc_fx::tick_flag`).
+    ticks: HashMap<uuid::Uuid, i64>,
     /// Mixed into the persist key: 0 for the composition, one value per routed output, so
     /// an effect drawn in several outputs in one frame keeps one history for each.
     persist_scope: u128,
@@ -676,20 +678,37 @@ impl Fx {
             }
             let buf = &self.bufs[self.next];
             self.next += 1;
-            queue.write_buffer(buf, 0, bytemuck::cast_slice(&e.uniforms));
+            // Persistent effect: its previous output is bound as PREV_PIXEL, and this
+            // frame's result is copied back after the pass.
+            let hist = e.persistent.map(|id| {
+                let key = uuid::Uuid::from_u128(id.as_u128() ^ self.persist_scope);
+                let (tex, how) = self
+                    .persist
+                    .acquire(key, size, || make_history(device, size));
+                (key, tex, how)
+            });
+            let mut uniforms = e.uniforms;
+            // A ticking effect (freeze) learns per instance whether this draw starts a new
+            // tick: slot 0 carries its rate in, and the flag goes out in its place.
+            if let Some((key, _, how)) = &hist
+                && uniforms[0][3] > 0.0
+            {
+                let last = (*how == crate::persist::Acquired::Kept)
+                    .then(|| self.ticks.get(key).copied())
+                    .flatten();
+                let (flag, tick) = vjc_fx::tick_flag(uniforms[0][0], uniforms[0][3], last);
+                uniforms[0][3] = flag;
+                self.ticks.insert(*key, tick);
+            } else {
+                uniforms[0][3] = 0.0;
+            }
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(&uniforms));
             let out = (0..3).find(|&i| Some(i) != cur).unwrap_or(0);
             let src = match cur {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
-            // Persistent effect: its previous output is bound as PREV_PIXEL, and this
-            // frame's result is copied back after the pass.
-            let hist = e.persistent.map(|id| {
-                let key = uuid::Uuid::from_u128(id.as_u128() ^ self.persist_scope);
-                self.persist
-                    .acquire(key, size, || make_history(device, size))
-                    .0
-            });
+            let hist = hist.map(|h| h.1);
             draw_pass(
                 device,
                 enc,
@@ -1271,6 +1290,7 @@ impl Compositor {
             mix_bufs: vec![],
             mix_next: 0,
             persist: PersistStore::default(),
+            ticks: HashMap::new(),
             persist_scope: 0,
         };
         let (target, target_view) = make_target(device, w, h);
@@ -2046,6 +2066,8 @@ impl Compositor {
         }
         self.fx.scratch.sweep();
         self.fx.persist.sweep();
+        let persist = &self.fx.persist;
+        self.fx.ticks.retain(|k, _| persist.contains(k));
         queue.submit(Some(enc.finish()));
         self.fx.ml.dispatch(device, queue);
     }
@@ -3586,6 +3608,85 @@ mod tests {
             px_at(&img, 14, 1)[..3],
             [0, 0, 0],
             "right of the moved edge is empty"
+        );
+    }
+
+    /// Freeze keeps its frame inside a tick and while held; a new tick without hold grabs
+    /// the new one, however many ticks TIME skipped (an even jump left the old parity
+    /// check blind). Each case has its control. The kept alpha is the input's own.
+    #[test]
+    fn gpu_freeze_grabs_on_any_tick_change_and_keeps_alpha() {
+        use vjc_model::Value::{Bool, Number};
+        let Some((device, queue)) = gpu() else { return };
+        let (white, black) = ([255u8; 4].repeat(256), [0, 0, 0, 255].repeat(256));
+        let half = [10u8, 20, 30, 128].repeat(256);
+        let id = Some(uuid::Uuid::from_u128(5));
+        let fps = ("fps", Number(1.0));
+        let run =
+            |comp: &mut Compositor, set: &[(&str, vjc_model::Value)], t: f32, d: &[u8], s: u64| {
+                px_at(
+                    &run_fx(&device, &queue, comp, "freeze", set, t, id, d, s),
+                    4,
+                    4,
+                )
+            };
+        let mut comp = fx_comp(&device, "freeze");
+        // First draw grabs.
+        assert_eq!(
+            run(&mut comp, std::slice::from_ref(&fps), 0.1, &white, 1)[0],
+            255
+        );
+        // Same tick: the black frame is not grabbed (control for the jumps below).
+        assert_eq!(
+            run(&mut comp, std::slice::from_ref(&fps), 0.8, &black, 2)[0],
+            255
+        );
+        // TIME jumped two ticks (0 -> 2): same parity, still a new tick.
+        assert_eq!(
+            run(&mut comp, std::slice::from_ref(&fps), 2.3, &black, 3)[0],
+            0
+        );
+        // One tick on: grabs white again.
+        assert_eq!(
+            run(&mut comp, std::slice::from_ref(&fps), 3.1, &white, 4)[0],
+            255
+        );
+        // Hold: later ticks keep the white frame.
+        let hold = [fps.clone(), ("hold", Bool(true))];
+        assert_eq!(run(&mut comp, &hold, 6.5, &black, 5)[0], 255);
+        // Released: a new tick grabs again.
+        assert_eq!(
+            run(&mut comp, std::slice::from_ref(&fps), 9.2, &black, 6)[0],
+            0
+        );
+        // The kept frame carries the input's alpha, not a marker.
+        let mut comp = fx_comp(&device, "freeze");
+        let id2 = Some(uuid::Uuid::from_u128(6));
+        let a = |comp: &mut Compositor, t: f32, d: &[u8], s: u64| {
+            px_at(
+                &run_fx(
+                    &device,
+                    &queue,
+                    comp,
+                    "freeze",
+                    std::slice::from_ref(&fps),
+                    t,
+                    id2,
+                    d,
+                    s,
+                ),
+                4,
+                4,
+            )
+        };
+        let first = a(&mut comp, 0.1, &half, 1);
+        let kept = a(&mut comp, 0.5, &white, 2);
+        assert_eq!(kept, first, "same tick keeps the frame as it was");
+        // Over the opaque backdrop, half alpha halves the colour (10 -> 5); an alpha
+        // overwritten by a marker would leave it at 10.
+        assert!(
+            kept[0].abs_diff(5) <= 1 && kept[2].abs_diff(15) <= 1,
+            "{kept:?}"
         );
     }
 

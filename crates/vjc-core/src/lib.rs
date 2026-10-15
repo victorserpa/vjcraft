@@ -89,6 +89,15 @@ pub enum Command {
         layer: LayerId,
         column: ColumnIdx,
     },
+    /// Plays the clip of cell (`layer`, `column`) on layer `onto` (clip target Active or
+    /// Free). The event keeps `onto` as the layer; the app remembers where the clip
+    /// lives. Runtime only: not undoable.
+    TriggerClipOn {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        onto: LayerId,
+    },
     /// Stops the layer. Runtime only: not undoable.
     ClearLayer {
         layer: LayerId,
@@ -492,6 +501,17 @@ pub enum Command {
         layer: LayerId,
         column: ColumnIdx,
         snap: Option<vjc_model::BeatSnap>,
+    },
+    /// Clip target of the composition. Undoable.
+    SetCompClipTarget {
+        target: vjc_model::ClipTarget,
+    },
+    /// Clip target override of one clip (`Composition` = follow). Undoable.
+    SetClipTarget {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        target: vjc_model::ClipTarget,
     },
     /// Column triggers skip this layer. Undoable.
     SetLayerIgnoreColumn {
@@ -1258,6 +1278,7 @@ pub fn clip_from_path(path: PathBuf) -> Clip {
         blend_override: None,
         transition: None,
         trigger_style: Default::default(),
+        target: Default::default(),
         beat_snap: None,
         channels: Default::default(),
         fit: FitMode::default(),
@@ -1432,11 +1453,82 @@ fn trigger_event(
     }
 }
 
+/// Same event, aimed at another layer.
+fn with_layer(ev: Event, to: LayerId) -> Event {
+    match ev {
+        Event::ClipStarted {
+            deck, column, path, ..
+        } => Event::ClipStarted {
+            deck,
+            layer: to,
+            column,
+            path,
+        },
+        Event::CaptureStarted {
+            deck,
+            column,
+            device,
+            ..
+        } => Event::CaptureStarted {
+            deck,
+            layer: to,
+            column,
+            device,
+        },
+        Event::NetworkStarted {
+            deck,
+            column,
+            protocol,
+            name,
+            ..
+        } => Event::NetworkStarted {
+            deck,
+            layer: to,
+            column,
+            protocol,
+            name,
+        },
+        Event::GeneratorStarted { deck, column, .. } => Event::GeneratorStarted {
+            deck,
+            layer: to,
+            column,
+        },
+        other => other,
+    }
+}
+
 /// What is live right now: runtime state the pure project does not hold.
 #[derive(Debug, Clone, Default)]
 pub struct TriggerCtx {
-    /// Clips in the air: (layer, deck, column).
-    pub playing: Vec<(LayerId, DeckId, ColumnIdx)>,
+    /// The selected layer (target "Active layer").
+    pub selected: Option<LayerId>,
+    /// Layers with a clip in the air: (layer it plays on, deck, layer the clip lives in,
+    /// column). The two layers differ when the clip was redirected.
+    pub playing: Vec<(LayerId, DeckId, LayerId, ColumnIdx)>,
+}
+
+/// The layer a clip of `own` plays on under target `style`.
+pub fn resolve_target(
+    p: &Project,
+    ctx: &TriggerCtx,
+    own: LayerId,
+    style: vjc_model::ClipTarget,
+) -> LayerId {
+    let layers = &p.composition.layers;
+    match style {
+        vjc_model::ClipTarget::Active => ctx
+            .selected
+            .filter(|s| layers.iter().any(|l| l.id == *s))
+            .unwrap_or(own),
+        // Layers are ordered top to bottom: the first empty one from the bottom.
+        vjc_model::ClipTarget::Free => layers
+            .iter()
+            .rev()
+            .map(|l| l.id)
+            .find(|id| !ctx.playing.iter().any(|x| x.0 == *id))
+            .unwrap_or(own),
+        _ => own,
+    }
 }
 
 /// Effective trigger style of the clip in a cell (Normal when the cell is empty).
@@ -1472,6 +1564,12 @@ pub fn effective_beat_snap(
             deck,
             layer,
             column,
+        }
+        | Command::TriggerClipOn {
+            deck,
+            layer,
+            column,
+            ..
         } => vjc_model::BeatSnap::effective(
             clip_in(p, deck, layer, column).and_then(|k| k.beat_snap),
             col(column),
@@ -1484,21 +1582,65 @@ pub fn effective_beat_snap(
     }
 }
 
-/// Turns a user's `TriggerClip` on a Toggle clip that is already playing into an eject of
-/// its layer. Everything else passes through. The eject is immediate: it does not wait
-/// for the beat snap (only the triggers that start a clip do).
+/// Turns a user's `TriggerClip` into what must really run: an eject (toggle on the clip
+/// that is playing), a redirect to the target layer, or the command unchanged. Other
+/// commands pass through. The eject is immediate: it does not wait for the beat snap.
 pub fn resolve_trigger(p: &Project, ctx: &TriggerCtx, cmd: Command) -> Command {
-    if let Command::TriggerClip {
+    let Command::TriggerClip {
         deck,
         layer,
         column,
     } = cmd
-        && trigger_style_of(p, deck, layer, column) == vjc_model::TriggerStyle::Toggle
-        && ctx.playing.contains(&(layer, deck, column))
+    else {
+        return cmd;
+    };
+    let Some(k) = clip_in(p, deck, layer, column) else {
+        return cmd;
+    };
+    if trigger_style_of(p, deck, layer, column) == vjc_model::TriggerStyle::Toggle
+        && let Some(x) = ctx
+            .playing
+            .iter()
+            .find(|x| x.1 == deck && x.2 == layer && x.3 == column)
     {
-        return Command::ClearLayer { layer };
+        return Command::ClearLayer { layer: x.0 };
     }
-    cmd
+    let onto = resolve_target(p, ctx, layer, k.target.resolve(p.composition.clip_target));
+    if onto == layer {
+        cmd
+    } else {
+        Command::TriggerClipOn {
+            deck,
+            layer,
+            column,
+            onto,
+        }
+    }
+}
+
+/// A Hold clip the button or key put in the air.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoldFired {
+    pub deck: DeckId,
+    /// Layer of the cell the clip lives in.
+    pub layer: LayerId,
+    pub column: ColumnIdx,
+    pub clip: vjc_model::ClipId,
+    /// Layer it plays on.
+    pub onto: LayerId,
+}
+
+/// The eject that ends a Hold on release: only while the clip the Hold fired is still the
+/// one in the air (same origin cell, same clip id). Anything else that took the layer
+/// since is left alone.
+pub fn hold_release(
+    p: &Project,
+    playing: &[(LayerId, DeckId, LayerId, ColumnIdx)],
+    h: &HoldFired,
+) -> Option<Command> {
+    let same_air = playing.contains(&(h.onto, h.deck, h.layer, h.column));
+    let same_clip = clip_in(p, h.deck, h.layer, h.column).is_some_and(|k| k.id == h.clip);
+    (same_air && same_clip).then_some(Command::ClearLayer { layer: h.onto })
 }
 
 fn clip_mut(
@@ -1607,6 +1749,7 @@ fn touched_layers(cmd: &Command, out: &mut Vec<LayerId>) {
             }
             out.push(to.0);
         }
+        Command::TriggerClipOn { layer, onto, .. } => out.extend([*layer, *onto]),
         Command::Batch { commands } => commands.iter().for_each(|c| touched_layers(c, out)),
         _ => {}
     }
@@ -1740,6 +1883,20 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             Ok(Applied {
                 inverse: None,
                 events: vec![ev],
+            })
+        }
+        Command::TriggerClipOn {
+            deck,
+            layer,
+            column,
+            onto,
+        } => {
+            check_cell(p, layer, column)?;
+            layer_idx(p, onto)?;
+            let ev = trigger_event(p, deck, layer, column)?;
+            Ok(Applied {
+                inverse: None,
+                events: vec![with_layer(ev, onto)],
             })
         }
         Command::TriggerColumn { deck, column } => trigger_column(p, deck, column),
@@ -2830,6 +2987,28 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         Command::SetCompTriggerStyle { style } => {
             let prev = std::mem::replace(&mut p.composition.trigger_style, style);
             undoable(Command::SetCompTriggerStyle { style: prev }, vec![])
+        }
+        Command::SetCompClipTarget { target } => {
+            let prev = std::mem::replace(&mut p.composition.clip_target, target);
+            undoable(Command::SetCompClipTarget { target: prev }, vec![])
+        }
+        Command::SetClipTarget {
+            deck,
+            layer,
+            column,
+            target,
+        } => {
+            let k = clip_mut(p, deck, layer, column)?;
+            let prev = std::mem::replace(&mut k.target, target);
+            undoable(
+                Command::SetClipTarget {
+                    deck,
+                    layer,
+                    column,
+                    target: prev,
+                },
+                vec![],
+            )
         }
         Command::SetLayerIgnoreColumn { layer, ignore } => {
             let i = layer_idx(p, layer)?;
@@ -7831,7 +8010,7 @@ mod tests {
         let mut ctx = TriggerCtx::default();
         // Nothing playing: the first trigger plays.
         assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), trig(l1));
-        ctx.playing.push((l1, A, 0));
+        ctx.playing.push((l1, A, l1, 0));
         assert_eq!(
             resolve_trigger(&p, &ctx, trig(l1)),
             Command::ClearLayer { layer: l1 }
@@ -7839,6 +8018,94 @@ mod tests {
         // Control: a Normal clip (own override beats the composition) plays again.
         p.composition.decks[0].clips[0].clip.trigger_style = vjc_model::TriggerStyle::Normal;
         assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), trig(l1));
+    }
+
+    #[test]
+    fn clip_target_own_active_and_free() {
+        let (mut p, [l1, l2, l3]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        let on = |l: LayerId| Command::TriggerClipOn {
+            deck: A,
+            layer: l1,
+            column: 0,
+            onto: l,
+        };
+        let mut ctx = TriggerCtx {
+            selected: Some(l2),
+            ..Default::default()
+        };
+        // Own (the default): the command is untouched, whatever is selected.
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), trig(l1));
+        // Active: plays on the selected layer.
+        p.composition.clip_target = vjc_model::ClipTarget::Active;
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), on(l2));
+        // Control: nothing selected falls back to the clip's own layer.
+        ctx.selected = None;
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), trig(l1));
+        // Free: the lowest layer with nothing in the air.
+        p.composition.clip_target = vjc_model::ClipTarget::Free;
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), on(l3));
+        ctx.playing.push((l3, A, l3, 7));
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), on(l2));
+        // Control: the clip's own override beats the composition.
+        p.composition.decks[0].clips[0].clip.target = vjc_model::ClipTarget::Own;
+        assert_eq!(resolve_trigger(&p, &ctx, trig(l1)), trig(l1));
+    }
+
+    #[test]
+    fn trigger_on_aims_the_event_at_the_target_layer() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        let ev = apply(
+            &mut p,
+            Command::TriggerClipOn {
+                deck: A,
+                layer: l1,
+                column: 0,
+                onto: l2,
+            },
+        )
+        .unwrap()
+        .events;
+        assert!(
+            matches!(ev.as_slice(), [Event::GeneratorStarted { layer, column: 0, .. }] if *layer == l2)
+        );
+        // Control: a plain trigger stays on its own layer.
+        let ev = apply(&mut p, trig(l1)).unwrap().events;
+        assert!(matches!(ev.as_slice(), [Event::GeneratorStarted { layer, .. }] if *layer == l1));
+    }
+
+    #[test]
+    fn hold_release_ejects_only_the_clip_it_played() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        gen_cell(&mut p, l2, 0);
+        let clip = clip_in(&p, A, l1, 0).unwrap().id;
+        let h = HoldFired {
+            deck: A,
+            layer: l1,
+            column: 0,
+            clip,
+            onto: l2,
+        };
+        // The clip it played is in the air on the target layer: eject that layer.
+        assert_eq!(
+            hold_release(&p, &[(l2, A, l1, 0)], &h),
+            Some(Command::ClearLayer { layer: l2 })
+        );
+        // Another clip took the layer since: left alone.
+        assert_eq!(hold_release(&p, &[(l2, A, l2, 0)], &h), None);
+        // Nothing in the air (it was ejected by someone else): nothing to do.
+        assert_eq!(hold_release(&p, &[], &h), None);
+        // The cell now holds a different clip (same place, new content): left alone.
+        p.composition.decks[0]
+            .clips
+            .iter_mut()
+            .find(|k| k.layer == l1 && k.column == 0)
+            .unwrap()
+            .clip
+            .id = uuid::Uuid::new_v4();
+        assert_eq!(hold_release(&p, &[(l2, A, l1, 0)], &h), None);
     }
 
     #[test]
