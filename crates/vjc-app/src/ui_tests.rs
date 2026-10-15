@@ -1712,7 +1712,7 @@ fn property_sections_collapse() {
     // Tall bottom area so the Dashboard header is on screen and clickable.
     let mut h = app_sized(1400.0, 1500.0);
     h.state_mut().apply_layout(Layout {
-        params_h: 1000.0,
+        params_h: 1200.0,
         ..Layout::default()
     });
     settle(&mut h);

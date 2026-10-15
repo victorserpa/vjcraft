@@ -661,6 +661,9 @@ pub struct Track {
     pub opacity: Param,
     pub blend: BlendMode,
     pub effects: Vec<Effect>,
+    /// Audio effects (`vjc-media` `audio_fx` kinds), in processing order. Old files: none.
+    #[serde(default)]
+    pub audio_effects: Vec<Effect>,
     pub volume: Param,
     pub pan: Param,
     /// Reframing of the picture; projects saved before it existed open with identity.
@@ -1571,6 +1574,7 @@ impl Track {
             opacity: Param::number("Opacity", 1.0, Some((0.0, 1.0))),
             blend,
             effects: vec![],
+            audio_effects: vec![],
             volume: Param::number("Volume", 1.0, Some((0.0, 1.0))),
             pan: Param::number("Pan", 0.0, Some((-1.0, 1.0))),
             transform: Transform::default(),

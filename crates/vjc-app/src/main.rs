@@ -2,6 +2,7 @@ mod api_io;
 mod artnet_out;
 mod artnet_reduce;
 mod artnet_scan;
+mod audio_fx_ui;
 mod audio_react;
 mod autopilot_ui;
 mod browser;
@@ -3614,6 +3615,7 @@ impl State {
                 o.player.set_audio(vol * fade, pan, fade > 0.0);
             }
         }
+        self.sync_audio_fx();
         for (layer, (deck, col, player)) in &self.players {
             let Some(clip) = clip_for(&self.project, &self.origin, *layer, *deck, *col) else {
                 continue;
@@ -4053,7 +4055,7 @@ impl State {
                 .find(|x| x.id == l)
                 .map(|l| vjc_core::anim::dial_values(&l.track.dials))
         };
-        let (layer_dials, clip_dials) = match owner {
+        let (layer_dials, clip_dials) = match owner.map(EffectTarget::base) {
             Some(EffectTarget::Layer(l)) => (layer_of(l), None),
             Some(EffectTarget::Clip {
                 deck,
@@ -7601,6 +7603,7 @@ impl State {
         }
         if params::section(ui, "sec-comp-audio", "Master audio") {
             self.audio_rows(ui, AudioTarget::Master, &c.master, cmds);
+            self.audio_chain_ui(ui, EffectTarget::MasterAudio, cmds);
         }
         if params::section(ui, "sec-transform", "Transform") {
             self.transform_rows(ui, EffectTarget::Master, cmds);
@@ -7902,6 +7905,7 @@ impl State {
         }
         if params::section(ui, "sec-layer-audio", "Audio") {
             self.audio_rows(ui, AudioTarget::Layer(lid), &l.track, cmds);
+            self.audio_chain_ui(ui, EffectTarget::LayerAudio(lid), cmds);
         }
         if params::section(ui, "sec-layer-transform", "Transform") {
             self.transform_rows(ui, EffectTarget::Layer(lid), cmds);
@@ -8513,6 +8517,15 @@ impl State {
         }
         if params::section(ui, "sec-clip-audio", "Audio") {
             self.audio_rows(ui, AudioTarget::Clip(deck, layer, column), &k.track, cmds);
+            self.audio_chain_ui(
+                ui,
+                EffectTarget::ClipAudio {
+                    deck,
+                    layer,
+                    column,
+                },
+                cmds,
+            );
         }
         if params::section(ui, "sec-clip-effects", "Effects") {
             self.chain_ui(

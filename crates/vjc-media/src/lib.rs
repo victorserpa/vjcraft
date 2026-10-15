@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 pub mod analysis;
 pub mod audio;
+pub mod audio_fx;
 pub mod capture;
 pub mod ltc_in;
 pub mod sequence;
@@ -231,6 +232,15 @@ impl Player {
     pub fn set_audio(&self, volume: f32, pan: f32, audible: bool) {
         if let Some(a) = &self.audio {
             a.voice.set(volume, pan, audible);
+        }
+    }
+
+    /// Per-frame audio effects: the clip's chain and the layer bus (1-based, 0 = none) it
+    /// sums into.
+    pub fn set_audio_fx(&self, bus: u32, specs: &[audio_fx::FxSpec], rate: u32, bpm: f32) {
+        if let Some(a) = &self.audio {
+            a.voice.set_bus(bus);
+            a.voice.fx.set(specs, rate, bpm);
         }
     }
 

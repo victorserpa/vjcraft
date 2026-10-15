@@ -1104,8 +1104,7 @@ fn anim_param_mut(p: &mut Project, t: AnimTarget) -> Result<&mut Param, Error> {
             target,
             effect,
             param,
-        } => effects::track_mut(p, target)?
-            .effects
+        } => effects::fx_mut(p, target)?
             .iter_mut()
             .find(|e| e.id == effect)
             .ok_or(Error::NoEffect)?
@@ -5774,6 +5773,109 @@ mod tests {
             bypass: false,
             dry_wet: 1.0,
             params: vec![vjc_model::Param::number("amount", 1.0, Some((0.0, 1.0)))],
+        }
+    }
+
+    #[test]
+    fn audio_chains_are_separate_ordered_undoable_and_persist() {
+        fn strip(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.remove("audio_effects");
+                    m.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let (mut p, l) = setup();
+        for t in targets(&mut p, l) {
+            let at = match t {
+                EffectTarget::Master => EffectTarget::MasterAudio,
+                EffectTarget::Layer(l) => EffectTarget::LayerAudio(l),
+                EffectTarget::Clip {
+                    deck,
+                    layer,
+                    column,
+                } => EffectTarget::ClipAudio {
+                    deck,
+                    layer,
+                    column,
+                },
+                _ => unreachable!(),
+            };
+            let (a, b) = (fx("audio.gain"), fx("audio.delay"));
+            let (ia, ib) = (a.id, b.id);
+            let mut h = History::new();
+            let now = Instant::now();
+            for (e, index) in [(a, 0), (b, 0)] {
+                h.exec(
+                    &mut p,
+                    Command::AddEffect {
+                        target: at,
+                        effect: e,
+                        index,
+                    },
+                    now,
+                )
+                .unwrap();
+            }
+            let order = |p: &Project| -> Vec<EffectId> {
+                effects::chain(p, at)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.id)
+                    .collect()
+            };
+            assert_eq!(order(&p), [ib, ia]);
+            assert!(
+                effects::chain(&p, t).unwrap().is_empty(),
+                "video chain untouched"
+            );
+            h.exec(
+                &mut p,
+                Command::MoveEffect {
+                    target: at,
+                    effect: ib,
+                    index: 1,
+                },
+                now,
+            )
+            .unwrap();
+            assert_eq!(order(&p), [ia, ib]);
+            h.exec(
+                &mut p,
+                Command::SetEffectParam {
+                    target: at,
+                    effect: ia,
+                    param: 0,
+                    value: Value::Number(0.25),
+                },
+                now,
+            )
+            .unwrap();
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(serde_json::from_str::<Project>(&json).unwrap(), p);
+            let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+            strip(&mut old);
+            let old: Project = serde_json::from_value(old).unwrap();
+            assert!(old.composition.master.audio_effects.is_empty());
+            h.exec(
+                &mut p,
+                Command::RemoveEffect {
+                    target: at,
+                    effect: ia,
+                },
+                now,
+            )
+            .unwrap();
+            assert_eq!(order(&p), [ib]);
+            h.undo(&mut p).unwrap().unwrap();
+            assert_eq!(order(&p), [ia, ib]);
+            for _ in 0..4 {
+                h.undo(&mut p).unwrap().unwrap();
+            }
+            assert!(effects::chain(&p, at).unwrap().is_empty());
         }
     }
 

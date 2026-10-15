@@ -16,10 +16,60 @@ pub enum EffectTarget {
     /// Chain run over the composed result of a layer group.
     Group(GroupId),
     Master,
+    /// Audio chain of a clip (processed on the audio thread, not drawn).
+    ClipAudio {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+    },
+    /// Audio chain of a layer: its clips summed.
+    LayerAudio(LayerId),
+    /// Audio chain of the master output.
+    MasterAudio,
+}
+
+impl EffectTarget {
+    /// True for the audio chains.
+    pub fn is_audio(self) -> bool {
+        matches!(
+            self,
+            EffectTarget::ClipAudio { .. }
+                | EffectTarget::LayerAudio(_)
+                | EffectTarget::MasterAudio
+        )
+    }
+
+    /// The track that owns the chain (the video target of an audio one).
+    pub fn base(self) -> EffectTarget {
+        match self {
+            EffectTarget::ClipAudio {
+                deck,
+                layer,
+                column,
+            } => EffectTarget::Clip {
+                deck,
+                layer,
+                column,
+            },
+            EffectTarget::LayerAudio(l) => EffectTarget::Layer(l),
+            EffectTarget::MasterAudio => EffectTarget::Master,
+            t => t,
+        }
+    }
+}
+
+/// The effect list a command edits: video effects, or the audio ones of audio targets.
+pub fn fx_mut(p: &mut Project, t: EffectTarget) -> Result<&mut Vec<Effect>, Error> {
+    let tr = track_mut(p, t.base())?;
+    Ok(if t.is_audio() {
+        &mut tr.audio_effects
+    } else {
+        &mut tr.effects
+    })
 }
 
 pub fn track_mut(p: &mut Project, t: EffectTarget) -> Result<&mut Track, Error> {
-    match t {
+    match t.base() {
         EffectTarget::Master => Ok(&mut p.composition.master),
         EffectTarget::Group(g) => {
             let i = crate::groups::group_idx(p, g)?;
@@ -42,12 +92,13 @@ pub fn track_mut(p: &mut Project, t: EffectTarget) -> Result<&mut Track, Error> 
                 .map(|k| &mut k.clip.track)
                 .ok_or(Error::NoClip)
         }
+        _ => Err(Error::InvalidValue),
     }
 }
 
 /// The track of a target, read-only (None if the target does not exist).
 pub fn track(p: &Project, t: EffectTarget) -> Option<&Track> {
-    match t {
+    match t.base() {
         EffectTarget::Master => Some(&p.composition.master),
         EffectTarget::Group(g) => p.composition.group(g).map(|x| &x.track),
         EffectTarget::Layer(l) => p
@@ -61,31 +112,19 @@ pub fn track(p: &Project, t: EffectTarget) -> Option<&Track> {
             layer,
             column,
         } => crate::clip_in(p, deck, layer, column).map(|c| &c.track),
+        _ => None,
     }
 }
 
 /// The chain of a target, read-only (None if the target does not exist).
 pub fn chain(p: &Project, t: EffectTarget) -> Option<&[Effect]> {
-    match t {
-        EffectTarget::Master => Some(&p.composition.master.effects),
-        EffectTarget::Group(g) => p
-            .composition
-            .groups
-            .iter()
-            .find(|x| x.id == g)
-            .map(|x| x.track.effects.as_slice()),
-        EffectTarget::Layer(l) => p
-            .composition
-            .layers
-            .iter()
-            .find(|x| x.id == l)
-            .map(|x| x.track.effects.as_slice()),
-        EffectTarget::Clip {
-            deck,
-            layer,
-            column,
-        } => crate::clip_in(p, deck, layer, column).map(|c| c.track.effects.as_slice()),
-    }
+    track(p, t).map(|x| {
+        if t.is_audio() {
+            x.audio_effects.as_slice()
+        } else {
+            x.effects.as_slice()
+        }
+    })
 }
 
 /// Longest string a text parameter keeps (bad data guard; the shader reads fewer).
@@ -102,7 +141,7 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             effect,
             index,
         } => {
-            let fx = &mut track_mut(p, target)?.effects;
+            let fx = fx_mut(p, target)?;
             if fx.iter().any(|e| e.id == effect.id) {
                 return Err(Error::InvalidValue);
             }
@@ -111,7 +150,7 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             undoable(Command::RemoveEffect { target, effect: id }, vec![])
         }
         Command::RemoveEffect { target, effect } => {
-            let fx = &mut track_mut(p, target)?.effects;
+            let fx = fx_mut(p, target)?;
             let i = pos(fx, effect)?;
             let removed = fx.remove(i);
             undoable(
@@ -128,7 +167,7 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             effect,
             index,
         } => {
-            let fx = &mut track_mut(p, target)?.effects;
+            let fx = fx_mut(p, target)?;
             let i = pos(fx, effect)?;
             let e = fx.remove(i);
             fx.insert(index.min(fx.len()), e);
@@ -146,7 +185,7 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             effect,
             bypass,
         } => {
-            let fx = &mut track_mut(p, target)?.effects;
+            let fx = fx_mut(p, target)?;
             let i = pos(fx, effect)?;
             let prev = std::mem::replace(&mut fx[i].bypass, bypass);
             undoable(
@@ -166,7 +205,7 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             if !dry_wet.is_finite() {
                 return Err(Error::InvalidValue);
             }
-            let fx = &mut track_mut(p, target)?.effects;
+            let fx = fx_mut(p, target)?;
             let i = pos(fx, effect)?;
             let prev = std::mem::replace(&mut fx[i].dry_wet, dry_wet.clamp(0.0, 1.0));
             undoable(
@@ -184,7 +223,7 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             param,
             value,
         } => {
-            let fx = &mut track_mut(p, target)?.effects;
+            let fx = fx_mut(p, target)?;
             let i = pos(fx, effect)?;
             let prm = fx[i].params.get_mut(param).ok_or(Error::InvalidValue)?;
             if std::mem::discriminant(&prm.value) != std::mem::discriminant(&value) {
@@ -228,7 +267,7 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             effect,
             params,
         } => {
-            let fx = &mut track_mut(p, target)?.effects;
+            let fx = fx_mut(p, target)?;
             let i = pos(fx, effect)?;
             let prev = fx[i].params.clone();
             for new in params {

@@ -78,6 +78,10 @@ pub fn effect_address(
             column,
         } => (active == Some((deck, column)))
             .then(|| layer_address(p, layer, &format!("clip/effect/{}/{tail}", k + 1)))?,
+        // Audio chains have no OSC/MIDI address yet (their params map through animations).
+        EffectTarget::ClipAudio { .. }
+        | EffectTarget::LayerAudio(_)
+        | EffectTarget::MasterAudio => None,
     }
 }
 
@@ -94,7 +98,10 @@ pub fn transform_address(
     match target {
         EffectTarget::Master => Some(format!("/comp/{tail}")),
         EffectTarget::Layer(l) => layer_address(p, l, &tail),
-        EffectTarget::Group(_) => None,
+        EffectTarget::Group(_)
+        | EffectTarget::ClipAudio { .. }
+        | EffectTarget::LayerAudio(_)
+        | EffectTarget::MasterAudio => None,
         EffectTarget::Clip {
             deck,
             layer,

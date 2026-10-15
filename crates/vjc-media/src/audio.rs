@@ -11,6 +11,7 @@
 //! re-seeks to the playhead once it is audible again. No pitch-shifting or time-stretching.
 
 use crate::Shared;
+use crate::audio_fx::{Buses, FxChain, MAX_BUSES};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_next as ff;
 use std::path::Path;
@@ -106,6 +107,10 @@ pub struct Voice {
     volume: AtomicU32,
     pan: AtomicU32,
     audible: AtomicBool,
+    /// Layer bus the voice sums into before the bus chain (0 = straight to the master).
+    bus: AtomicU32,
+    /// Effects of the clip, run on this voice alone.
+    pub fx: FxChain,
     flush: AtomicBool,
     /// Whether the voice goes into the recording tap (the metronome click does not).
     recorded: AtomicBool,
@@ -118,6 +123,8 @@ impl Voice {
             volume: AtomicU32::new(1.0f32.to_bits()),
             pan: AtomicU32::new(0.0f32.to_bits()),
             audible: AtomicBool::new(false),
+            bus: AtomicU32::new(0),
+            fx: FxChain::new(1),
             flush: AtomicBool::new(false),
             recorded: AtomicBool::new(true),
         }
@@ -133,6 +140,11 @@ impl Voice {
         self.volume.store(volume.to_bits(), Ordering::Relaxed);
         self.pan.store(pan.to_bits(), Ordering::Relaxed);
         self.audible.store(audible, Ordering::Relaxed);
+    }
+
+    /// Routes the voice through layer bus `bus` (1-based, 0 = none).
+    pub fn set_bus(&self, bus: u32) {
+        self.bus.store(bus, Ordering::Relaxed);
     }
 
     fn audible(&self) -> bool {
@@ -177,23 +189,48 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
     (1.0 - p.max(0.0), 1.0 + p.min(0.0))
 }
 
+/// Scratch and routing of one mix pass: preallocated so the callback never allocates.
+pub struct MixFx {
+    buses: Arc<Buses>,
+    rate: u32,
+    voice_buf: Vec<f32>,
+    bus_buf: Vec<Vec<f32>>,
+}
+
+impl MixFx {
+    /// Buffers for blocks of up to `samples` interleaved samples.
+    pub fn new(buses: Arc<Buses>, rate: u32, samples: usize) -> MixFx {
+        MixFx {
+            buses,
+            rate,
+            voice_buf: vec![0.0; samples],
+            bus_buf: vec![vec![0.0; samples]; MAX_BUSES],
+        }
+    }
+}
+
 /// Mixes every voice into `out` (interleaved stereo, overwritten) and clamps to [-1, 1].
-/// Allocation-free; safe for the audio callback.
+/// Helper for tests and offline use: it allocates its scratch. The callback uses `mix_fx`.
 pub fn mix_stereo(out: &mut [f32], voices: &[Arc<Voice>]) {
-    mix_voices(out, None, voices);
+    let mut fx = MixFx::new(Arc::new(Buses::new()), 48_000, out.len());
+    mix_voices(out, None, voices, &mut fx);
 }
 
 /// Like `mix_stereo`, and also writes into `tap` (same length) the mix of the voices that
 /// are recorded: what the master recording hears, without the metronome.
 pub fn mix_stereo_tap(out: &mut [f32], tap: &mut [f32], voices: &[Arc<Voice>]) {
-    mix_voices(out, Some(tap), voices);
+    let mut fx = MixFx::new(Arc::new(Buses::new()), 48_000, out.len());
+    mix_voices(out, Some(tap), voices, &mut fx);
 }
 
-fn mix_voices(out: &mut [f32], mut tap: Option<&mut [f32]>, voices: &[Arc<Voice>]) {
+/// Voice -> clip chain -> layer bus chain -> master chain. Allocation-free.
+fn mix_voices(out: &mut [f32], mut tap: Option<&mut [f32]>, voices: &[Arc<Voice>], fx: &mut MixFx) {
+    let len = out.len();
     out.fill(0.0);
     if let Some(t) = tap.as_deref_mut() {
         t.fill(0.0);
     }
+    let mut used = [false; MAX_BUSES];
     for v in voices {
         if !v.audible() {
             v.ring.skip_all();
@@ -206,18 +243,52 @@ fn mix_voices(out: &mut [f32], mut tap: Option<&mut [f32]>, voices: &[Arc<Voice>
         let vol = if vol.is_finite() { vol.max(0.0) } else { 0.0 };
         let (gl, gr) = pan_gains(f32::from_bits(v.pan.load(Ordering::Relaxed)));
         let rec = v.recorded.load(Ordering::Relaxed);
-        for (i, frame) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let vb = &mut fx.voice_buf[..len];
+        vb.fill(0.0);
+        for frame in vb.as_chunks_mut::<2>().0 {
             let Some([l, r]) = v.ring.pop_frame() else {
                 break;
             };
-            let (l, r) = (l * vol * gl, r * vol * gr);
-            frame[0] += l;
-            frame[1] += r;
-            if rec && let Some(t) = tap.as_deref_mut() {
-                t[i * 2] += l;
-                t[i * 2 + 1] += r;
+            frame[0] = l * vol * gl;
+            frame[1] = r * vol * gr;
+        }
+        v.fx.process(vb, 0, fx.rate);
+        let bus = v.bus.load(Ordering::Relaxed) as usize;
+        if (1..=MAX_BUSES).contains(&bus) {
+            let b = &mut fx.bus_buf[bus - 1][..len];
+            if !used[bus - 1] {
+                b.fill(0.0);
+                used[bus - 1] = true;
+            }
+            for (d, s) in b.iter_mut().zip(vb.iter()) {
+                *d += *s;
+            }
+            continue;
+        }
+        for (d, s) in out.iter_mut().zip(vb.iter()) {
+            *d += *s;
+        }
+        if rec && let Some(t) = tap.as_deref_mut() {
+            for (d, s) in t.iter_mut().zip(vb.iter()) {
+                *d += *s;
             }
         }
+    }
+    for (i, _) in used.iter().enumerate().filter(|(_, u)| **u) {
+        let b = &mut fx.bus_buf[i][..len];
+        fx.buses.layers[i].process(b, 0, fx.rate);
+        for (d, s) in out.iter_mut().zip(b.iter()) {
+            *d += *s;
+        }
+        if let Some(t) = tap.as_deref_mut() {
+            for (d, s) in t.iter_mut().zip(b.iter()) {
+                *d += *s;
+            }
+        }
+    }
+    fx.buses.master.process(out, 0, fx.rate);
+    if let Some(t) = tap.as_deref_mut() {
+        fx.buses.master.process(t, 1, fx.rate);
     }
     for s in out.iter_mut().chain(tap.into_iter().flatten()) {
         *s = s.clamp(-1.0, 1.0);
@@ -346,6 +417,7 @@ impl Drop for Guard {
 pub struct AudioEngine {
     voices: VoiceList,
     tap: Arc<Tap>,
+    buses: Arc<Buses>,
     rate: Arc<AtomicU32>,
     _guard: Arc<Guard>,
 }
@@ -365,6 +437,8 @@ impl AudioEngine {
         let v = voices.clone();
         let tap = Arc::new(Tap::new());
         let t = tap.clone();
+        let buses = Arc::new(Buses::new());
+        let bs = buses.clone();
         let shared_rate = Arc::new(AtomicU32::new(0));
         let sr = shared_rate.clone();
         let thread = std::thread::Builder::new()
@@ -372,7 +446,15 @@ impl AudioEngine {
             .spawn(move || {
                 // The cpal stream is not Send: it lives and dies on this thread.
                 let failed = Arc::new(AtomicBool::new(false));
-                let open = || open_stream(v.clone(), t.clone(), failed.clone(), device.as_deref());
+                let open = || {
+                    open_stream(
+                        v.clone(),
+                        t.clone(),
+                        bs.clone(),
+                        failed.clone(),
+                        device.as_deref(),
+                    )
+                };
                 match open() {
                     Ok((stream, rate)) => {
                         sr.store(rate, Ordering::Release);
@@ -392,6 +474,7 @@ impl AudioEngine {
         Ok(AudioEngine {
             voices,
             tap,
+            buses,
             rate: shared_rate,
             _guard: Arc::new(Guard {
                 stop: Some(stop_tx),
@@ -403,6 +486,11 @@ impl AudioEngine {
     /// The recording tap of the master output.
     pub fn tap(&self) -> Arc<Tap> {
         self.tap.clone()
+    }
+
+    /// Layer bus and master effect chains of the mixer.
+    pub fn buses(&self) -> Arc<Buses> {
+        self.buses.clone()
     }
 
     /// Device sample rate in Hz.
@@ -555,6 +643,7 @@ fn pick_output(name: Option<&str>) -> Option<cpal::Device> {
 fn open_stream(
     voices: VoiceList,
     tap: Arc<Tap>,
+    buses: Arc<Buses>,
     failed: Arc<AtomicBool>,
     device: Option<&str>,
 ) -> Result<(cpal::Stream, u32), String> {
@@ -565,10 +654,10 @@ fn open_stream(
     let cfg = supported.config();
     let rate = cfg.sample_rate;
     let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, cfg, voices, tap, failed),
-        cpal::SampleFormat::I16 => build::<i16>(&device, cfg, voices, tap, failed),
-        cpal::SampleFormat::U16 => build::<u16>(&device, cfg, voices, tap, failed),
-        cpal::SampleFormat::I32 => build::<i32>(&device, cfg, voices, tap, failed),
+        cpal::SampleFormat::F32 => build::<f32>(&device, cfg, voices, tap, buses, failed),
+        cpal::SampleFormat::I16 => build::<i16>(&device, cfg, voices, tap, buses, failed),
+        cpal::SampleFormat::U16 => build::<u16>(&device, cfg, voices, tap, buses, failed),
+        cpal::SampleFormat::I32 => build::<i32>(&device, cfg, voices, tap, buses, failed),
         other => return Err(format!("Unsupported audio sample format {other}")),
     }
     .map_err(|e| format!("Audio output: {e}"))?;
@@ -579,13 +668,13 @@ fn open_stream(
 /// Mixes one callback block into `st`. If the voice list is busy the block is silence, and
 /// the tap still gets what was output: it must receive every frame so its sample count (the
 /// recording's audio PTS) never drifts from the video.
-fn render_block(voices: &VoiceList, tap: &Tap, st: &mut [f32], tp: &mut [f32]) {
+fn render_block(voices: &VoiceList, tap: &Tap, fx: &mut MixFx, st: &mut [f32], tp: &mut [f32]) {
     match voices.try_lock() {
         Ok(g) if tap.is_on() => {
-            mix_stereo_tap(st, tp, &g);
+            mix_voices(st, Some(tp), &g, fx);
             tap.feed(tp);
         }
-        Ok(g) => mix_stereo(st, &g),
+        Ok(g) => mix_voices(st, None, &g, fx),
         Err(_) => {
             st.fill(0.0);
             tap.feed(st);
@@ -598,6 +687,7 @@ fn build<T>(
     cfg: cpal::StreamConfig,
     voices: VoiceList,
     tap: Arc<Tap>,
+    buses: Arc<Buses>,
     failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::Error>
 where
@@ -606,6 +696,7 @@ where
     let ch = (cfg.channels as usize).max(1);
     let mut scratch = vec![0f32; SCRATCH_FRAMES * 2];
     let mut tap_scratch = vec![0f32; SCRATCH_FRAMES * 2];
+    let mut mixfx = MixFx::new(buses, cfg.sample_rate, SCRATCH_FRAMES * 2);
     device.build_output_stream(
         cfg,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
@@ -613,7 +704,7 @@ where
                 let frames = chunk.len() / ch;
                 let st = &mut scratch[..frames * 2];
                 let tp = &mut tap_scratch[..frames * 2];
-                render_block(&voices, &tap, st, tp);
+                render_block(&voices, &tap, &mut mixfx, st, tp);
                 for (i, f) in chunk.chunks_exact_mut(ch).enumerate() {
                     let (l, r) = (st[i * 2], st[i * 2 + 1]);
                     if ch == 1 {
@@ -1351,7 +1442,12 @@ mod device_tests {
         tap.start();
         let (mut st, mut tp) = (vec![1.0f32; 64], vec![0f32; 64]);
         let _held = voices.lock().unwrap();
-        super::render_block(&voices, &tap, &mut st, &mut tp);
+        let mut fx = super::MixFx::new(
+            std::sync::Arc::new(crate::audio_fx::Buses::new()),
+            48_000,
+            64,
+        );
+        super::render_block(&voices, &tap, &mut fx, &mut st, &mut tp);
         assert!(st.iter().all(|s| *s == 0.0));
         assert_eq!(tap.len_frames(), 32, "tap counts the silent block");
         assert_eq!(tap.pop_frame(), Some([0.0, 0.0]));
