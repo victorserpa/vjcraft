@@ -104,6 +104,14 @@ pub fn command_for(p: &Project, ctx: &Ctx, s: &Shortcut, ev: &Event) -> Option<C
     }
 }
 
+/// Whether `ev` is the release of the control behind `s`: its address with value 0 (Trigger
+/// or Toggle). Lets a Hold clip go.
+pub fn releases(s: &Shortcut, ev: &Event) -> bool {
+    matches!(&s.source, ControlSource::Osc { address } if *address == ev.address)
+        && matches!(s.mode, ShortcutMode::Trigger | ShortcutMode::Toggle)
+        && ev.value.is_some_and(|v| v <= 0.0)
+}
+
 pub fn source_of(ev: &Event) -> ControlSource {
     ControlSource::Osc {
         address: ev.address.clone(),
@@ -181,8 +189,9 @@ pub fn label_for(p: &Project, target: &str) -> Option<String> {
         })
 }
 
-/// Which deck/column plays on a layer; the app owns that state.
-pub type Active<'a> = &'a dyn Fn(LayerId) -> Option<(DeckId, ColumnIdx)>;
+/// Every deck/column cell playing on a layer (its own clip and the ones redirected to
+/// it); the app owns that state.
+pub type Active<'a> = &'a dyn Fn(LayerId) -> Vec<(DeckId, ColumnIdx)>;
 
 /// Output state in our own address space: clip playing per layer (1 on the playing clip),
 /// layer and master opacity, bpm, and the beat index.
@@ -195,11 +204,12 @@ pub fn out_states(p: &Project, ctx: &Ctx, active: Active, beat: i64) -> HashMap<
         {
             out.insert(a, v);
         }
-        if let Some((d, col)) = active(l.id)
-            && d == deck
-            && let Some(a) = shortcuts::clip_address(p, l.id, col)
-        {
-            out.insert(a, 1.0);
+        for (d, col) in active(l.id) {
+            if d == deck
+                && let Some(a) = shortcuts::clip_address(p, l.id, col)
+            {
+                out.insert(a, 1.0);
+            }
         }
     }
     for a in ["/comp/master/opacity", "/comp/tempo/bpm"] {

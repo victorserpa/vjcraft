@@ -52,7 +52,7 @@ curl -X POST -H 'Content-Type: application/json' \
 ```
 
 `GET /api/v1/composition` returns name, size, fps, `bpm`, `master`, `crossfader`, `layers`
-(number, name, opacity, bypass, solo, group, active_column), `groups`, `columns` and `decks`
+(number, name, opacity, bypass, solo, group, active_column, active_columns), `groups`, `columns` and `decks`
 (with their clips: layer, column, name, kind).
 
 ## WebSocket

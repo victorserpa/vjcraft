@@ -120,6 +120,43 @@ pub fn command_for(p: &Project, ctx: &Ctx, s: &Shortcut, device: &str, m: Msg) -
     }
 }
 
+/// Whether `m` is the release of the control behind `s`: its note going off, or its CC
+/// (Trigger/Toggle) falling below the press threshold. Lets a Hold clip go.
+pub fn releases(s: &Shortcut, device: &str, m: Msg) -> bool {
+    match (&s.source, m) {
+        (
+            ControlSource::MidiNote {
+                device: d,
+                channel,
+                note,
+            },
+            Msg::NoteOff {
+                channel: c,
+                note: n,
+            },
+        ) => d == device && *channel == c && *note == n,
+        (
+            ControlSource::MidiCc {
+                device: d,
+                channel,
+                cc,
+            },
+            Msg::Cc {
+                channel: c,
+                cc: n,
+                value,
+            },
+        ) => {
+            d == device
+                && *channel == c
+                && *cc == n
+                && matches!(s.mode, ShortcutMode::Trigger | ShortcutMode::Toggle)
+                && value < 64
+        }
+        _ => false,
+    }
+}
+
 /// Defaults for a learned MIDI control: knobs on continuous targets are Absolute over the
 /// target's range; everything else follows the key defaults.
 fn default_for(target: &str, src: &ControlSource) -> (ShortcutMode, (f64, f64)) {
@@ -209,14 +246,15 @@ pub fn label_for(p: &Project, target: &str) -> Option<String> {
 /// A controller LED: device name, channel, note.
 pub type Led = (String, u8, u8);
 
-/// Which deck/column plays on a layer; the app owns that state.
-pub type Active<'a> = &'a dyn Fn(LayerId) -> Option<(DeckId, ColumnIdx)>;
+/// Every deck/column cell playing on a layer (its own clip and the ones redirected to
+/// it); the app owns that state.
+pub type Active<'a> = &'a dyn Fn(LayerId) -> Vec<(DeckId, ColumnIdx)>;
 
 /// On/off state of every note-mapped target with state: a clip playing, a column playing
 /// on any layer, or a bypass/toggle at or above the middle of its range.
 pub fn led_states(p: &Project, ctx: &Ctx, active: Active) -> HashMap<Led, bool> {
     let deck = p.composition.current_deck;
-    let playing = |layer: LayerId, col: ColumnIdx| active(layer) == Some((deck, col));
+    let playing = |layer: LayerId, col: ColumnIdx| active(layer).contains(&(deck, col));
     let mut out = HashMap::new();
     for s in &p.shortcuts {
         let ControlSource::MidiNote {
@@ -511,7 +549,7 @@ mod tests {
         };
         let mut p = p;
         p.shortcuts.push(s);
-        let none = |_: LayerId| None;
+        let none = |_: LayerId| Vec::new();
         let off = led_states(&p, &Ctx::new(None, false), &none);
         let on = led_states(&p, &Ctx::new(None, true), &none);
         let key = ("pad".to_string(), 0u8, 5u8);

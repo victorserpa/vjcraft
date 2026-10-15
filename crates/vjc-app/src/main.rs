@@ -545,6 +545,7 @@ fn draw_chain(
                 dry_wet: e.dry_wet,
                 ml: ml_draw,
                 persistent: isf.persistent.then_some(e.id),
+                ticking: isf.tick_input.is_some(),
             });
         }
     }
@@ -1004,24 +1005,36 @@ fn dests_in(
     out
 }
 
-/// Cell state for LEDs, OSC and the API: what is on air in the cells of `layer`. A cell
-/// that sends its clip to another layer shows it; the layer that receives it does not
-/// light the cell at the same column.
+/// Cell state for LEDs, OSC and the API: every cell on air in `layer`'s row. The layer's own
+/// clip counts (unless the layer is only showing a redirected one), and so does each of its
+/// clips playing on another layer.
 fn cell_active_of(
     players: &HashMap<LayerId, (DeckId, u32, Player)>,
     gens: &Gens,
     origin: &HashMap<LayerId, (DeckId, LayerId, u32)>,
     layer: LayerId,
-) -> Option<(DeckId, u32)> {
+) -> Vec<(DeckId, u32)> {
+    cells_on_air(origin, layer, |l| active_of(players, gens, l))
+}
+
+fn cells_on_air(
+    origin: &HashMap<LayerId, (DeckId, LayerId, u32)>,
+    layer: LayerId,
+    on_air: impl Fn(LayerId) -> Option<(DeckId, u32)>,
+) -> Vec<(DeckId, u32)> {
+    let mut out = Vec::new();
     if !origin.contains_key(&layer)
-        && let Some(a) = active_of(players, gens, layer)
+        && let Some(a) = on_air(layer)
     {
-        return Some(a);
+        out.push(a);
     }
-    origin
-        .iter()
-        .find(|(dest, (d, l, c))| *l == layer && active_of(players, gens, **dest) == Some((*d, *c)))
-        .map(|(_, (d, _, c))| (*d, *c))
+    for (dest, (d, l, c)) in origin {
+        if *l == layer && on_air(*dest) == Some((*d, *c)) && !out.contains(&(*d, *c)) {
+            out.push((*d, *c));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// "New generator" submenu: creates the clip in the cell and plays it.
@@ -2559,9 +2572,18 @@ impl State {
         let ncols = c.columns.len() as u32;
         self.snap_pending.retain(|(_, h)| match &h.act {
             SnapAct::Cmd(cmd) => match **cmd {
-                Command::TriggerClip { layer, column, .. }
-                | Command::TriggerClipOn { layer, column, .. } => {
+                Command::TriggerClip { layer, column, .. } => {
                     column < ncols && c.layers.iter().any(|l| l.id == layer)
+                }
+                Command::TriggerClipOn {
+                    layer,
+                    column,
+                    onto,
+                    ..
+                } => {
+                    column < ncols
+                        && c.layers.iter().any(|l| l.id == layer)
+                        && c.layers.iter().any(|l| l.id == onto)
                 }
                 Command::TriggerColumn { column, .. } => column < ncols,
                 _ => true,
@@ -3858,9 +3880,26 @@ impl State {
         self.preview_target = PreviewTarget::Clip(deck, layer, column);
     }
 
+    /// One trigger for every cell of `layer` in `column..column + n` that is on air, each on
+    /// the layer it plays on (it may have been redirected).
+    fn live_cells(&self, deck: DeckId, layer: LayerId, column: u32, n: u32) -> Vec<Command> {
+        (column..column + n)
+            .filter_map(|c| {
+                let onto = self.dest_of(Some(deck), layer, c)?;
+                Some(Command::TriggerClipOn {
+                    deck,
+                    layer,
+                    column: c,
+                    onto,
+                })
+            })
+            .collect()
+    }
+
     /// Several files/folders dropped from `column` on: one per column, in name order, adding
-    /// the missing columns, as a single undo step. Nothing is triggered unless the first cell
-    /// is on air (then it reloads, as `drop_cell`). Returns (placed, ignored).
+    /// the missing columns, as a single undo step. Nothing is triggered unless a cell of the
+    /// range is on air (then each live cell reloads, on its own destination). Returns
+    /// (placed, ignored).
     fn drop_many(&mut self, layer: LayerId, column: u32, paths: Vec<PathBuf>) -> (usize, usize) {
         let (files, ignored) = expand_drop(paths);
         if files.is_empty() {
@@ -3869,8 +3908,7 @@ impl State {
         let deck = self.project.composition.current_deck;
         // The layer's on-air cell, if the drop replaces it: reload it after the batch.
         let n = files.len() as u32;
-        let live = (column..column + n)
-            .find_map(|c| self.dest_of(Some(deck), layer, c).map(|onto| (c, onto)));
+        let live = self.live_cells(deck, layer, column, n);
         let have = self.project.composition.columns.len() as u32;
         let mut commands = Vec::new();
         for i in have..column + files.len() as u32 {
@@ -3894,13 +3932,8 @@ impl State {
             });
         }
         self.exec(Command::Batch { commands });
-        if let Some((c, onto)) = live {
-            self.exec(Command::TriggerClipOn {
-                deck,
-                layer,
-                column: c,
-                onto,
-            });
+        for cmd in live {
+            self.exec(cmd);
         }
         self.selected = Some((layer, column));
         self.selected_deck = Some(deck);
@@ -4160,6 +4193,7 @@ impl State {
                         dry_wet: 1.0,
                         ml: None,
                         persistent: None,
+                        ticking: false,
                     })
                 }
                 _ => None,
@@ -4286,6 +4320,7 @@ impl State {
                         dry_wet: 1.0,
                         ml: None,
                         persistent: None,
+                        ticking: false,
                     })
                 }
                 _ => None,
@@ -4742,6 +4777,23 @@ impl State {
         self.holds.push(run);
     }
 
+    /// Runs the command of shortcut `id`; a trigger of a Hold clip holds for as long as that
+    /// binding is down (its release calls `hold_release`).
+    fn run_shortcut(&mut self, id: Uuid, c: Command) {
+        match c {
+            Command::TriggerClip {
+                deck,
+                layer,
+                column,
+            } if vjc_core::trigger_style_of(&self.project, deck, layer, column)
+                == vjc_model::TriggerStyle::Hold =>
+            {
+                self.hold_fire(hold::Src::Binding(id), deck, layer, column);
+            }
+            c => self.exec(c),
+        }
+    }
+
     /// The button or key is up. A trigger still waiting for its beat is taken back and
     /// nothing is ejected; otherwise the layer is ejected only if the clip this Hold
     /// played is still the one in the air.
@@ -4821,7 +4873,16 @@ impl State {
                 .collect()
         });
         for key in up {
-            self.hold_release(hold::Src::Key(key));
+            let ids: Vec<Uuid> = self
+                .project
+                .shortcuts
+                .iter()
+                .filter(|s| vjc_core::shortcuts::key_of(s) == Some(key.name()))
+                .map(|s| s.id)
+                .collect();
+            for id in ids {
+                self.hold_release(hold::Src::Binding(id));
+            }
         }
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -4878,26 +4939,15 @@ impl State {
         let rt = self.rt_ctx();
         for key in pressed {
             let name = key.name();
-            let cmds: Vec<Command> = self
+            let cmds: Vec<(Uuid, Command)> = self
                 .project
                 .shortcuts
                 .iter()
                 .filter(|s| vjc_core::shortcuts::key_of(s) == Some(name))
-                .filter_map(|s| vjc_core::shortcuts::activate(&self.project, &rt, s))
+                .filter_map(|s| Some((s.id, vjc_core::shortcuts::activate(&self.project, &rt, s)?)))
                 .collect();
-            for c in cmds {
-                match c {
-                    Command::TriggerClip {
-                        deck,
-                        layer,
-                        column,
-                    } if vjc_core::trigger_style_of(&self.project, deck, layer, column)
-                        == vjc_model::TriggerStyle::Hold =>
-                    {
-                        self.hold_fire(hold::Src::Key(key), deck, layer, column);
-                    }
-                    c => self.exec(c),
-                }
+            for (id, c) in cmds {
+                self.run_shortcut(id, c);
             }
         }
     }
@@ -4937,15 +4987,26 @@ impl State {
                 }
                 continue;
             }
-            let rt = self.rt_ctx();
-            let cmds: Vec<Command> = self
+            // Note off (or a low CC) lets go of the Hold clips on that control.
+            let off: Vec<Uuid> = self
                 .project
                 .shortcuts
                 .iter()
-                .filter_map(|s| m::command_for(&self.project, &rt, s, &device, msg))
+                .filter(|s| m::releases(s, &device, msg))
+                .map(|s| s.id)
                 .collect();
-            for c in cmds {
-                self.exec(c);
+            for id in off {
+                self.hold_release(hold::Src::Binding(id));
+            }
+            let rt = self.rt_ctx();
+            let cmds: Vec<(Uuid, Command)> = self
+                .project
+                .shortcuts
+                .iter()
+                .filter_map(|s| Some((s.id, m::command_for(&self.project, &rt, s, &device, msg)?)))
+                .collect();
+            for (id, c) in cmds {
+                self.run_shortcut(id, c);
             }
         }
         let rt = self.rt_ctx();
@@ -4981,16 +5042,30 @@ impl State {
                 }
                 continue;
             }
+            // OSC 0 lets go of the Hold clips on that address.
+            let off: Vec<Uuid> = self
+                .project
+                .shortcuts
+                .iter()
+                .filter(|s| o::releases(s, &ev))
+                .map(|s| s.id)
+                .collect();
+            for id in off {
+                self.hold_release(hold::Src::Binding(id));
+            }
             let rt = self.rt_ctx();
-            let mut cmds: Vec<Command> = o::direct(&self.project, &rt, &ev).into_iter().collect();
-            cmds.extend(
-                self.project
-                    .shortcuts
-                    .iter()
-                    .filter_map(|s| o::command_for(&self.project, &rt, s, &ev)),
-            );
-            for c in cmds {
+            let direct: Vec<Command> = o::direct(&self.project, &rt, &ev).into_iter().collect();
+            let bound: Vec<(Uuid, Command)> = self
+                .project
+                .shortcuts
+                .iter()
+                .filter_map(|s| Some((s.id, o::command_for(&self.project, &rt, s, &ev)?)))
+                .collect();
+            for c in direct {
                 self.exec(c);
+            }
+            for (id, c) in bound {
+                self.run_shortcut(id, c);
             }
         }
         if !self.prefs.osc.out_enabled {
@@ -9342,6 +9417,35 @@ fn window_grew(prev: egui::Vec2, now: egui::Vec2) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_layer_shows_its_own_cell_and_every_redirect() {
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let deck = Uuid::from_u128(9);
+        // Source layer `a`: its cells 0 and 1 play redirected on `b` and `c`.
+        let origin = HashMap::from([(b, (deck, a, 0)), (c, (deck, a, 1))]);
+        let air = |l: LayerId| {
+            if l == b {
+                Some((deck, 0))
+            } else if l == c {
+                Some((deck, 1))
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            super::cells_on_air(&origin, a, air),
+            vec![(deck, 0), (deck, 1)]
+        );
+        // A layer that only shows a redirected clip does not light its own column.
+        assert!(super::cells_on_air(&origin, b, air).is_empty());
+        // Own clip and a redirect together.
+        let own = |l: LayerId| if l == a { Some((deck, 2)) } else { air(l) };
+        assert_eq!(
+            super::cells_on_air(&origin, a, own),
+            vec![(deck, 0), (deck, 1), (deck, 2)]
+        );
+    }
+
     #[test]
     fn resume_ignores_a_replaced_clip_and_is_pruned() {
         let mut p = vjc_model::Project::new("t");

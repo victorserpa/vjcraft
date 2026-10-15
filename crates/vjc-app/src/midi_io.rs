@@ -87,6 +87,14 @@ impl Midi {
         Midi { rx, out }
     }
 
+    /// Idle, with the sender that feeds `rx` (UI tests inject messages).
+    #[cfg(test)]
+    pub fn idle_fed() -> (Midi, Sender<In>) {
+        let (tx, rx) = channel();
+        let (out, _out_rx) = channel();
+        (Midi { rx, out }, tx)
+    }
+
     pub fn send(&self, device: &str, bytes: [u8; 3]) {
         let _ = self.out.send((device.to_owned(), bytes));
     }

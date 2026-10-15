@@ -15,11 +15,12 @@ pub const ARM: Duration = Duration::from_millis(150);
 /// Pointer travel, in points, after which a press is a drag (egui's click distance).
 pub const DRAG_PX: f32 = 6.0;
 
-/// What is holding: the mouse button or a key.
+/// What is holding: the mouse button, or one shortcut binding (a key, a MIDI note or an OSC
+/// address). It is the binding, not the key: two shortcuts on one key are two holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Src {
     Mouse,
-    Key(egui::Key),
+    Binding(uuid::Uuid),
 }
 
 /// A mouse press on a Hold cell that has not decided yet.

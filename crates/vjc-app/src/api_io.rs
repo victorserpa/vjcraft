@@ -284,12 +284,15 @@ fn snapshot(p: &Project, ctx: &Ctx, active: Active) -> Value {
                 .group
                 .and_then(|g| c.groups.iter().position(|x| x.id == g))
                 .map(|gi| ng - gi);
-            let col = active(l.id)
+            let cols: Vec<u32> = active(l.id)
+                .into_iter()
                 .filter(|(d, _)| *d == c.current_deck)
-                .map(|(_, col)| col + 1);
+                .map(|(_, col)| col + 1)
+                .collect();
+            let col = cols.first().copied();
             json!({
                 "number": n, "name": l.name, "opacity": cur(&format!("/comp/layer/{n}/opacity")),
-                "bypass": l.bypass, "solo": l.solo, "group": group, "active_column": col,
+                "bypass": l.bypass, "solo": l.solo, "group": group, "active_column": col, "active_columns": cols,
             })
         })
         .collect();
@@ -1055,7 +1058,7 @@ mod tests {
                 };
                 let mut p = pj.lock().unwrap();
                 let ctx = Ctx::new(None, false);
-                let (cmd, reply) = answer(&p, &ctx, &|_| None, m.req);
+                let (cmd, reply) = answer(&p, &ctx, &|_| Vec::new(), m.req);
                 if let Some(c) = cmd {
                     let _ = history.exec(&mut p, c, Instant::now());
                 }

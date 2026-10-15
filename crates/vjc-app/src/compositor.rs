@@ -395,6 +395,24 @@ pub struct EffectDraw {
     /// Instance id of a persistent effect (trails, echo): the effect gets its own previous
     /// output as `PREV_PIXEL`. None for ordinary effects.
     pub persistent: Option<uuid::Uuid>,
+    /// The effect declares a tick input (freeze): only then does the runtime write the
+    /// `NEW_TICK` flag into slot 0. Every other effect's uniforms are left as packed.
+    pub ticking: bool,
+}
+
+/// Writes the `NEW_TICK` flag into slot 0 of a ticking effect (rate in, flag out) and
+/// returns the tick to remember. Effects that do not tick are not touched.
+pub(crate) fn apply_tick(
+    ticking: bool,
+    uniforms: &mut vjc_fx::Uniforms,
+    last: Option<i64>,
+) -> Option<i64> {
+    if !ticking || uniforms[0][3] <= 0.0 {
+        return None;
+    }
+    let (flag, tick) = vjc_fx::tick_flag(uniforms[0][0], uniforms[0][3], last);
+    uniforms[0][3] = flag;
+    Some(tick)
 }
 
 /// What an effect with this dry/wet costs.
@@ -690,17 +708,13 @@ impl Fx {
             let mut uniforms = e.uniforms;
             // A ticking effect (freeze) learns per instance whether this draw starts a new
             // tick: slot 0 carries its rate in, and the flag goes out in its place.
-            if let Some((key, _, how)) = &hist
-                && uniforms[0][3] > 0.0
-            {
+            if let Some((key, _, how)) = &hist {
                 let last = (*how == crate::persist::Acquired::Kept)
                     .then(|| self.ticks.get(key).copied())
                     .flatten();
-                let (flag, tick) = vjc_fx::tick_flag(uniforms[0][0], uniforms[0][3], last);
-                uniforms[0][3] = flag;
-                self.ticks.insert(*key, tick);
-            } else {
-                uniforms[0][3] = 0.0;
+                if let Some(tick) = apply_tick(e.ticking, &mut uniforms, last) {
+                    self.ticks.insert(*key, tick);
+                }
             }
             queue.write_buffer(buf, 0, bytemuck::cast_slice(&uniforms));
             let out = (0..3).find(|&i| Some(i) != cur).unwrap_or(0);
@@ -2300,6 +2314,20 @@ impl Compositor {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_a_ticking_effect_gets_the_tick_flag() {
+        let mut u = [[0.0; 4]; vjc_fx::MAX_SLOTS];
+        u[0] = [0.5, 8.0, 8.0, 3.0];
+        // A persistent effect with a positive value in that lane is not a ticker.
+        let mut plain = u;
+        assert_eq!(apply_tick(false, &mut plain, None), None);
+        assert_eq!(plain, u, "uniforms untouched");
+        // A ticking one: rate in, flag out (2 = first draw).
+        let mut t = u;
+        assert!(apply_tick(true, &mut t, None).is_some());
+        assert_eq!(t[0][3], 2.0);
+    }
+
     fn near(a: (f32, f32), b: (f32, f32)) -> bool {
         (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5
     }
@@ -2584,6 +2612,7 @@ mod tests {
             dry_wet: 1.0,
             ml: None,
             persistent: Some(uuid::Uuid::from_u128(99)),
+            ticking: false,
         };
         let layer = LayerDraw {
             id: uuid::Uuid::from_u128(7),
@@ -2777,6 +2806,7 @@ mod tests {
             dry_wet: 1.0,
             ml: None,
             persistent: None,
+            ticking: false,
         };
         let src = [51u8, 102, 204, 255];
         for on_master in [false, true] {
@@ -2864,6 +2894,7 @@ mod tests {
                 dry_wet: 1.0,
                 ml: None,
                 persistent: None,
+                ticking: false,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -2941,6 +2972,7 @@ mod tests {
                 dry_wet: 1.0,
                 ml: None,
                 persistent: None,
+                ticking: false,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -3105,6 +3137,7 @@ mod tests {
                     dry_wet: 1.0,
                     ml: None,
                     persistent: None,
+                    ticking: false,
                 };
                 let (effects, gen_draw, fr) = if generator {
                     (vec![], Some(draw), None)
@@ -3173,6 +3206,7 @@ mod tests {
             dry_wet,
             ml: None,
             persistent: None,
+            ticking: false,
         };
         let src = [255u8, 255, 255, 255];
         // (chain, expected red)
@@ -3276,6 +3310,7 @@ mod tests {
                 dry_wet: 1.0,
                 ml: None,
                 persistent: instance_id,
+                ticking: false,
             };
             let mut last = [0u8; 4];
             for (serial, px) in [[255u8; 4], [0, 0, 0, 255]].iter().enumerate() {
@@ -3326,6 +3361,7 @@ mod tests {
             dry_wet: 1.0,
             ml: None,
             persistent: Some(uuid::Uuid::from_u128(7)),
+            ticking: false,
         };
         let mut comp = Compositor::new(&device, 1, 1);
         comp.add_effect(&device, "trails", &wgsl).unwrap();
@@ -3448,6 +3484,7 @@ mod tests {
             dry_wet: 1.0,
             ml: None,
             persistent,
+            ticking: isf.tick_input.is_some(),
         };
         let l = [layer(1, 1.0, BlendMode::Normal, vec![fx], data, serial)];
         comp.render(device, queue, &l, &[], 1.0);
@@ -3800,6 +3837,7 @@ mod tests {
                         dry_wet: 1.0,
                         ml: Some(ml.clone()),
                         persistent: None,
+                        ticking: false,
                     }],
                     frame: Some((2, 1, &red, 1)),
                     generator: None,
@@ -3904,6 +3942,7 @@ mod tests {
                     dry_wet,
                     ml: None,
                     persistent: None,
+                    ticking: false,
                 }],
                 frame: Some((1, 4, &img, 1)),
                 generator: None,
@@ -4164,6 +4203,7 @@ mod tests {
                         dry_wet: 1.0,
                         ml: Some(ml.clone()),
                         persistent: None,
+                        ticking: false,
                     }],
                     frame: Some((1, 4, &red, 1)),
                     generator: None,
@@ -4400,6 +4440,7 @@ mod tests {
             dry_wet: 1.0,
             ml: None,
             persistent: None,
+            ticking: false,
         };
         let (below, src) = ([255u8, 0, 0, 255], [51u8, 102, 204, 255]);
         let layers = [solid(1, &below, 1.0), solid(2, &src, 1.0)];
@@ -4682,6 +4723,7 @@ mod tests {
                     dry_wet: 0.7,
                     ml: None,
                     persistent: None,
+                    ticking: false,
                 }
             })
             .collect();

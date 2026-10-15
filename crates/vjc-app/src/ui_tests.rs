@@ -5180,14 +5180,20 @@ fn hold_press_that_becomes_a_drag_plays_nothing() {
     h.event(button(true));
     h.step();
     assert!(h.state().hold_arm.is_some(), "the press arms");
-    // A slow machine must not turn the press into a hold before the drag starts.
-    h.state_mut().hold_arm.as_mut().unwrap().at += std::time::Duration::from_secs(60);
+    // The press is already old enough to count as a hold: only the drag cancel stands
+    // between it and the air. The first move already leaves the click distance.
+    h.state_mut().hold_arm.as_mut().unwrap().at -= hold::ARM * 4;
     for i in 1..=4 {
         h.event(egui::Event::PointerMoved(
-            pos + egui::vec2(4.0 * i as f32, 0.0),
+            pos + egui::vec2(hold::DRAG_PX * 2.0 * i as f32, 0.0),
         ));
         h.step();
     }
+    // Checked with the button still down: the release would eject a wrong Fire.
+    assert!(
+        h.state().holds.is_empty() && h.state().hold_arm.is_none(),
+        "the drag cancelled the press while the button is down"
+    );
     h.event(button(false));
     settle(&mut h);
     let st = h.state();
@@ -5359,6 +5365,179 @@ fn hold_key_down_plays_and_key_up_ejects() {
     h.event(key(egui::Key::W, false));
     settle(&mut h);
     assert_eq!(air_of(&h, top), Some((deck, 2)), "Normal keeps playing");
+}
+
+fn hold_shortcut(
+    source: vjc_model::ControlSource,
+    target: &str,
+    mode: vjc_model::ShortcutMode,
+) -> vjc_model::Shortcut {
+    vjc_model::Shortcut {
+        id: Uuid::new_v4(),
+        source,
+        target: target.into(),
+        mode,
+        range: (0.0, 1.0),
+        invert: false,
+        effect: None,
+    }
+}
+
+// Hold: two shortcuts on one key both play, and both let go on key up
+#[test]
+fn hold_two_shortcuts_on_one_key_both_play_and_release() {
+    let (mut h, deck, top, bottom) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    style(&mut h, deck, bottom, 1, vjc_model::TriggerStyle::Hold);
+    let key_q = vjc_model::ControlSource::Key { code: "Q".into() };
+    let t = || vjc_model::ShortcutMode::Trigger;
+    h.state_mut().project.shortcuts.extend([
+        hold_shortcut(key_q.clone(), "/comp/layer/2/clip/2/connect", t()),
+        hold_shortcut(key_q, "/comp/layer/1/clip/2/connect", t()),
+    ]);
+    let key = |pressed| egui::Event::Key {
+        key: egui::Key::Q,
+        physical_key: Some(egui::Key::Q),
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(key(true));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)), "first binding plays");
+    assert_eq!(air_of(&h, bottom), Some((deck, 1)), "second binding plays");
+    h.event(key(false));
+    settle(&mut h);
+    assert_eq!((air_of(&h, top), air_of(&h, bottom)), (None, None));
+    assert!(h.state().holds.is_empty());
+}
+
+// Hold: MIDI note off and OSC 0 let go like a key up
+#[test]
+fn hold_midi_note_off_and_osc_zero_release() {
+    let (mut h, deck, top, bottom) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    style(&mut h, deck, bottom, 1, vjc_model::TriggerStyle::Hold);
+    let t = || vjc_model::ShortcutMode::Trigger;
+    h.state_mut().project.shortcuts.extend([
+        hold_shortcut(
+            vjc_model::ControlSource::MidiNote {
+                device: "pad".into(),
+                channel: 0,
+                note: 7,
+            },
+            "/comp/layer/2/clip/2/connect",
+            t(),
+        ),
+        hold_shortcut(
+            vjc_model::ControlSource::Osc {
+                address: "/hold/b".into(),
+            },
+            "/comp/layer/1/clip/2/connect",
+            t(),
+        ),
+    ]);
+    let (midi, midi_tx) = midi_io::Midi::idle_fed();
+    let (osc, osc_tx) = osc_io::Osc::idle_fed();
+    h.state_mut().midi = midi;
+    h.state_mut().osc = osc;
+    let send_midi = |h: &mut Harness<'_, State>, status: u8, vel: u8| {
+        midi_tx
+            .send(midi_io::In::Msg(
+                "pad".into(),
+                vec![status, 7, vel],
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+        h.state_mut().midi_pump();
+        settle(h);
+    };
+    let send_osc = |h: &mut Harness<'_, State>, v: f64| {
+        osc_tx
+            .send(vjc_core::osc::Event {
+                address: "/hold/b".into(),
+                value: Some(v),
+            })
+            .unwrap();
+        h.state_mut().osc_pump();
+        settle(h);
+    };
+    send_midi(&mut h, 0x90, 100);
+    assert_eq!(air_of(&h, top), Some((deck, 1)), "note on plays");
+    send_midi(&mut h, 0x80, 0);
+    assert_eq!(air_of(&h, top), None, "note off lets go");
+    send_midi(&mut h, 0x90, 100);
+    send_midi(&mut h, 0x90, 0);
+    assert_eq!(air_of(&h, top), None, "note on velocity 0 is a note off");
+    send_osc(&mut h, 1.0);
+    assert_eq!(air_of(&h, bottom), Some((deck, 1)), "OSC 1 plays");
+    send_osc(&mut h, 0.0);
+    assert_eq!(air_of(&h, bottom), None, "OSC 0 lets go");
+    assert!(h.state().holds.is_empty());
+}
+
+// Drop of several files: every live cell of the range reloads on its own destination
+#[test]
+fn multi_drop_retriggers_every_live_cell_on_its_destination() {
+    let (mut h, deck, top, bottom) = hold_setup();
+    h.state_mut().exec(Command::SetCompClipTarget {
+        target: vjc_model::ClipTarget::Free,
+    });
+    for column in [1, 2] {
+        h.state_mut().exec(Command::TriggerClip {
+            deck,
+            layer: top,
+            column,
+        });
+        settle(&mut h);
+    }
+    assert_eq!(h.state().dest_of(Some(deck), top, 1), Some(bottom));
+    assert_eq!(h.state().dest_of(Some(deck), top, 2), Some(top));
+    let cmds = h.state().live_cells(deck, top, 1, 2);
+    assert_eq!(
+        cmds,
+        vec![
+            Command::TriggerClipOn {
+                deck,
+                layer: top,
+                column: 1,
+                onto: bottom
+            },
+            Command::TriggerClipOn {
+                deck,
+                layer: top,
+                column: 2,
+                onto: top
+            },
+        ]
+    );
+}
+
+// Beat snap: a deferred trigger aimed at a layer that was deleted is dropped
+#[test]
+fn prune_snapped_drops_a_trigger_whose_destination_is_gone() {
+    let (mut h, deck, top, bottom) = hold_setup();
+    let st = h.state_mut();
+    let at = std::time::Instant::now();
+    let defer = |onto| {
+        (
+            1e9,
+            Held {
+                at,
+                token: 0,
+                act: SnapAct::Cmd(Box::new(Command::TriggerClipOn {
+                    deck,
+                    layer: top,
+                    column: 1,
+                    onto,
+                })),
+            },
+        )
+    };
+    st.snap_pending.push(defer(bottom));
+    st.snap_pending.push(defer(Uuid::new_v4()));
+    st.prune_snapped();
+    assert_eq!(st.snap_pending.len(), 1, "only the live destination stays");
 }
 
 // Clip target: Own / Active / Free, and the redirected clip keeps its own settings
