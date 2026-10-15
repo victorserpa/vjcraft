@@ -248,6 +248,85 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "infinite_zoom",
         include_str!("../../../assets/effects/infinite_zoom.fs"),
     ),
+    (
+        "add_subtract",
+        include_str!("../../../assets/effects/add_subtract.fs"),
+    ),
+    (
+        "color_pass",
+        include_str!("../../../assets/effects/color_pass.fs"),
+    ),
+    (
+        "hue_rotate_cycle",
+        include_str!("../../../assets/effects/hue_rotate_cycle.fs"),
+    ),
+    (
+        "contrast_curve",
+        include_str!("../../../assets/effects/contrast_curve.fs"),
+    ),
+    (
+        "gamma_rgb",
+        include_str!("../../../assets/effects/gamma_rgb.fs"),
+    ),
+    (
+        "exposure_flash",
+        include_str!("../../../assets/effects/exposure_flash.fs"),
+    ),
+    (
+        "edge_glow",
+        include_str!("../../../assets/effects/edge_glow.fs"),
+    ),
+    (
+        "displace_map",
+        include_str!("../../../assets/effects/displace_map.fs"),
+    ),
+    (
+        "wave_warp",
+        include_str!("../../../assets/effects/wave_warp.fs"),
+    ),
+    (
+        "stripes_overlay",
+        include_str!("../../../assets/effects/stripes_overlay.fs"),
+    ),
+    ("slide", include_str!("../../../assets/effects/slide.fs")),
+    (
+        "radial_mosaic",
+        include_str!("../../../assets/effects/radial_mosaic.fs"),
+    ),
+    (
+        "stingy_sphere",
+        include_str!("../../../assets/effects/stingy_sphere.fs"),
+    ),
+    ("goo", include_str!("../../../assets/effects/goo.fs")),
+    (
+        "fragment",
+        include_str!("../../../assets/effects/fragment.fs"),
+    ),
+    (
+        "iterate",
+        include_str!("../../../assets/effects/iterate.fs"),
+    ),
+    (
+        "shift_glitch",
+        include_str!("../../../assets/effects/shift_glitch.fs"),
+    ),
+    ("lowres", include_str!("../../../assets/effects/lowres.fs")),
+    (
+        "shadow_drop",
+        include_str!("../../../assets/effects/shadow_drop.fs"),
+    ),
+    (
+        "outline",
+        include_str!("../../../assets/effects/outline.fs"),
+    ),
+    (
+        "cross_hatch",
+        include_str!("../../../assets/effects/cross_hatch.fs"),
+    ),
+    (
+        "rain_drops",
+        include_str!("../../../assets/effects/rain_drops.fs"),
+    ),
 ];
 
 /// Bundled generators: ISF without an image input, rendered at composition size.
@@ -322,6 +401,38 @@ pub const GENERATORS: &[(&str, &str)] = &[
     (
         "gradient_sweep",
         include_str!("../../../assets/generators/gradient_sweep.fs"),
+    ),
+    (
+        "spectrum_bars",
+        include_str!("../../../assets/generators/spectrum_bars.fs"),
+    ),
+    (
+        "waveform_line",
+        include_str!("../../../assets/generators/waveform_line.fs"),
+    ),
+    (
+        "grid_3d",
+        include_str!("../../../assets/generators/grid_3d.fs"),
+    ),
+    (
+        "hex_grid",
+        include_str!("../../../assets/generators/hex_grid.fs"),
+    ),
+    (
+        "spiral",
+        include_str!("../../../assets/generators/spiral.fs"),
+    ),
+    (
+        "lissajous",
+        include_str!("../../../assets/generators/lissajous.fs"),
+    ),
+    (
+        "stars_warp",
+        include_str!("../../../assets/generators/stars_warp.fs"),
+    ),
+    (
+        "lava_lamp",
+        include_str!("../../../assets/generators/lava_lamp.fs"),
     ),
 ];
 
@@ -1530,6 +1641,52 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
         ] {
             let src = builtin_source(id).unwrap_or_else(|| panic!("{id} not registered"));
             parse(src).unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+    }
+
+    /// The fx-pack-2 files all parse, have unique ids and are registered under their file name.
+    #[test]
+    fn fx_pack_2_parses_with_unique_ids() {
+        let ids: Vec<&str> = BUILTIN.iter().chain(GENERATORS).map(|(k, _)| *k).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate ids");
+        for id in [
+            "add_subtract",
+            "color_pass",
+            "hue_rotate_cycle",
+            "contrast_curve",
+            "gamma_rgb",
+            "exposure_flash",
+            "edge_glow",
+            "displace_map",
+            "wave_warp",
+            "stripes_overlay",
+            "slide",
+            "radial_mosaic",
+            "stingy_sphere",
+            "goo",
+            "fragment",
+            "iterate",
+            "shift_glitch",
+            "lowres",
+            "shadow_drop",
+            "outline",
+            "cross_hatch",
+            "rain_drops",
+            "spectrum_bars",
+            "waveform_line",
+            "grid_3d",
+            "hex_grid",
+            "spiral",
+            "lissajous",
+            "stars_warp",
+            "lava_lamp",
+        ] {
+            let src = builtin_source(id).unwrap_or_else(|| panic!("{id} not registered"));
+            let isf = parse(src).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(!isf.categories.is_empty(), "{id}: no categories");
         }
     }
 
