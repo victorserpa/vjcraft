@@ -1,7 +1,8 @@
 /*{
-  "DESCRIPTION": "Spectrum analyser bars. ISF audio inputs are not supported here, so the levels are synthetic and move with TIME; set bpm to pulse the bass.",
+  "DESCRIPTION": "Spectrum analyser bars fed by the master audio analysis. With no audio the levels are synthetic and move with TIME; set bpm to pulse the bass.",
   "CATEGORIES": ["Generator"],
   "INPUTS": [
+    { "NAME": "audioSpec", "TYPE": "audioFFT", "MAX": 64 },
     { "NAME": "colorLow", "TYPE": "color", "DEFAULT": [0.1, 0.9, 0.4, 1.0] },
     { "NAME": "colorHigh", "TYPE": "color", "DEFAULT": [1.0, 0.2, 0.3, 1.0] },
     { "NAME": "background", "TYPE": "color", "DEFAULT": [0.02, 0.02, 0.06, 1.0] },
@@ -13,6 +14,11 @@
 }*/
 float level_(float i, float n) {
     float x = i / n;
+    // Alpha of the texture is 1 only while audio is playing.
+    if (IMG_NORM_PIXEL(audioSpec, vec2(0.5, 0.5)).a > 0.5) {
+        float v = IMG_NORM_PIXEL(audioSpec, vec2((i + 0.5) / n, 0.5)).r;
+        return clamp(v * sensitivity * 1.6, 0.02, 1.0);
+    }
     float beat = TIME * bpm / 60.0;
     float kick = exp(-fract(beat) * 5.0);
     float low = (1.0 - x) * (0.35 + 0.65 * kick);

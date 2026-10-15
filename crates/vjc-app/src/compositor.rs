@@ -579,6 +579,7 @@ pub(crate) fn draw_pass(
         buf,
         (src, dst, mask, prev),
         &[],
+        None,
     );
 }
 
@@ -599,6 +600,7 @@ fn draw_pass_targets(
         &wgpu::TextureView,
     ),
     targets: &[&wgpu::TextureView],
+    audio: Option<[&wgpu::TextureView; 2]>,
 ) {
     let mut entries = vec![
         wgpu::BindGroupEntry {
@@ -626,6 +628,13 @@ fn draw_pass_targets(
         entries.push(wgpu::BindGroupEntry {
             binding: vjc_fx::TARGET_BINDING + k as u32,
             resource: wgpu::BindingResource::TextureView(targets.get(k).copied().unwrap_or(prev)),
+        });
+    }
+    // Spectrum and waveform; shaders without audio inputs never read them.
+    for k in 0..2 {
+        entries.push(wgpu::BindGroupEntry {
+            binding: vjc_fx::AUDIO_BINDING + k as u32,
+            resource: wgpu::BindingResource::TextureView(audio.map_or(prev, |a| a[k])),
         });
     }
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -668,6 +677,7 @@ impl Fx {
         blank: &wgpu::TextureView,
         dst: &wgpu::TextureView,
         g: &EffectDraw,
+        audio: [&wgpu::TextureView; 2],
     ) {
         let Some(pipe) = self.pipes.get(&g.kind) else {
             // Not compiled or failed: clear, so the layer never shows the previous clip.
@@ -701,8 +711,16 @@ impl Fx {
         let buf = &self.bufs[self.next];
         self.next += 1;
         queue.write_buffer(buf, 0, bytemuck::cast_slice(&g.uniforms));
-        draw_pass(
-            device, enc, bgl, sampler, pipe, buf, blank, dst, blank, blank,
+        draw_pass_targets(
+            device,
+            enc,
+            bgl,
+            sampler,
+            pipe,
+            buf,
+            (blank, dst, blank, blank),
+            &[],
+            Some(audio),
         );
     }
 
@@ -850,6 +868,7 @@ impl Fx {
                         buf,
                         (src, dst, mask.unwrap_or(src), src),
                         &views,
+                        None,
                     );
                     if let Some(t) = &pass.target {
                         let k = names.iter().position(|n| n == t).unwrap_or(0);
@@ -1122,6 +1141,8 @@ pub struct Compositor {
     /// Index (in the frame's layer list) of the mask layer now held in `mask`.
     mask_cur: Option<usize>,
     sampler: wgpu::Sampler,
+    /// Spectrum and waveform rows read by generators with ISF audio inputs.
+    audio: [(wgpu::Texture, wgpu::TextureView); 2],
     /// 1x1 texture bound as the (unused) input image of generators.
     blank: wgpu::TextureView,
     /// Opaque black 1x1 texture, its uniform and bind group: draws the master fade.
@@ -1213,7 +1234,7 @@ fn make_base(
 /// Bind group layout of every effect / generator pass (also used by the browser thumbnails).
 pub(crate) fn fx_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let mut e: Vec<wgpu::BindGroupLayoutEntry> = vec![];
-    for binding in 0..vjc_fx::TARGET_BINDING + vjc_fx::MAX_TARGETS as u32 {
+    for binding in 0..vjc_fx::AUDIO_BINDING + 2 {
         e.push(wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1497,6 +1518,24 @@ impl Compositor {
             white_ready: false,
             mask_cur: None,
             sampler,
+            audio: [0, 1].map(|_| {
+                let t = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("fx_audio"),
+                    size: wgpu::Extent3d {
+                        width: vjc_fx::AUDIO_TEX_W as u32,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let v = t.create_view(&Default::default());
+                (t, v)
+            }),
             blank,
             fade: (fade_tex, fade_buf, fade_bind),
             slots: HashMap::new(),
@@ -1654,6 +1693,7 @@ impl Compositor {
                 &self.blank,
                 &slot.view,
                 g,
+                [&self.audio[0].1, &self.audio[1].1],
             );
         }
         let out = self.fx.run(
@@ -1943,6 +1983,28 @@ impl Compositor {
         pass.set_bind_group(1, &self.base_bind, &[]);
         pass.draw(0..3, 0..1);
         true
+    }
+
+    /// Uploads this frame's audio analysis for generators with ISF `audio` / `audioFFT`
+    /// inputs: `spectrum` and `wave` in 0..1 (wave 0.5 = silence); without `active` audio
+    /// the textures read zero and the shaders fall back to their synthetic picture.
+    pub fn set_audio(&self, queue: &wgpu::Queue, spectrum: &[f32], wave: &[f32], active: bool) {
+        for (tex, data) in self.audio.iter().zip([spectrum, wave]) {
+            queue.write_texture(
+                tex.0.as_image_copy(),
+                &vjc_fx::audio_texels(data, active),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(vjc_fx::AUDIO_TEX_W as u32 * 4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: vjc_fx::AUDIO_TEX_W as u32,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     /// `master` runs over the finished composition, then the master fade: black drawn with
@@ -3134,6 +3196,113 @@ mod tests {
         for (g, w) in got.iter().zip([51u8, 102, 204, 255]) {
             assert!(g.abs_diff(w) <= 2, "{got:?}");
         }
+    }
+
+    /// Renders `spectrum_bars` on the GPU and returns the RGBA bytes of a 64x36 picture.
+    fn render_spectrum(audio: Option<&[f32]>) -> Option<Vec<u8>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        let (w, h) = (64u32, 36u32);
+        let (isf, wgsl) =
+            vjc_fx::compile(vjc_fx::builtin_source("spectrum_bars").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, w, h);
+        comp.add_effect(&device, "spectrum_bars", &wgsl).unwrap();
+        // A fake FFT: the lower half of the bins is full, the upper half silent.
+        match audio {
+            Some(spec) => comp.set_audio(&queue, spec, &[0.5; 8], true),
+            None => comp.set_audio(&queue, &[], &[], false),
+        }
+        let layer = [LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![],
+            frame: None,
+            generator: Some(EffectDraw {
+                kind: "spectrum_bars".into(),
+                uniforms: isf.pack(&isf.default_params(), 0.0, (w, h)),
+                dry_wet: 1.0,
+                ml: None,
+                persistent: None,
+                ticking: false,
+            }),
+            transition: None,
+            transform: Affine::IDENTITY,
+            channels: Default::default(),
+            mask: Default::default(),
+        }];
+        comp.render(&device, &queue, &layer, &[], 1.0);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        Some(got)
+    }
+
+    /// Pixels of picture column `x` clearly brighter than the dark background, in a 64x36
+    /// RGBA readback.
+    fn lit_in_column(px: &[u8], x: usize) -> usize {
+        (0..36)
+            .filter(|y| {
+                let p = &px[y * 256 + x * 4..][..3];
+                p.iter().map(|c| u32::from(*c)).sum::<u32>() > 150
+            })
+            .count()
+    }
+
+    /// ISF `audioFFT` end to end: a fake spectrum drives the bars, no audio keeps the
+    /// synthetic fallback. Skipped when there is no adapter.
+    #[test]
+    fn gpu_spectrum_bars_follow_the_fake_fft() {
+        let mut spec = vec![1.0f32; 64];
+        spec[32..].fill(0.0);
+        let Some(px) = render_spectrum(Some(&spec)) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        // Bar 8 (x 17) sits in the loud half, bar 24 (x 49) in the silent one.
+        assert!(
+            lit_in_column(&px, 17) >= 30,
+            "loud bar {}",
+            lit_in_column(&px, 17)
+        );
+        assert!(
+            lit_in_column(&px, 49) <= 3,
+            "silent bar {}",
+            lit_in_column(&px, 49)
+        );
+        // No audio: the synthetic levels light both.
+        let px = render_spectrum(None).unwrap();
+        assert!(lit_in_column(&px, 17) >= 2 && lit_in_column(&px, 49) >= 2);
     }
 
     /// Master fade on the GPU: opacity 0.5 halves the colour towards black, bypass (opacity 0)

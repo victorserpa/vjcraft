@@ -1047,16 +1047,62 @@ pub enum Animation {
     },
     Envelope {
         points: Vec<(f64, f64)>,
+        /// Cycle length, in beats or seconds according to `unit`.
         beats: f64,
         #[serde(default)]
         motion: Motion,
+        /// Curve of the segment that starts at point `i` (missing entries are linear).
+        #[serde(default)]
+        curves: Vec<EnvCurve>,
+        #[serde(default)]
+        unit: EnvUnit,
     },
     Dashboard {
         dial: u32,
         /// Whose dial: the composition's, the layer's or the clip's the param lives on.
         #[serde(default)]
         scope: DialScope,
+        /// Output window of this link as a fraction of the param range.
+        #[serde(default)]
+        min: f32,
+        #[serde(default = "one_f32")]
+        max: f32,
     },
+}
+
+/// Shape of one envelope segment, from its point to the next.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum EnvCurve {
+    #[default]
+    Linear,
+    /// Keeps the point's value until the next point.
+    Hold,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    /// Cubic bezier easing with control points (x1, y1) and (x2, y2) in segment units.
+    Bezier([f32; 4]),
+}
+
+impl EnvCurve {
+    pub fn label(self) -> &'static str {
+        match self {
+            EnvCurve::Linear => "Linear",
+            EnvCurve::Hold => "Hold",
+            EnvCurve::EaseIn => "Ease in",
+            EnvCurve::EaseOut => "Ease out",
+            EnvCurve::EaseInOut => "Ease in/out",
+            EnvCurve::Bezier(_) => "Bezier",
+        }
+    }
+}
+
+/// Unit of an envelope's cycle length.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnvUnit {
+    #[default]
+    Beats,
+    Seconds,
 }
 
 /// What an animation does after its first cycle.
@@ -1091,10 +1137,16 @@ pub enum AnimDirection {
 }
 
 /// Loop mode and direction of a Timeline, Beats or Envelope animation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Motion {
     pub mode: LoopMode,
     pub direction: AnimDirection,
+    /// Time-based animations count from the clip's trigger instead of the global clock.
+    #[serde(default)]
+    pub follow_clip: bool,
+    /// Playhead parked at this position of the cycle (0..1) instead of running.
+    #[serde(default)]
+    pub scrub: Option<f64>,
 }
 
 /// Which dashboard a `Animation::Dashboard` reads. Layer and Clip mean the layer or clip
@@ -2199,6 +2251,8 @@ mod tests {
             serde_json::from_str(r#"{"Beats":{"beats":4.0,"curve":"Sine"}}"#).unwrap();
         assert!(matches!(a, Animation::Beats { motion, .. } if motion == Motion::default()));
         let m = Motion {
+            follow_clip: false,
+            scrub: None,
             mode: LoopMode::PingPong,
             direction: AnimDirection::Backward,
         };
@@ -2339,16 +2393,44 @@ mod tests {
     }
 
     #[test]
+    fn envelope_and_motion_saved_before_curves_and_scrub_load_with_defaults() {
+        let old: Animation = serde_json::from_str(
+            r#"{"Envelope":{"points":[[0.0,0.0],[1.0,1.0]],"beats":4.0,
+                "motion":{"mode":"PingPong","direction":"Backward"}}}"#,
+        )
+        .unwrap();
+        let Animation::Envelope {
+            curves,
+            unit,
+            motion,
+            beats,
+            ..
+        } = old
+        else {
+            panic!("not an envelope");
+        };
+        assert!(curves.is_empty());
+        assert_eq!(unit, EnvUnit::default());
+        assert_eq!(beats, 4.0);
+        assert_eq!(motion.mode, LoopMode::PingPong);
+        assert!(!motion.follow_clip && motion.scrub.is_none());
+    }
+
+    #[test]
     fn dashboard_animation_without_scope_loads_as_comp() {
         let old: Animation = serde_json::from_str(r#"{"Dashboard":{"dial":2}}"#).unwrap();
         assert_eq!(
             old,
             Animation::Dashboard {
+                min: 0.0,
+                max: 1.0,
                 dial: 2,
                 scope: DialScope::Comp
             }
         );
         let new = Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 1,
             scope: DialScope::Clip,
         };

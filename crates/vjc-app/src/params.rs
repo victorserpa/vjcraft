@@ -175,6 +175,24 @@ fn motion_controls(ui: &mut egui::Ui, id: egui::Id, m: &mut vjc_model::Motion) -
             vjc_model::AnimDirection::Backward
         };
     }
+    if ui
+        .selectable_label(m.follow_clip, "Follow clip")
+        .on_hover_text("Count from the clip's trigger instead of the global clock")
+        .clicked()
+    {
+        m.follow_clip = !m.follow_clip;
+    }
+    let mut scrubbing = m.scrub.is_some();
+    if ui
+        .checkbox(&mut scrubbing, "Scrub")
+        .on_hover_text("Park the playhead at a position of the cycle")
+        .changed()
+    {
+        m.scrub = scrubbing.then_some(0.0);
+    }
+    if let Some(p) = &mut m.scrub {
+        ui.add(egui::Slider::new(p, 0.0..=1.0).show_value(true));
+    }
     *m != before
 }
 
@@ -204,11 +222,15 @@ pub fn default_animation(kind: &str) -> Option<Animation> {
             curve: Curve::Sine,
         }),
         "Envelope" => Some(Animation::Envelope {
+            curves: vec![],
+            unit: Default::default(),
             motion: Default::default(),
             points: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
             beats: 4.0,
         }),
         "Dashboard" => Some(Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 0,
             scope: Default::default(),
         }),
@@ -274,54 +296,172 @@ fn curve_graph(ui: &mut egui::Ui, a: &Animation) -> egui::Rect {
     rect
 }
 
+/// What the envelope editor edits.
+pub struct EnvEdit<'a> {
+    pub points: &'a mut Vec<(f64, f64)>,
+    pub curves: &'a mut Vec<vjc_model::EnvCurve>,
+    pub cycle: f64,
+    pub unit: vjc_model::EnvUnit,
+    pub motion: vjc_model::Motion,
+}
+
+/// Snap grid choices, in cycle units (beats or seconds); 0 = off.
+const SNAP_GRIDS: [f64; 5] = [0.0, 0.25, 0.5, 1.0, 2.0];
+
 /// The envelope curve with draggable points: drag a point to move it, double click on empty
-/// space to add one. Returns true when the points changed.
-fn envelope_editor(ui: &mut egui::Ui, points: &mut Vec<(f64, f64)>, beats: f64) -> bool {
+/// space to add one, right click a point to delete it. A grid snaps x to beats (or seconds);
+/// the selected point's segment has a curve type and, for Bezier, two draggable handles.
+/// Returns true when the points or curves changed.
+fn envelope_editor(ui: &mut egui::Ui, id: egui::Id, e: EnvEdit) -> bool {
+    use vjc_core::anim as an;
+    let EnvEdit {
+        points,
+        curves,
+        cycle,
+        unit,
+        motion,
+    } = e;
+    curves.resize(points.len(), vjc_model::EnvCurve::Linear);
     let a = Animation::Envelope {
-        motion: Default::default(),
+        motion,
         points: points.clone(),
-        beats,
+        beats: cycle,
+        curves: curves.clone(),
+        unit,
     };
     let rect = curve_graph(ui, &a);
-    let r = ui.interact(
-        rect,
-        ui.id().with("env-graph"),
-        egui::Sense::click_and_drag(),
-    );
+    let r = ui.interact(rect, id.with("env-graph"), egui::Sense::click_and_drag());
     let to_unit = |p: egui::Pos2| {
         (
             f64::from((p.x - rect.left()) / rect.width()),
             f64::from((rect.bottom() - p.y) / rect.height()),
         )
     };
-    let drag_id = ui.id().with("env-drag");
+    let (drag_id, sel_id, grid_id) = (id.with("env-drag"), id.with("env-sel"), id.with("env-grid"));
+    let grid: f64 = ui.data(|d| d.get_temp(grid_id)).unwrap_or(0.0);
+    let snap = |x: f64| an::env_snap(x, cycle, grid);
     let mut changed = false;
     if r.drag_started()
         && let Some(p) = r.interact_pointer_pos()
     {
         let (x, y) = to_unit(p);
-        let hit = vjc_core::anim::env_nearest(points, x, y, ENV_PICK);
-        ui.data_mut(|d| d.insert_temp(drag_id, hit));
+        let hit = an::env_nearest(points, x, y, ENV_PICK);
+        ui.data_mut(|d| {
+            d.insert_temp(drag_id, hit);
+            if hit.is_some() {
+                d.insert_temp(sel_id, hit);
+            }
+        });
     }
     if r.dragged()
         && let Some(p) = r.interact_pointer_pos()
         && let Some(Some(i)) = ui.data(|d| d.get_temp::<Option<usize>>(drag_id))
     {
         let (x, y) = to_unit(p);
-        changed |= vjc_core::anim::env_move(points, i, x, y);
+        changed |= an::env_move(points, i, snap(x), y);
     }
     if r.double_clicked()
         && let Some(p) = r.interact_pointer_pos()
     {
         let (x, y) = to_unit(p);
-        if vjc_core::anim::env_nearest(points, x, y, ENV_PICK).is_none() {
-            changed |= vjc_core::anim::env_insert(points, x, y).is_some();
+        if an::env_nearest(points, x, y, ENV_PICK).is_none() {
+            changed |= an::env_insert_curve(points, curves, snap(x), y).is_some();
         }
     }
-    for p in points.iter() {
-        ui.painter()
-            .circle_filled(graph_pos(rect, p.0, p.1), 3.0, crate::theme::TEXT);
+    if r.secondary_clicked()
+        && let Some(p) = r.interact_pointer_pos()
+    {
+        let (x, y) = to_unit(p);
+        if let Some(i) = an::env_nearest(points, x, y, ENV_PICK) {
+            changed |= an::env_remove(points, curves, i);
+        }
     }
+    let sel = ui
+        .data(|d| d.get_temp::<Option<usize>>(sel_id))
+        .flatten()
+        .filter(|i| i + 1 < points.len());
+    for (i, p) in points.iter().enumerate() {
+        let c = if Some(i) == sel {
+            crate::theme::ACCENT
+        } else {
+            crate::theme::TEXT
+        };
+        ui.painter()
+            .circle_filled(graph_pos(rect, p.0, p.1), 3.0, c);
+    }
+    if let Some(i) = sel {
+        if let vjc_model::EnvCurve::Bezier(mut h) = curves[i] {
+            let (p0, p1) = (points[i], points[i + 1]);
+            for k in 0..2 {
+                let (cx, cy) = (f64::from(h[2 * k]), f64::from(h[2 * k + 1]));
+                let pos = graph_pos(rect, p0.0 + (p1.0 - p0.0) * cx, p0.1 + (p1.1 - p0.1) * cy);
+                ui.painter()
+                    .circle_stroke(pos, 4.0, egui::Stroke::new(1.5, crate::theme::ACCENT));
+                let hr = ui.interact(
+                    egui::Rect::from_center_size(pos, egui::vec2(10.0, 10.0)),
+                    id.with(("bz", k)),
+                    egui::Sense::drag(),
+                );
+                if hr.dragged()
+                    && let Some(q) = hr.interact_pointer_pos()
+                    && (p1.0 - p0.0).abs() > 1e-9
+                {
+                    let (x, y) = to_unit(q);
+                    h[2 * k] = ((x - p0.0) / (p1.0 - p0.0)).clamp(0.0, 1.0) as f32;
+                    h[2 * k + 1] = if (p1.1 - p0.1).abs() > 1e-9 {
+                        ((y - p0.1) / (p1.1 - p0.1)).clamp(-1.0, 2.0) as f32
+                    } else {
+                        h[2 * k + 1]
+                    };
+                    curves[i] = vjc_model::EnvCurve::Bezier(h);
+                    changed = true;
+                }
+            }
+        }
+        let before = curves[i];
+        egui::ComboBox::from_id_salt(id.with("seg-curve"))
+            .selected_text(format!("Segment {}: {}", i + 1, before.label()))
+            .show_ui(ui, |ui| {
+                for c in [
+                    vjc_model::EnvCurve::Linear,
+                    vjc_model::EnvCurve::Hold,
+                    vjc_model::EnvCurve::EaseIn,
+                    vjc_model::EnvCurve::EaseOut,
+                    vjc_model::EnvCurve::EaseInOut,
+                    vjc_model::EnvCurve::Bezier([0.42, 0.0, 0.58, 1.0]),
+                ] {
+                    let on = std::mem::discriminant(&c) == std::mem::discriminant(&curves[i]);
+                    if ui.selectable_label(on, c.label()).clicked() && !on {
+                        curves[i] = c;
+                    }
+                }
+            });
+        changed |= curves[i] != before;
+    } else {
+        ui.weak("Click a point to pick its curve");
+    }
+    let unit_name = match unit {
+        vjc_model::EnvUnit::Beats => "beats",
+        vjc_model::EnvUnit::Seconds => "s",
+    };
+    egui::ComboBox::from_id_salt(id.with("grid"))
+        .selected_text(if grid > 0.0 {
+            format!("Snap {grid} {unit_name}")
+        } else {
+            "Snap off".to_string()
+        })
+        .show_ui(ui, |ui| {
+            for g in SNAP_GRIDS {
+                let n = if g > 0.0 {
+                    format!("{g} {unit_name}")
+                } else {
+                    "Off".to_string()
+                };
+                if ui.selectable_label(g == grid, n).clicked() {
+                    ui.data_mut(|d| d.insert_temp(grid_id, g));
+                }
+            }
+        });
     changed
 }
 
@@ -409,20 +549,47 @@ fn anim_menu(
             points,
             beats,
             motion,
+            curves,
+            unit,
         }) => {
+            let before = *unit;
+            egui::ComboBox::from_id_salt(id.with("unit"))
+                .selected_text(match unit {
+                    vjc_model::EnvUnit::Beats => "Beats",
+                    vjc_model::EnvUnit::Seconds => "Seconds",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(unit, vjc_model::EnvUnit::Beats, "Beats");
+                    ui.selectable_value(unit, vjc_model::EnvUnit::Seconds, "Seconds");
+                });
+            changed |= *unit != before;
             changed |= ui
                 .add(
                     egui::DragValue::new(beats)
-                        .range(0.25..=64.0)
-                        .suffix(" beats"),
+                        .range(0.25..=600.0)
+                        .suffix(match unit {
+                            vjc_model::EnvUnit::Beats => " beats",
+                            vjc_model::EnvUnit::Seconds => " s",
+                        }),
                 )
                 .changed();
             changed |= motion_controls(ui, id.with("m"), motion);
-            changed |= envelope_editor(ui, points, *beats);
+            changed |= envelope_editor(
+                ui,
+                id,
+                EnvEdit {
+                    points,
+                    curves,
+                    cycle: *beats,
+                    unit: *unit,
+                    motion: *motion,
+                },
+            );
             ui.menu_button("Preset", |ui| {
                 for pre in vjc_core::anim::EnvPreset::ALL {
                     if ui.button(pre.label()).clicked() {
                         *points = pre.points();
+                        curves.clear();
                         changed = true;
                         ui.close();
                     }
@@ -443,15 +610,18 @@ fn anim_menu(
                 });
             }
             if let Some(i) = remove {
-                points.remove(i);
-                changed = true;
+                changed |= vjc_core::anim::env_remove(points, curves, i);
             }
             if crate::icons::button(ui, crate::icons::i::PLUS, "Add point").clicked() {
-                points.push((1.0, 0.5));
-                changed = true;
+                changed |= vjc_core::anim::env_insert_curve(points, curves, 1.0, 0.5).is_some();
             }
         }
-        Some(Animation::Dashboard { dial, scope }) => {
+        Some(Animation::Dashboard {
+            dial,
+            scope,
+            min,
+            max,
+        }) => {
             let before = *scope;
             egui::ComboBox::from_id_salt(id.with("scope"))
                 .selected_text(scope.label())
@@ -466,6 +636,16 @@ fn anim_menu(
                 .add(egui::DragValue::new(&mut n).range(1..=8).prefix("Dial "))
                 .changed();
             *dial = n - 1;
+            for (v, p) in [(&mut *min, "Min "), (&mut *max, "Max ")] {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(v)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .prefix(p),
+                    )
+                    .changed();
+            }
         }
         Some(Animation::Audio {
             band,

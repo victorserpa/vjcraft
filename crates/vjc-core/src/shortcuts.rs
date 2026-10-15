@@ -496,7 +496,7 @@ fn dial_of(s: &str) -> Option<u32> {
 }
 
 fn dial_value(dials: &[vjc_model::Param], dial: u32) -> f64 {
-    dials.get(dial as usize).map_or(0.0, |d| number(&d.value))
+    dials.get(dial as usize).map_or(0.0, super::anim::dial_norm)
 }
 
 fn number_of(s: &str) -> Option<usize> {
@@ -557,7 +557,7 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
                 p.composition
                     .dashboard
                     .get(i)
-                    .map_or(0.0, |d| number(&d.value)),
+                    .map_or(0.0, super::anim::dial_norm),
             )
         }
         _ => None,

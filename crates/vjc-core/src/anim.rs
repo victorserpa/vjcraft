@@ -3,7 +3,8 @@
 //! animating never dirties the project nor enters the history.
 
 use vjc_model::{
-    AnimDirection, Animation, Curve, DialScope, FftBand, LoopMode, Motion, Param, Value,
+    AnimDirection, Animation, Curve, DialScope, EnvCurve, EnvUnit, FftBand, LoopMode, Motion,
+    Param, Value,
 };
 
 /// Dials per composition.
@@ -56,11 +57,21 @@ impl AnimCtx<'_> {
 /// Current dial values (0..=1) of a dials list, padded with zeros to `DIALS`.
 pub fn dial_values(dials: &[vjc_model::Param]) -> Vec<f64> {
     (0..DIALS)
-        .map(|i| match dials.get(i).map(|p| &p.value) {
-            Some(Value::Number(n)) => *n,
-            _ => 0.0,
-        })
+        .map(|i| dials.get(i).map_or(0.0, dial_norm))
         .collect()
+}
+
+/// A dial's value normalised to 0..=1 over its (editable) range.
+pub fn dial_norm(p: &Param) -> f64 {
+    let Value::Number(n) = p.value else {
+        return 0.0;
+    };
+    let (lo, hi) = p.range.unwrap_or((0.0, 1.0));
+    if hi > lo {
+        ((n - lo) / (hi - lo)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// One step of attack/release smoothing: `prev` moves toward `target` with time constant
@@ -133,17 +144,54 @@ pub fn shape(curve: &Curve, cycles: f64) -> f64 {
     }
 }
 
-fn envelope(points: &[(f64, f64)], x: f64) -> f64 {
-    let mut pts: Vec<(f64, f64)> = points.to_vec();
+/// Eased progress `t` (0..=1) of one segment under `curve`.
+pub fn ease(curve: EnvCurve, t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    match curve {
+        EnvCurve::Linear => t,
+        EnvCurve::Hold => 0.0,
+        EnvCurve::EaseIn => t * t,
+        EnvCurve::EaseOut => t * (2.0 - t),
+        EnvCurve::EaseInOut => t * t * (3.0 - 2.0 * t),
+        EnvCurve::Bezier([x1, y1, x2, y2]) => {
+            let (x1, y1, x2, y2) = (
+                f64::from(x1).clamp(0.0, 1.0),
+                f64::from(y1),
+                f64::from(x2).clamp(0.0, 1.0),
+                f64::from(y2),
+            );
+            let at = |a: f64, b: f64, u: f64| {
+                let v = 1.0 - u;
+                3.0 * v * v * u * a + 3.0 * v * u * u * b + u * u * u
+            };
+            // x is monotonic in u for x1, x2 in 0..=1: bisect for the u that gives t.
+            let (mut lo, mut hi) = (0.0, 1.0);
+            for _ in 0..40 {
+                let mid = 0.5 * (lo + hi);
+                if at(x1, x2, mid) < t {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            at(y1, y2, 0.5 * (lo + hi))
+        }
+    }
+}
+
+fn envelope(points: &[(f64, f64)], curves: &[EnvCurve], x: f64) -> f64 {
+    // Sort points together with their segment curves.
+    let mut pts: Vec<(f64, f64, EnvCurve)> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.0, p.1, curves.get(i).copied().unwrap_or_default()))
+        .collect();
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
     let x = x.rem_euclid(1.0);
     match pts.as_slice() {
         [] => 0.0,
-        [(_, y)] => *y,
-        [first, .., last] if x <= first.0 => {
-            let _ = last;
-            first.1
-        }
+        [(_, y, _)] => *y,
+        [first, ..] if x <= first.0 => first.1,
         [.., last] if x >= last.0 => last.1,
         _ => pts
             .windows(2)
@@ -153,7 +201,8 @@ fn envelope(points: &[(f64, f64)], x: f64) -> f64 {
                 if span <= 0.0 {
                     w[1].1
                 } else {
-                    w[0].1 + (w[1].1 - w[0].1) * (x - w[0].0) / span
+                    let e = ease(w[0].2, (x - w[0].0) / span);
+                    w[0].1 + (w[1].1 - w[0].1) * e
                 }
             }),
     }
@@ -245,7 +294,11 @@ impl EnvPreset {
 pub fn preview(anim: &Animation, n: usize) -> Vec<f64> {
     let cycle = match anim {
         Animation::Timeline { duration_secs, .. } => *duration_secs,
-        Animation::Beats { beats, .. } | Animation::Envelope { beats, .. } => *beats,
+        Animation::Beats { beats, .. } => *beats,
+        Animation::Envelope { beats, unit, .. } => match unit {
+            EnvUnit::Beats => *beats,
+            EnvUnit::Seconds => return preview_secs(anim, *beats, n),
+        },
         _ => return Vec::new(),
     };
     (0..n)
@@ -260,6 +313,18 @@ pub fn preview(anim: &Animation, n: usize) -> Vec<f64> {
                     beat_phase: at,
                     ..Default::default()
                 },
+            };
+            unit(anim, &ctx)
+        })
+        .collect()
+}
+
+fn preview_secs(anim: &Animation, cycle: f64, n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| {
+            let ctx = AnimCtx {
+                time_secs: cycle * i as f64 / n as f64,
+                ..Default::default()
             };
             unit(anim, &ctx)
         })
@@ -303,9 +368,49 @@ pub fn env_insert(points: &mut Vec<(f64, f64)>, x: f64, y: f64) -> Option<usize>
     Some(at)
 }
 
+/// Inserts a point like `env_insert` and keeps `curves` aligned: the new point's segment
+/// starts as a copy of the one it splits.
+pub fn env_insert_curve(
+    points: &mut Vec<(f64, f64)>,
+    curves: &mut Vec<EnvCurve>,
+    x: f64,
+    y: f64,
+) -> Option<usize> {
+    curves.resize(points.len(), EnvCurve::Linear);
+    let at = env_insert(points, x, y)?;
+    let inherit = at.checked_sub(1).map_or(EnvCurve::Linear, |i| curves[i]);
+    curves.insert(at, inherit);
+    Some(at)
+}
+
+/// Removes point `i` and its segment curve; the last two points stay. False when nothing
+/// was removed.
+pub fn env_remove(points: &mut Vec<(f64, f64)>, curves: &mut Vec<EnvCurve>, i: usize) -> bool {
+    if i >= points.len() || points.len() <= 2 {
+        return false;
+    }
+    curves.resize(points.len(), EnvCurve::Linear);
+    points.remove(i);
+    curves.remove(i);
+    true
+}
+
+/// Snaps envelope position `x` (0..1 of a cycle of `cycle` units) to a grid of `grid` units;
+/// no grid (0 or less) leaves it alone.
+pub fn env_snap(x: f64, cycle: f64, grid: f64) -> f64 {
+    if grid <= 0.0 || cycle <= 0.0 || !x.is_finite() {
+        return x;
+    }
+    let step = grid / cycle;
+    ((x / step).round() * step).clamp(0.0, 1.0)
+}
+
 /// Applies loop mode and direction to a position in cycles (`x` grows with the clock).
 /// Loop keeps the continuous position (backward = negated); PingPong folds it into 0..1.
 pub fn motion_phase(m: Motion, x: f64) -> f64 {
+    if let Some(p) = m.scrub.filter(|p| p.is_finite()) {
+        return p.clamp(0.0, 1.0 - 1e-9);
+    }
     let back = m.direction == AnimDirection::Backward;
     let p = match m.mode {
         LoopMode::Loop => return if back { -x } else { x },
@@ -320,9 +425,10 @@ pub fn motion_phase(m: Motion, x: f64) -> f64 {
 /// Origin of an animation's cycle count: the clip's trigger time for `Once`, else the
 /// clock origin.
 fn start(ctx: &AnimCtx, m: Motion) -> (f64, f64) {
-    match m.mode {
-        LoopMode::Once => ctx.clip_start.unwrap_or((0.0, 0.0)),
-        _ => (0.0, 0.0),
+    if m.mode == LoopMode::Once || m.follow_clip {
+        ctx.clip_start.unwrap_or((0.0, 0.0))
+    } else {
+        (0.0, 0.0)
     }
 }
 
@@ -399,20 +505,33 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
             points,
             beats,
             motion,
-        } => envelope(
-            points,
-            motion_phase(
-                *motion,
-                safe_div(ctx.beat_phase - start(ctx, *motion).1, *beats),
-            ),
-        ),
-        Animation::Dashboard { dial, scope } => {
+            curves,
+            unit,
+        } => {
+            let (t0, b0) = start(ctx, *motion);
+            let elapsed = match unit {
+                EnvUnit::Beats => ctx.beat_phase - b0,
+                EnvUnit::Seconds => ctx.time_secs - t0,
+            };
+            envelope(
+                points,
+                curves,
+                motion_phase(*motion, safe_div(elapsed, *beats)),
+            )
+        }
+        Animation::Dashboard {
+            dial,
+            scope,
+            min,
+            max,
+        } => {
             let dials = match scope {
                 DialScope::Comp => ctx.dashboard,
                 DialScope::Layer => ctx.layer_dials.unwrap_or(&[]),
                 DialScope::Clip => ctx.clip_dials.unwrap_or(&[]),
             };
-            dials.get(*dial as usize).copied().unwrap_or(0.0)
+            let v = dials.get(*dial as usize).copied().unwrap_or(0.0);
+            f64::from(*min) + v.clamp(0.0, 1.0) * f64::from(*max - *min)
         }
     };
     if t.is_finite() {
@@ -577,6 +696,8 @@ mod tests {
             "cycle length does not change the shape"
         );
         let env = Animation::Envelope {
+            curves: vec![],
+            unit: Default::default(),
             motion: Default::default(),
             points: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
             beats: 8.0,
@@ -586,6 +707,8 @@ mod tests {
         assert!(
             preview(
                 &Animation::Dashboard {
+                    min: 0.0,
+                    max: 1.0,
                     dial: 0,
                     scope: Default::default()
                 },
@@ -615,6 +738,8 @@ mod tests {
         assert_eq!(pts, before);
         // The dragged envelope changes the evaluated value.
         let mut a = Animation::Envelope {
+            curves: vec![],
+            unit: Default::default(),
             motion: Default::default(),
             points: vec![(0.0, 0.0), (1.0, 1.0)],
             beats: 2.0,
@@ -660,6 +785,8 @@ mod tests {
     #[test]
     fn envelope_interpolates() {
         let a = Animation::Envelope {
+            curves: vec![],
+            unit: Default::default(),
             motion: Default::default(),
             points: vec![(1.0, 0.0), (0.0, 1.0)],
             beats: 2.0,
@@ -692,6 +819,8 @@ mod tests {
         );
         assert_eq!(evaluate(&pr, &au, &ctx(0.0, 0.0, &[], &[])), 0.0);
         let d = Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 1,
             scope: Default::default(),
         };
@@ -790,6 +919,8 @@ mod tests {
     fn envelope_presets_shape_the_cycle() {
         let at = |pre: EnvPreset, x: f64| {
             let a = Animation::Envelope {
+                curves: vec![],
+                unit: Default::default(),
                 motion: Default::default(),
                 points: pre.points(),
                 beats: 4.0,
@@ -841,7 +972,12 @@ mod tests {
         let base = ctx(0.0, 0.0, &[], &comp);
         let c = base.scoped(&layer, &clip);
         let read = |scope| {
-            let a = Animation::Dashboard { dial: 0, scope };
+            let a = Animation::Dashboard {
+                min: 0.0,
+                max: 1.0,
+                dial: 0,
+                scope,
+            };
             evaluate(&p((0.0, 1.0)), &a, &c)
         };
         assert_eq!(read(DialScope::Comp), 0.1);
@@ -850,6 +986,8 @@ mod tests {
         // A scope with no dials (param outside any layer/clip) reads 0, not the comp's.
         let none = base.scoped(&[], &[]);
         let a = Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 0,
             scope: DialScope::Layer,
         };
@@ -876,7 +1014,12 @@ mod tests {
             let a = Animation::Beats {
                 beats: 4.0,
                 curve: Curve::Saw,
-                motion: Motion { mode, direction },
+                motion: Motion {
+                    follow_clip: false,
+                    scrub: None,
+                    mode,
+                    direction,
+                },
             };
             evaluate(&p((0.0, 1.0)), &a, &ctx(b, 1.0, &[], &[]))
         };
@@ -897,6 +1040,8 @@ mod tests {
             beats: 4.0,
             curve: Curve::Saw,
             motion: Motion {
+                follow_clip: false,
+                scrub: None,
                 mode: LoopMode::Once,
                 direction: AnimDirection::Forward,
             },
@@ -923,6 +1068,8 @@ mod tests {
             beats: 4.0,
             curve: Curve::Saw,
             motion: Motion {
+                follow_clip: false,
+                scrub: None,
                 mode: LoopMode::Once,
                 direction: AnimDirection::Backward,
             },
@@ -933,5 +1080,95 @@ mod tests {
             ..Default::default()
         };
         assert!(evaluate(&p((0.0, 1.0)), &b, &c).abs() < 1e-6);
+    }
+
+    #[test]
+    fn envelope_curve_types_shape_the_segment() {
+        let pts = vec![(0.0, 0.0), (1.0, 1.0)];
+        let at = |c: EnvCurve, x: f64| envelope(&pts, &[c], x);
+        assert!((at(EnvCurve::Linear, 0.5) - 0.5).abs() < 1e-9);
+        assert_eq!(at(EnvCurve::Hold, 0.99), 0.0);
+        assert!((at(EnvCurve::EaseIn, 0.5) - 0.25).abs() < 1e-9);
+        assert!((at(EnvCurve::EaseOut, 0.5) - 0.75).abs() < 1e-9);
+        assert!((at(EnvCurve::EaseInOut, 0.5) - 0.5).abs() < 1e-9);
+        assert!(at(EnvCurve::EaseInOut, 0.25) < 0.25);
+        // Bezier through the diagonal handles is linear; steep first handle runs ahead.
+        assert!((at(EnvCurve::Bezier([0.33, 0.33, 0.66, 0.66]), 0.5) - 0.5).abs() < 0.02);
+        assert!(at(EnvCurve::Bezier([0.1, 0.9, 0.9, 1.0]), 0.2) > 0.5);
+        // Missing curve entries are linear.
+        assert!((envelope(&pts, &[], 0.25) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn envelope_edits_keep_curves_aligned_and_snap() {
+        let mut p = vec![(0.0, 0.0), (1.0, 1.0)];
+        let mut c = vec![EnvCurve::Hold];
+        assert_eq!(env_insert_curve(&mut p, &mut c, 0.5, 0.5), Some(1));
+        assert_eq!(c, vec![EnvCurve::Hold, EnvCurve::Hold, EnvCurve::Linear]);
+        assert!(env_remove(&mut p, &mut c, 1));
+        assert!(!env_remove(&mut p, &mut c, 0), "two points stay");
+        assert_eq!((p.len(), c.len()), (2, 2));
+        assert!((env_snap(0.37, 4.0, 1.0) - 0.25).abs() < 1e-9);
+        assert_eq!(env_snap(0.37, 4.0, 0.0), 0.37);
+    }
+
+    #[test]
+    fn envelope_in_seconds_follows_time_not_beats() {
+        let a = Animation::Envelope {
+            points: vec![(0.0, 0.0), (1.0, 1.0)],
+            beats: 4.0,
+            motion: Motion::default(),
+            curves: vec![],
+            unit: EnvUnit::Seconds,
+        };
+        let p = Param::number("x", 0.0, Some((0.0, 1.0)));
+        let ctx = AnimCtx {
+            beat_phase: 3.0,
+            time_secs: 1.0,
+            ..Default::default()
+        };
+        assert!((evaluate(&p, &a, &ctx) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timeline_scrub_parks_and_follow_clip_counts_from_trigger() {
+        let p = Param::number("x", 0.0, Some((0.0, 1.0)));
+        let mut m = Motion::default();
+        let mk = |motion| Animation::Timeline {
+            duration_secs: 4.0,
+            curve: Curve::Saw,
+            motion,
+        };
+        let ctx = AnimCtx {
+            time_secs: 10.0,
+            clip_start: Some((9.0, 0.0)),
+            ..Default::default()
+        };
+        // Global time: 10 s / 4 s = 2.5 cycles -> 0.5.
+        assert!((evaluate(&p, &mk(m), &ctx) - 0.5).abs() < 1e-9);
+        m.follow_clip = true;
+        assert!((evaluate(&p, &mk(m), &ctx) - 0.25).abs() < 1e-9);
+        m.scrub = Some(0.75);
+        assert!((evaluate(&p, &mk(m), &ctx) - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dashboard_link_window_and_dial_range() {
+        let p = Param::number("x", 0.0, Some((0.0, 10.0)));
+        let a = Animation::Dashboard {
+            dial: 0,
+            scope: DialScope::Comp,
+            min: 0.2,
+            max: 0.6,
+        };
+        let ctx = AnimCtx {
+            dashboard: &[0.5],
+            ..Default::default()
+        };
+        assert!((evaluate(&p, &a, &ctx) - 4.0).abs() < 1e-5);
+        let mut d = Param::number("d", 5.0, Some((2.0, 6.0)));
+        assert!((dial_norm(&d) - 0.75).abs() < 1e-9);
+        d.range = Some((3.0, 3.0));
+        assert_eq!(dial_norm(&d), 0.0);
     }
 }

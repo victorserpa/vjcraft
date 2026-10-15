@@ -445,6 +445,21 @@ pub fn builtin_source(id: &str) -> Option<&'static str> {
         .map(|(_, s)| *s)
 }
 
+/// True when the bundled shader `id` declares an ISF `audio` / `audioFFT` input.
+pub fn uses_audio(id: &str) -> bool {
+    static KINDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KINDS
+        .get_or_init(|| {
+            BUILTIN
+                .iter()
+                .chain(GENERATORS)
+                .filter(|(_, src)| parse(src).is_ok_and(|i| !i.audio.is_empty()))
+                .map(|(k, _)| *k)
+                .collect()
+        })
+        .contains(&id)
+}
+
 /// Default params of a bundled generator (None if `id` is not one).
 pub fn generator_params(id: &str) -> Option<Vec<Param>> {
     let (_, src) = GENERATORS.iter().find(|(k, _)| *k == id)?;
@@ -531,8 +546,50 @@ pub struct Input {
     pub kind: InputKind,
 }
 
+/// An ISF `"TYPE": "audio"` (waveform) or `"audioFFT"` (spectrum) input: a one row texture
+/// the shader samples with `IMG_NORM_PIXEL(name, vec2(x, 0.5))`. Channel r holds the value
+/// (0..1); channel a is 1 while audio is playing and 0 otherwise, so a shader can fall back
+/// to a synthetic picture when it reads 0 at `x = 0.5`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioInput {
+    pub name: String,
+    /// `audioFFT`: spectrum bins, low to high. Otherwise the waveform.
+    pub fft: bool,
+    /// ISF `MAX`: samples the shader asks for (1..=`AUDIO_TEX_W`, default 64). The runtime
+    /// texture is always `AUDIO_TEX_W` wide, so this only tells the shader's author what
+    /// resolution is meaningful.
+    pub samples: usize,
+}
+
+/// Width of the audio textures, in texels.
+pub const AUDIO_TEX_W: usize = 256;
+/// Bind group slot of the spectrum texture; the waveform is the next one.
+pub const AUDIO_BINDING: u32 = TARGET_BINDING + MAX_TARGETS as u32;
+
+/// RGBA8 row of `AUDIO_TEX_W` texels for an audio texture: `data` (0..1) stretched over the
+/// row, alpha 255 when `active`. Without audio the row is all zero.
+pub fn audio_texels(data: &[f32], active: bool) -> Vec<u8> {
+    let mut out = vec![0u8; AUDIO_TEX_W * 4];
+    if !active || data.is_empty() {
+        return out;
+    }
+    for (k, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let src = (k * data.len() / AUDIO_TEX_W).min(data.len() - 1);
+        let v = data[src];
+        let v = if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        *px = [(v * 255.0).round() as u8, 0, 0, 255];
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Isf {
+    /// Audio inputs (not listed in `inputs`: they are textures, not uniforms).
+    pub audio: Vec<AudioInput>,
     pub description: String,
     pub categories: Vec<String>,
     /// Controllable inputs, in file order (the image input is not listed).
@@ -836,7 +893,8 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
                 .collect()
         })
         .unwrap_or_default();
-    let mut inputs = vec![];
+    let mut inputs: Vec<Input> = vec![];
+    let mut audio: Vec<AudioInput> = vec![];
     for i in json
         .get("INPUTS")
         .and_then(|v| v.as_array())
@@ -852,6 +910,20 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
         let f = |k: &str, d: f64| i.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
         let kind = match ty {
             "image" => continue,
+            "audio" | "audioFFT" => {
+                if !valid_ident(&name) || inputs.iter().any(|i| i.name == name) {
+                    return err(format!("invalid input name {name}"));
+                }
+                if audio.iter().any(|a: &AudioInput| a.name == name) {
+                    return err(format!("duplicate input {name}"));
+                }
+                audio.push(AudioInput {
+                    name,
+                    fft: ty == "audioFFT",
+                    samples: (f("MAX", 64.0) as usize).clamp(1, AUDIO_TEX_W),
+                });
+                continue;
+            }
             "float" => {
                 let (min, max) = (f("MIN", 0.0), f("MAX", 1.0));
                 InputKind::Float {
@@ -952,6 +1024,7 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
         return err("TICK_INPUT cannot be combined with PASSES");
     }
     Ok(Isf {
+        audio,
         persistent,
         tick_input,
         passes,
@@ -1338,6 +1411,29 @@ pub fn glsl_source(isf: &Isf) -> String {
             ));
         }
     }
+    if isf.audio.iter().any(|a| a.fft) {
+        s.push_str(&format!(
+            "layout(set = 0, binding = {}) uniform texture2D vjc_audio_fft;\n",
+            AUDIO_BINDING
+        ));
+    }
+    if isf.audio.iter().any(|a| !a.fft) {
+        s.push_str(&format!(
+            "layout(set = 0, binding = {}) uniform texture2D vjc_audio_wave;\n",
+            AUDIO_BINDING + 1
+        ));
+    }
+    for a in &isf.audio {
+        s.push_str(&format!(
+            "#define {} {}\n",
+            a.name,
+            if a.fft {
+                "vjc_audio_fft"
+            } else {
+                "vjc_audio_wave"
+            }
+        ));
+    }
     for (n, i) in isf.inputs_iter() {
         let slot = format!("isf_u.p[{n}]");
         let expr = match &i.kind {
@@ -1385,7 +1481,7 @@ impl Isf {
 }
 
 /// Translates ISF to a WGSL fragment module (entry point `main`; bindings: 0 uniform
-/// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects), 4 previous output of this instance (persistent effects only; blank otherwise), 5.. named PASSES targets (`targets()` order); `@location(0)` input is the ISF y-up uv).
+/// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects), 4 previous output of this instance (persistent effects only; blank otherwise), 5.. named PASSES targets (`targets()` order), `AUDIO_BINDING` spectrum and +1 waveform textures (only declared when the shader has audio inputs); `@location(0)` input is the ISF y-up uv).
 pub fn translate(isf: &Isf) -> Result<String, FxError> {
     use naga::{back::wgsl, front::glsl, valid};
     let names: Vec<&str> = isf.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -1560,6 +1656,65 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
         assert!(translate(&isf).is_err());
         let isf = parse("/*{}*/ void main() { gl_FragColor = vec3(1.0); }").unwrap();
         assert!(translate(&isf).is_err());
+    }
+
+    const AUDIO_SRC: &str = r#"/*{"INPUTS":[
+        {"NAME":"spec","TYPE":"audioFFT","MAX":32},
+        {"NAME":"wave","TYPE":"audio","MAX":9999},
+        {"NAME":"gain","TYPE":"float","MIN":0,"MAX":2,"DEFAULT":1}]}*/
+void main() {
+    float a = IMG_NORM_PIXEL(spec, vec2(isf_FragNormCoord.x, 0.5)).r;
+    float w = IMG_NORM_PIXEL(wave, vec2(isf_FragNormCoord.x, 0.5)).r;
+    gl_FragColor = vec4(vec3(a * gain, w, 0.0), 1.0);
+}"#;
+
+    #[test]
+    fn audio_inputs_parse_and_are_not_uniforms() {
+        let isf = parse(AUDIO_SRC).unwrap();
+        assert_eq!(isf.inputs.len(), 1, "only gain is a uniform");
+        assert_eq!(
+            isf.audio,
+            vec![
+                AudioInput {
+                    name: "spec".into(),
+                    fft: true,
+                    samples: 32
+                },
+                AudioInput {
+                    name: "wave".into(),
+                    fft: false,
+                    samples: AUDIO_TEX_W
+                },
+            ]
+        );
+        let dup = AUDIO_SRC.replace(r#""NAME":"wave""#, r#""NAME":"spec""#);
+        assert!(parse(&dup).is_err());
+    }
+
+    #[test]
+    fn audio_inputs_bind_textures() {
+        let wgsl = translate(&parse(AUDIO_SRC).unwrap()).unwrap();
+        for b in [AUDIO_BINDING, AUDIO_BINDING + 1] {
+            assert!(
+                wgsl.contains(&format!("@binding({b})")),
+                "binding {b}\n{wgsl}"
+            );
+        }
+        // A shader with no audio input declares neither.
+        let plain = translate(&parse(BUILTIN[0].1).unwrap()).unwrap();
+        assert!(!plain.contains(&format!("@binding({AUDIO_BINDING})")));
+    }
+
+    #[test]
+    fn audio_texels_stretch_and_flag_activity() {
+        assert!(audio_texels(&[1.0], false).iter().all(|b| *b == 0));
+        let t = audio_texels(&[0.0, 1.0], true);
+        assert_eq!(t.len(), AUDIO_TEX_W * 4);
+        assert_eq!((t[0], t[3]), (0, 255));
+        assert_eq!(
+            (t[(AUDIO_TEX_W - 1) * 4], t[AUDIO_TEX_W * 4 - 1]),
+            (255, 255)
+        );
     }
 
     #[test]

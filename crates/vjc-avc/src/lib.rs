@@ -1031,6 +1031,8 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
             }
             w.mapped_anim.insert(node_id(env));
             return Some(Animation::Envelope {
+                curves: vec![],
+                unit: Default::default(),
                 motion: Default::default(),
                 points,
                 beats,
@@ -1043,6 +1045,8 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
     {
         w.mapped_anim.insert(node_id(d));
         return Some(Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: id as u32 - 1,
             scope: Default::default(),
         });
@@ -1199,6 +1203,8 @@ mod tests {
         assert_eq!(
             a,
             Some(Animation::Envelope {
+                curves: vec![],
+                unit: Default::default(),
                 motion: Default::default(),
                 points: vec![(0.0, 1.0), (1.0, 0.0)],
                 beats: 4.0
@@ -1224,6 +1230,8 @@ mod tests {
         assert_eq!(
             a,
             Some(Animation::Dashboard {
+                min: 0.0,
+                max: 1.0,
                 dial: 2,
                 scope: Default::default()
             })

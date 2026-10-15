@@ -258,6 +258,14 @@ pub enum Command {
         dial: u32,
         value: f64,
     },
+    /// Renames a dial and sets its range (undoable, coalesces). The dial keeps its position
+    /// in 0..=1 whatever the range.
+    SetDialInfo {
+        owner: DialRef,
+        dial: u32,
+        name: String,
+        range: (f64, f64),
+    },
     SetBlend {
         layer: LayerId,
         blend: BlendMode,
@@ -825,9 +833,18 @@ pub enum AudioParam {
     Pan,
 }
 
+/// Whose dashboard a dial belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialRef {
+    Comp,
+    Layer(LayerId),
+    Clip(DeckId, LayerId, ColumnIdx),
+}
+
 /// What a coalescible command targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
+    DialInfo(DialRef, u32),
     Opacity(LayerId),
     Audio(AudioTarget, AudioParam),
     Speed(DeckId, LayerId, ColumnIdx),
@@ -908,6 +925,7 @@ impl Command {
             Command::SetSliceInput { screen, slice, .. } => {
                 Some(Target::SliceInput(*screen, *slice))
             }
+            Command::SetDialInfo { owner, dial, .. } => Some(Target::DialInfo(*owner, *dial)),
             Command::SetDashboardDial { dial, .. } => Some(Target::Dial(*dial)),
             Command::SetLayerDial { layer, dial, .. } => Some(Target::LayerDial(*layer, *dial)),
             Command::SetClipDial {
@@ -1231,20 +1249,74 @@ fn check_cell(p: &Project, layer: LayerId, column: ColumnIdx) -> Result<(), Erro
     }
 }
 
-/// Sets dial `dial` of a dashboard (growing it to `anim::DIALS` named dials first) and
-/// returns the previous value.
-fn set_dial(dials: &mut Vec<Param>, dial: u32, value: f64) -> Result<f64, Error> {
-    if dial as usize >= anim::DIALS || !value.is_finite() {
-        return Err(Error::InvalidValue);
-    }
+/// Grows a dashboard to `anim::DIALS` named dials.
+fn fill_dials(dials: &mut Vec<Param>) {
     while dials.len() < anim::DIALS {
         let n = dials.len() + 1;
         dials.push(Param::number(&format!("Dial {n}"), 0.0, Some((0.0, 1.0))));
     }
+}
+
+/// Sets dial `dial` of a dashboard (growing it to `anim::DIALS` named dials first) to
+/// `value`, a position in 0..=1 over the dial's range, and returns the previous position.
+fn set_dial(dials: &mut Vec<Param>, dial: u32, value: f64) -> Result<f64, Error> {
+    if dial as usize >= anim::DIALS || !value.is_finite() {
+        return Err(Error::InvalidValue);
+    }
+    fill_dials(dials);
     let prm = &mut dials[dial as usize];
-    let prev = number(&prm.value);
-    prm.set_number(value);
+    let prev = anim::dial_norm(prm);
+    let (lo, hi) = prm.range.unwrap_or((0.0, 1.0));
+    prm.set_number(lo + value.clamp(0.0, 1.0) * (hi - lo));
     Ok(prev)
+}
+
+/// Renames dial `dial` and sets its range; returns the old name and range.
+fn set_dial_info(
+    dials: &mut Vec<Param>,
+    dial: u32,
+    name: &str,
+    range: (f64, f64),
+) -> Result<(String, (f64, f64)), Error> {
+    let name = name.trim();
+    if dial as usize >= anim::DIALS
+        || name.is_empty()
+        || !range.0.is_finite()
+        || !range.1.is_finite()
+        || range.0 >= range.1
+    {
+        return Err(Error::InvalidValue);
+    }
+    fill_dials(dials);
+    let prm = &mut dials[dial as usize];
+    let norm = anim::dial_norm(prm);
+    let old = (
+        std::mem::replace(&mut prm.name, name.to_string()),
+        prm.range.unwrap_or((0.0, 1.0)),
+    );
+    prm.range = Some(range);
+    prm.default = Value::Number(range.0);
+    prm.set_number(range.0 + norm * (range.1 - range.0));
+    Ok(old)
+}
+
+fn dials_of(p: &mut Project, owner: DialRef) -> Result<&mut Vec<Param>, Error> {
+    match owner {
+        DialRef::Comp => Ok(&mut p.composition.dashboard),
+        DialRef::Layer(layer) => {
+            let i = layer_idx(p, layer)?;
+            Ok(&mut p.composition.layers[i].track.dials)
+        }
+        DialRef::Clip(deck, layer, column) => {
+            check_cell(p, layer, column)?;
+            deck_mut(p, deck)?
+                .clips
+                .iter_mut()
+                .find(|k| k.layer == layer && k.column == column)
+                .map(|k| &mut k.clip.track.dials)
+                .ok_or(Error::NoClip)
+        }
+    }
 }
 
 fn transport_mut(
@@ -3665,6 +3737,23 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetDialInfo {
+            owner,
+            dial,
+            name,
+            range,
+        } => {
+            let (name, range) = set_dial_info(dials_of(p, owner)?, dial, &name, range)?;
+            undoable(
+                Command::SetDialInfo {
+                    owner,
+                    dial,
+                    name,
+                    range,
+                },
+                vec![],
+            )
+        }
         Command::SetDashboardDial { dial, value } => {
             let prev = set_dial(&mut p.composition.dashboard, dial, value)?;
             undoable(Command::SetDashboardDial { dial, value: prev }, vec![])
@@ -6012,6 +6101,8 @@ mod tests {
         let before = p.clone();
         let mut loud = vjc_model::Param::number("amount", 9.0, Some((0.0, 100.0)));
         loud.animation = Some(vjc_model::Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 1,
             scope: Default::default(),
         });
@@ -6371,6 +6462,8 @@ mod tests {
         let t = Instant::now();
         let target = AnimTarget::LayerOpacity(l);
         let a = vjc_model::Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 2,
             scope: Default::default(),
         };
@@ -6401,6 +6494,110 @@ mod tests {
     }
 
     #[test]
+    fn envelope_edits_are_undoable_and_dial_info_round_trips() {
+        let (mut p, l, _) = grid();
+        let mut h = History::new();
+        let t = Instant::now();
+        let target = AnimTarget::LayerOpacity(l);
+        let env = |points: Vec<(f64, f64)>, curves| vjc_model::Animation::Envelope {
+            points,
+            beats: 4.0,
+            motion: Default::default(),
+            curves,
+            unit: Default::default(),
+        };
+        let get = |p: &Project| p.composition.layers[0].track.opacity.animation.clone();
+        let (mut pts, mut cur) = (vec![(0.0, 0.0), (1.0, 1.0)], vec![]);
+        let mut seq = vec![];
+        // add, move, delete
+        let i = anim::env_insert_curve(&mut pts, &mut cur, 0.5, 0.5).unwrap();
+        seq.push(env(pts.clone(), cur.clone()));
+        anim::env_move(&mut pts, i, 0.6, 0.9);
+        seq.push(env(pts.clone(), cur.clone()));
+        anim::env_remove(&mut pts, &mut cur, i);
+        seq.push(env(pts.clone(), cur.clone()));
+        let mut prev = None;
+        for (k, a) in seq.iter().enumerate() {
+            h.exec(
+                &mut p,
+                Command::SetAnimation {
+                    target,
+                    animation: Some(a.clone()),
+                },
+                t + COALESCE_WINDOW * 4 * (k as u32 + 1),
+            )
+            .unwrap();
+            assert_eq!(get(&p).as_ref(), Some(a));
+            prev = Some(a.clone());
+        }
+        let _ = prev;
+        for k in (0..seq.len() - 1).rev() {
+            h.undo(&mut p).unwrap().unwrap();
+            assert_eq!(get(&p).as_ref(), Some(&seq[k]));
+        }
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(get(&p), None);
+
+        // Dial name and range: value keeps its position; undo restores both.
+        h.exec(
+            &mut p,
+            Command::SetDashboardDial {
+                dial: 1,
+                value: 0.5,
+            },
+            t + Duration::from_secs(60),
+        )
+        .unwrap();
+        h.exec(
+            &mut p,
+            Command::SetDialInfo {
+                owner: DialRef::Comp,
+                dial: 1,
+                name: "Speed".into(),
+                range: (10.0, 20.0),
+            },
+            t + Duration::from_secs(120),
+        )
+        .unwrap();
+        let d = &p.composition.dashboard[1];
+        assert_eq!((d.name.as_str(), d.range), ("Speed", Some((10.0, 20.0))));
+        assert_eq!(d.value, Value::Number(15.0));
+        assert_eq!(anim::dial_norm(d), 0.5);
+        h.undo(&mut p).unwrap().unwrap();
+        let d = &p.composition.dashboard[1];
+        assert_eq!((d.name.as_str(), d.range), ("Dial 2", Some((0.0, 1.0))));
+        assert_eq!(d.value, Value::Number(0.5));
+        let bad = Command::SetDialInfo {
+            owner: DialRef::Comp,
+            dial: 1,
+            name: " ".into(),
+            range: (0.0, 1.0),
+        };
+        assert_eq!(apply(&mut p, bad).unwrap_err(), Error::InvalidValue);
+    }
+
+    #[test]
+    fn renamed_dial_with_range_stays_mappable_by_normalised_value() {
+        let (mut p, _, _) = grid();
+        apply(
+            &mut p,
+            Command::SetDialInfo {
+                owner: DialRef::Comp,
+                dial: 2,
+                name: "Zoom".into(),
+                range: (10.0, 20.0),
+            },
+        )
+        .unwrap();
+        // MIDI/OSC send 0..1: the dial lands at the matching point of its range.
+        let cmd = shortcuts::resolve(&p, "/comp/dashboard/3", 0.5).unwrap();
+        apply(&mut p, cmd).unwrap();
+        assert_eq!(p.composition.dashboard[2].value, Value::Number(15.0));
+        let ctx = shortcuts::Ctx::new(None, false);
+        assert_eq!(shortcuts::current(&p, &ctx, "/comp/dashboard/3"), Some(0.5));
+    }
+
+    #[test]
     fn set_animation_drag_is_one_undo_step() {
         let (mut p, l, _) = grid();
         let mut h = History::new();
@@ -6412,6 +6609,8 @@ mod tests {
                 Command::SetAnimation {
                     target,
                     animation: Some(vjc_model::Animation::Dashboard {
+                        min: 0.0,
+                        max: 1.0,
                         dial: d,
                         scope: Default::default(),
                     }),

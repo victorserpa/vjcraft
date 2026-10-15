@@ -1,6 +1,8 @@
 //! Live audio analysis: mono input samples in, band levels out. The input callback only
 //! buffers; every `FFT_SIZE` samples it runs one small FFT and publishes five levels
 //! (low, low-mid, mid, high, overall) as atomics, so readers on the UI thread never block.
+//! The same block also yields a log-spaced spectrum and a downsampled waveform (for ISF
+//! `audioFFT` / `audio` inputs), published through a lock the audio thread only `try_lock`s.
 
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::Arc;
@@ -9,6 +11,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub const FFT_SIZE: usize = 1024;
 /// Published levels: low, low-mid, mid, high, overall.
 pub const BANDS: usize = 5;
+/// Log-spaced spectrum bins published per block.
+pub const SPECTRUM_BINS: usize = 64;
+/// Waveform points published per block.
+pub const WAVE_POINTS: usize = 128;
+/// Lowest and highest spectrum frequency, in Hz.
+const SPEC_LO: f32 = 40.0;
+const SPEC_HI: f32 = 16_000.0;
 /// Band edges in Hz: low < 250 <= low-mid < 1000 <= mid < 4000 <= high.
 const EDGES: [f32; 3] = [250.0, 1000.0, 4000.0];
 
@@ -26,6 +35,10 @@ pub fn band_levels(samples: &[f32], rate: u32) -> [f32; BANDS] {
 }
 
 fn band_levels_with(fft: &dyn rustfft::Fft<f32>, samples: &[f32], rate: u32) -> [f32; BANDS] {
+    bands_of(&windowed_fft(fft, samples), samples, rate)
+}
+
+fn windowed_fft(fft: &dyn rustfft::Fft<f32>, samples: &[f32]) -> Vec<Complex<f32>> {
     let n = samples.len();
     let mut buf: Vec<Complex<f32>> = samples
         .iter()
@@ -36,6 +49,11 @@ fn band_levels_with(fft: &dyn rustfft::Fft<f32>, samples: &[f32], rate: u32) -> 
         })
         .collect();
     fft.process(&mut buf);
+    buf
+}
+
+fn bands_of(buf: &[Complex<f32>], samples: &[f32], rate: u32) -> [f32; BANDS] {
+    let n = samples.len();
     // A sine of amplitude A peaks at A*n/4 with a Hann window, spreading over ~3 bins.
     let norm = n as f32 / 4.0;
     let hz = rate as f32 / n as f32;
@@ -55,9 +73,87 @@ fn band_levels_with(fft: &dyn rustfft::Fft<f32>, samples: &[f32], rate: u32) -> 
     out
 }
 
+/// Spectrum of a windowed FFT as `SPECTRUM_BINS` log-spaced levels 0..=1 (a sine of
+/// amplitude A reads about A in its bin, lightly compressed so quiet tones show).
+fn spectrum_of(buf: &[Complex<f32>], rate: u32) -> [f32; SPECTRUM_BINS] {
+    let n = buf.len();
+    let mut out = [0.0f32; SPECTRUM_BINS];
+    if n < 8 || rate == 0 {
+        return out;
+    }
+    let hz = rate as f32 / n as f32;
+    let hi = SPEC_HI.min(rate as f32 / 2.0);
+    let ratio = (hi / SPEC_LO).powf(1.0 / SPECTRUM_BINS as f32);
+    let norm = n as f32 / 4.0;
+    for (i, o) in out.iter_mut().enumerate() {
+        let (f0, f1) = (
+            SPEC_LO * ratio.powi(i as i32),
+            SPEC_LO * ratio.powi(i as i32 + 1),
+        );
+        // At least the FFT bin under the band's centre.
+        let k0 = ((f0 / hz).floor() as usize).clamp(1, n / 2 - 1);
+        let k1 = ((f1 / hz).ceil() as usize).clamp(k0 + 1, n / 2);
+        let peak = buf[k0..k1].iter().map(|c| c.norm()).fold(0.0f32, f32::max);
+        *o = (peak / norm).clamp(0.0, 1.0).sqrt();
+    }
+    out
+}
+
+/// Waveform of `samples` as `WAVE_POINTS` points in 0..=1 (0.5 = silence).
+fn wave_of(samples: &[f32]) -> [f32; WAVE_POINTS] {
+    let mut out = [0.5f32; WAVE_POINTS];
+    if samples.is_empty() {
+        return out;
+    }
+    for (i, o) in out.iter_mut().enumerate() {
+        let a = i * samples.len() / WAVE_POINTS;
+        let b = ((i + 1) * samples.len() / WAVE_POINTS).clamp(a + 1, samples.len());
+        let mean = samples[a..b].iter().filter(|s| s.is_finite()).sum::<f32>() / (b - a) as f32;
+        *o = (0.5 + 0.5 * mean).clamp(0.0, 1.0);
+    }
+    out
+}
+
+/// Spectrum and waveform of one analysed block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Detail {
+    pub spectrum: [f32; SPECTRUM_BINS],
+    pub wave: [f32; WAVE_POINTS],
+}
+
+impl Default for Detail {
+    fn default() -> Self {
+        Detail {
+            spectrum: [0.0; SPECTRUM_BINS],
+            wave: [0.5; WAVE_POINTS],
+        }
+    }
+}
+
+/// Spectrum and waveform of `samples` (same windowing as `band_levels`).
+pub fn detail(samples: &[f32], rate: u32) -> Detail {
+    let n = samples.len();
+    if n < 8 || rate == 0 {
+        return Detail::default();
+    }
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(n);
+    detail_with(&*fft, samples, rate).1
+}
+
+fn detail_with(fft: &dyn rustfft::Fft<f32>, samples: &[f32], rate: u32) -> ([f32; BANDS], Detail) {
+    let buf = windowed_fft(fft, samples);
+    (
+        bands_of(&buf, samples, rate),
+        Detail {
+            spectrum: spectrum_of(&buf, rate),
+            wave: wave_of(samples),
+        },
+    )
+}
+
 /// Levels shared between the analysis (audio thread) and readers: f32 bits in atomics.
 #[derive(Debug, Default)]
-pub struct SharedBands([AtomicU32; BANDS], AtomicU32);
+pub struct SharedBands([AtomicU32; BANDS], AtomicU32, std::sync::Mutex<Detail>);
 
 impl SharedBands {
     pub fn store(&self, v: &[f32; BANDS]) {
@@ -65,6 +161,16 @@ impl SharedBands {
             a.store(x.to_bits(), Ordering::Relaxed);
         }
         self.1.fetch_add(1, Ordering::Release);
+    }
+    /// Publishes the spectrum and waveform; skipped (the reader keeps the last ones) if a
+    /// reader holds the lock at that instant, so the audio thread never waits.
+    pub fn store_detail(&self, d: &Detail) {
+        if let Ok(mut g) = self.2.try_lock() {
+            g.clone_from(d);
+        }
+    }
+    pub fn load_detail(&self) -> Detail {
+        self.2.lock().map(|g| g.clone()).unwrap_or_default()
     }
     /// Number of `store` calls so far; a reader tells a stalled input by it not moving.
     pub fn blocks(&self) -> u32 {
@@ -88,7 +194,9 @@ pub fn sink(shared: Arc<SharedBands>, rate: u32) -> impl FnMut(&[f32]) + Send + 
         for &s in data {
             buf.push(s);
             if buf.len() == FFT_SIZE {
-                shared.store(&band_levels_with(&*fft, &buf, rate));
+                let (bands, d) = detail_with(&*fft, &buf, rate);
+                shared.store_detail(&d);
+                shared.store(&bands);
                 buf.clear();
             }
         }
@@ -103,6 +211,27 @@ mod tests {
         (0..FFT_SIZE)
             .map(|i| amp * (std::f32::consts::TAU * hz * i as f32 / rate as f32).sin())
             .collect()
+    }
+
+    #[test]
+    fn spectrum_peaks_at_the_tone_and_wave_follows_the_signal() {
+        let d = detail(&sine(1000.0, 48_000, 0.8), 48_000);
+        let top = d
+            .spectrum
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        // 1 kHz on a log axis from 40 Hz to 16 kHz.
+        let want =
+            ((1000.0f32 / SPEC_LO).ln() / (SPEC_HI / SPEC_LO).ln() * SPECTRUM_BINS as f32) as usize;
+        assert!(top.abs_diff(want) <= 2, "peak {top}, want ~{want}");
+        assert!(d.spectrum[top] > 0.5);
+        assert!(d.spectrum[2] < 0.1 && d.spectrum[SPECTRUM_BINS - 2] < 0.1);
+        assert!(d.wave.iter().all(|w| (0.0..=1.0).contains(w)));
+        assert!(d.wave.iter().any(|w| (w - 0.5).abs() > 0.1));
+        assert_eq!(detail(&[], 48_000), Detail::default());
     }
 
     #[test]

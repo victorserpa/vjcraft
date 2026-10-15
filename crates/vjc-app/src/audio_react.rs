@@ -44,6 +44,10 @@ pub struct AudioReact {
     shared: Arc<SharedBands>,
     /// Levels of this frame (refreshed by `refresh`).
     pub levels: [f32; BANDS],
+    /// Spectrum and waveform of this frame, for ISF audio inputs; `playing` is false when
+    /// there is no live input (the generators then use their synthetic fallback).
+    pub detail: vjc_media::analysis::Detail,
+    pub playing: bool,
     pub smoother: Arc<AudioSmoother>,
     last_scan: Option<Instant>,
     failures: u32,
@@ -65,7 +69,14 @@ pub fn uses_audio(comp: &vjc_model::Composition) -> bool {
     comp.for_each_param(&mut |p| {
         found |= matches!(p.animation, Some(vjc_model::Animation::Audio { .. }));
     });
+    // A generator with ISF audio inputs (spectrum_bars, waveform_line) needs the input too.
     found
+        || comp.decks.iter().any(|d| {
+            d.clips.iter().any(|k| {
+                matches!(&k.clip.source, vjc_model::Source::Generator { kind, .. }
+                    if vjc_fx::uses_audio(kind))
+            })
+        })
 }
 
 impl AudioReact {
@@ -75,6 +86,8 @@ impl AudioReact {
             opener,
             shared: Arc::default(),
             levels: [0.0; BANDS],
+            detail: Default::default(),
+            playing: false,
             smoother: Arc::default(),
             last_scan: None,
             failures: 0,
@@ -113,10 +126,16 @@ impl AudioReact {
         let stalled = self
             .last_block
             .is_none_or(|t| now.saturating_duration_since(t) > STALL_AFTER);
-        self.levels = if self.input.is_some() && !stalled {
+        self.playing = self.input.is_some() && !stalled;
+        self.levels = if self.playing {
             self.shared.load()
         } else {
             [0.0; BANDS]
+        };
+        self.detail = if self.playing {
+            self.shared.load_detail()
+        } else {
+            Default::default()
         };
     }
 
@@ -171,6 +190,8 @@ mod tests {
         let mut c = comp();
         assert!(!uses_audio(&c));
         c.master.opacity.animation = Some(Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 0,
             scope: Default::default(),
         });

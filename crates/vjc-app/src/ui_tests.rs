@@ -4719,6 +4719,8 @@ fn layer_dial_reads_its_own_layer_not_the_selected_one() {
     let ctx = st.anim_ctx(&input);
     let mut p = vjc_model::Param::number("x", 0.0, Some((0.0, 1.0)));
     p.animation = Some(vjc_model::Animation::Dashboard {
+        min: 0.0,
+        max: 1.0,
         dial: 0,
         scope: vjc_model::DialScope::Layer,
     });

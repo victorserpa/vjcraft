@@ -430,6 +430,7 @@ struct Outgoing {
 /// Whose dashboard a dial row edits.
 #[derive(Clone, Copy)]
 enum DialOwner {
+    Comp,
     Layer(LayerId),
     Clip(DeckId, LayerId, u32),
 }
@@ -1167,13 +1168,6 @@ fn transition_kinds() -> Vec<(String, String)> {
 
 fn labeled<T: Copy>(v: &[(T, &str)]) -> Vec<(T, String)> {
     v.iter().map(|(a, n)| (*a, n.to_string())).collect()
-}
-
-fn number_of(v: &vjc_model::Value) -> f64 {
-    match v {
-        vjc_model::Value::Number(n) => *n,
-        _ => 0.0,
-    }
 }
 
 /// Edits one effect param; returns the new value when the user changed it.
@@ -4072,7 +4066,7 @@ impl State {
             layer_dials,
             clip_dials,
             dials: (0..vjc_core::anim::DIALS)
-                .map(|i| d.get(i).map_or(0.0, |p| number_of(&p.value)))
+                .map(|i| d.get(i).map_or(0.0, vjc_core::anim::dial_norm))
                 .collect(),
             bands: self.audio_react.levels,
             smoother: self.audio_react.smoother.clone(),
@@ -4497,6 +4491,12 @@ impl State {
         }
         comp.master_transform = xf_inverse(&c.master.transform, &actx, frame_px);
         comp.preview = if want_preview { preview_src } else { None };
+        comp.set_audio(
+            &rs.queue,
+            &self.audio_react.detail.spectrum,
+            &self.audio_react.detail.wave,
+            self.audio_react.playing,
+        );
         comp.render_routed(
             &rs.device,
             &rs.queue,
@@ -7612,20 +7612,8 @@ impl State {
             self.cue_list(ui, cmds);
         }
         if params::section(ui, "sec-dashboard", "Dashboard") {
-            for (i, v) in dials.iter().enumerate() {
-                let n = i + 1;
-                let r = ui.horizontal(|ui| {
-                    params::param_slider(ui, ("dial", i), &format!("Dial {n}"), *v, 0.0, (0.0, 1.0))
-                });
-                if let Some(value) = r.inner {
-                    cmds.push(Command::SetDashboardDial {
-                        dial: i as u32,
-                        value,
-                    });
-                }
-                self.targets
-                    .push((r.response.rect, format!("/comp/dashboard/{n}")));
-            }
+            let vals: Vec<f64> = dials.to_vec();
+            self.dial_rows(ui, DialOwner::Comp, &vals, cmds);
         }
         if params::section(ui, "sec-effects", "Effects") {
             self.chain_ui(ui, EffectTarget::Master, cmds);
@@ -8731,19 +8719,69 @@ impl State {
         vals: &[f64],
         cmds: &mut Vec<Command>,
     ) {
+        let dial_ref = match owner {
+            DialOwner::Comp => vjc_core::DialRef::Comp,
+            DialOwner::Layer(l) => vjc_core::DialRef::Layer(l),
+            DialOwner::Clip(d, l, c) => vjc_core::DialRef::Clip(d, l, c),
+        };
+        let list: Vec<vjc_model::Param> = match owner {
+            DialOwner::Comp => self.project.composition.dashboard.clone(),
+            DialOwner::Layer(l) => self
+                .project
+                .composition
+                .layers
+                .iter()
+                .find(|x| x.id == l)
+                .map(|x| x.track.dials.clone())
+                .unwrap_or_default(),
+            DialOwner::Clip(deck, l, c) => vjc_core::clip_in(&self.project, deck, l, c)
+                .map(|k| k.track.dials.clone())
+                .unwrap_or_default(),
+        };
         for (i, v) in vals.iter().enumerate() {
             let n = i + 1;
             let id = match owner {
+                DialOwner::Comp => ("dial", i as u64),
                 DialOwner::Layer(l) => ("ldial", l.as_u128() as u64 ^ i as u64),
                 DialOwner::Clip(_, l, c) => {
                     ("cdial", l.as_u128() as u64 ^ u64::from(c) << 8 ^ i as u64)
                 }
             };
-            let r = ui.horizontal(|ui| {
-                params::param_slider(ui, id, &format!("Dial {n}"), *v, 0.0, (0.0, 1.0))
+            let (name, (lo, hi)) = list.get(i).map_or_else(
+                || (format!("Dial {n}"), (0.0, 1.0)),
+                |p| (p.name.clone(), p.range.unwrap_or((0.0, 1.0))),
+            );
+            let r = ui.horizontal(|ui| params::param_slider(ui, id, &name, *v, 0.0, (0.0, 1.0)));
+            // Right click: rename the dial and set its range.
+            r.response.context_menu(|ui| {
+                let key = egui::Id::new(("dial-name", id));
+                let mut buf: String = ui.data(|d| d.get_temp(key)).unwrap_or_else(|| name.clone());
+                let e = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+                let (mut nlo, mut nhi) = (lo, hi);
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut nlo).speed(0.1).prefix("Min "));
+                    ui.add(egui::DragValue::new(&mut nhi).speed(0.1).prefix("Max "));
+                });
+                let commit_name = e.lost_focus() && !buf.trim().is_empty();
+                ui.data_mut(|d| d.insert_temp(key, buf.clone()));
+                if nhi <= nlo {
+                    nhi = nlo + 0.001;
+                }
+                if commit_name || (nlo, nhi) != (lo, hi) {
+                    cmds.push(Command::SetDialInfo {
+                        owner: dial_ref,
+                        dial: i as u32,
+                        name: if commit_name { buf } else { name.clone() },
+                        range: (nlo, nhi),
+                    });
+                }
             });
             if let Some(value) = r.inner {
                 cmds.push(match owner {
+                    DialOwner::Comp => Command::SetDashboardDial {
+                        dial: i as u32,
+                        value,
+                    },
                     DialOwner::Layer(layer) => Command::SetLayerDial {
                         layer,
                         dial: i as u32,
@@ -8759,6 +8797,7 @@ impl State {
                 });
             }
             let addr = match owner {
+                DialOwner::Comp => Some(format!("/comp/dashboard/{n}")),
                 DialOwner::Layer(l) => {
                     vjc_core::shortcuts::dial_address(&self.project, l, None, None, i)
                 }

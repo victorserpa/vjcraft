@@ -1,7 +1,8 @@
 /*{
-  "DESCRIPTION": "Oscilloscope-style waveform line. ISF audio inputs are not supported here, so the wave is synthetic (a few sines that swell on the beat).",
+  "DESCRIPTION": "Oscilloscope-style waveform line fed by the master audio. With no audio the wave is synthetic (a few sines that swell on the beat).",
   "CATEGORIES": ["Generator"],
   "INPUTS": [
+    { "NAME": "audioWave", "TYPE": "audio", "MAX": 128 },
     { "NAME": "lineColor", "TYPE": "color", "DEFAULT": [0.3, 1.0, 0.6, 1.0] },
     { "NAME": "background", "TYPE": "color", "DEFAULT": [0.0, 0.03, 0.04, 1.0] },
     { "NAME": "amplitude", "TYPE": "float", "MIN": 0.05, "MAX": 0.5, "DEFAULT": 0.25 },
@@ -11,6 +12,11 @@
   ]
 }*/
 float wave_(float x) {
+    // Alpha of the texture is 1 only while audio is playing.
+    if (IMG_NORM_PIXEL(audioWave, vec2(0.5, 0.5)).a > 0.5) {
+        float s = IMG_NORM_PIXEL(audioWave, vec2(x, 0.5)).r * 2.0 - 1.0;
+        return s * sin(clamp(x, 0.0, 1.0) * 3.1416);
+    }
     float kick = exp(-fract(TIME * bpm / 60.0) * 4.0);
     float env = 0.5 + 0.5 * kick;
     float w = sin(x * 9.0 + TIME * 3.0) * 0.5

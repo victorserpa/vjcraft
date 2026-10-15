@@ -332,6 +332,8 @@ mod merge_tests {
 
     fn anim() -> Animation {
         Animation::Dashboard {
+            min: 0.0,
+            max: 1.0,
             dial: 1,
             scope: Default::default(),
         }
