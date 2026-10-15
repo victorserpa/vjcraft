@@ -106,6 +106,7 @@ struct State {
     /// Texture-memory limit in bytes (`VJC_VRAM_LIMIT_MB`).
     vram_limit: u64,
     frame_ms: frame_stats::FrameStats,
+    render_gate: FrameGate,
     /// Status-bar frame-time text, rebuilt every 500 ms so its galley stays cached.
     frame_label: (Option<std::time::Instant>, String),
     /// Decoders opened ahead for the deck the user is about to switch to.
@@ -756,19 +757,75 @@ fn prune_resume(
     resume.retain(|k, (id, _)| vjc_core::clip_in(p, k.0, k.1, k.2).is_some_and(|c| c.id == *id));
 }
 
-/// Time between repaints of live video: the composition fps is the ceiling (max 60).
+/// Time between repaints of live video: the composition fps is the ceiling (max 240).
 fn repaint_interval(fps: impl Into<f64>) -> std::time::Duration {
     std::time::Duration::from_secs_f64(1.0 / repaint_fps(fps))
 }
 
-/// Repaint rate for live video: the composition fps, kept to 1..=60 (NaN or junk = 60).
+/// Repaint rate for live video: the composition fps, kept to 1..=240 (NaN or junk = 60).
 fn repaint_fps(fps: impl Into<f64>) -> f64 {
     let f = fps.into();
     if f.is_finite() {
-        f.clamp(1.0, 60.0)
+        f.clamp(1.0, 240.0)
     } else {
         60.0
     }
+}
+
+/// Render limiter: extra vsync ticks (120 Hz monitor, 60 fps comp) reuse the last frame.
+/// Frames follow a fixed schedule (`next` advances by one interval), so any vsync rate,
+/// integer multiple or not, averages to the composition fps.
+#[derive(Default)]
+struct FrameGate {
+    next: Option<std::time::Instant>,
+}
+
+impl FrameGate {
+    /// True when a new composition frame is due at `now`. A tick may come up to half a
+    /// vsync early (timer jitter); a late or stalled loop does not try to catch up.
+    fn due(&mut self, now: std::time::Instant, fps: impl Into<f64>) -> bool {
+        let iv = repaint_interval(fps);
+        let slack = iv.mul_f64(0.25);
+        match self.next {
+            Some(n) if now + slack < n => false,
+            Some(n) => {
+                let next = n + iv;
+                // Fell behind by more than one frame: restart the schedule from now.
+                self.next = Some(if next + slack < now { now + iv } else { next });
+                true
+            }
+            None => {
+                self.next = Some(now + iv);
+                true
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn gate_renders(vsync_hz: f64, comp_fps: f64, ticks: u32) -> u32 {
+    let t0 = std::time::Instant::now();
+    let mut g = FrameGate::default();
+    (0..ticks)
+        .filter(|i| {
+            g.due(
+                t0 + std::time::Duration::from_secs_f64(f64::from(*i) / vsync_hz),
+                comp_fps,
+            )
+        })
+        .count() as u32
+}
+
+#[test]
+fn gate_halves_renders_at_120hz_vsync_with_60fps_comp() {
+    assert_eq!(gate_renders(120.0, 60.0, 240), 120);
+    // Non-integer ratio: 144 Hz vsync for one second still gives about 60 frames.
+    let n = gate_renders(144.0, 60.0, 144);
+    assert!((59..=61).contains(&n), "144 Hz: {n}");
+    // Negative control: a 120 fps comp renders every tick.
+    assert_eq!(gate_renders(120.0, 120.0, 240), 240);
+    // 60 Hz vsync, 60 fps comp: every tick.
+    assert_eq!(gate_renders(60.0, 60.0, 120), 120);
 }
 
 #[test]
@@ -777,9 +834,10 @@ fn repaint_interval_is_capped_by_composition_fps() {
     // Lower composition fps: slower repaint (the cap is respected).
     assert!((ms(30.0) - 1000.0 / 30.0).abs() < 1e-6);
     assert!(ms(30.0) > ms(60.0));
-    // Default stays 60, and nothing repaints faster than 60 fps.
+    // Default stays 60, and nothing repaints faster than 240 fps.
     assert!((ms(60.0) - 1000.0 / 60.0).abs() < 1e-6);
-    assert!((ms(240.0) - 1000.0 / 60.0).abs() < 1e-6);
+    assert!((ms(120.0) - 1000.0 / 120.0).abs() < 1e-6);
+    assert!((ms(1000.0) - 1000.0 / 240.0).abs() < 1e-6);
     // Control: a bad value falls back to 60, never panics.
     assert!((ms(f32::NAN) - 1000.0 / 60.0).abs() < 1e-6);
 }
@@ -1440,6 +1498,7 @@ impl State {
             vram_dog: vram::Watchdog::default(),
             vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
+            render_gate: FrameGate::default(),
             frame_label: (None, String::new()),
             preload: preload::Preload::default(),
             frames: 0,
@@ -8657,7 +8716,10 @@ impl eframe::App for State {
         self.poll_monitors();
         self.tick_clock();
         self.audio_react.refresh(&self.project.composition);
-        self.compose(frame);
+        // Extra vsync ticks (120 Hz output) keep the last composition frame.
+        if self.render_gate.due(t0, self.project.composition.fps) {
+            self.compose(frame);
+        }
         if self.frames.is_multiple_of(30) {
             self.vram_watch();
         }
