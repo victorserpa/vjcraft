@@ -6513,3 +6513,14 @@ fn snapshot_writes_a_png_into_the_chosen_folder() {
     assert!(h.state().status.contains("nothing to capture"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression (CPU): with nothing changing a step must not trigger a chain of extra passes
+/// (pacing itself is `ui_pace_wait`, unit-tested in main.rs, and applied in `App::ui`).
+#[test]
+fn idle_ui_does_not_request_extra_passes() {
+    let mut h = app_with(State::headless(prefs()), egui::vec2(1280.0, 800.0));
+    let n0 = h.ctx.cumulative_pass_nr();
+    h.run_steps(20);
+    let passes = h.ctx.cumulative_pass_nr() - n0;
+    assert!(passes <= 40, "{passes} passes in 20 steps");
+}

@@ -60,7 +60,7 @@ impl ClipThumbs {
                     break;
                 }
                 if let Some(c) = rp.lock().unwrap().as_ref() {
-                    c.request_repaint();
+                    crate::wake::after(c);
                 }
             }
         });

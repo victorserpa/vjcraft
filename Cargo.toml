@@ -15,3 +15,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }

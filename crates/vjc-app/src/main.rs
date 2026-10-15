@@ -40,6 +40,7 @@ mod slice_render;
 mod source_info;
 mod theme;
 mod timecode_io;
+mod ui_stats;
 mod vram;
 mod wake;
 mod wave_ui;
@@ -114,6 +115,8 @@ struct State {
     /// Texture-memory limit in bytes (`VJC_VRAM_LIMIT_MB`).
     vram_limit: u64,
     frame_ms: frame_stats::FrameStats,
+    ui_stats: ui_stats::UiStats,
+    last_ui: Option<std::time::Instant>,
     render_gate: FrameGate,
     /// Status-bar frame-time text, rebuilt every 500 ms so its galley stays cached.
     frame_label: (Option<std::time::Instant>, String),
@@ -849,6 +852,22 @@ fn repaint_interval(fps: impl Into<f64>) -> std::time::Duration {
     std::time::Duration::from_secs_f64(1.0 / repaint_fps(fps))
 }
 
+/// Shortest gap between UI frames: the render interval, but never longer than 1/60 s so
+/// a low composition fps (1, 24) does not make the controls lag.
+fn ui_pace_gap(fps: impl Into<f64>) -> std::time::Duration {
+    repaint_interval(fps).min(std::time::Duration::from_secs_f64(1.0 / 60.0))
+}
+
+/// How long to wait before starting a UI frame so frames are at least `min_gap` apart.
+fn ui_pace_wait(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    min_gap: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let since = now.checked_duration_since(last?)?;
+    min_gap.checked_sub(since).filter(|d| !d.is_zero())
+}
+
 /// Repaint rate for live video: the composition fps, kept to 1..=240 (NaN or junk = 60).
 fn repaint_fps(fps: impl Into<f64>) -> f64 {
     let f = fps.into();
@@ -923,6 +942,33 @@ fn gate_halves_renders_at_120hz_vsync_with_60fps_comp() {
     assert_eq!(gate_renders(120.0, 120.0, 240), 240);
     // 60 Hz vsync, 60 fps comp: every tick.
     assert_eq!(gate_renders(60.0, 60.0, 120), 120);
+}
+
+#[test]
+fn ui_pace_gap_never_exceeds_a_60hz_frame() {
+    use std::time::Duration as D;
+    let cap = D::from_secs_f64(1.0 / 60.0);
+    assert_eq!(
+        ui_pace_gap(1.0),
+        cap,
+        "1 fps composition: the UI still runs at 60"
+    );
+    assert_eq!(ui_pace_gap(24.0), cap);
+    assert_eq!(ui_pace_gap(120.0), repaint_interval(120.0));
+}
+
+#[test]
+fn ui_pace_waits_only_for_the_rest_of_the_gap() {
+    use std::time::{Duration as D, Instant};
+    let t = Instant::now();
+    let gap = D::from_millis(16);
+    assert_eq!(ui_pace_wait(None, t, gap), None);
+    assert_eq!(
+        ui_pace_wait(Some(t), t + D::from_millis(4), gap),
+        Some(D::from_millis(12))
+    );
+    assert_eq!(ui_pace_wait(Some(t), t + D::from_millis(16), gap), None);
+    assert_eq!(ui_pace_wait(Some(t), t + D::from_millis(40), gap), None);
 }
 
 #[test]
@@ -1717,6 +1763,8 @@ impl State {
             vram_dog: vram::Watchdog::default(),
             vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
+            ui_stats: ui_stats::UiStats::new(),
+            last_ui: None,
             render_gate: FrameGate::default(),
             frame_label: (None, String::new()),
             preload: preload::Preload::default(),
@@ -9853,6 +9901,7 @@ impl State {
                 builder,
                 |ui, _class| {
                     let ctx = ui.ctx().clone();
+                    ui_stats::child_pass(&ctx);
                     let full = ui.max_rect();
                     ui.painter()
                         .rect_filled(full, 0.0, crate::theme::MONITOR_BG);
@@ -9950,7 +9999,17 @@ const BLACKOUT_KEY: (egui::Modifiers, egui::Key) = (
 
 impl eframe::App for State {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Pace the UI: an unthrottled swapchain (vsync off, occluded window, output window
+        // redrawing the parent) would otherwise run the whole UI thousands of times a second.
+        let min_gap = ui_pace_gap(effective_fps(
+            self.project.composition.fps,
+            self.prefs.video.max_fps,
+        ));
+        if let Some(wait) = ui_pace_wait(self.last_ui, std::time::Instant::now(), min_gap) {
+            std::thread::sleep(wait);
+        }
         let t0 = std::time::Instant::now();
+        self.last_ui = Some(t0);
         self.poll_monitors();
         self.tick_clock();
         self.audio_react.refresh(&self.project.composition);
@@ -9972,6 +10031,7 @@ impl eframe::App for State {
         }
         State::ui(self, ui);
         let ctx = ui.ctx().clone();
+        self.ui_stats.frame(&ctx);
         self.output_window(&ctx);
         self.frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
         // VJC_FRAME_LOG=1 prints the counter every 120 frames (measuring N layers).

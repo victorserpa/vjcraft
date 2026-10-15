@@ -95,7 +95,7 @@ impl SourceInfos {
                 let info = vjc_media::probe(&p);
                 let _ = tx.send((p, info));
                 if let Some(c) = rp.lock().unwrap().as_ref() {
-                    c.request_repaint();
+                    crate::wake::after(c);
                 }
             });
         }
