@@ -5357,6 +5357,8 @@ impl State {
             let tap = help(tap, "tap");
             self.targets.push((tap.rect, "/comp/tempo/tap".into()));
             if tap.clicked() {
+                #[cfg(test)]
+                let now = self.history_now.unwrap_or(now);
                 cmds.push(Command::Tap { at: now });
             }
             for (state, icon, tip) in [

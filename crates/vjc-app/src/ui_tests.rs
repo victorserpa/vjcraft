@@ -86,6 +86,16 @@ fn snap(h: &mut Harness<'_, State>, name: &str) {
     img.save(dir.join(format!("{name}.png"))).unwrap();
 }
 
+/// Taps the tempo button with an injected clock: `ms` after a fixed origin, no real sleep.
+fn tap_at(h: &mut Harness<'_, State>, ms: u64) {
+    thread_local! {
+        static ORIGIN: std::time::Instant = std::time::Instant::now();
+    }
+    let t = ORIGIN.with(|o| *o + std::time::Duration::from_millis(ms));
+    h.state_mut().history_now = Some(t);
+    click(h, "Tap");
+}
+
 fn click(h: &mut Harness<'_, State>, label: &str) {
     h.get_by_label(label).click();
     settle(h);
@@ -296,9 +306,9 @@ fn tap_bpm_halve_double_and_resync() {
     click(&mut h, "\u{00d7}2");
     assert_eq!(bpm(&h), 240.0);
     // Two taps 400 ms apart read ~150 BPM.
-    click(&mut h, "Tap");
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    click(&mut h, "Tap");
+    tap_at(&mut h, 0);
+    tap_at(&mut h, 400);
+    h.state_mut().history_now = None;
     let tapped = bpm(&h);
     assert!((100.0..=200.0).contains(&tapped), "tapped bpm {tapped}");
     click(&mut h, "Resync");
@@ -4029,7 +4039,7 @@ fn clip_name_at(h: &Harness<'_, State>, layer_idx: usize, col: u32) -> String {
 
 /// Waits (pumping the UI) until the player of `lid` has decoded a frame.
 fn wait_frame(h: &mut Harness<'_, State>, lid: LayerId) -> bool {
-    for _ in 0..100 {
+    for _ in 0..60 {
         h.step();
         if h.state()
             .players
@@ -4066,7 +4076,15 @@ fn whole_gig_through_the_ui() {
     };
     // The data dir is a scratch one: nothing here may reach the user's own.
     let dir = base.parent().unwrap().join("gig");
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
     let mut h = app_with(State::headless(prefs()), egui::vec2(1600.0, 1000.0));
     assert_eq!(layers_cols(&h), (3, 9));
 
@@ -4198,8 +4216,17 @@ fn whole_gig_through_the_ui() {
 
     // 6. Effect on layer 1 through the header menu, then a param.
     // The panels also carry "Add effect" buttons; the layer headers' come last.
-    let hdr = all(&h, "Add effect") - 3;
-    nth_label(&h, "Add effect", hdr + 1).click();
+    // Layer 1's header button is the one lowest-numbered after the panels': pick by
+    // vertical position instead of counting from the end.
+    let row_y = cell_center(&h, 1, 0).1.y;
+    h.query_all_by_label("Add effect")
+        .min_by(|a, b| {
+            (a.rect().center().y - row_y)
+                .abs()
+                .total_cmp(&(b.rect().center().y - row_y).abs())
+        })
+        .expect("Add effect on layer 1's row")
+        .click();
     settle(&mut h);
     let fx_id = vjc_fx::BUILTIN[0].0;
     click(&mut h, &fx_label(fx_id));
@@ -4285,9 +4312,9 @@ fn whole_gig_through_the_ui() {
     assert_eq!(clip_id_at(&h, lids[2], 4), Some(moved));
 
     // 11. BPM by tapping.
-    click(&mut h, "Tap");
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    click(&mut h, "Tap");
+    tap_at(&mut h, 0);
+    tap_at(&mut h, 400);
+    h.state_mut().history_now = None;
     let bpm = h.state().project.composition.tempo.bpm;
     assert!((100.0..=200.0).contains(&bpm), "tapped bpm {bpm}");
 
@@ -4338,6 +4365,8 @@ fn whole_gig_through_the_ui() {
         "reopened clip plays"
     );
     assert!(wait_frame(&mut h2, lid_b), "reopened clip decodes");
+    click(&mut h2, "Stop all layers");
+    assert!(h2.state().players.is_empty(), "h2 players stopped");
 
     // 14. Clear all stops everything.
     assert!(playing_count(&h) > 0);
