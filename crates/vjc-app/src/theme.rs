@@ -36,7 +36,6 @@ pub const RADIUS_SM: u8 = 3;
 pub const FIELD_W_SM: f32 = 60.0;
 pub const FIELD_W_MD: f32 = 110.0;
 pub const FIELD_W_LG: f32 = 240.0;
-pub const FIELD_W_NAME: f32 = 140.0;
 pub const DIALOG_W: f32 = 360.0;
 pub const COMBO_W_SM: f32 = 40.0;
 

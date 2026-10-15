@@ -9,10 +9,10 @@ use vjc_core::{Command, dmx, mapping};
 use vjc_model::{ChannelOrder, Fixture, OutputDevice, PixelFormat, Screen};
 
 use crate::theme::{
-    COMBO_W_SM, FIELD_W_MD, FIELD_W_NAME, HANDLE_GRAB_K, HANDLE_R, OUTPUT_CANVAS_W, OUTPUT_LIST_W,
-    OUTPUT_WIN_W, OUTPUT_WIN_X, OUTPUT_WIN_Y, SNAP_PX, STROKE_CANVAS, STROKE_HANDLE,
+    COMBO_W_SM, HANDLE_GRAB_K, HANDLE_R, OUTPUT_CANVAS_W, OUTPUT_LIST_W, OUTPUT_WIN_W,
+    OUTPUT_WIN_X, OUTPUT_WIN_Y, SNAP_PX, STROKE_CANVAS, STROKE_HANDLE,
 };
-use crate::widgets::{self, Kind};
+use crate::widgets::{self, Kind, Width, field_int, field_text, panel_window, toggle};
 
 /// Largest screen size, fixture grid side and Art-Net universe the fields accept.
 const MAX_SCREEN_PX: u32 = 16384;
@@ -190,7 +190,7 @@ impl State {
             .and_then(|id| screens.iter().find(|s| s.id == id))
             .or(screens.first())
             .cloned();
-        egui::Window::new("Output setup")
+        panel_window(ctx, "Output setup")
             .open(&mut open)
             .default_width(OUTPUT_WIN_W)
             // Open below the menu bar: the default position covered "Output" and ate its clicks.
@@ -221,7 +221,7 @@ impl State {
             return;
         }
         let mut open = true;
-        egui::Window::new("Display info")
+        panel_window(ctx, "Display info")
             .open(&mut open)
             .show(ctx, |ui| {
                 if self.monitors.is_empty() {
@@ -314,8 +314,7 @@ impl State {
             let on = cur.is_some_and(|c| c.id == s.id);
             ui.horizontal(|ui| {
                 let mut en = s.enabled;
-                if ui
-                    .checkbox(&mut en, "")
+                if toggle(ui, &mut en, "")
                     .on_hover_text("On / off (off sends black)")
                     .changed()
                 {
@@ -421,16 +420,8 @@ impl State {
                 }
             });
         let (mut w, mut h) = (c.width, c.height);
-        let a = ui.add(
-            egui::DragValue::new(&mut w)
-                .range(1..=MAX_SCREEN_PX)
-                .prefix("W "),
-        );
-        let b = ui.add(
-            egui::DragValue::new(&mut h)
-                .range(1..=MAX_SCREEN_PX)
-                .prefix("H "),
-        );
+        let a = field_int(ui, &mut w, 1..=MAX_SCREEN_PX, "W ", "");
+        let b = field_int(ui, &mut h, 1..=MAX_SCREEN_PX, "H ", "");
         if a.changed() || b.changed() {
             cmds.push(Command::SetScreenSize {
                 screen: c.id,
@@ -440,7 +431,7 @@ impl State {
         }
         let mut pp = c.pixel_perfect;
         if crate::help::help(
-            ui.checkbox(&mut pp, "Pixel-perfect (nearest)"),
+            toggle(ui, &mut pp, "Pixel-perfect (nearest)"),
             "out-pixel-perfect",
         )
         .changed()
@@ -508,7 +499,7 @@ impl State {
                 .unwrap_or_else(|| ip.clone());
             ui.horizontal(|ui| {
                 ui.label("IP");
-                let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(FIELD_W_MD));
+                let r = field_text(ui, &mut text, Width::Md, None);
                 if r.lost_focus() && text.trim() != ip {
                     new_ip = text.trim().to_owned();
                 }
@@ -669,8 +660,8 @@ impl State {
             ),
         );
         ui.horizontal(|ui| {
-            ui.checkbox(&mut f.flip_h, "Flip H");
-            ui.checkbox(&mut f.flip_v, "Flip V");
+            toggle(ui, &mut f.flip_h, "Flip H");
+            toggle(ui, &mut f.flip_v, "Flip V");
         });
         ui.label("Input (centre, size, rotation)");
         ui.horizontal(|ui| {
@@ -736,7 +727,7 @@ impl State {
             let mut text = ui
                 .data_mut(|d| d.get_temp::<String>(name_id))
                 .unwrap_or_else(|| f.name.clone());
-            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(FIELD_W_NAME));
+            let r = field_text(ui, &mut text, Width::Md, None);
             if r.lost_focus() && !text.trim().is_empty() {
                 f.name = text.trim().to_owned();
             }
@@ -747,16 +738,8 @@ impl State {
             }
         });
         ui.horizontal(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut f.width)
-                    .range(1..=MAX_FIXTURE_SIDE)
-                    .prefix("W "),
-            );
-            ui.add(
-                egui::DragValue::new(&mut f.height)
-                    .range(1..=MAX_FIXTURE_SIDE)
-                    .prefix("H "),
-            );
+            field_int(ui, &mut f.width, 1..=MAX_FIXTURE_SIDE, "W ", "");
+            field_int(ui, &mut f.height, 1..=MAX_FIXTURE_SIDE, "H ", "");
             while !dmx::valid(f) {
                 // Keep the grid within what the mapper accepts.
                 f.height = (f.height / 2).max(1);
@@ -787,7 +770,7 @@ impl State {
                 });
         });
         widgets::slider(ui, &mut f.gamma, 0.5..=3.0, "Gamma");
-        ui.checkbox(&mut f.serpentine, "Serpentine (odd rows reversed)");
+        toggle(ui, &mut f.serpentine, "Serpentine (odd rows reversed)");
     }
 
     /// Click on a slice number: plain selects only it; shift / cmd toggles it in the
@@ -881,7 +864,7 @@ impl State {
                         Command::Batch { commands: rm }
                     });
                 }
-                ui.checkbox(&mut self.snap, "Snap");
+                toggle(ui, &mut self.snap, "Snap");
                 let rows = mapping::rows_of(sl.output_mesh.len(), sl.mesh_cols);
                 let mut grid = (sl.mesh_cols, rows);
                 for (n, v) in [("Cols", &mut grid.0), ("Rows", &mut grid.1)] {
@@ -954,7 +937,7 @@ impl State {
                         ])));
                     }
                 } else if let Some(m) = &sl.mask {
-                    ui.checkbox(&mut self.edit_mask, "Edit points");
+                    toggle(ui, &mut self.edit_mask, "Edit points");
                     let can_rm = m.len() > 3 && self.sel_mask_pt.is_some_and(|i| i < m.len());
                     if ui
                         .add_enabled_ui(can_rm, |ui| {
@@ -985,7 +968,7 @@ impl State {
             });
             ui.horizontal(|ui| {
                 let mut inv = sl.mask_invert;
-                if ui.checkbox(&mut inv, "Invert mask").changed() {
+                if toggle(ui, &mut inv, "Invert mask").changed() {
                     cmds.push(Command::SetSliceMaskInvert {
                         screen: scr.id,
                         slice: sl.id,
@@ -1022,7 +1005,7 @@ impl State {
         widgets::section(ui, "Soft edge", |ui| {
             ui.horizontal_wrapped(|ui| {
                 let mut on = sl.soft_edge.is_some();
-                if ui.checkbox(&mut on, "Enabled").changed() {
+                if toggle(ui, &mut on, "Enabled").changed() {
                     cmds.push(Command::SetSliceSoftEdge {
                         screen: scr.id,
                         slice: sl.id,
@@ -1066,8 +1049,8 @@ impl State {
         widgets::section(ui, "Alpha", |ui| {
             ui.horizontal(|ui| {
                 let (mut key, mut bg) = (sl.is_key, sl.black_bg);
-                let a = ui.checkbox(&mut key, "Is Key").changed();
-                let b = ui.checkbox(&mut bg, "Black BG").changed();
+                let a = toggle(ui, &mut key, "Is Key").changed();
+                let b = toggle(ui, &mut bg, "Black BG").changed();
                 if a || b {
                     cmds.push(Command::SetSliceKey {
                         screen: scr.id,

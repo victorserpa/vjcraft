@@ -588,14 +588,14 @@ fn group_menu(
             ] {
                 let Some(nb) = nb else { continue };
                 if let Some(group) = nb.group {
-                    if ui.button(join).clicked() {
+                    if widgets::btn(ui, join, widgets::Kind::Secondary).clicked() {
                         cmds.push(Command::MoveLayerToGroup {
                             layer: me.id,
                             group,
                         });
                         ui.close();
                     }
-                } else if ui.button(label).clicked() {
+                } else if widgets::btn(ui, label, widgets::Kind::Secondary).clicked() {
                     let group =
                         vjc_model::LayerGroup::new(&format!("Group {}", comp.groups.len() + 1));
                     cmds.push(Command::CreateGroup {
@@ -614,14 +614,18 @@ fn group_menu(
                 .count();
             let edge = above.is_none_or(|a| a.group != Some(group))
                 || below.is_none_or(|b| b.group != Some(group));
-            if ui
-                .add_enabled(members > 1 && edge, egui::Button::new("Remove from group"))
-                .clicked()
+            if widgets::btn_if(
+                ui,
+                members > 1 && edge,
+                "Remove from group",
+                widgets::Kind::Secondary,
+            )
+            .clicked()
             {
                 cmds.push(Command::MoveLayerOutOfGroup { layer: me.id });
                 ui.close();
             }
-            if ui.button("Ungroup").clicked() {
+            if widgets::btn(ui, "Ungroup", widgets::Kind::Secondary).clicked() {
                 cmds.push(Command::Ungroup { group });
                 ui.close();
             }
@@ -2059,22 +2063,25 @@ impl State {
             return;
         };
         let (mut keep, mut save) = (true, false);
-        egui::Window::new("Save layout as")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut keep)
-            .show(ctx, |ui| {
-                let r = ui.text_edit_singleline(&mut name);
-                r.request_focus();
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui
-                    .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+        let esc = widgets::dialog(ctx, "Save layout as", true, |ui| {
+            let r = widgets::field_text(ui, &mut name, widgets::Width::Lg, None);
+            r.request_focus();
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.horizontal(|ui| {
+                if widgets::btn_if(ui, !name.trim().is_empty(), "Save", widgets::Kind::Primary)
                     .clicked()
                     || enter
                 {
                     save = true;
                 }
+                if widgets::btn(ui, "Cancel", widgets::Kind::Secondary).clicked() {
+                    keep = false;
+                }
             });
+        });
+        if esc {
+            keep = false;
+        }
         if save && !name.trim().is_empty() {
             let n = name.trim();
             if self.prefs.layouts.custom.iter().any(|l| l.name == n) {
@@ -2148,16 +2155,14 @@ impl State {
             return;
         };
         let (mut yes, mut no) = (false, false);
-        egui::Window::new("Replace layout?")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(format!("Layout \"{name}\" already exists. Replace it?"));
-                ui.horizontal(|ui| {
-                    yes = ui.button("Replace").clicked();
-                    no = ui.button("Cancel").clicked();
-                });
+        let esc = widgets::dialog(ctx, "Replace layout?", true, |ui| {
+            ui.label(format!("Layout \"{name}\" already exists. Replace it?"));
+            ui.horizontal(|ui| {
+                yes = widgets::btn(ui, "Replace", widgets::Kind::Danger).clicked();
+                no = widgets::btn(ui, "Cancel", widgets::Kind::Secondary).clicked();
             });
+        });
+        no |= esc;
         if yes {
             self.save_layout_as(&name);
         }

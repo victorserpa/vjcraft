@@ -48,6 +48,54 @@ pub fn btn(ui: &mut egui::Ui, label: &str, kind: Kind) -> egui::Response {
     ui.add(b.corner_radius(RADIUS_SM))
 }
 
+/// Button that is greyed out and inert unless `enabled`.
+pub fn btn_if(ui: &mut egui::Ui, enabled: bool, label: &str, kind: Kind) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| btn(ui, label, kind)).inner
+}
+
+/// Checkbox with the kit text color.
+pub fn toggle(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    ui.add(egui::Checkbox::new(value, RichText::new(label).color(TEXT)))
+}
+
+/// Integer/any-numeric field (drag or type) clamped to `range`, with optional prefix/suffix.
+pub fn field_int<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    range: std::ops::RangeInclusive<T>,
+    prefix: &str,
+    suffix: &str,
+) -> egui::Response {
+    let bad = !range.contains(value);
+    ui.scope(|ui| {
+        if bad {
+            let v = ui.visuals_mut();
+            for w in [&mut v.widgets.inactive, &mut v.widgets.hovered] {
+                w.bg_stroke = Stroke::new(STROKE_W, DANGER);
+            }
+        }
+        ui.add(
+            egui::DragValue::new(value)
+                .range(range)
+                .prefix(prefix)
+                .suffix(suffix),
+        )
+    })
+    .inner
+}
+
+/// Tool window (non-modal) with the kit frame: SURFACE fill and BORDER stroke.
+pub fn panel_window<'a>(
+    ctx: &egui::Context,
+    title: impl Into<egui::WidgetText>,
+) -> egui::Window<'a> {
+    egui::Window::new(title).frame(
+        egui::Frame::window(&ctx.global_style())
+            .fill(crate::theme::SURFACE)
+            .stroke(Stroke::new(STROKE_W, crate::theme::BORDER)),
+    )
+}
+
 /// Titled group: bold title, separator, body, then spacing.
 pub fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.label(

@@ -1,7 +1,9 @@
 //! Preferences window (File > Preferences..., Cmd+,). Edits apply live;
 //! the file is written when the window closes.
 
-use crate::widgets::{Kind, Width, btn, field_text, help, section};
+use crate::widgets::{
+    Kind, Width, btn, field_int, field_text, help, panel_window, section, toggle,
+};
 use crate::{PrefsTab, State, api_io};
 use eframe::egui;
 use vjc_model::FitMode;
@@ -14,7 +16,7 @@ impl State {
         let mut open = true;
         let mut done = false;
         let before = self.prefs.clone();
-        egui::Window::new("Preferences")
+        panel_window(ctx, "Preferences")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -40,18 +42,11 @@ impl State {
                 let p = &mut self.prefs;
                 match self.prefs_tab {
                     PrefsTab::General => {
-                        ui.checkbox(&mut p.general.autosave, "Autosave recovery file");
+                        toggle(ui, &mut p.general.autosave, "Autosave recovery file");
                         ui.add_enabled_ui(p.general.autosave, |ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut p.general.autosave_secs)
-                                    .range(5..=3600)
-                                    .suffix(" s"),
-                            );
+                            field_int(ui, &mut p.general.autosave_secs, 5..=3600, "", " s");
                         });
-                        ui.checkbox(
-                            &mut p.general.open_last_project,
-                            "Open last project at startup",
-                        );
+                        toggle(ui, &mut p.general.open_last_project, "Open last project at startup");
                         ui.horizontal(|ui| {
                             ui.label("Browser start folder");
                             let mut t = p
@@ -145,14 +140,10 @@ impl State {
                     PrefsTab::Video => {
                         ui.label("New composition");
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut p.video.width).range(1..=16384));
+                            field_int(ui, &mut p.video.width, 1..=16384, "", "");
                             ui.label("x");
-                            ui.add(egui::DragValue::new(&mut p.video.height).range(1..=16384));
-                            ui.add(
-                                egui::DragValue::new(&mut p.video.fps)
-                                    .range(1.0..=240.0)
-                                    .suffix(" fps"),
-                            );
+                            field_int(ui, &mut p.video.height, 1..=16384, "", "");
+                            field_int(ui, &mut p.video.fps, 1.0..=240.0, "", " fps");
                         });
                         egui::ComboBox::from_label("Default clip fit")
                             .selected_text(p.video.fit.label())
@@ -176,21 +167,12 @@ impl State {
                                     ui.selectable_value(&mut p.video.max_fps, n, l);
                                 }
                             });
-                        ui.checkbox(
-                            &mut p.video.folder_sequence,
-                            "Dropped folder of numbered images becomes one sequence clip",
-                        );
-                        ui.checkbox(&mut p.video.vsync, "VSync (applies on next launch)");
+                        toggle(ui, &mut p.video.folder_sequence, "Dropped folder of numbered images becomes one sequence clip");
+                        toggle(ui, &mut p.video.vsync, "VSync (applies on next launch)");
                     }
                     PrefsTab::Control => {
-                        ui.checkbox(
-                            &mut p.control.default_shortcuts,
-                            "New projects get the default shortcut preset",
-                        );
-                        ui.checkbox(
-                            &mut p.control.offer_shortcuts,
-                            "Offer the preset when opening a project without shortcuts",
-                        );
+                        toggle(ui, &mut p.control.default_shortcuts, "New projects get the default shortcut preset");
+                        toggle(ui, &mut p.control.offer_shortcuts, "Offer the preset when opening a project without shortcuts");
                         ui.horizontal(|ui| {
                             ui.label("Beat snap");
                             for m in vjc_model::BeatSnap::ALL {
@@ -212,7 +194,7 @@ impl State {
                             }
                             for n in ins.iter() {
                                 let mut on = p.midi.input_enabled(n);
-                                if ui.checkbox(&mut on, n).changed() {
+                                if toggle(ui, &mut on, n).changed() {
                                     p.midi.set_input(n, on);
                                 }
                             }
@@ -223,7 +205,7 @@ impl State {
                             }
                             for n in outs.iter() {
                                 let mut on = p.midi.output_enabled(n);
-                                if ui.checkbox(&mut on, n).changed() {
+                                if toggle(ui, &mut on, n).changed() {
                                     p.midi.set_output(n, on);
                                 }
                             }
@@ -235,44 +217,41 @@ impl State {
                     }
                     PrefsTab::Osc => {
                         let o = &mut p.osc;
-                        ui.checkbox(&mut o.in_enabled, "Receive OSC");
+                        toggle(ui, &mut o.in_enabled, "Receive OSC");
                         ui.add_enabled_ui(o.in_enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Port");
-                                ui.add(egui::DragValue::new(&mut o.in_port).range(1..=65535));
+                                field_int(ui, &mut o.in_port, 1..=65535, "", "");
                             });
-                            ui.checkbox(
-                                &mut o.accept_network,
-                                "Accept from network (default: this computer only)",
-                            );
+                            toggle(ui, &mut o.accept_network, "Accept from network (default: this computer only)");
                         });
                         ui.separator();
-                        ui.checkbox(&mut o.out_enabled, "Send OSC feedback");
+                        toggle(ui, &mut o.out_enabled, "Send OSC feedback");
                         ui.add_enabled_ui(o.out_enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Host");
                                 field_text(ui, &mut o.out_host, Width::Md, None);
                                 ui.label("Port");
-                                ui.add(egui::DragValue::new(&mut o.out_port).range(1..=65535));
+                                field_int(ui, &mut o.out_port, 1..=65535, "", "");
                             });
                         });
                         help(ui, "Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
                     }
                     PrefsTab::Dmx => {
                         let d = &mut p.dmx;
-                        ui.checkbox(&mut d.enabled, "Receive Art-Net (DMX in)");
+                        toggle(ui, &mut d.enabled, "Receive Art-Net (DMX in)");
                         ui.add_enabled_ui(d.enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Interface IP");
                                 field_text(ui, &mut d.interface, Width::Md, None);
                                 ui.label("Port");
-                                ui.add(egui::DragValue::new(&mut d.port).range(1..=65535));
+                                field_int(ui, &mut d.port, 1..=65535, "", "");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("First universe");
-                                ui.add(egui::DragValue::new(&mut d.universe).range(0..=32767));
+                                field_int(ui, &mut d.universe, 0..=32767, "", "");
                                 ui.label("Count");
-                                ui.add(egui::DragValue::new(&mut d.universes).range(1..=64));
+                                field_int(ui, &mut d.universes, 1..=64, "", "");
                             });
                         });
                         if d.enabled {
@@ -364,13 +343,13 @@ impl State {
                                 ui.horizontal(|ui| {
                                     ui.label("Channel");
                                     let mut c = u32::from(*channel) + 1;
-                                    if ui.add(egui::DragValue::new(&mut c).range(1..=64)).changed() {
+                                    if field_int(ui, &mut c, 1..=64, "", "").changed() {
                                         *channel = (c - 1) as u16;
                                     }
                                 });
                                 let mut auto = t.ltc_fps.is_none();
                                 ui.horizontal(|ui| {
-                                    if ui.checkbox(&mut auto, "Detect frame rate").changed() {
+                                    if toggle(ui, &mut auto, "Detect frame rate").changed() {
                                         t.ltc_fps = (!auto).then_some(vjc_model::TcFps::F25);
                                     }
                                     if let Some(f) = &mut t.ltc_fps {
@@ -386,11 +365,7 @@ impl State {
                         }
                         ui.horizontal(|ui| {
                             ui.label("Offset");
-                            ui.add(
-                                egui::DragValue::new(&mut t.offset_frames)
-                                    .range(-1_000_000..=1_000_000)
-                                    .suffix(" frames"),
-                            );
+                            field_int(ui, &mut t.offset_frames, -1_000_000..=1_000_000, "", " frames");
                         });
                         ui.horizontal(|ui| {
                             ui.label("On signal loss");
@@ -401,17 +376,14 @@ impl State {
                     }
                     PrefsTab::Api => {
                         let a = &mut p.api;
-                        ui.checkbox(&mut a.enabled, "Enable Remote API (HTTP + WebSocket)");
+                        toggle(ui, &mut a.enabled, "Enable Remote API (HTTP + WebSocket)");
                         ui.add_enabled_ui(a.enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Port");
-                                ui.add(egui::DragValue::new(&mut a.port).range(1..=65534));
+                                field_int(ui, &mut a.port, 1..=65534, "", "");
                                 help(ui, &format!("WebSocket: {}", u32::from(a.port) + 1));
                             });
-                            ui.checkbox(
-                                &mut a.expose_network,
-                                "Expose to the network (default: this computer only)",
-                            );
+                            toggle(ui, &mut a.expose_network, "Expose to the network (default: this computer only)");
                         });
                         if a.enabled && a.expose_network {
                             ui.colored_label(

@@ -5886,3 +5886,29 @@ fn prefs_tab_moves_focus_forward_in_visual_order() {
         );
     }
 }
+
+#[test]
+fn prefs_and_output_setup_kit_windows_render() {
+    let mut h = app();
+    h.state_mut().prefs_open = true;
+    h.state_mut().output_setup_open = true;
+    settle(&mut h);
+    for l in ["General", "Close", "Autosave recovery file"] {
+        assert!(exists(&h, l), "prefs: {l}");
+    }
+    for l in ["Output setup", "Screens"] {
+        assert!(exists(&h, l), "output: {l}");
+    }
+    for tab in [
+        "Audio",
+        "Video",
+        "Control",
+        "MIDI",
+        "OSC",
+        "DMX",
+        "Remote API",
+        "Timecode",
+    ] {
+        click(&mut h, tab);
+    }
+}

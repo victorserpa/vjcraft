@@ -2,6 +2,7 @@
 //! export whole output setups as files in the user folder, apart from the project.
 //! File work is in `vjc_io::output_presets`; loading is the undoable `SetOutputSetup`.
 
+use crate::widgets::{Kind, btn, btn_if};
 use crate::{State, theme};
 use eframe::egui;
 use std::path::Path;
@@ -160,27 +161,21 @@ impl State {
             );
             let text = self.preset_text.clone();
             let valid = presets::clean_name(&text).is_some();
-            if ui
-                .add_enabled(valid, egui::Button::new("Save preset"))
-                .clicked()
-            {
+            if btn_if(ui, valid, "Save preset", Kind::Primary).clicked() {
                 self.preset_save(&text);
             }
             let Some(cur) = sel else {
-                ui.add_enabled(false, egui::Button::new("Load preset"));
-                if ui.button("Import preset...").clicked() {
+                btn_if(ui, false, "Load preset", Kind::Secondary);
+                if btn(ui, "Import preset...", Kind::Secondary).clicked() {
                     self.preset_import_dialog();
                 }
                 return;
             };
-            if ui.button("Load preset").clicked() {
+            if btn(ui, "Load preset", Kind::Secondary).clicked() {
                 self.preset_load(&cur);
             }
             let renamable = valid && text.trim() != cur;
-            if ui
-                .add_enabled(renamable, egui::Button::new("Rename preset"))
-                .clicked()
-            {
+            if btn_if(ui, renamable, "Rename preset", Kind::Secondary).clicked() {
                 self.preset_rename(&cur, &text);
             }
             let label = if self.preset_confirm_delete {
@@ -188,17 +183,22 @@ impl State {
             } else {
                 "Delete preset"
             };
-            if ui.button(label).clicked() {
+            let kind = if self.preset_confirm_delete {
+                Kind::Danger
+            } else {
+                Kind::Secondary
+            };
+            if btn(ui, label, kind).clicked() {
                 if self.preset_confirm_delete {
                     self.preset_delete(&cur);
                 } else {
                     self.preset_confirm_delete = true;
                 }
             }
-            if ui.button("Import preset...").clicked() {
+            if btn(ui, "Import preset...", Kind::Secondary).clicked() {
                 self.preset_import_dialog();
             }
-            if ui.button("Export preset...").clicked()
+            if btn(ui, "Export preset...", Kind::Secondary).clicked()
                 && let Some(dest) = rfd::FileDialog::new()
                     .add_filter("Output preset", &[presets::EXT])
                     .set_file_name(format!("{cur}.{}", presets::EXT))
@@ -210,9 +210,9 @@ impl State {
         if !self.preset_warnings.is_empty() {
             let mut dismiss = false;
             for w in &self.preset_warnings {
-                ui.colored_label(theme::BEAT_DOWN, w);
+                ui.colored_label(theme::DANGER, w);
             }
-            ui.horizontal(|ui| dismiss = ui.button("Dismiss warnings").clicked());
+            ui.horizontal(|ui| dismiss = btn(ui, "Dismiss warnings", Kind::Secondary).clicked());
             if dismiss {
                 self.preset_warnings.clear();
             }
