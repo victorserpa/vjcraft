@@ -189,6 +189,65 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "zoom_blur",
         include_str!("../../../assets/effects/zoom_blur.fs"),
     ),
+    (
+        "exposure_gamma",
+        include_str!("../../../assets/effects/exposure_gamma.fs"),
+    ),
+    (
+        "vibrance",
+        include_str!("../../../assets/effects/vibrance.fs"),
+    ),
+    (
+        "color_balance",
+        include_str!("../../../assets/effects/color_balance.fs"),
+    ),
+    ("sepia", include_str!("../../../assets/effects/sepia.fs")),
+    (
+        "black_white",
+        include_str!("../../../assets/effects/black_white.fs"),
+    ),
+    (
+        "colorize",
+        include_str!("../../../assets/effects/colorize.fs"),
+    ),
+    (
+        "thermal",
+        include_str!("../../../assets/effects/thermal.fs"),
+    ),
+    (
+        "night_vision",
+        include_str!("../../../assets/effects/night_vision.fs"),
+    ),
+    ("sketch", include_str!("../../../assets/effects/sketch.fs")),
+    (
+        "oil_paint",
+        include_str!("../../../assets/effects/oil_paint.fs"),
+    ),
+    (
+        "cartoon",
+        include_str!("../../../assets/effects/cartoon.fs"),
+    ),
+    ("bloom", include_str!("../../../assets/effects/bloom.fs")),
+    (
+        "fisheye",
+        include_str!("../../../assets/effects/fisheye.fs"),
+    ),
+    ("pinch", include_str!("../../../assets/effects/pinch.fs")),
+    ("vortex", include_str!("../../../assets/effects/vortex.fs")),
+    ("shake", include_str!("../../../assets/effects/shake.fs")),
+    ("flip", include_str!("../../../assets/effects/flip.fs")),
+    (
+        "rotate_zoom",
+        include_str!("../../../assets/effects/rotate_zoom.fs"),
+    ),
+    (
+        "mirror_quad",
+        include_str!("../../../assets/effects/mirror_quad.fs"),
+    ),
+    (
+        "infinite_zoom",
+        include_str!("../../../assets/effects/infinite_zoom.fs"),
+    ),
 ];
 
 /// Bundled generators: ISF without an image input, rendered at composition size.
@@ -230,6 +289,40 @@ pub const GENERATORS: &[(&str, &str)] = &[
     ),
     ("waves", include_str!("../../../assets/generators/waves.fs")),
     ("text", include_str!("../../../assets/generators/text.fs")),
+    (
+        "tunnel",
+        include_str!("../../../assets/generators/tunnel.fs"),
+    ),
+    (
+        "metaballs",
+        include_str!("../../../assets/generators/metaballs.fs"),
+    ),
+    ("fire", include_str!("../../../assets/generators/fire.fs")),
+    (
+        "clouds",
+        include_str!("../../../assets/generators/clouds.fs"),
+    ),
+    ("lines", include_str!("../../../assets/generators/lines.fs")),
+    (
+        "circles_grid",
+        include_str!("../../../assets/generators/circles_grid.fs"),
+    ),
+    (
+        "triangles",
+        include_str!("../../../assets/generators/triangles.fs"),
+    ),
+    (
+        "lens_flare",
+        include_str!("../../../assets/generators/lens_flare.fs"),
+    ),
+    (
+        "particles",
+        include_str!("../../../assets/generators/particles.fs"),
+    ),
+    (
+        "gradient_sweep",
+        include_str!("../../../assets/generators/gradient_sweep.fs"),
+    ),
 ];
 
 /// Source of a bundled effect or generator.
@@ -1393,6 +1486,51 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
             .unwrap_or_else(|e| panic!("{id}: {e:?}"));
         }
         assert!(generator_params("invert").is_none());
+    }
+
+    /// The fx-pack-1 files all parse, have unique ids and are registered under their file name.
+    #[test]
+    fn fx_pack_1_parses_with_unique_ids() {
+        let ids: Vec<&str> = BUILTIN.iter().chain(GENERATORS).map(|(k, _)| *k).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate ids");
+        for id in [
+            "exposure_gamma",
+            "vibrance",
+            "color_balance",
+            "sepia",
+            "black_white",
+            "colorize",
+            "thermal",
+            "night_vision",
+            "sketch",
+            "oil_paint",
+            "cartoon",
+            "bloom",
+            "fisheye",
+            "pinch",
+            "vortex",
+            "shake",
+            "flip",
+            "rotate_zoom",
+            "mirror_quad",
+            "infinite_zoom",
+            "tunnel",
+            "metaballs",
+            "fire",
+            "clouds",
+            "lines",
+            "circles_grid",
+            "triangles",
+            "lens_flare",
+            "particles",
+            "gradient_sweep",
+        ] {
+            let src = builtin_source(id).unwrap_or_else(|| panic!("{id} not registered"));
+            parse(src).unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
     }
 
     /// Every .fs under assets/ (registered or not) must go ISF -> WGSL -> naga validate,
