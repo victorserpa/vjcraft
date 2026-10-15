@@ -216,6 +216,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
             set_opacity(&mut comp.master, o, &mut warnings);
         }
         comp.master.effects = import_chain(m, &mut warnings);
+        import_transform(m, &mut comp.master, &mut warnings);
         effects_imported += comp.master.effects.len();
     }
 
@@ -234,6 +235,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
                 set_opacity(&mut track, o, &mut warnings);
             }
             track.effects = import_chain(vt, &mut warnings);
+            import_transform(vt, &mut track, &mut warnings);
             effects_imported += track.effects.len();
         }
         comp.layers.push(Layer {
@@ -424,13 +426,8 @@ fn node_id(n: &Node) -> usize {
     std::ptr::from_ref(n) as usize
 }
 
-/// Effects of a track's own RenderPassChain (not the source's chain).
-fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
-    let Some(chain) = vt.kids("RenderPass").find(|r| {
-        r.attr("baseType") == Some("RenderPassChain") || r.attr("name") == Some("RenderPassChain")
-    }) else {
-        return vec![];
-    };
+/// Effect nodes of a chain with the dry/wet value of their wrapper, if any.
+fn chain_items(chain: &Node) -> Vec<(&Node, Option<f64>)> {
     let mut out = vec![];
     for rp in chain.kids("RenderPass") {
         let (inner, wet) = match rp.attr("baseType") {
@@ -444,7 +441,243 @@ fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
             Some("Effect") => (Some(rp), None),
             _ => continue,
         };
-        let Some(inner) = inner else { continue };
+        if let Some(inner) = inner {
+            out.push((inner, wet));
+        }
+    }
+    out
+}
+
+fn track_chain(vt: &Node) -> Option<&Node> {
+    vt.kids("RenderPass").find(|r| {
+        r.attr("baseType") == Some("RenderPassChain") || r.attr("name") == Some("RenderPassChain")
+    })
+}
+
+/// Position / scale / rotation of the track's TransformEffect, with their animations
+/// (envelopes included). Param names and the scale unit (percent when the range goes past
+/// 10) are inferred, not documented; anything else in the effect warns.
+fn import_transform(vt: &Node, track: &mut Track, w: &mut Warns) {
+    let Some(chain) = track_chain(vt) else { return };
+    for (inner, _) in chain_items(chain) {
+        if inner.attr("type").or(inner.attr("name")) != Some("TransformEffect") {
+            continue;
+        }
+        let Some(params) = inner.child("Params") else {
+            continue;
+        };
+        for sp in params.kids("ParamRange") {
+            let sname = sp.attr("name").unwrap_or("");
+            let Some(v) = sp.num("value").filter(|v| v.is_finite()) else {
+                continue;
+            };
+            let percent = sp
+                .child("ValueRange")
+                .and_then(|r| r.num("max"))
+                .is_some_and(|m| m > TRANSFORM_PERCENT_ABOVE);
+            let t = &mut track.transform;
+            let (target, v) = match norm(sname).as_str() {
+                "positionx" | "x" => (&mut t.x, v),
+                "positiony" | "y" => (&mut t.y, v),
+                "scale" => (&mut t.scale, if percent { v / 100.0 } else { v }),
+                "scalew" | "width" => (&mut t.scale_w, if percent { v / 100.0 } else { v }),
+                "scaleh" | "height" => (&mut t.scale_h, if percent { v / 100.0 } else { v }),
+                "rotation" | "rotationz" | "rotate" => (&mut t.rotation, v),
+                "opacity" | "anchorx" | "anchory" => continue,
+                _ => {
+                    w.add("transform param not imported", sname);
+                    continue;
+                }
+            };
+            target.set_number(v);
+            target.default = target.value.clone();
+            target.animation = param_animation(sp, w);
+        }
+    }
+}
+
+const TRANSFORM_PERCENT_ABOVE: f64 = 10.0;
+
+/// (kind id, dry/wet, [(param, min, max, default)]) of the model's audio effects. Mirrors
+/// `vjc_media::audio_fx::FxKind` (vjc-media is not a dependency here).
+type AudioFxSpec = (&'static str, f32, &'static [(&'static str, f64, f64, f64)]);
+
+fn audio_fx_spec(name: &str) -> Option<AudioFxSpec> {
+    Some(match norm(name).as_str() {
+        "gain" | "volume" | "audiogain" => ("audio.gain", 1.0, &[("Gain dB", -60.0, 24.0, 0.0)]),
+        "pan" | "audiopan" | "balance" => ("audio.pan", 1.0, &[("Pan", -1.0, 1.0, 0.0)]),
+        "eq" | "eq3" | "3bandeq" | "equalizer" | "equaliser" | "threebandeq" => (
+            "audio.eq3",
+            1.0,
+            &[
+                ("Low dB", -18.0, 18.0, 0.0),
+                ("Mid dB", -18.0, 18.0, 0.0),
+                ("High dB", -18.0, 18.0, 0.0),
+            ],
+        ),
+        "lowpass" | "lowpassfilter" | "lpf" => (
+            "audio.lowpass",
+            1.0,
+            &[
+                ("Cutoff Hz", 20.0, 20000.0, 20000.0),
+                ("Resonance", 0.5, 10.0, 0.707),
+            ],
+        ),
+        "highpass" | "highpassfilter" | "hpf" => (
+            "audio.highpass",
+            1.0,
+            &[
+                ("Cutoff Hz", 20.0, 20000.0, 20.0),
+                ("Resonance", 0.5, 10.0, 0.707),
+            ],
+        ),
+        "delay" | "echo" | "audiodelay" => (
+            "audio.delay",
+            0.4,
+            &[
+                ("Time ms", 1.0, 2000.0, 250.0),
+                ("Sync beats", 0.0, 8.0, 0.0),
+                ("Feedback", 0.0, 0.95, 0.35),
+            ],
+        ),
+        "reverb" | "audioreverb" => (
+            "audio.reverb",
+            0.3,
+            &[("Room", 0.0, 1.0, 0.5), ("Damping", 0.0, 1.0, 0.5)],
+        ),
+        "compressor" | "compress" => (
+            "audio.compressor",
+            1.0,
+            &[
+                ("Threshold dB", -60.0, 0.0, -18.0),
+                ("Ratio", 1.0, 20.0, 4.0),
+                ("Attack ms", 0.1, 200.0, 10.0),
+                ("Release ms", 5.0, 2000.0, 120.0),
+                ("Makeup dB", 0.0, 24.0, 0.0),
+            ],
+        ),
+        "limiter" => (
+            "audio.limiter",
+            1.0,
+            &[
+                ("Ceiling dB", -24.0, 0.0, -1.0),
+                ("Release ms", 5.0, 2000.0, 80.0),
+            ],
+        ),
+        "bitcrusher" | "bitcrush" | "crusher" => (
+            "audio.bitcrusher",
+            1.0,
+            &[("Bits", 1.0, 16.0, 8.0), ("Downsample", 1.0, 32.0, 1.0)],
+        ),
+        _ => return None,
+    })
+}
+
+/// Audio part of a clip: volume, pan, the separate audio file (when the video is another
+/// file) and the audio effect chain. Names are matched loosely; unknown effects warn.
+fn import_audio_track(
+    at: &Node,
+    vt: Option<&Node>,
+    source: &Source,
+    track: &mut Track,
+    w: &mut Warns,
+) {
+    if let Some(a) = at
+        .child("PrimarySource")
+        .and_then(|p| p.child("AudioFileSource"))
+    {
+        w.mapped_anim.insert(node_id(a));
+        let file = a.attr("FileName").or(a.attr("fileName"));
+        if vt.is_some()
+            && file
+                .is_some_and(|f| !matches!(source, Source::File { path } if path.as_os_str() == f))
+        {
+            w.add(
+                "audio file differs from the video, not imported",
+                file.unwrap_or(""),
+            );
+        }
+    }
+    if let Some(params) = at.child("Params") {
+        if let Some(sp) = range_param(params, "Volume")
+            && let Some(v) = sp.num("value").filter(|v| v.is_finite())
+        {
+            track.volume.set_number(v);
+            track.volume.default = track.volume.value.clone();
+            track.volume.animation = param_animation(sp, w);
+        }
+        if let Some(sp) = range_param(params, "Pan")
+            && let Some(v) = sp.num("value").filter(|v| v.is_finite())
+        {
+            // A 0..1 source range has its centre at 0.5; ours is -1..1.
+            let unit = sp
+                .child("ValueRange")
+                .is_some_and(|r| r.num("min") == Some(0.0) && r.num("max") == Some(1.0));
+            track.pan.set_number(if unit { v * 2.0 - 1.0 } else { v });
+            track.pan.default = track.pan.value.clone();
+            track.pan.animation = param_animation(sp, w);
+        }
+    }
+    let Some(chain) = at.child("AudioEffectChain") else {
+        return;
+    };
+    let chain = track_chain(chain).unwrap_or(chain);
+    for (inner, wet) in chain_items(chain) {
+        w.chain_effects.insert(node_id(inner));
+        let name = inner.attr("type").or(inner.attr("name")).unwrap_or("?");
+        let Some((kind, mix, specs)) = audio_fx_spec(name) else {
+            w.add("audio effect not imported", name);
+            continue;
+        };
+        let mut fx = Effect {
+            id: Uuid::new_v4(),
+            kind: kind.into(),
+            bypass: false,
+            dry_wet: mix,
+            params: specs
+                .iter()
+                .map(|(n, lo, hi, d)| Param::number(n, *d, Some((*lo, *hi))))
+                .collect(),
+        };
+        if let Some(v) = wet {
+            fx.dry_wet = v.clamp(0.0, 1.0) as f32;
+            fx.bypass = v <= 0.0;
+        }
+        if let Some(params) = inner.child("Params") {
+            for sp in params.kids("ParamRange") {
+                let sname = norm(sp.attr("name").unwrap_or(""));
+                let Some(v) = sp.num("value").filter(|v| v.is_finite()) else {
+                    continue;
+                };
+                // Ours carry the unit in the name ("Cutoff Hz"): a prefix match is enough.
+                let target = fx
+                    .params
+                    .iter_mut()
+                    .find(|p| !sname.is_empty() && norm(&p.name).starts_with(&sname));
+                match target {
+                    Some(t) if t.range.is_none_or(|(lo, hi)| (lo..=hi).contains(&v)) => {
+                        t.set_number(v);
+                        t.default = t.value.clone();
+                        t.animation = param_animation(sp, w);
+                    }
+                    _ => w.add(
+                        "audio effect param not mapped (default used)",
+                        &format!("{name}.{}", sp.attr("name").unwrap_or("")),
+                    ),
+                }
+            }
+        }
+        track.audio_effects.push(fx);
+    }
+}
+
+/// Effects of a track's own RenderPassChain (not the source's chain).
+fn import_chain(vt: &Node, w: &mut Warns) -> Vec<Effect> {
+    let Some(chain) = track_chain(vt) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for (inner, wet) in chain_items(chain) {
         let name = inner.attr("type").or(inner.attr("name")).unwrap_or("?");
         if name == "TransformEffect" {
             continue;
@@ -571,17 +804,31 @@ fn blend_from_name(name: &str) -> BlendMode {
 }
 
 fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
-    let vt = c.child("VideoTrack")?;
-    let vs = vt.child("PrimarySource")?.child("VideoSource")?;
-    let source = if let Some(f) = vs.child("VideoFormatReaderSource") {
+    let audio_file = c
+        .child("AudioTrack")
+        .and_then(|a| a.child("PrimarySource"))
+        .and_then(|p| p.child("AudioFileSource"));
+    let vt = c.child("VideoTrack");
+    let vs = vt
+        .and_then(|v| v.child("PrimarySource"))
+        .and_then(|p| p.child("VideoSource"));
+    let source = if let Some(f) = vs.and_then(|v| v.child("VideoFormatReaderSource")) {
         Source::File {
             path: PathBuf::from(f.attr("fileName")?),
         }
-    } else if vs.attr("type") == Some("GeneratorVideoSource") {
-        let rp = vs.find(
-            &|n| n.tag == "RenderPass" && n.attr("baseType") == Some("Generator"),
-            &[],
-        );
+    } else if let (None, Some(a)) = (vs, audio_file) {
+        // The model has no audio-only source: the audio file is a File source and plays
+        // through the layer's audio.
+        Source::File {
+            path: PathBuf::from(a.attr("FileName").or(a.attr("fileName"))?),
+        }
+    } else if vs.is_some_and(|v| v.attr("type") == Some("GeneratorVideoSource")) {
+        let rp = vs.and_then(|v| {
+            v.find(
+                &|n| n.tag == "RenderPass" && n.attr("baseType") == Some("Generator"),
+                &[],
+            )
+        });
         let avc_name = rp
             .and_then(|r| r.attr("type").or(r.attr("name")))
             .unwrap_or("Generator");
@@ -609,11 +856,17 @@ fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
     let name = param_text(c, "Name")
         .or_else(|| c.attr("name").map(String::from))
         .unwrap_or_else(|| "Clip".into());
-    let mut track = Track::new(blend_of(vt));
-    if let Some(o) = track_opacity(vt) {
-        set_opacity(&mut track, o, warnings);
+    let mut track = Track::new(vt.map(blend_of).unwrap_or(BlendMode::Normal));
+    if let Some(vt) = vt {
+        if let Some(o) = track_opacity(vt) {
+            set_opacity(&mut track, o, warnings);
+        }
+        track.effects = import_chain(vt, warnings);
+        import_transform(vt, &mut track, warnings);
     }
-    track.effects = import_chain(vt, warnings);
+    if let Some(at) = c.child("AudioTrack") {
+        import_audio_track(at, vt, &source, &mut track, warnings);
+    }
     let transport = import_transport(c, warnings);
     Some(Clip {
         id: Uuid::new_v4(),
@@ -743,12 +996,19 @@ const MIN_TIMELINE_MS: f64 = 50.0;
 /// Animation of a ParamRange: envelope (BehaviourDouble) wins, then dashboard link, then
 /// timeline. Sources that were turned into an `Animation` are recorded so they do not warn.
 fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
-    let beats_of = |n: &Node| {
-        n.child("Beats_d")
-            // Mode 0 (or absent) counts manual beats; other modes are not understood.
-            .filter(|b| b.num("mode").is_none_or(|m| m == 0.0))
-            .and_then(|b| b.num("numManualBeats"))
-            .filter(|b| *b > 0.0)
+    // Mode 0 (or absent) counts manual beats. Other modes are not documented: they use the
+    // detected beat count when there is one, else the manual one, with a warning.
+    let mut inferred_mode = None;
+    let mut beats_of = |n: &Node| {
+        let b = n.child("Beats_d")?;
+        let mode = b.num("mode").unwrap_or(0.0);
+        let positive = |k: &str| b.num(k).filter(|v| *v > 0.0 && v.is_finite());
+        if mode == 0.0 {
+            return positive("numManualBeats");
+        }
+        let v = positive("numDetectedBeats").or_else(|| positive("numManualBeats"))?;
+        inferred_mode = Some(mode);
+        Some(v)
     };
     if let Some(env) = sp.find(&|n| n.tag == "ModifierEnvelope", &[]) {
         let mut points: Vec<(f64, f64)> = env
@@ -765,7 +1025,10 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
             .unwrap_or_default();
         if !points.is_empty() {
             points.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let beats = sp.children.iter().find_map(beats_of).unwrap_or(4.0);
+            let beats = sp.children.iter().find_map(&mut beats_of).unwrap_or(4.0);
+            if let Some(m) = inferred_mode {
+                w.add("beats mode inferred", &format!("mode {m}"));
+            }
             w.mapped_anim.insert(node_id(env));
             return Some(Animation::Envelope {
                 motion: Default::default(),
@@ -790,7 +1053,10 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
         let ms = t
             .num("defaultMillisecondsDuration")
             .filter(|m| *m >= MIN_TIMELINE_MS);
-        let anim = match (ms, beats_of(t)) {
+        let beats = beats_of(t);
+        // A non-zero beat mode is tempo driven: it wins over the fixed duration.
+        let ms = if inferred_mode.is_some() { None } else { ms };
+        let anim = match (ms, beats) {
             (Some(ms), _) => Animation::Timeline {
                 motion: Default::default(),
                 duration_secs: ms / 1000.0,
@@ -803,6 +1069,9 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
             },
             _ => return None,
         };
+        if let Some(m) = inferred_mode {
+            w.add("beats mode inferred", &format!("mode {m}"));
+        }
         w.mapped_anim.insert(node_id(t));
         return Some(anim);
     }
@@ -821,7 +1090,9 @@ fn collect_unsupported(root: &Node, w: &mut Warns) {
                 Some("envelopes not imported (param not mapped)")
             }
             "WireRenderPass" => Some("output wiring ignored"),
-            "AudioFileSource" => Some("audio sources ignored (clips have no audio slot)"),
+            "AudioFileSource" if !mapped.contains(&node_id(n)) => {
+                Some("audio source not imported (not inside a clip)")
+            }
             "PhaseSourceTimeline" | "PhaseSourceDashboardLink" if !mapped.contains(&node_id(n)) => {
                 Some("param animation/dashboard links not imported (param not mapped)")
             }
@@ -847,6 +1118,77 @@ mod tests {
             .animation
             .clone();
         (i, a)
+    }
+
+    fn clip_of(inner: &str) -> Import {
+        let xml = format!(
+            r#"<Composition name="x" numColumns="1"><Layer layerIndex="0"/><Deck><Clip layerIndex="0" columnIndex="0">{inner}</Clip></Deck></Composition>"#
+        );
+        super::import_str(&xml).unwrap()
+    }
+
+    #[test]
+    fn audio_only_clip_with_volume_pan_and_effects() {
+        let i = clip_of(
+            r#"<AudioTrack><Params name="Params"><ParamRange name="Volume" value="0.25"/><ParamRange name="Pan" value="0.75"><ValueRange type="minMax" min="0" max="1"/></ParamRange></Params><PrimarySource><AudioFileSource FileName="/a.wav"/></PrimarySource><AudioEffectChain><RenderPass baseType="DryWetEffect"><Params><ParamRange name="Opacity" value="0.5"/></Params><RenderPass baseType="Effect" type="Reverb"><Params><ParamRange name="Room" value="0.8"/><ParamRange name="Bogus" value="1"/></Params></RenderPass></RenderPass><RenderPass baseType="Effect" type="Low Pass"><Params><ParamRange name="Cutoff" value="800"/></Params></RenderPass><RenderPass baseType="Effect" type="Flanger"/></AudioEffectChain></AudioTrack>"#,
+        );
+        let c = &i.project.composition.decks[0].clips[0].clip;
+        assert_eq!(
+            c.source,
+            Source::File {
+                path: "/a.wav".into()
+            }
+        );
+        assert_eq!(c.track.volume.value, Value::Number(0.25));
+        assert_eq!(c.track.pan.value, Value::Number(0.5));
+        let fx = &c.track.audio_effects;
+        assert_eq!(fx.len(), 2);
+        assert_eq!(fx[0].kind, "audio.reverb");
+        assert_eq!(fx[0].dry_wet, 0.5);
+        assert_eq!(fx[0].params[0].value, Value::Number(0.8));
+        assert_eq!(fx[1].kind, "audio.lowpass");
+        assert_eq!(fx[1].params[0].value, Value::Number(800.0));
+        assert_eq!(i.warning_counts.get("audio effect not imported"), Some(&1));
+        assert_eq!(
+            i.warning_counts
+                .get("audio effect param not mapped (default used)"),
+            Some(&1)
+        );
+        assert!(i.warning_counts.keys().all(|k| !k.contains("audio source")));
+        assert!(i.warning_counts.keys().all(|k| !k.contains("outside")));
+    }
+
+    #[test]
+    fn separate_audio_file_on_video_clip_warns() {
+        let i = clip_of(
+            r#"<VideoTrack><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/v.mov"/></VideoSource></PrimarySource></VideoTrack><AudioTrack><PrimarySource><AudioFileSource FileName="/other.wav"/></PrimarySource></AudioTrack>"#,
+        );
+        assert_eq!(
+            i.warning_counts
+                .get("audio file differs from the video, not imported"),
+            Some(&1)
+        );
+        let i = clip_of(
+            r#"<VideoTrack><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/v.mov"/></VideoSource></PrimarySource></VideoTrack><AudioTrack><PrimarySource><AudioFileSource FileName="/v.mov"/></PrimarySource></AudioTrack>"#,
+        );
+        assert!(i.warning_counts.is_empty(), "{:?}", i.warning_counts);
+    }
+
+    #[test]
+    fn transform_envelope_and_values_import() {
+        let i = clip_of(
+            r#"<VideoTrack><RenderPass baseType="RenderPassChain"><RenderPass baseType="Effect" type="TransformEffect"><Params><ParamRange name="Position X" value="100"><BehaviourDouble><Modifier><ModifierEnvelope><points><point x="0" y="0"/><point x="1" y="1"/></points></ModifierEnvelope></Modifier></BehaviourDouble></ParamRange><ParamRange name="Scale" value="200"><ValueRange type="minMax" min="0" max="500"/></ParamRange><ParamRange name="Rotation" value="45"/><ParamRange name="Skew" value="1"/></Params></RenderPass></RenderPass><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/v.mov"/></VideoSource></PrimarySource></VideoTrack>"#,
+        );
+        let t = &i.project.composition.decks[0].clips[0].clip.track.transform;
+        assert_eq!(t.x.value, Value::Number(100.0));
+        assert!(matches!(t.x.animation, Some(Animation::Envelope { .. })));
+        assert_eq!(t.scale.value, Value::Number(2.0));
+        assert_eq!(t.rotation.value, Value::Number(45.0));
+        assert_eq!(
+            i.warning_counts.get("transform param not imported"),
+            Some(&1)
+        );
+        assert!(i.warning_counts.keys().all(|k| !k.contains("envelope")));
     }
 
     #[test]
@@ -934,10 +1276,14 @@ mod tests {
         assert!(
             matches!(a, Some(Animation::Timeline { duration_secs, .. }) if duration_secs == 0.5)
         );
-        // Unknown beat mode is not read as manual beats.
-        let (_, a) = anim_of(
-            r#"<PhaseSourceTimeline><Beats_d mode="2" numManualBeats="4"/></PhaseSourceTimeline>"#,
+        // A non-manual beat mode is mapped (inferred) with a warning, and wins over ms.
+        let (i, a) = anim_of(
+            r#"<PhaseSourceTimeline defaultMillisecondsDuration="900"><Beats_d mode="2" numManualBeats="4" numDetectedBeats="8"/></PhaseSourceTimeline>"#,
         );
+        assert!(matches!(a, Some(Animation::Beats { beats, .. }) if beats == 8.0));
+        assert!(i.warning_counts.contains_key("beats mode inferred"));
+        // Nothing usable: no animation.
+        let (_, a) = anim_of(r#"<PhaseSourceTimeline><Beats_d mode="2"/></PhaseSourceTimeline>"#);
         assert_eq!(a, None);
     }
 
@@ -952,7 +1298,7 @@ mod tests {
         );
         assert!(
             i.warning_counts
-                .contains_key("audio sources ignored (clips have no audio slot)")
+                .contains_key("audio source not imported (not inside a clip)")
         );
     }
 
