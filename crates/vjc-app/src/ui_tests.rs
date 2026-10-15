@@ -5912,3 +5912,49 @@ fn prefs_and_output_setup_kit_windows_render() {
         click(&mut h, tab);
     }
 }
+
+#[test]
+fn oversize_composition_is_shown_not_clamped_on_draw() {
+    let mut st = State::headless(prefs());
+    st.tex_cap = 8192;
+    st.project.composition.width = 20000;
+    let mut h = app_with(st, egui::vec2(1280.0, 800.0));
+    click(&mut h, "Composition");
+    settle(&mut h);
+    settle(&mut h);
+    assert_eq!(h.state().project.composition.width, 20000);
+    assert!(!h.state().dirty, "drawing must not emit SetCompositionSize");
+}
+
+#[test]
+fn tex_cap_falls_back_when_unknown() {
+    assert_eq!(tex_cap_from(0), 16384);
+    assert_eq!(tex_cap_from(8192), 8192);
+    assert_eq!(tex_cap_from(32768), 16384);
+}
+
+#[test]
+fn retrigger_restarts_clip_start() {
+    let mut st = State::headless(prefs());
+    let l = st.project.composition.layers[0].id;
+    st.mark_clip_start(l);
+    let first = st.clip_start[&l];
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    st.mark_clip_start(l);
+    assert!(st.clip_start[&l].0 > first.0);
+}
+
+#[test]
+fn new_layer_uses_default_blend_pref() {
+    let l = new_layer_with(3, &vjc_model::BlendMode::Add);
+    assert_eq!(l.track.blend, vjc_model::BlendMode::Add);
+    assert_eq!(new_layer(3).track.blend, vjc_model::BlendMode::Normal);
+}
+
+#[test]
+fn confirm_quit_only_asks_when_clean() {
+    assert!(quit_needs_confirm(true, false));
+    // Dirty projects get the unsaved-changes dialog instead.
+    assert!(!quit_needs_confirm(true, true));
+    assert!(!quit_needs_confirm(false, false));
+}

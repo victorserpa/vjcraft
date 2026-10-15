@@ -84,6 +84,29 @@ pub fn field_int<T: egui::emath::Numeric>(
     .inner
 }
 
+/// Pixel-size field capped by the GPU texture limit. A value already above `cap`
+/// is shown as is, with a warning outline, and never rewritten on draw: only what
+/// the user types is clamped.
+pub fn size_field(ui: &mut egui::Ui, value: &mut u32, cap: u32, prefix: &str) -> egui::Response {
+    let bad = *value > cap;
+    ui.scope(|ui| {
+        if bad {
+            let v = ui.visuals_mut();
+            for w in [&mut v.widgets.inactive, &mut v.widgets.hovered] {
+                w.bg_stroke = Stroke::new(STROKE_W, DANGER);
+            }
+        }
+        ui.add(
+            egui::DragValue::new(value)
+                .speed(0.0)
+                .range(1..=cap)
+                .clamp_existing_to_range(false)
+                .prefix(prefix),
+        )
+    })
+    .inner
+}
+
 /// Tool window (non-modal) with the kit frame: SURFACE fill and BORDER stroke.
 pub fn panel_window<'a>(
     ctx: &egui::Context,

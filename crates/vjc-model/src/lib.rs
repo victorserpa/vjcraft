@@ -1064,15 +1064,18 @@ pub enum LoopMode {
     Loop,
     /// Alternates forward and backward cycles.
     PingPong,
+    /// Runs one cycle from the moment its clip is triggered, then holds the end.
+    Once,
 }
 
 impl LoopMode {
-    pub const ALL: [LoopMode; 2] = [LoopMode::Loop, LoopMode::PingPong];
+    pub const ALL: [LoopMode; 3] = [LoopMode::Loop, LoopMode::PingPong, LoopMode::Once];
 
     pub fn label(self) -> &'static str {
         match self {
             LoopMode::Loop => "Loop",
             LoopMode::PingPong => "PingPong",
+            LoopMode::Once => "Once",
         }
     }
 }

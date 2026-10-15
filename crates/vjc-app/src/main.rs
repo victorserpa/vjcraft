@@ -97,6 +97,8 @@ struct ScreenRt {
 }
 
 struct State {
+    /// Largest texture side the GPU supports (adapter limit); 16384 until known.
+    tex_cap: u32,
     project: Project,
     history: History,
     warnings: Vec<String>,
@@ -133,6 +135,8 @@ struct State {
     /// follows the clip transport (speed, direction, pause); a layer has a player or a
     /// generator, never both.
     gens: HashMap<LayerId, (DeckId, u32, f64)>,
+    /// (seconds, beats) at which each layer's clip was triggered (`Once` animations).
+    clip_start: HashMap<LayerId, (f64, f64)>,
     /// Deck tab being renamed, with its edit buffer.
     renaming: Option<(DeckId, String)>,
     /// Tests pin the clock the undo history coalesces with, so a slow machine cannot split
@@ -1558,6 +1562,19 @@ fn layer_ops_menu(
     });
 }
 
+/// New layer using the blend mode chosen in the preferences.
+fn new_layer_with(n: usize, blend: &BlendMode) -> Layer {
+    let mut l = new_layer(n);
+    l.track.blend = blend.clone();
+    l
+}
+
+/// Whether closing the window needs a confirmation of its own (the unsaved-changes
+/// dialog already covers a dirty project).
+fn quit_needs_confirm(confirm_quit: bool, dirty: bool) -> bool {
+    confirm_quit && !dirty
+}
+
 fn new_layer(n: usize) -> Layer {
     Layer {
         id: Uuid::new_v4(),
@@ -1630,6 +1647,7 @@ impl State {
     fn build(prefs: Prefs, live: bool) -> Self {
         let project = fresh_project(&prefs);
         State {
+            tex_cap: 16384,
             project,
             history: History::new(),
             warnings: vec![],
@@ -1646,6 +1664,7 @@ impl State {
             audio: None,
             metro: None,
             gens: HashMap::new(),
+            clip_start: HashMap::new(),
             heads: HashMap::new(),
             src_info: Default::default(),
             flow: Flow::default(),
@@ -2855,6 +2874,7 @@ impl State {
                             player.attach_audio(&engine);
                         }
                         self.players.insert(layer, (deck, column, player));
+                        self.mark_clip_start(layer);
                         self.set_origin(layer, deck, src, column);
                         let tr = self.transport(deck, src, column);
                         let dir = tr.map_or(Direction::Forward, |t| t.direction);
@@ -2938,6 +2958,7 @@ impl State {
                     self.flow.regions.remove(&layer);
                     self.flow.pos.remove(&layer);
                     self.gens.insert(layer, (deck, column, 0.0));
+                    self.mark_clip_start(layer);
                     self.set_origin(layer, deck, src_of(layer), column);
                 }
                 Event::Seek {
@@ -2968,6 +2989,7 @@ impl State {
                     self.flow.auto_time.remove(&layer);
                     self.players.remove(&layer);
                     self.gens.remove(&layer);
+                    self.clip_start.remove(&layer);
                     self.origin.remove(&layer);
                 }
                 Event::FaderStart { layer } => {
@@ -4051,6 +4073,13 @@ impl State {
         }
     }
 
+    /// Records the clock readings of a clip trigger on `layer`.
+    fn mark_clip_start(&mut self, layer: LayerId) {
+        let secs = self.fx_epoch.elapsed().as_secs_f64();
+        let beats = self.clock.phase(std::time::Instant::now());
+        self.clip_start.insert(layer, (secs, beats));
+    }
+
     /// Animation inputs of this frame.
     fn anim_ctx<'a>(&self, input: &'a AnimIn) -> vjc_core::anim::AnimCtx<'a> {
         vjc_core::anim::AnimCtx {
@@ -4061,6 +4090,7 @@ impl State {
             dashboard: &input.dials,
             layer_dials: input.layer_dials.as_deref(),
             clip_dials: input.clip_dials.as_deref(),
+            clip_start: None,
         }
     }
 
@@ -4219,7 +4249,9 @@ impl State {
                 vjc_core::anim::dial_values(&l.track.dials),
                 clip.map_or_else(Vec::new, |k| vjc_core::anim::dial_values(&k.track.dials)),
             );
-            let lctx = actx.scoped(&layer_dials, &clip_dials);
+            let lctx = actx
+                .scoped(&layer_dials, &clip_dials)
+                .with_clip_start(self.clip_start.get(&l.id).copied());
             let clip_fx = clip.map(|k| k.track.effects.as_slice());
             let generator = match (clip.map(|k| &k.source), gens.get(&l.id)) {
                 (Some(vjc_model::Source::Generator { kind, params }), Some((_, _, t)))
@@ -4348,7 +4380,9 @@ impl State {
                     .map_or_else(Vec::new, |x| vjc_core::anim::dial_values(&x.track.dials)),
                 vjc_core::anim::dial_values(&k.track.dials),
             );
-            let pctx = actx.scoped(&layer_dials, &clip_dials);
+            let pctx = actx
+                .scoped(&layer_dials, &clip_dials)
+                .with_clip_start(self.clip_start.get(&l).copied());
             let t = self
                 .clip_prev
                 .as_ref()
@@ -6068,8 +6102,22 @@ impl State {
         self.remove_layer_modal(&ctx);
         self.output_setup_window(&ctx);
         self.display_info_window(&ctx);
-        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.confirm_discard() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let stay = if self.dirty {
+                !self.confirm_discard()
+            } else if quit_needs_confirm(self.prefs.general.confirm_quit, self.dirty) {
+                rfd::MessageDialog::new()
+                    .set_title("Quit VJCraft")
+                    .set_description("Quit VJCraft?")
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    != rfd::MessageDialogResult::Yes
+            } else {
+                false
+            };
+            if stay {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
         }
         self.autosave();
         let title = self.window_title();
@@ -6245,6 +6293,7 @@ impl State {
                                     rec_info: rec_info.clone(),
                                     layers: comp.layers.len(),
                                     columns: ncols as usize,
+                                    blend: self.prefs.general.default_blend.clone(),
                                 },
                                 &mut cmds,
                                 &mut self.targets,
@@ -7068,6 +7117,7 @@ impl State {
                     rec_info: rec_info.clone(),
                     layers: comp.layers.len(),
                     columns: ncols as usize,
+                    blend: self.prefs.general.default_blend.clone(),
                 },
                 &mut cmds,
                 &mut self.targets,
@@ -7322,13 +7372,9 @@ impl State {
             let size_row = ui.horizontal(|ui| {
                 params::row_label(ui, "Size");
                 // speed 0: typed only, so a drag does not resize the output every frame.
-                size_changed |= ui
-                    .add(egui::DragValue::new(&mut w).speed(0.0).range(1..=16384))
-                    .changed();
+                size_changed |= widgets::size_field(ui, &mut w, self.tex_cap, "").changed();
                 ui.label("x");
-                size_changed |= ui
-                    .add(egui::DragValue::new(&mut h).speed(0.0).range(1..=16384))
-                    .changed();
+                size_changed |= widgets::size_field(ui, &mut h, self.tex_cap, "").changed();
                 ui.label("fps");
                 size_changed |= ui
                     .add(
@@ -7848,6 +7894,27 @@ impl State {
                 }
                 if ui.button("Ungroup").clicked() {
                     cmds.push(Command::Ungroup { group: gid });
+                }
+                if ui
+                    .button("Eject")
+                    .on_hover_text("Stop every layer of the group")
+                    .clicked()
+                {
+                    cmds.extend(vjc_core::groups::eject_commands(&self.project, gid));
+                }
+                if let Some((_, col)) = self.selected
+                    && ui
+                        .button("Trigger column")
+                        .on_hover_text("Trigger the selected cell's column on this group only")
+                        .clicked()
+                {
+                    let deck = self.project.composition.current_deck;
+                    cmds.extend(vjc_core::groups::trigger_column_commands(
+                        &self.project,
+                        gid,
+                        deck,
+                        col,
+                    ));
                 }
             });
         }
@@ -9391,6 +9458,12 @@ fn autoplay_paths(v: &std::ffi::OsStr) -> Vec<PathBuf> {
     }
 }
 
+/// Texture cap to use for a reported adapter limit: 16384 when unknown (0).
+fn tex_cap_from(limit: u32) -> u32 {
+    // Above 16384 a single texture is gigabytes; keep the old ceiling as the upper bound.
+    if limit == 0 { 16384 } else { limit.min(16384) }
+}
+
 fn main() -> eframe::Result {
     let (prefs, warn) = match prefs_path() {
         Some(p) => Prefs::load(&p),
@@ -9402,6 +9475,15 @@ fn main() -> eframe::Result {
     options.viewport = egui::ViewportBuilder::default()
         .with_inner_size([1600.0, 1000.0])
         .with_maximized(small);
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut options.wgpu_options.wgpu_setup {
+        // eframe asks for 8192 by default; ask for what the adapter can do.
+        let base = c.device_descriptor.clone();
+        c.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut d = base(adapter);
+            d.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+            d
+        });
+    }
     if !prefs.video.vsync {
         options.wgpu_options.surface.present_mode = wgpu::PresentMode::AutoNoVsync;
     }
@@ -9412,6 +9494,9 @@ fn main() -> eframe::Result {
             theme::apply_style(&cc.egui_ctx);
             wake::install(&cc.egui_ctx);
             let mut s = State::new(prefs);
+            if let Some(rs) = &cc.wgpu_render_state {
+                s.tex_cap = tex_cap_from(rs.adapter.limits().max_texture_dimension_2d);
+            }
             if let Some(w) = warn {
                 s.status = w.clone();
                 s.warnings.push(w);

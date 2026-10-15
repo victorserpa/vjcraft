@@ -24,6 +24,42 @@ pub fn members(p: &Project, id: GroupId) -> Vec<usize> {
         .collect()
 }
 
+/// Stops every layer of the group (the group's Eject). Empty for an unknown group.
+pub fn eject_commands(p: &Project, id: GroupId) -> Vec<Command> {
+    members(p, id)
+        .into_iter()
+        .map(|i| Command::ClearLayer {
+            layer: p.composition.layers[i].id,
+        })
+        .collect()
+}
+
+/// Triggers `column` on the layers of the group only, like a column trigger: a layer with
+/// no clip there is cleared; layers that ignore column triggers or are locked are left alone.
+pub fn trigger_column_commands(
+    p: &Project,
+    id: GroupId,
+    deck: vjc_model::DeckId,
+    column: u32,
+) -> Vec<Command> {
+    members(p, id)
+        .into_iter()
+        .map(|i| &p.composition.layers[i])
+        .filter(|l| !l.ignore_column_trigger && !l.lock_content)
+        .map(|l| {
+            if crate::clip_in(p, deck, l.id, column).is_some() {
+                Command::TriggerClip {
+                    deck,
+                    layer: l.id,
+                    column,
+                }
+            } else {
+                Command::ClearLayer { layer: l.id }
+            }
+        })
+        .collect()
+}
+
 /// Group-vector slot for a group whose first layer sits at layer index `first`.
 fn slot(p: &Project, first: usize) -> usize {
     p.composition
@@ -594,5 +630,26 @@ mod tests {
         );
         h.undo(&mut p).unwrap().unwrap();
         assert!(effects::chain(&p, target).unwrap().is_empty());
+    }
+
+    #[test]
+    fn group_eject_and_column_trigger_touch_only_members() {
+        let (mut p, ids) = setup();
+        let mut h = History::new();
+        let g = create(&mut p, &mut h, &[ids[1], ids[2]]).unwrap();
+        let e = eject_commands(&p, g);
+        assert_eq!(
+            e,
+            vec![
+                Command::ClearLayer { layer: ids[1] },
+                Command::ClearLayer { layer: ids[2] }
+            ]
+        );
+        assert!(eject_commands(&p, Uuid::new_v4()).is_empty());
+        // No clips anywhere: the column trigger clears members only; locked ones stay.
+        p.composition.layers[2].lock_content = true;
+        let deck = p.composition.current_deck;
+        let c = trigger_column_commands(&p, g, deck, 0);
+        assert_eq!(c, vec![Command::ClearLayer { layer: ids[1] }]);
     }
 }

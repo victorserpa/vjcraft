@@ -224,6 +224,8 @@ pub struct MasterState {
     pub rec_info: Option<String>,
     pub layers: usize,
     pub columns: usize,
+    /// Blend mode of layers added from here (preferences).
+    pub blend: vjc_model::BlendMode,
 }
 
 /// Top-left cell: "Composition" title over X (clear all), B (bypass), Rec and add layer/column.
@@ -335,7 +337,7 @@ pub fn composition_header(
     .clicked()
     {
         cmds.push(Command::AddLayer {
-            layer: crate::new_layer(m.layers + 1),
+            layer: crate::new_layer_with(m.layers + 1, &m.blend),
             index: 0,
         });
     }

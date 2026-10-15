@@ -15,7 +15,6 @@ use crate::theme::{
 use crate::widgets::{self, Kind, Width, field_int, field_text, panel_window, toggle};
 
 /// Largest screen size, fixture grid side and Art-Net universe the fields accept.
-const MAX_SCREEN_PX: u32 = 16384;
 const MAX_FIXTURE_SIDE: u32 = 1024;
 /// Height of the Art-Net fixture list before it scrolls.
 const ARTNET_LIST_H: f32 = 320.0;
@@ -419,9 +418,10 @@ impl State {
                     }
                 }
             });
+        let cap = self.tex_cap;
         let (mut w, mut h) = (c.width, c.height);
-        let a = field_int(ui, &mut w, 1..=MAX_SCREEN_PX, "W ", "");
-        let b = field_int(ui, &mut h, 1..=MAX_SCREEN_PX, "H ", "");
+        let a = crate::widgets::size_field(ui, &mut w, cap, "W ");
+        let b = crate::widgets::size_field(ui, &mut h, cap, "H ");
         if a.changed() || b.changed() {
             cmds.push(Command::SetScreenSize {
                 screen: c.id,
@@ -674,6 +674,19 @@ impl State {
                 f.input = Default::default();
             }
         });
+        // Sample the area of one slice of this screen instead of typing numbers.
+        if let Some(scr) = self.project.output.screens.iter().find(|s| s.id == screen) {
+            ui.menu_button("Fit to slice", |ui| {
+                for (n, s) in scr.slices.iter().enumerate() {
+                    if ui.button(format!("Slice {}", n + 1)).clicked() {
+                        if let Some(i) = dmx::input_for_slice(s, scr.width, scr.height) {
+                            f.input = i;
+                        }
+                        ui.close();
+                    }
+                }
+            });
+        }
         widgets::slider(ui, &mut f.color.brightness, 0.0..=2.0, "Brightness");
         widgets::slider(ui, &mut f.color.contrast, 0.0..=2.0, "Contrast");
         widgets::slider(ui, &mut f.color.r, 0.0..=2.0, "Red");

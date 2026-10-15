@@ -27,10 +27,20 @@ pub struct AnimCtx<'a> {
     pub layer_dials: Option<&'a [f64]>,
     /// Dials of the clip the evaluated param belongs to (`DialScope::Clip`); `None` as above.
     pub clip_dials: Option<&'a [f64]>,
+    /// (seconds, beats) on the clocks above when the layer's clip was triggered; `Once`
+    /// animations count their cycle from there. `None`: they count from the clock origin.
+    pub clip_start: Option<(f64, f64)>,
 }
 
 impl AnimCtx<'_> {
     /// This frame's context for params owned by a layer and, when given, its clip.
+    pub fn with_clip_start(self, start: Option<(f64, f64)>) -> Self {
+        AnimCtx {
+            clip_start: start,
+            ..self
+        }
+    }
+
     pub fn scoped<'b>(&self, layer: &'b [f64], clip: &'b [f64]) -> AnimCtx<'b>
     where
         Self: 'b,
@@ -300,9 +310,20 @@ pub fn motion_phase(m: Motion, x: f64) -> f64 {
     let p = match m.mode {
         LoopMode::Loop => return if back { -x } else { x },
         LoopMode::PingPong => 1.0 - ((x.rem_euclid(2.0)) - 1.0).abs(),
+        // Holds the end after one cycle (never wraps back to the start).
+        LoopMode::Once => x.clamp(0.0, 1.0),
     };
     let p = p.min(1.0 - 1e-9);
     if back { 1.0 - p } else { p }
+}
+
+/// Origin of an animation's cycle count: the clip's trigger time for `Once`, else the
+/// clock origin.
+fn start(ctx: &AnimCtx, m: Motion) -> (f64, f64) {
+    match m.mode {
+        LoopMode::Once => ctx.clip_start.unwrap_or((0.0, 0.0)),
+        _ => (0.0, 0.0),
+    }
 }
 
 /// Normalised 0..=1 output of the animation.
@@ -314,7 +335,10 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
             motion,
         } => shape(
             curve,
-            motion_phase(*motion, safe_div(ctx.time_secs, *duration_secs)),
+            motion_phase(
+                *motion,
+                safe_div(ctx.time_secs - start(ctx, *motion).0, *duration_secs),
+            ),
         ),
         Animation::Beats {
             beats,
@@ -322,7 +346,10 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
             motion,
         } => shape(
             curve,
-            motion_phase(*motion, safe_div(ctx.beat_phase, *beats)),
+            motion_phase(
+                *motion,
+                safe_div(ctx.beat_phase - start(ctx, *motion).1, *beats),
+            ),
         ),
         Animation::Audio {
             band: b,
@@ -374,7 +401,10 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
             motion,
         } => envelope(
             points,
-            motion_phase(*motion, safe_div(ctx.beat_phase, *beats)),
+            motion_phase(
+                *motion,
+                safe_div(ctx.beat_phase - start(ctx, *motion).1, *beats),
+            ),
         ),
         Animation::Dashboard { dial, scope } => {
             let dials = match scope {
@@ -859,5 +889,49 @@ mod tests {
         assert!((at(PingPong, Forward, 1.0) - 0.25).abs() < 1e-9);
         assert!((at(PingPong, Forward, 6.0) - 0.5).abs() < 1e-9);
         assert!((at(PingPong, Backward, 1.0) - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn once_runs_from_trigger_and_holds_end() {
+        let a = Animation::Beats {
+            beats: 4.0,
+            curve: Curve::Saw,
+            motion: Motion {
+                mode: LoopMode::Once,
+                direction: AnimDirection::Forward,
+            },
+        };
+        let at = |beat: f64, start: Option<(f64, f64)>| {
+            let c = AnimCtx {
+                beat_phase: beat,
+                clip_start: start,
+                ..Default::default()
+            };
+            evaluate(&p((0.0, 1.0)), &a, &c)
+        };
+        // Clock already far past one cycle (beat 100) when triggered: starts from 0.
+        let s = Some((0.0, 100.0));
+        assert!(at(100.0, s).abs() < 1e-9);
+        assert!((at(101.0, s) - 0.25).abs() < 1e-9);
+        // Holds the end, never wraps.
+        assert!((at(104.0, s) - 1.0).abs() < 1e-6);
+        assert!((at(250.0, s) - 1.0).abs() < 1e-6);
+        // Retrigger restarts.
+        assert!((at(251.0, Some((0.0, 250.0))) - 0.25).abs() < 1e-9);
+        // Backward holds at 0.
+        let b = Animation::Beats {
+            beats: 4.0,
+            curve: Curve::Saw,
+            motion: Motion {
+                mode: LoopMode::Once,
+                direction: AnimDirection::Backward,
+            },
+        };
+        let c = AnimCtx {
+            beat_phase: 110.0,
+            clip_start: s,
+            ..Default::default()
+        };
+        assert!(evaluate(&p((0.0, 1.0)), &b, &c).abs() < 1e-6);
     }
 }

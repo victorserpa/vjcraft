@@ -609,9 +609,45 @@ pub fn label_for(p: &Project, target: &str) -> Option<String> {
         })
 }
 
+/// Fixture input rectangle covering a slice's output area on a `width` x `height` screen
+/// (normalized centre and size, no rotation). `None` for an empty or degenerate slice.
+pub fn input_for_slice(
+    slice: &vjc_model::Slice,
+    width: u32,
+    height: u32,
+) -> Option<vjc_model::FixtureInput> {
+    let r = crate::slice_geom::bbox(&slice.output_mesh)?;
+    let (sw, sh) = (width as f32, height as f32);
+    if sw <= 0.0 || sh <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
+        return None;
+    }
+    let (cx, cy) = r.center();
+    Some(vjc_model::FixtureInput {
+        x: cx / sw,
+        y: cy / sh,
+        w: r.w / sw,
+        h: r.h / sh,
+        rotation: 0.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_for_slice_is_the_normalized_output_bbox() {
+        let mut s = crate::mapping::new_slice(400, 200);
+        s.output_mesh = vec![(100.0, 50.0), (300.0, 50.0), (100.0, 150.0), (300.0, 150.0)];
+        s.mesh_cols = 2;
+        let i = input_for_slice(&s, 400, 200).unwrap();
+        assert_eq!((i.x, i.y, i.w, i.h), (0.5, 0.5, 0.5, 0.5));
+        s.output_mesh.clear();
+        assert!(input_for_slice(&s, 400, 200).is_none());
+        // A point mesh has no area.
+        s.output_mesh = vec![(5.0, 5.0)];
+        assert!(input_for_slice(&s, 400, 200).is_none());
+    }
 
     fn dmx(universe: u16, n: usize) -> ArtDmx {
         ArtDmx {

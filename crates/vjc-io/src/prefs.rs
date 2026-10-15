@@ -27,6 +27,10 @@ pub struct General {
     pub browser_grid: bool,
     /// Folder the output recorder writes into; `None` = `~/Movies/VJCraft`.
     pub record_folder: Option<PathBuf>,
+    /// Ask before quitting even when the project has no unsaved changes.
+    pub confirm_quit: bool,
+    /// Blend mode of layers added from the toolbar.
+    pub default_blend: vjc_model::BlendMode,
 }
 
 /// Longest recent-projects list kept.
@@ -86,6 +90,8 @@ impl Default for General {
             favorites: vec![],
             browser_grid: false,
             record_folder: None,
+            confirm_quit: false,
+            default_blend: vjc_model::BlendMode::Normal,
         }
     }
 }
@@ -804,5 +810,27 @@ mod tests {
         };
         let back: Video = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
         assert_eq!(back.max_fps, 30);
+    }
+}
+
+#[cfg(test)]
+mod general_extra_tests {
+    use super::*;
+
+    #[test]
+    fn confirm_quit_and_default_blend_roundtrip_and_default() {
+        let g = General::default();
+        assert!(!g.confirm_quit);
+        assert_eq!(g.default_blend, vjc_model::BlendMode::Normal);
+        let mut p = Prefs::default();
+        p.general.confirm_quit = true;
+        p.general.default_blend = vjc_model::BlendMode::Screen;
+        let s = serde_json::to_string(&p).unwrap();
+        let q: Prefs = serde_json::from_str(&s).unwrap();
+        assert!(q.general.confirm_quit);
+        assert_eq!(q.general.default_blend, vjc_model::BlendMode::Screen);
+        // Old files without the keys still load.
+        let old: Prefs = serde_json::from_str(r#"{"general":{"autosave":false}}"#).unwrap();
+        assert!(!old.general.confirm_quit);
     }
 }

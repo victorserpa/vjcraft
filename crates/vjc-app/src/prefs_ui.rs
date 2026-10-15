@@ -47,6 +47,15 @@ impl State {
                             field_int(ui, &mut p.general.autosave_secs, 5..=3600, "", " s");
                         });
                         toggle(ui, &mut p.general.open_last_project, "Open last project at startup");
+                        toggle(ui, &mut p.general.confirm_quit, "Confirm before quitting");
+                        egui::ComboBox::from_label("Blend of new layers")
+                            .selected_text(blend_name(&p.general.default_blend))
+                            .show_ui(ui, |ui| {
+                                for b in DEFAULT_BLENDS {
+                                    let name = blend_name(&b);
+                                    ui.selectable_value(&mut p.general.default_blend, b, name);
+                                }
+                            });
                         ui.horizontal(|ui| {
                             ui.label("Browser start folder");
                             let mut t = p
@@ -422,4 +431,14 @@ impl State {
             }
         }
     }
+}
+
+/// Blend modes offered as the default of new layers.
+const DEFAULT_BLENDS: [vjc_model::BlendMode; 6] = {
+    use vjc_model::BlendMode::{Add, Multiply, Normal, Overlay, Screen, Subtract};
+    [Normal, Add, Multiply, Screen, Overlay, Subtract]
+};
+
+fn blend_name(b: &vjc_model::BlendMode) -> String {
+    format!("{b:?}")
 }
