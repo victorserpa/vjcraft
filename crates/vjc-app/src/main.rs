@@ -32,6 +32,7 @@ mod persist;
 mod pool;
 mod prefs_ui;
 mod preload;
+mod shortcut_editor;
 mod slice_inspector;
 mod slice_render;
 mod source_info;
@@ -247,6 +248,7 @@ struct State {
     last_autosave: std::time::Instant,
     prefs: Prefs,
     prefs_open: bool,
+    sc_ed: shortcut_editor::Editor,
     /// Autosaved project waiting for a Restore/Discard answer.
     recovery_offer: Option<PathBuf>,
     /// Relink dialog is showing.
@@ -1750,6 +1752,7 @@ impl State {
             dirty: false,
             last_autosave: std::time::Instant::now(),
             prefs_open: false,
+            sc_ed: Default::default(),
             recovery_offer: None,
             relink_open: false,
             toasts: Vec::new(),
@@ -4986,6 +4989,7 @@ impl State {
     /// Key shortcuts from the project, plus the learn flow. Nothing fires while a widget
     /// has keyboard focus (text field or a focused button), so Space never also presses it.
     fn shortcut_keys(&mut self, ctx: &egui::Context) {
+        self.sc_ed.captured = false;
         // Key up lets go of a Hold, whatever has the focus now.
         let up: Vec<egui::Key> = ctx.input(|i| {
             i.events
@@ -5021,6 +5025,19 @@ impl State {
                 })
                 .collect()
         });
+        if self.sc_armed() == Some(shortcut_editor::Src::Key) {
+            for key in pressed {
+                if key == egui::Key::Escape {
+                    self.sc_ed.learn = None;
+                    self.sc_ed.learn_all = false;
+                } else if self.sc_capture(vjc_model::ControlSource::Key {
+                    code: key.name().into(),
+                }) {
+                    break;
+                }
+            }
+            return;
+        }
         if self.learn {
             for key in pressed {
                 if self.learn_midi && matches!(key, egui::Key::Delete | egui::Key::Backspace) {
@@ -5075,6 +5092,7 @@ impl State {
     /// then LEDs of mapped notes are updated where the state changed.
     fn midi_pump(&mut self) {
         use vjc_core::midi as m;
+        self.sc_ed.captured = false;
         while let Ok(ev) = self.midi.rx.try_recv() {
             let (device, bytes, at) = match ev {
                 midi_io::In::Msg(d, ..) if !self.prefs.midi.input_enabled(&d) => continue,
@@ -5096,6 +5114,24 @@ impl State {
             let Some(msg) = m::parse(&bytes) else {
                 continue;
             };
+            // Editor learn: the row's source family is captured, never fired.
+            if self.sc_armed() == Some(shortcut_editor::Src::Midi) {
+                // Only the capture is swallowed: a release still lets go of its Hold.
+                let off: Vec<Uuid> = self
+                    .project
+                    .shortcuts
+                    .iter()
+                    .filter(|s| m::releases(s, &device, msg))
+                    .map(|s| s.id)
+                    .collect();
+                for id in off {
+                    self.hold_release(hold::Src::Binding(id));
+                }
+                if let Some(src) = m::source_of(&device, msg) {
+                    self.sc_capture(src);
+                }
+                continue;
+            }
             if self.learn {
                 if self.learn_midi
                     && let Some(target) = self.learn_target.clone()
@@ -5150,7 +5186,24 @@ impl State {
             self.osc_cfg = Some(cfg);
             self.osc_prev.clear();
         }
+        self.sc_ed.captured = false;
         while let Ok(ev) = self.osc.rx.try_recv() {
+            if self.sc_armed() == Some(shortcut_editor::Src::Osc) {
+                let off: Vec<Uuid> = self
+                    .project
+                    .shortcuts
+                    .iter()
+                    .filter(|s| o::releases(s, &ev))
+                    .map(|s| s.id)
+                    .collect();
+                for id in off {
+                    self.hold_release(hold::Src::Binding(id));
+                }
+                if o::learnable(&ev) {
+                    self.sc_capture(o::source_of(&ev));
+                }
+                continue;
+            }
             if self.learn {
                 if self.learn_midi
                     && o::learnable(&ev)
@@ -5218,7 +5271,12 @@ impl State {
             self.dmx_cfg = Some(cfg);
         }
         let mut learned = false;
+        self.sc_ed.captured = false;
         while let Ok(ev) = self.dmx.rx.try_recv() {
+            if self.sc_armed() == Some(shortcut_editor::Src::Dmx) {
+                self.sc_capture(d::source_of(&ev));
+                continue;
+            }
             if self.learn {
                 if self.learn_midi
                     && !learned
@@ -5694,6 +5752,10 @@ impl State {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                if ui.button("Shortcuts...").clicked() {
+                    ui.close();
+                    self.sc_ed.open = true;
+                }
                 if ui
                     .add_enabled(
                         self.history.can_undo(),
@@ -6101,6 +6163,7 @@ impl State {
             self.prefs_open = true;
         }
         self.prefs_window(&ctx);
+        self.shortcut_editor_window(&ctx);
         self.recovery_window(&ctx);
         self.relink_window(&ctx);
         self.save_layout_window(&ctx);

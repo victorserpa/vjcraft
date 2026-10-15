@@ -875,8 +875,37 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let shortcut = p.shortcuts.remove(i);
             undoable(Command::AddShortcut { shortcut, index: i }, vec![])
         }
+        Command::UpdateShortcut { shortcut } => {
+            if !shortcut.range.0.is_finite() || !shortcut.range.1.is_finite() {
+                return Err(Error::InvalidValue);
+            }
+            let i = p
+                .shortcuts
+                .iter()
+                .position(|s| s.id == shortcut.id)
+                .ok_or(Error::NoShortcut)?;
+            let mut shortcut = shortcut;
+            if shortcut.target != p.shortcuts[i].target {
+                shortcut.effect = effect_of_target(p, &shortcut.target);
+            }
+            let prev = std::mem::replace(&mut p.shortcuts[i], shortcut);
+            undoable(Command::UpdateShortcut { shortcut: prev }, vec![])
+        }
         _ => unreachable!("not a shortcut command"),
     }
+}
+
+/// Ids of the shortcuts that share their input with another one (same source).
+pub fn conflicts(p: &Project) -> std::collections::HashSet<Uuid> {
+    p.shortcuts
+        .iter()
+        .filter(|a| {
+            p.shortcuts
+                .iter()
+                .any(|b| b.id != a.id && b.source == a.source)
+        })
+        .map(|s| s.id)
+        .collect()
 }
 
 #[cfg(test)]

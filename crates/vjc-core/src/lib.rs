@@ -781,6 +781,10 @@ pub enum Command {
     RemoveShortcut {
         id: Uuid,
     },
+    /// Replaces the shortcut with the same id (inline edit, re-learn).
+    UpdateShortcut {
+        shortcut: vjc_model::Shortcut,
+    },
 }
 
 /// A param that can be animated.
@@ -3721,7 +3725,9 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::SetGroupSpeed { .. }
         | Command::MoveLayerToGroup { .. }
         | Command::MoveLayerOutOfGroup { .. } => groups::apply(p, cmd),
-        Command::AddShortcut { .. } | Command::RemoveShortcut { .. } => shortcuts::apply(p, cmd),
+        Command::AddShortcut { .. }
+        | Command::RemoveShortcut { .. }
+        | Command::UpdateShortcut { .. } => shortcuts::apply(p, cmd),
         Command::SetBpm { bpm } => {
             if !bpm.is_finite() || bpm <= 0.0 {
                 return Err(Error::InvalidValue);

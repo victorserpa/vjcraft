@@ -5958,3 +5958,386 @@ fn confirm_quit_only_asks_when_clean() {
     assert!(!quit_needs_confirm(true, true));
     assert!(!quit_needs_confirm(false, false));
 }
+
+// Shortcuts editor
+fn sc_row(source: vjc_model::ControlSource, target: &str) -> vjc_model::Shortcut {
+    hold_shortcut(source, target, vjc_model::ShortcutMode::Trigger)
+}
+
+fn sc_sources() -> [vjc_model::ControlSource; 4] {
+    use vjc_model::ControlSource as C;
+    [
+        C::Key { code: "Q".into() },
+        C::MidiNote {
+            device: "pad".into(),
+            channel: 0,
+            note: 36,
+        },
+        C::Osc {
+            address: "/ext/go".into(),
+        },
+        C::Dmx {
+            universe: 1,
+            channel: 7,
+        },
+    ]
+}
+
+fn sc_app() -> Harness<'static, State> {
+    let mut h = app();
+    h.state_mut().project.shortcuts.clear();
+    for (i, s) in sc_sources().into_iter().enumerate() {
+        let t = format!("/comp/layer/1/clip/{}/connect", i + 1);
+        h.state_mut().project.shortcuts.push(sc_row(s, &t));
+    }
+    h.state_mut().sc_ed.open = true;
+    settle(&mut h);
+    h
+}
+
+#[test]
+fn shortcut_editor_lists_every_source() {
+    let mut h = sc_app();
+    for l in ["Keyboard", "MIDI", "OSC", "DMX"] {
+        assert!(all(&h, l) >= 1, "{l}");
+    }
+    assert!(has_text(&h, "/ext/go"));
+    h.state_mut().sc_ed.filter = Some(shortcut_editor::Src::Osc);
+    assert_eq!(
+        shortcut_editor::visible(&h.state().project, h.state().sc_ed.filter, "").len(),
+        1
+    );
+    assert_eq!(
+        shortcut_editor::visible(&h.state().project, None, "CLIP/2").len(),
+        1
+    );
+}
+
+#[test]
+fn shortcut_editor_edits_are_undoable() {
+    let mut h = sc_app();
+    click_top(&mut h, "Duplicate");
+    assert_eq!(h.state().project.shortcuts.len(), 5);
+    h.state_mut().undo();
+    assert_eq!(h.state().project.shortcuts.len(), 4);
+    click_top(&mut h, "Delete");
+    assert_eq!(h.state().project.shortcuts.len(), 3);
+    h.state_mut().undo();
+    assert_eq!(h.state().project.shortcuts.len(), 4);
+    let mut edited = h.state().project.shortcuts[0].clone();
+    edited.invert = true;
+    h.state_mut()
+        .exec(Command::UpdateShortcut { shortcut: edited });
+    assert!(h.state().project.shortcuts[0].invert);
+    h.state_mut().undo();
+    assert!(!h.state().project.shortcuts[0].invert);
+}
+
+#[test]
+fn shortcut_editor_learns_midi_osc_dmx_and_key() {
+    use vjc_model::ControlSource as C;
+    let mut h = sc_app();
+    let ids: Vec<Uuid> = h.state().project.shortcuts.iter().map(|s| s.id).collect();
+    let src = |h: &Harness<'_, State>, i: usize| h.state().project.shortcuts[i].source.clone();
+    let new_midi = C::MidiCc {
+        device: "pad".into(),
+        channel: 2,
+        cc: 9,
+    };
+    h.state_mut().sc_ed.learn = Some(ids[1]);
+    assert!(!h.state_mut().sc_capture(C::Osc {
+        address: "/x".into()
+    }));
+    assert!(h.state_mut().sc_capture(new_midi.clone()));
+    assert_eq!(src(&h, 1), new_midi);
+    let osc = C::Osc {
+        address: "/new".into(),
+    };
+    h.state_mut().sc_ed.captured = false; // next pump
+    h.state_mut().sc_ed.learn = Some(ids[2]);
+    assert!(h.state_mut().sc_capture(osc.clone()));
+    assert_eq!(src(&h, 2), osc);
+    // Key: learn swallows the press (no firing) and stores it.
+    let (mut h, deck, top, _) = hold_setup();
+    h.state_mut().project.shortcuts.clear();
+    let row = sc_row(C::Key { code: "Q".into() }, "/comp/layer/2/clip/1/connect");
+    let id = row.id;
+    h.state_mut().project.shortcuts.push(row);
+    h.state_mut().sc_ed.learn = Some(id);
+    h.event(egui::Event::Key {
+        key: egui::Key::W,
+        physical_key: Some(egui::Key::W),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), None, "learn must not fire");
+    assert_eq!(
+        h.state().project.shortcuts[0].source,
+        C::Key { code: "W".into() }
+    );
+    assert!(h.state().sc_ed.learn.is_none());
+    let _ = deck;
+}
+
+#[test]
+fn shortcut_editor_flags_conflicts() {
+    let mut h = sc_app();
+    assert!(vjc_core::shortcuts::conflicts(&h.state().project).is_empty());
+    let mut d = h.state().project.shortcuts[0].clone();
+    d.id = Uuid::new_v4();
+    let dup = d.id;
+    h.state_mut().project.shortcuts.push(d);
+    let c = vjc_core::shortcuts::conflicts(&h.state().project);
+    assert_eq!(c.len(), 2);
+    assert!(c.contains(&dup));
+}
+
+#[test]
+fn shortcut_editor_export_import_roundtrip() {
+    let h = sc_app();
+    let json = shortcut_editor::export_json(&h.state().project);
+    let mut other = Project::new("o");
+    let cmds = shortcut_editor::import_json(&other, &json).unwrap();
+    assert_eq!(cmds.len(), 4);
+    for c in cmds {
+        vjc_core::apply(&mut other, c).unwrap();
+    }
+    let strip = |p: &Project| -> Vec<_> {
+        p.shortcuts
+            .iter()
+            .map(|s| {
+                (
+                    s.source.clone(),
+                    s.target.clone(),
+                    s.mode.clone(),
+                    s.range,
+                    s.invert,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(strip(&other), strip(&h.state().project));
+    assert!(shortcut_editor::import_json(&other, "{}").is_err());
+}
+
+fn sc_key_event(k: egui::Key, pressed: bool) -> egui::Event {
+    egui::Event::Key {
+        key: k,
+        physical_key: Some(k),
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+// Learn all: one knob burst in one pump maps one row only
+#[test]
+fn shortcut_learn_all_knob_burst_captures_one_row() {
+    use vjc_model::ControlSource as C;
+    let mut h = app();
+    let cc = |n: u8| C::MidiCc {
+        device: "pad".into(),
+        channel: 0,
+        cc: n,
+    };
+    h.state_mut().project.shortcuts = (0..3)
+        .map(|i| {
+            sc_row(
+                cc(100 + i),
+                &format!("/comp/layer/1/clip/{}/connect", i + 1),
+            )
+        })
+        .collect();
+    let ids: Vec<Uuid> = h.state().project.shortcuts.iter().map(|s| s.id).collect();
+    let (midi, tx) = midi_io::Midi::idle_fed();
+    h.state_mut().midi = midi;
+    h.state_mut().sc_ed.learn = Some(ids[0]);
+    h.state_mut().sc_ed.learn_all = true;
+    for v in 0..20u8 {
+        tx.send(midi_io::In::Msg(
+            "pad".into(),
+            vec![0xB0, 7, v],
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+    }
+    h.state_mut().midi_pump();
+    let sc = &h.state().project.shortcuts;
+    assert_eq!(sc[0].source, cc(7));
+    assert_eq!(sc[1].source, cc(101));
+    assert_eq!(sc[2].source, cc(102));
+    assert_eq!(h.state().sc_ed.learn, Some(ids[1]), "row 2 armed");
+    // The same knob, next frame, is still ignored; another control moves on.
+    tx.send(midi_io::In::Msg(
+        "pad".into(),
+        vec![0xB0, 7, 1],
+        std::time::Instant::now(),
+    ))
+    .unwrap();
+    h.state_mut().midi_pump();
+    assert_eq!(h.state().project.shortcuts[1].source, cc(101));
+    tx.send(midi_io::In::Msg(
+        "pad".into(),
+        vec![0xB0, 8, 1],
+        std::time::Instant::now(),
+    ))
+    .unwrap();
+    h.state_mut().midi_pump();
+    assert_eq!(h.state().project.shortcuts[1].source, cc(8));
+    assert_eq!(h.state().sc_ed.learn, Some(ids[2]));
+}
+
+// Import: an out-of-range MIDI channel is refused with a message, labels never overflow
+#[test]
+fn shortcut_import_rejects_out_of_range_midi() {
+    use vjc_model::ControlSource as C;
+    let mut p = Project::new("o");
+    p.shortcuts.push(sc_row(
+        C::MidiNote {
+            device: "d".into(),
+            channel: 0,
+            note: 1,
+        },
+        "/t",
+    ));
+    let good = shortcut_editor::export_json(&p);
+    assert!(shortcut_editor::import_json(&p, &good).is_ok());
+    let bad = good.replace("\"channel\": 0", "\"channel\": 255");
+    assert_ne!(good, bad);
+    let err = shortcut_editor::import_json(&p, &bad).unwrap_err();
+    assert!(err.contains("255"), "{err}");
+    let bad = good.replace("\"note\": 1", "\"note\": 200");
+    assert!(shortcut_editor::import_json(&p, &bad).is_err());
+    let label = shortcut_editor::input_label(&C::MidiCc {
+        device: "d".into(),
+        channel: 255,
+        cc: 1,
+    });
+    assert!(label.contains("ch256"), "{label}");
+}
+
+// Armed Key row: key up still lets go of a Hold that is down
+#[test]
+fn armed_key_row_still_releases_hold_on_key_up() {
+    use vjc_model::ControlSource as C;
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    let armed = sc_row(C::Key { code: "E".into() }, "/comp/layer/2/clip/3/connect");
+    let armed_id = armed.id;
+    h.state_mut().project.shortcuts = vec![
+        sc_row(C::Key { code: "Q".into() }, "/comp/layer/2/clip/2/connect"),
+        armed,
+    ];
+    h.event(sc_key_event(egui::Key::Q, true));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), Some((deck, 1)), "key down plays");
+    h.state_mut().sc_ed.learn = Some(armed_id);
+    h.event(sc_key_event(egui::Key::Q, false));
+    settle(&mut h);
+    assert_eq!(air_of(&h, top), None, "key up lets go while armed");
+    assert!(h.state().holds.is_empty());
+}
+
+// Armed MIDI row: note off still lets go of a Hold
+#[test]
+fn armed_midi_row_still_releases_hold_on_note_off() {
+    use vjc_model::ControlSource as C;
+    let (mut h, deck, top, _) = hold_setup();
+    style(&mut h, deck, top, 1, vjc_model::TriggerStyle::Hold);
+    let armed = sc_row(
+        C::MidiNote {
+            device: "pad".into(),
+            channel: 0,
+            note: 50,
+        },
+        "/comp/layer/2/clip/3/connect",
+    );
+    let armed_id = armed.id;
+    h.state_mut().project.shortcuts = vec![
+        sc_row(
+            C::MidiNote {
+                device: "pad".into(),
+                channel: 0,
+                note: 7,
+            },
+            "/comp/layer/2/clip/2/connect",
+        ),
+        armed,
+    ];
+    let (midi, tx) = midi_io::Midi::idle_fed();
+    h.state_mut().midi = midi;
+    let send = |h: &mut Harness<'_, State>, status: u8, vel: u8| {
+        tx.send(midi_io::In::Msg(
+            "pad".into(),
+            vec![status, 7, vel],
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+        h.state_mut().midi_pump();
+        settle(h);
+    };
+    send(&mut h, 0x90, 100);
+    assert_eq!(air_of(&h, top), Some((deck, 1)), "note on plays");
+    h.state_mut().sc_ed.learn = Some(armed_id);
+    send(&mut h, 0x80, 0);
+    assert_eq!(air_of(&h, top), None, "note off lets go while armed");
+    send(&mut h, 0x90, 100);
+    send(&mut h, 0x90, 0);
+    assert_eq!(air_of(&h, top), None, "velocity 0 lets go while armed");
+}
+
+// Armed Key row: typing in a focused text field is not captured
+#[test]
+fn armed_key_row_ignores_typing_in_text_field() {
+    use vjc_model::ControlSource as C;
+    let mut h = sc_app();
+    let id = h.state().project.shortcuts[0].id;
+    h.state_mut().sc_ed.learn = Some(id);
+    h.get_all_by_value("/comp/layer/1/clip/1/connect")
+        .next()
+        .unwrap()
+        .click();
+    settle(&mut h);
+    h.event(sc_key_event(egui::Key::W, true));
+    settle(&mut h);
+    assert_eq!(
+        h.state().project.shortcuts[0].source,
+        C::Key { code: "Q".into() },
+        "typing must not be captured"
+    );
+    assert_eq!(h.state().sc_ed.learn, Some(id), "still armed");
+}
+
+#[test]
+fn deleted_shortcut_stops_firing() {
+    let (mut h, deck, top, _) = hold_setup();
+    let key = |h: &mut Harness<'_, State>, k: egui::Key| {
+        h.event(egui::Event::Key {
+            key: k,
+            physical_key: Some(k),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        settle(h);
+    };
+    let row = |c: &str, clip: u32| {
+        sc_row(
+            vjc_model::ControlSource::Key { code: c.into() },
+            &format!("/comp/layer/2/clip/{clip}/connect"),
+        )
+    };
+    h.state_mut().project.shortcuts.clear();
+    let (w, e) = (row("W", 2), row("Q", 3));
+    let wid = w.id;
+    h.state_mut().project.shortcuts.extend([w, e]);
+    h.state_mut().exec(Command::RemoveShortcut { id: wid });
+    key(&mut h, egui::Key::W);
+    assert_eq!(air_of(&h, top), None, "deleted row does not fire");
+    key(&mut h, egui::Key::Q);
+    assert_eq!(air_of(&h, top), Some((deck, 2)), "control still fires");
+    key(&mut h, egui::Key::W);
+    assert_eq!(air_of(&h, top), Some((deck, 2)), "deleted row stays silent");
+}

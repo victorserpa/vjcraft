@@ -4673,6 +4673,7 @@ dependencies = [
  "pollster 1.0.1",
  "rfd",
  "rusty_link",
+ "serde",
  "serde_json",
  "tiny_http",
  "tungstenite",
