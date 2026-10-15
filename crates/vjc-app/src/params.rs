@@ -800,6 +800,26 @@ pub fn text_field(
     label: &str,
     current: &str,
 ) -> Option<String> {
+    text_field_impl(ui, id, label, current, false)
+}
+
+/// Like `text_field`, but the text may be emptied (free notes).
+pub fn text_field_free(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug + std::fmt::Debug,
+    label: &str,
+    current: &str,
+) -> Option<String> {
+    text_field_impl(ui, id, label, current, true)
+}
+
+fn text_field_impl(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug + std::fmt::Debug,
+    label: &str,
+    current: &str,
+    allow_empty: bool,
+) -> Option<String> {
     let id = ui.id().with(id);
     let mut out = None;
     ui.horizontal(|ui| {
@@ -821,7 +841,7 @@ pub fn text_field(
         if e.lost_focus() {
             ui.data_mut(|d| d.remove_temp::<(String, u64)>(id));
             let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            if !esc && !buf.trim().is_empty() && buf.trim() != current {
+            if !esc && (allow_empty || !buf.trim().is_empty()) && buf.trim() != current {
                 out = Some(buf.trim().to_string());
             }
         } else if e.has_focus() {

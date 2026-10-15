@@ -9,6 +9,8 @@
 //! Everything here is pure CPU work and returns errors instead of panicking, so the app
 //! can run it on a worker thread and disable the effect on failure.
 
+pub mod lut;
+
 use vjc_model::{Effect, Param, Value};
 
 /// Max uniform slots (vec4 each): slot 0 holds TIME and RENDERSIZE, the rest the inputs.
@@ -327,6 +329,7 @@ pub const BUILTIN: &[(&str, &str)] = &[
         "rain_drops",
         include_str!("../../../assets/effects/rain_drops.fs"),
     ),
+    ("lut3d", include_str!("../../../assets/effects/lut3d.fs")),
 ];
 
 /// Bundled generators: ISF without an image input, rendered at composition size.
@@ -1370,6 +1373,7 @@ fn pack_default(v: &Value) -> [f32; 4] {
 pub fn new_effect(kind: &str) -> Option<Effect> {
     let isf = parse(builtin_source(kind)?).ok()?;
     Some(Effect {
+        blend: Default::default(),
         id: uuid::Uuid::new_v4(),
         kind: kind.to_string(),
         bypass: false,

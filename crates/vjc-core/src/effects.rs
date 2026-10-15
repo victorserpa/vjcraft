@@ -197,6 +197,34 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetEffectBlend {
+            target,
+            effect,
+            blend,
+        } => {
+            let fx = fx_mut(p, target)?;
+            let i = pos(fx, effect)?;
+            let prev = std::mem::replace(&mut fx[i].blend, blend);
+            undoable(
+                Command::SetEffectBlend {
+                    target,
+                    effect,
+                    blend: prev,
+                },
+                vec![],
+            )
+        }
+        Command::ReplaceEffects { target, effects } => {
+            let fx = fx_mut(p, target)?;
+            let prev = std::mem::replace(fx, effects);
+            undoable(
+                Command::ReplaceEffects {
+                    target,
+                    effects: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetEffectDryWet {
             target,
             effect,

@@ -10,6 +10,7 @@ use vjc_model::{Effect, Param, Value};
 /// A new instance of `kind` with its default params (all animatable numbers).
 pub fn new_effect(kind: FxKind) -> Effect {
     Effect {
+        blend: Default::default(),
         id: uuid::Uuid::new_v4(),
         kind: kind.id().into(),
         bypass: false,

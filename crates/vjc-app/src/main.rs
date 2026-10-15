@@ -17,6 +17,7 @@ mod grid_ui;
 mod help;
 mod hold;
 mod icons;
+mod io_monitor;
 mod link_io;
 mod midi_io;
 mod ml_fx;
@@ -41,6 +42,7 @@ mod theme;
 mod timecode_io;
 mod vram;
 mod wake;
+mod wave_ui;
 mod widgets;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
@@ -228,6 +230,17 @@ struct State {
     tc_devices: Option<(Vec<String>, Vec<String>)>,
     /// MIDI (input, output) port names for the Preferences tab; `None` = rescan.
     midi_ports: Option<(Vec<String>, Vec<String>)>,
+    /// Last incoming MIDI / OSC messages for the monitor windows (Preferences).
+    midi_log: io_monitor::Log,
+    osc_log: io_monitor::Log,
+    midi_monitor_open: bool,
+    osc_monitor_open: bool,
+    /// Snapshot PNG asked from a clip menu, served after the next composition frame.
+    snap_req: Option<(DeckId, LayerId, u32)>,
+    /// Shuffle bags of layer autopilots in Random / Bag mode.
+    layer_bags: std::cell::RefCell<HashMap<LayerId, Vec<u32>>>,
+    /// Opens a file in the file manager; a no-op in tests.
+    reveal: Box<dyn wave_ui::Reveal>,
     led_prev: HashMap<vjc_core::midi::Led, bool>,
     /// OSC sockets thread, the config last sent to it, and the output state last sent.
     osc: osc_io::Osc,
@@ -547,11 +560,26 @@ fn draw_chain(
         } else {
             None
         };
+        // A LUT effect without a readable LUT is skipped (passthrough).
+        let lut = if e.kind == "lut3d" {
+            let path = e.params.iter().find_map(|p| match &p.value {
+                vjc_model::Value::Text(t) if p.name == "file" => Some(t.as_str()),
+                _ => None,
+            });
+            match path.and_then(|p| lib.lut(p)) {
+                Some(l) => Some(l),
+                None => continue,
+            }
+        } else {
+            None
+        };
         if let Some(isf) = lib.isf(&e.kind) {
             out.push(EffectDraw {
                 kind: e.kind.clone(),
                 uniforms: isf.pack(&vjc_core::anim::resolve(&e.params, ctx), time, size),
                 dry_wet: e.dry_wet,
+                blend: vjc_core::blend::fx_mix_id(&e.blend),
+                lut,
                 ml: ml_draw,
                 persistent: isf.needs_instance().then_some(e.id),
                 ticking: isf.tick_input.is_some(),
@@ -659,8 +687,16 @@ fn group_header(
     let gid = g.id;
     ui.vertical(|ui| {
         let name = ui.add(
-            egui::Button::new(icons::with_text(ui, icons::i::CARET_DOWN, &g.name))
-                .selected(*sel_group == Some(gid)),
+            egui::Button::new(icons::with_text(
+                ui,
+                if g.folded {
+                    icons::i::CARET_RIGHT
+                } else {
+                    icons::i::CARET_DOWN
+                },
+                &g.name,
+            ))
+            .selected(*sel_group == Some(gid)),
         );
         name.widget_info(|| {
             egui::WidgetInfo::selected(
@@ -677,6 +713,18 @@ fn group_header(
         name.context_menu(|ui| {
             if crate::widgets::btn(ui, "Ungroup", crate::widgets::Kind::Secondary).clicked() {
                 cmds.push(Command::Ungroup { group: gid });
+                ui.close();
+            }
+            let fold = if g.folded {
+                "Unfold group"
+            } else {
+                "Fold group"
+            };
+            if crate::widgets::btn(ui, fold, crate::widgets::Kind::Secondary).clicked() {
+                cmds.push(Command::SetGroupFolded {
+                    group: gid,
+                    folded: !g.folded,
+                });
                 ui.close();
             }
             ui.separator();
@@ -712,6 +760,16 @@ fn group_header(
         }
         if s.changed() {
             cmds.push(Command::SetGroupSolo { group: gid, solo });
+        }
+        if ui
+            .small_button(if g.folded { "Unfold" } else { "Fold" })
+            .on_hover_text("Collapse or expand the group's layers in the grid")
+            .clicked()
+        {
+            cmds.push(Command::SetGroupFolded {
+                group: gid,
+                folded: !g.folded,
+            });
         }
         if ui
             .small_button("Ungroup")
@@ -1577,6 +1635,8 @@ fn quit_needs_confirm(confirm_quit: bool, dirty: bool) -> bool {
 
 fn new_layer(n: usize) -> Layer {
     Layer {
+        color: None,
+        folded: false,
         id: Uuid::new_v4(),
         name: format!("Layer {n}"),
         track: Track::new(BlendMode::Normal),
@@ -1613,6 +1673,7 @@ fn fresh_project(prefs: &Prefs) -> Project {
     }
     for i in 1..=9 {
         c.columns.push(Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id: Uuid::new_v4(),
@@ -1716,6 +1777,17 @@ impl State {
             tc: timecode_io::TcRuntime::new(),
             tc_devices: None,
             midi_ports: None,
+            midi_log: io_monitor::Log::default(),
+            osc_log: io_monitor::Log::default(),
+            midi_monitor_open: false,
+            osc_monitor_open: false,
+            snap_req: None,
+            layer_bags: Default::default(),
+            reveal: if live {
+                Box::new(wave_ui::SystemReveal)
+            } else {
+                Box::<wave_ui::NoReveal>::default()
+            },
             collect_job: None,
             midi: if live {
                 midi_io::Midi::spawn()
@@ -2994,7 +3066,19 @@ impl State {
                 }
                 Event::FaderStart { layer } => {
                     // The playing clip restarts from the start of its region, in place.
-                    if self.active(layer).is_some() {
+                    // The clip's own override wins over the layer's flag.
+                    let enabled = self
+                        .clip_on(layer)
+                        .and_then(|k| k.extras.fader_start)
+                        .or_else(|| {
+                            self.project
+                                .composition
+                                .layers
+                                .iter()
+                                .find(|l| l.id == layer)
+                                .map(|l| l.fader_start)
+                        });
+                    if enabled == Some(true) && self.active(layer).is_some() {
                         self.flow.beat_loops.remove(&layer);
                         let (start, _) = self.region_of(layer);
                         if let Some(c) = self.flow.loops.get_mut(&layer) {
@@ -3413,7 +3497,9 @@ impl State {
         let rand = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(1, |d| d.as_nanos() as u64);
-        vjc_core::playback::next_clip(l.autopilot.mode, cur, &playable, rand).map(|c| (deck, c))
+        let mut bags = self.layer_bags.borrow_mut();
+        let bag = bags.entry(layer).or_default();
+        vjc_core::playback::next_clip_ap(&l.autopilot, cur, &playable, rand, bag).map(|c| (deck, c))
     }
 
     /// Deck and column of the clip playing on the layer (video or generator).
@@ -3530,6 +3616,15 @@ impl State {
     /// Effective speed = `speed` x beat-sync factor (clip length = n beats).
     fn tick_clock(&mut self) {
         let now = std::time::Instant::now();
+        // Preferences > Control sets how far the nudge buttons change the speed.
+        let rate = f64::from(self.prefs.control.nudge_percent) / 100.0;
+        let rate = rate.clamp(
+            vjc_core::clock::NUDGE_RANGE.0,
+            vjc_core::clock::NUDGE_RANGE.1,
+        );
+        if (self.clock.nudge_rate() - rate).abs() > 1e-9 {
+            self.clock.set_nudge_rate(rate, now);
+        }
         let on = self.project.composition.tempo.link_enabled;
         self.link_sync.update(
             &mut self.link,
@@ -3976,6 +4071,7 @@ impl State {
         for i in have..column + files.len() as u32 {
             commands.push(Command::AddColumn {
                 column: vjc_model::Column {
+                    color: None,
                     autopilot: Default::default(),
                     beat_snap: None,
                     id: Uuid::new_v4(),
@@ -4138,6 +4234,56 @@ impl State {
         });
     }
 
+    /// Serves a Snapshot PNG request: the clip's current frame when it is playing, else the
+    /// composition output. Saves into the snapshot folder (asked once, then remembered).
+    fn serve_snapshot(&mut self, frame: &eframe::Frame) {
+        let Some((deck, layer, column)) = self.snap_req.take() else {
+            return;
+        };
+        let name = vjc_core::clip_in(&self.project, deck, layer, column)
+            .map_or_else(|| "snapshot".to_string(), |k| k.name.clone());
+        let playing = self
+            .players
+            .get(&layer)
+            .filter(|(d, c, _)| *d == deck && *c == column)
+            .and_then(|(_, _, p)| p.latest_frame());
+        let shot = match playing {
+            Some(f) => Some((f.width, f.height, f.data.to_vec())),
+            None => frame
+                .wgpu_render_state()
+                .zip(self.comp.as_ref())
+                .and_then(|(rs, comp)| comp.read_rgba(&rs.device, &rs.queue)),
+        };
+        self.write_snapshot(&name, shot);
+    }
+
+    /// Saves `shot` (width, height, RGBA) as a PNG named after `name`.
+    fn write_snapshot(&mut self, name: &str, shot: Option<(u32, u32, Vec<u8>)>) {
+        let Some((w, h, px)) = shot else {
+            self.status = "Snapshot: nothing to capture yet".into();
+            return;
+        };
+        let folder = match self.prefs.general.snapshot_folder.clone() {
+            Some(f) => f,
+            None => {
+                let Some(f) = rfd::FileDialog::new()
+                    .set_title("Folder for snapshots")
+                    .pick_folder()
+                else {
+                    self.status = "Snapshot cancelled".into();
+                    return;
+                };
+                self.prefs.general.snapshot_folder = Some(f.clone());
+                self.prefs_dirty = true;
+                f
+            }
+        };
+        self.status = match vjc_media::snapshot::save_png(&folder, name, w, h, &px) {
+            Ok(p) => format!("Snapshot saved: {}", p.display()),
+            Err(e) => e,
+        };
+    }
+
     fn compose(&mut self, frame: &eframe::Frame) {
         let Some(rs) = frame.wgpu_render_state() else {
             return;
@@ -4250,6 +4396,10 @@ impl State {
             let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
             let clip = active_of(players, gens, l.id)
                 .and_then(|(d, col)| clip_for(&self.project, origin, l.id, d, col));
+            // Strip video: this clip's picture is not drawn (its audio keeps playing).
+            if clip.is_some_and(|k| k.extras.strip_video) {
+                continue;
+            }
             // Layer and clip dashboards: dial animations on this layer's params read them.
             let (layer_dials, clip_dials) = (
                 vjc_core::anim::dial_values(&l.track.dials),
@@ -4266,6 +4416,8 @@ impl State {
                     self.fx.request(kind);
                     let ready = self.fx.status(kind) == Some(&fx::Status::Ready);
                     self.fx.isf(kind).filter(|_| ready).map(|isf| EffectDraw {
+                        lut: None,
+                        blend: Default::default(),
                         kind: kind.clone(),
                         uniforms: isf.pack(
                             &vjc_core::anim::resolve(params, &lctx),
@@ -4399,6 +4551,8 @@ impl State {
                     self.fx.request(kind);
                     let ready = self.fx.status(kind) == Some(&fx::Status::Ready);
                     self.fx.isf(kind).filter(|_| ready).map(|isf| EffectDraw {
+                        lut: None,
+                        blend: Default::default(),
                         kind: kind.clone(),
                         uniforms: isf.pack(&vjc_core::anim::resolve(params, &pctx), t, (w, h)),
                         dry_wet: 1.0,
@@ -5097,6 +5251,12 @@ impl State {
         use vjc_core::midi as m;
         self.sc_ed.captured = false;
         while let Ok(ev) = self.midi.rx.try_recv() {
+            if let midi_io::In::Msg(d, b, _) = &ev
+                && self.prefs.midi.input_enabled(d)
+            {
+                self.midi_log
+                    .push(io_monitor::midi_line(d, b, self.prefs.midi.middle_c));
+            }
             let (device, bytes, at) = match ev {
                 midi_io::In::Msg(d, ..) if !self.prefs.midi.input_enabled(&d) => continue,
                 midi_io::In::Connected(d) => {
@@ -5191,6 +5351,7 @@ impl State {
         }
         self.sc_ed.captured = false;
         while let Ok(ev) = self.osc.rx.try_recv() {
+            self.osc_log.push(io_monitor::osc_line(&ev));
             if self.sc_armed() == Some(shortcut_editor::Src::Osc) {
                 let off: Vec<Uuid> = self
                     .project
@@ -6160,6 +6321,20 @@ impl State {
             self.prefs_open = true;
         }
         self.prefs_window(&ctx);
+        if self.midi_monitor_open {
+            let hint = format!(
+                "Last {} messages. Note 60 is {}.",
+                io_monitor::MAX_LINES,
+                self.prefs.midi.middle_c.note_name(60)
+            );
+            self.midi_monitor_open =
+                io_monitor::window(&ctx, "MIDI monitor", &mut self.midi_log, &hint);
+        }
+        if self.osc_monitor_open {
+            let hint = format!("Last {} messages.", io_monitor::MAX_LINES);
+            self.osc_monitor_open =
+                io_monitor::window(&ctx, "OSC monitor", &mut self.osc_log, &hint);
+        }
         self.shortcut_editor_window(&ctx);
         self.recovery_window(&ctx);
         self.relink_window(&ctx);
@@ -6258,6 +6433,7 @@ impl State {
         };
         let mut pick: Option<(LayerId, u32)> = None;
         let mut acts: Vec<(LayerId, u32, CellAct)> = vec![];
+        let mut clip_acts: Vec<(LayerId, u32, wave_ui::ClipAct)> = vec![];
         let mut layer_dropped: Option<LayerId> = None;
         let mut remove_layer_req: Option<LayerId> = None;
         self.paint_layer_drop_line(&ctx);
@@ -6460,6 +6636,16 @@ impl State {
                                         self.col_sel == Some(ci as u32),
                                         &hover,
                                     );
+                                    if let Some(c) = theme::palette(comp.columns[ci].color) {
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(
+                                                rect.min,
+                                                egui::vec2(rect.width(), 4.0),
+                                            ),
+                                            0.0,
+                                            c,
+                                        );
+                                    }
                                     let r = help(r, "column");
                                     let nr = help(nr, "column");
                                     let stop_rect = egui::Rect::from_min_size(
@@ -6515,6 +6701,7 @@ impl State {
                             }
                             let col_ap = comp.columns[ci].autopilot.clone();
                             let col_snap = comp.columns[ci].beat_snap;
+                            let col_color = comp.columns[ci].color;
                             nr.context_menu(|ui| {
                                 if crate::widgets::btn(
                                     ui,
@@ -6525,6 +6712,12 @@ impl State {
                                 {
                                     self.col_renaming = Some((*cid, n.clone()));
                                     ui.close();
+                                }
+                                if let Some(color) = wave_ui::color_menu(ui, col_color) {
+                                    cmds.push(Command::SetColor {
+                                        target: vjc_core::ColorTarget::Column(*cid),
+                                        color,
+                                    });
                                 }
                                 autopilot_ui::column_menu(ui, *cid, &col_ap, &mut cmds);
                                 autopilot_ui::column_snap_menu(ui, *cid, col_snap, &mut cmds);
@@ -6552,6 +6745,7 @@ impl State {
                                 {
                                     cmds.push(Command::AddColumn {
                                         column: vjc_model::Column {
+                                            color: None,
                                             autopilot: Default::default(),
                                             beat_snap: None,
                                             id: Uuid::new_v4(),
@@ -6580,6 +6774,67 @@ impl State {
                                 );
                             }
                             let in_group = comp.layers[li].group.is_some();
+                            let group_folded = comp.layers[li]
+                                .group
+                                .and_then(|g| comp.group(g))
+                                .is_some_and(|g| g.folded);
+                            // Layers of a folded group have no row; a folded layer is one thin row.
+                            if group_folded {
+                                continue;
+                            }
+                            if comp.layers[li].folded {
+                                let layer = &comp.layers[li];
+                                let (hr, hresp) = ui.allocate_exact_size(
+                                    egui::vec2(theme::LAYER_HEAD_W, theme::FOLDED_ROW_H),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().rect_filled(hr, 0.0, theme::HEADER_BG);
+                                if let Some(c) = theme::palette(layer.color) {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            hr.min,
+                                            egui::vec2(4.0, hr.height()),
+                                        ),
+                                        0.0,
+                                        c,
+                                    );
+                                }
+                                ui.painter().text(
+                                    hr.left_center() + egui::vec2(10.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    icons::i::CARET_RIGHT,
+                                    theme::icon_font(theme::FS_XS),
+                                    theme::TEXT_MUTED,
+                                );
+                                ui.painter().text(
+                                    hr.left_center() + egui::vec2(24.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    &layer.name,
+                                    egui::FontId::proportional(theme::FS_XS),
+                                    theme::TEXT_MUTED,
+                                );
+                                hresp.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        true,
+                                        format!("Unfold layer {}", layer.name),
+                                    )
+                                });
+                                if hresp.clicked() {
+                                    cmds.push(Command::SetLayerFolded {
+                                        layer: lid,
+                                        folded: false,
+                                    });
+                                }
+                                for _ in 0..i64::from(ncols) + ghost_cols {
+                                    ui.allocate_exact_size(
+                                        egui::vec2(theme::CELL_W, theme::FOLDED_ROW_H),
+                                        egui::Sense::hover(),
+                                    );
+                                }
+                                ui.end_row();
+                                continue;
+                            }
                             ui.scope(|ui| {
                                 ui.spacing_mut().slider_width = theme::LAYER_ROW_H - 16.0;
                                 ui.spacing_mut().slider_rail_height = 4.0;
@@ -6589,6 +6844,16 @@ impl State {
                                     egui::Sense::hover(),
                                 );
                                 ui.painter().rect_filled(hr, 0.0, theme::HEADER_BG);
+                                if let Some(c) = theme::palette(layer.color) {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            hr.min,
+                                            egui::vec2(4.0, hr.height()),
+                                        ),
+                                        0.0,
+                                        c,
+                                    );
+                                }
                                 let at = |x: f32, y: f32, w: f32, h: f32| {
                                     egui::Rect::from_min_size(
                                         hr.min + egui::vec2(x, y),
@@ -6677,6 +6942,25 @@ impl State {
                                         ui.close();
                                     }
                                     ui.separator();
+                                    if let Some(color) = wave_ui::color_menu(ui, layer.color) {
+                                        cmds.push(Command::SetColor {
+                                            target: vjc_core::ColorTarget::Layer(lid),
+                                            color,
+                                        });
+                                    }
+                                    if crate::widgets::btn(
+                                        ui,
+                                        "Fold layer",
+                                        crate::widgets::Kind::Secondary,
+                                    )
+                                    .clicked()
+                                    {
+                                        cmds.push(Command::SetLayerFolded {
+                                            layer: lid,
+                                            folded: true,
+                                        });
+                                        ui.close();
+                                    }
                                     layer_ops_menu(ui, &self.project, lid, cur, &mut cmds);
                                     ui.separator();
                                     let from = active_of(&self.players, &self.gens, lid)
@@ -6971,8 +7255,29 @@ impl State {
                                     cell.all(),
                                     if clip.is_some() { "cell" } else { "cell-empty" },
                                 );
-                                if clip.is_some() {
+                                if let Some(c) = theme::palette(clip.and_then(|k| k.extras.color)) {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            r.rect.min,
+                                            egui::vec2(4.0, r.rect.height()),
+                                        ),
+                                        0.0,
+                                        c,
+                                    );
+                                }
+                                if let Some(k) = clip {
+                                    let lay = &comp.layers[li];
                                     r.context_menu(|ui| {
+                                        if let Some(a) = wave_ui::clip_menu(
+                                            ui,
+                                            (cur, lid, ci),
+                                            k,
+                                            (lay.ignore_column_trigger, lay.fader_start),
+                                            &mut cmds,
+                                        ) {
+                                            clip_acts.push((lid, ci, a));
+                                        }
+                                        ui.separator();
                                         for (txt, act) in [
                                             ("Trigger", CellAct::Trigger),
                                             ("Preview", CellAct::Preview),
@@ -7195,6 +7500,7 @@ impl State {
                                     {
                                         cmds.push(Command::AddColumn {
                                             column: vjc_model::Column {
+                                                color: None,
                                                 autopilot: Default::default(),
                                                 beat_snap: None,
                                                 id: Uuid::new_v4(),
@@ -7275,6 +7581,13 @@ impl State {
         }
         for (l, c, act) in acts {
             self.cell_act(cur, (l, c), act, &mut cmds);
+        }
+        for (l, c, act) in clip_acts {
+            self.selected = Some((l, c));
+            match act {
+                wave_ui::ClipAct::Reveal(path) => self.reveal.reveal(&path),
+                wave_ui::ClipAct::Snapshot => self.snap_req = Some((cur, l, c)),
+            }
         }
         if let Some((l, c)) = pick
             && let Some(path) = rfd::FileDialog::new()
@@ -7491,6 +7804,10 @@ impl State {
         if params::section(ui, "sec-video", "Video") {
             if let Some(name) = params::text_field(ui, "cname", "Name", &c.name) {
                 cmds.push(Command::SetCompositionName { name });
+            }
+            if let Some(text) = params::text_field_free(ui, "cdesc", "Description", &c.description)
+            {
+                cmds.push(Command::SetCompDescription { text });
             }
             let (mut w, mut h, mut fps) = (c.width, c.height, c.fps);
             let mut size_changed = false;
@@ -7899,6 +8216,7 @@ impl State {
                     autopilot: Autopilot { mode, ..ap.clone() },
                 });
             }
+            autopilot_ui::layer_extras(ui, lid, &ap, cmds);
             if ap.unit == AutopilotUnit::Loops {
                 if let Some(n) = params::param_slider(
                     ui,
@@ -9102,10 +9420,64 @@ impl State {
             if !open {
                 continue;
             }
+            // How the effect output is mixed over its input (Dry/Wet is the opacity).
+            ui.horizontal(|ui| {
+                params::row_label(ui, "Blend");
+                let label = vjc_core::blend::COMPOSITION_MODES
+                    .iter()
+                    .find(|(m, _)| *m == e.blend)
+                    .map_or("Normal", |(_, n)| *n);
+                crate::widgets::combo(ui, (e.id, "fxblend"), label, Some(110.0), |ui| {
+                    for mode in &vjc_core::blend::FX_MIX_MODES {
+                        let name = vjc_core::blend::COMPOSITION_MODES
+                            .iter()
+                            .find(|(m, _)| m == mode)
+                            .map_or("Normal", |(_, n)| *n);
+                        if crate::widgets::choice(ui, e.blend == *mode, name).clicked() {
+                            cmds.push(Command::SetEffectBlend {
+                                target,
+                                effect: e.id,
+                                blend: mode.clone(),
+                            });
+                        }
+                    }
+                });
+            });
+            if e.kind == "lut3d"
+                && let Some(pi) = e.params.iter().position(|p| p.name == "file")
+            {
+                let cur = match &e.params[pi].value {
+                    Value::Text(t) => t.clone(),
+                    _ => String::new(),
+                };
+                ui.horizontal(|ui| {
+                    if crate::widgets::btn(ui, "Load .cube...", crate::widgets::Kind::Secondary)
+                        .clicked()
+                        && let Some(f) = rfd::FileDialog::new()
+                            .add_filter("3D LUT", &["cube"])
+                            .pick_file()
+                    {
+                        cmds.push(Command::SetEffectParam {
+                            target,
+                            effect: e.id,
+                            param: pi,
+                            value: Value::Text(f.to_string_lossy().into_owned()),
+                        });
+                    }
+                    let name = std::path::Path::new(&cur).file_name().map_or_else(
+                        || "No LUT loaded".to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    crate::widgets::help(ui, &name);
+                });
+            }
             for (pi, p) in e.params.iter().enumerate() {
                 let Some(kind) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
                     continue;
                 };
+                if e.kind == "lut3d" && p.name == "file" {
+                    continue;
+                }
                 // Scope ids per effect so equal param names do not share edit state.
                 let mut an = None;
                 let (r, prect) = ui
@@ -9589,6 +9961,7 @@ impl eframe::App for State {
         ) {
             self.compose(frame);
         }
+        self.serve_snapshot(frame);
         if self.frames.is_multiple_of(30) {
             self.vram_watch();
         }
@@ -9886,6 +10259,7 @@ mod tests {
     #[test]
     fn outgoing_transition_keeps_the_clip_channel_mask() {
         let mut k = vjc_model::Clip {
+            extras: Default::default(),
             id: Uuid::new_v4(),
             name: "c".into(),
             source: vjc_model::Source::File {
@@ -10030,6 +10404,12 @@ mod audio_mix_tests {
         p.composition.layers[0].audio = true;
         p.composition.layers[0].video = false;
         assert!(audio_mix(&p, id, &clip).0 > 0.0);
+        // Stripping the clip's audio mutes it; stripping video does not.
+        let mut stripped = clip.clone();
+        stripped.extras.strip_video = true;
+        assert!(audio_mix(&p, id, &stripped).0 > 0.0);
+        stripped.extras.strip_audio = true;
+        assert_eq!(audio_mix(&p, id, &stripped).0, 0.0);
     }
 }
 
@@ -10089,6 +10469,7 @@ fn audio_mix(p: &Project, layer: LayerId, clip: &vjc_model::Clip) -> (f32, f32) 
         .layers
         .iter()
         .any(|l| l.id == layer && !l.audio)
+        || clip.extras.strip_audio
     {
         vol = 0.0;
     }

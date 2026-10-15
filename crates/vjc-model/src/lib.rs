@@ -66,6 +66,9 @@ pub struct Composition {
     /// Default destination layer of clips that defer to the composition.
     #[serde(default)]
     pub clip_target: ClipTarget,
+    /// Free-text note about the composition.
+    #[serde(default)]
+    pub description: String,
 }
 
 /// Which column the composition autopilot plays when its time is up.
@@ -210,6 +213,12 @@ pub struct Layer {
     /// Uses this layer's luminance as a mask for the layers below.
     #[serde(default)]
     pub mask_mode: MaskMode,
+    /// Palette index tinting the layer header (None = no colour).
+    #[serde(default)]
+    pub color: Option<u8>,
+    /// Collapsed in the grid UI.
+    #[serde(default)]
+    pub folded: bool,
 }
 
 /// What a layer masks: its luminance multiplies the layer(s) below it.
@@ -252,6 +261,9 @@ pub struct LayerGroup {
     /// Multiplies the speed of every clip in the group, 0..=4.
     #[serde(default = "one")]
     pub speed: f64,
+    /// Collapsed in the grid UI (its layers are hidden).
+    #[serde(default)]
+    pub folded: bool,
 }
 
 impl LayerGroup {
@@ -263,6 +275,7 @@ impl LayerGroup {
             solo: false,
             bypass: false,
             speed: 1.0,
+            folded: false,
         }
     }
 }
@@ -279,7 +292,13 @@ pub struct Column {
     /// Beat snap override of this column (None = the composition's).
     #[serde(default)]
     pub beat_snap: Option<BeatSnap>,
+    /// Palette index (1..=PALETTE_LEN) tinting the header; None = no colour.
+    #[serde(default)]
+    pub color: Option<u8>,
 }
+
+/// Number of colours in the chip palette (Arena colorid 1-6).
+pub const PALETTE_LEN: u8 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Deck {
@@ -319,6 +338,25 @@ pub struct Clip {
     /// Which layer the clip plays on; `Composition` defers to the composition's target.
     #[serde(default)]
     pub target: ClipTarget,
+    /// Per-clip colour, trigger/fader overrides and strip toggles.
+    #[serde(default)]
+    pub extras: ClipExtras,
+}
+
+/// Per-clip settings that are rarely touched. `None` overrides defer to the layer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipExtras {
+    /// Palette index tinting the cell (None = no colour).
+    pub color: Option<u8>,
+    /// Column triggers skip this clip's layer when it plays this clip (None = layer's).
+    pub ignore_column_trigger: Option<bool>,
+    /// Fader start for this clip (None = layer's).
+    pub fader_start: Option<bool>,
+    /// Audio track removed from playback.
+    pub strip_audio: bool,
+    /// Video track removed from playback (picture not drawn).
+    pub strip_video: bool,
 }
 
 /// How a trigger behaves over time (not where the clip starts: see `TriggerMode`).
@@ -837,9 +875,10 @@ impl Transform {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum BlendMode {
     // Generic compositing and transition modes; see docs/03-catalogo.md.
+    #[default]
     Normal,
     Add,
     Burn,
@@ -905,6 +944,10 @@ pub struct Effect {
     pub bypass: bool,
     pub dry_wet: f32,
     pub params: Vec<Param>,
+    /// How the effect output is mixed over its input (`dry_wet` is the opacity).
+    /// Normal (old files) = plain crossfade.
+    #[serde(default)]
+    pub blend: BlendMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -927,6 +970,16 @@ pub struct Autopilot {
     /// Beats or seconds between switches when `unit` is not `Loops`.
     #[serde(default = "default_every")]
     pub every: f64,
+    /// Random mode: how the pick is drawn (Any / Other / Bag).
+    #[serde(default = "random_other")]
+    pub random: RandomKind,
+    /// Next/Previous wrap around at the ends when on; off stops there.
+    #[serde(default = "yes", rename = "loop")]
+    pub looping: bool,
+}
+
+fn random_other() -> RandomKind {
+    RandomKind::Other
 }
 
 fn default_every() -> f64 {
@@ -952,6 +1005,8 @@ impl Default for Autopilot {
             every_loops: 1,
             unit: AutopilotUnit::Loops,
             every: default_every(),
+            random: RandomKind::Other,
+            looping: true,
         }
     }
 }
@@ -1761,6 +1816,7 @@ impl Project {
         Project {
             format_version: 1,
             composition: Composition {
+                description: String::new(),
                 autopilot: Default::default(),
                 beat_snap: None,
                 id: Uuid::new_v4(),
@@ -2027,6 +2083,8 @@ mod tests {
         assert_eq!(old.unit, AutopilotUnit::Loops);
         assert_eq!(old.every_loops, 3);
         let new = Autopilot {
+            looping: true,
+            random: RandomKind::Other,
             mode: AutopilotMode::FirstLast,
             every_loops: 1,
             unit: AutopilotUnit::Beats,
@@ -2051,6 +2109,7 @@ mod tests {
     #[test]
     fn column_name_roundtrips_and_defaults_when_absent() {
         let c = Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id: Uuid::new_v4(),
@@ -2069,6 +2128,8 @@ mod tests {
     fn solo_turns_other_layers_off() {
         let mut p = Project::new("t");
         let mk = |solo, bypass| Layer {
+            color: None,
+            folded: false,
             id: Uuid::new_v4(),
             name: "L".into(),
             track: Track::new(BlendMode::Normal),
@@ -2120,6 +2181,8 @@ mod tests {
         let mut p = Project::new("t");
         let lid = Uuid::new_v4();
         p.composition.layers.push(Layer {
+            color: None,
+            folded: false,
             id: lid,
             name: "L1".into(),
             track: Track::new(BlendMode::Add),
@@ -2145,6 +2208,7 @@ mod tests {
             lid,
             2,
             Clip {
+                extras: Default::default(),
                 id: Uuid::new_v4(),
                 name: "c".into(),
                 source: Source::File {
@@ -2206,6 +2270,7 @@ mod tests {
         c.autopilot.random = RandomKind::Bag;
         c.autopilot.looping = false;
         c.columns.push(Column {
+            color: None,
             id: Uuid::new_v4(),
             name: "c".into(),
             autopilot: ColumnAutopilot {
@@ -2281,6 +2346,7 @@ mod tests {
         let mut c = Project::new("t").composition;
         let p = || Param::number("p", 0.0, None);
         let eff = || Effect {
+            blend: Default::default(),
             id: Uuid::new_v4(),
             kind: "k".into(),
             bypass: false,
@@ -2290,6 +2356,8 @@ mod tests {
         c.master.effects.push(eff());
         c.layers.clear();
         c.layers.push(Layer {
+            color: None,
+            folded: false,
             id: Uuid::new_v4(),
             name: "L".into(),
             track: Track::new(BlendMode::Normal),
@@ -2317,6 +2385,7 @@ mod tests {
         c.groups = vec![g];
         let mut deck = c.decks[0].clone();
         let mut clip = Clip {
+            extras: Default::default(),
             id: Uuid::new_v4(),
             name: "c".into(),
             source: Source::Generator {
@@ -2463,6 +2532,7 @@ mod tests {
     #[test]
     fn clip_transition_roundtrips_and_old_clips_default_to_layer() {
         let mut clip = Clip {
+            extras: Default::default(),
             id: Uuid::new_v4(),
             name: "c".into(),
             source: Source::Generator {
@@ -2533,6 +2603,7 @@ mod tests {
         let mut p = Project::new("t");
         if p.composition.columns.is_empty() {
             p.composition.columns.push(Column {
+                color: None,
                 id: Uuid::new_v4(),
                 name: "1".into(),
                 autopilot: Default::default(),

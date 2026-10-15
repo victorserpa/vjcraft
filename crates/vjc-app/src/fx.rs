@@ -23,6 +23,14 @@ pub struct FxLib {
     status: HashMap<String, Status>,
     tx: Sender<Compiled>,
     rx: Receiver<Compiled>,
+    /// Parsed `.cube` files by path: modification time and the LUT (None = unreadable).
+    luts: HashMap<
+        String,
+        (
+            Option<std::time::SystemTime>,
+            Option<std::sync::Arc<vjc_fx::lut::Lut>>,
+        ),
+    >,
 }
 
 impl FxLib {
@@ -33,7 +41,28 @@ impl FxLib {
             status: HashMap::new(),
             tx,
             rx,
+            luts: HashMap::new(),
         }
+    }
+
+    /// The `.cube` LUT at `path`, parsed once and again when the file changes. None while
+    /// the path is empty, unreadable or not a supported LUT.
+    pub fn lut(&mut self, path: &str) -> Option<std::sync::Arc<vjc_fx::lut::Lut>> {
+        if path.trim().is_empty() {
+            return None;
+        }
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some((t, l)) = self.luts.get(path)
+            && *t == mtime
+        {
+            return l.clone();
+        }
+        let lut = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| vjc_fx::lut::parse_cube(&t).ok())
+            .map(std::sync::Arc::new);
+        self.luts.insert(path.to_string(), (mtime, lut.clone()));
+        lut
     }
 
     /// Parsed header of an effect (cached).

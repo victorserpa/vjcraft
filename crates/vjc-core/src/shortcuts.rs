@@ -942,6 +942,7 @@ mod effect_id_tests {
 
     fn fx(kind: &str) -> Effect {
         Effect {
+            blend: Default::default(),
             id: Uuid::new_v4(),
             kind: kind.into(),
             bypass: false,
@@ -1044,6 +1045,8 @@ mod effect_id_tests {
         let mut p = Project::new("t");
         let layer = Uuid::new_v4();
         p.composition.layers.push(vjc_model::Layer {
+            color: None,
+            folded: false,
             id: layer,
             name: "L1".into(),
             track: vjc_model::Track::new(vjc_model::BlendMode::Normal),

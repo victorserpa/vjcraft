@@ -279,6 +279,7 @@ mod tests {
         let d = tmp("legacyfx");
         let mut p = Project::new("T");
         let e = vjc_model::Effect {
+            blend: Default::default(),
             id: Default::default(),
             kind: "x".into(),
             bypass: false,
@@ -508,6 +509,8 @@ mod tests {
         g.speed = 2.0;
         // A group needs a member to survive opening.
         p.composition.layers.push(vjc_model::Layer {
+            color: None,
+            folded: false,
             id: uuid::Uuid::new_v4(),
             name: "L".into(),
             track: vjc_model::Track::new(vjc_model::BlendMode::Normal),

@@ -189,6 +189,11 @@ impl State {
                             }
                         });
                         help(ui, "Clip triggers and beat loops wait for the next beat or bar.");
+                        ui.horizontal(|ui| {
+                            ui.label("Tempo nudge range");
+                            field_int(ui, &mut p.control.nudge_percent, 1..=50, "", " %");
+                        });
+                        help(ui, "How much the nudge buttons speed up or slow down the tempo while held.");
                     }
                     PrefsTab::Midi => {
                         let (ins, outs) = self.midi_ports.get_or_insert_with(|| {
@@ -223,6 +228,15 @@ impl State {
                             self.midi_ports = None;
                         }
                         help(ui, "Disabled inputs are ignored; disabled outputs get no LED feedback.");
+                        ui.horizontal(|ui| {
+                            ui.label("Middle C (note 60) is");
+                            for m in [vjc_io::prefs::MiddleC::C3, vjc_io::prefs::MiddleC::C4] {
+                                ui.selectable_value(&mut p.midi.middle_c, m, m.label());
+                            }
+                        });
+                        if btn(ui, "MIDI monitor...", Kind::Secondary).clicked() {
+                            self.midi_monitor_open = true;
+                        }
                     }
                     PrefsTab::Osc => {
                         let o = &mut p.osc;
@@ -245,6 +259,9 @@ impl State {
                             });
                         });
                         help(ui, "Addresses like /comp/layer/1/opacity; learn others in Shortcuts > Edit MIDI.");
+                        if btn(ui, "OSC monitor...", Kind::Secondary).clicked() {
+                            self.osc_monitor_open = true;
+                        }
                     }
                     PrefsTab::Dmx => {
                         let d = &mut p.dmx;

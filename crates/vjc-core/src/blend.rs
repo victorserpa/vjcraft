@@ -70,6 +70,52 @@ pub fn effective_blend(layer: &BlendMode, clip_override: Option<&BlendMode>) -> 
     clip_override.unwrap_or(layer).clone()
 }
 
+/// Blend modes an effect can mix its output with over its input (index = shader id; 0 =
+/// Normal, a plain crossfade).
+pub const FX_MIX_MODES: [BlendMode; 13] = [
+    BlendMode::Normal,
+    BlendMode::Add,
+    BlendMode::Multiply,
+    BlendMode::Screen,
+    BlendMode::Overlay,
+    BlendMode::Difference,
+    BlendMode::Darken,
+    BlendMode::Lighten,
+    BlendMode::Subtract,
+    BlendMode::Exclusion,
+    BlendMode::HardLight,
+    BlendMode::Dodge,
+    BlendMode::Burn,
+];
+
+/// Shader id of an effect's mix blend; modes outside `FX_MIX_MODES` act as Normal.
+pub fn fx_mix_id(mode: &BlendMode) -> u32 {
+    FX_MIX_MODES.iter().position(|m| m == mode).unwrap_or(0) as u32
+}
+
+/// CPU twin of the effect mix shader for one pixel: `dry` is the effect input, `wet` its
+/// output, `opacity` the dry/wet amount.
+pub fn fx_mix_pixel(mode: &BlendMode, dry: [f32; 4], wet: [f32; 4], opacity: f32) -> [f32; 4] {
+    let id = fx_mix_id(mode);
+    let t = opacity.clamp(0.0, 1.0);
+    let blended = if id == 0 {
+        [wet[0], wet[1], wet[2]]
+    } else {
+        // Same formulas as `color_mode`, which the layer blend uses for these modes.
+        color_mode(
+            shader_id(mode),
+            [dry[0], dry[1], dry[2]],
+            [wet[0], wet[1], wet[2]],
+        )
+    };
+    let mut o = [0.0; 4];
+    for i in 0..3 {
+        o[i] = dry[i] + (blended[i] - dry[i]) * t;
+    }
+    o[3] = dry[3] + (wet[3] - dry[3]) * t;
+    o
+}
+
 pub fn shader_id(mode: &BlendMode) -> u32 {
     COMPOSITION_MODES
         .iter()
@@ -277,6 +323,19 @@ mod tests {
 
     const B: [f32; 4] = [0.8, 0.5, 0.2, 1.0];
     const S: [f32; 4] = [0.4, 0.5, 0.9, 1.0];
+
+    #[test]
+    fn fx_mix_normal_is_a_crossfade_and_multiply_differs() {
+        let (d, w) = ([0.8, 0.5, 0.2, 1.0], [0.4, 0.5, 0.9, 1.0]);
+        assert_eq!(fx_mix_pixel(&BlendMode::Normal, d, w, 1.0), w);
+        assert_eq!(fx_mix_pixel(&BlendMode::Normal, d, w, 0.0), d);
+        let half = fx_mix_pixel(&BlendMode::Normal, d, w, 0.5);
+        assert!((half[0] - 0.6).abs() < 1e-6);
+        let m = fx_mix_pixel(&BlendMode::Multiply, d, w, 1.0);
+        assert!((m[0] - 0.32).abs() < 1e-5 && (m[2] - 0.18).abs() < 1e-5);
+        // Every listed mode is distinct from Normal's id.
+        assert!(FX_MIX_MODES[1..].iter().all(|m| fx_mix_id(m) != 0));
+    }
 
     #[test]
     fn clip_override_wins_over_layer_blend() {

@@ -239,6 +239,8 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
             effects_imported += track.effects.len();
         }
         comp.layers.push(Layer {
+            color: None,
+            folded: false,
             id,
             name: param_text(l, "Name").unwrap_or_else(|| format!("Layer {}", idx + 1)),
             track,
@@ -282,6 +284,7 @@ pub fn import_str(xml: &str) -> Result<Import, AvcError> {
     });
     comp.columns = (0..ncols)
         .map(|i| Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id: Uuid::new_v4(),
@@ -630,6 +633,7 @@ fn import_audio_track(
             continue;
         };
         let mut fx = Effect {
+            blend: Default::default(),
             id: Uuid::new_v4(),
             kind: kind.into(),
             bypass: false,
@@ -869,6 +873,7 @@ fn import_clip(c: &Node, warnings: &mut Warns) -> Option<Clip> {
     }
     let transport = import_transport(c, warnings);
     Some(Clip {
+        extras: Default::default(),
         id: Uuid::new_v4(),
         name,
         source,

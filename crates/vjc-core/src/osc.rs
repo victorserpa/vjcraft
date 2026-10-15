@@ -282,6 +282,8 @@ mod tests {
 
     fn layer() -> vjc_model::Layer {
         vjc_model::Layer {
+            color: None,
+            folded: false,
             id: uuid::Uuid::new_v4(),
             name: "L".into(),
             track: vjc_model::Track::new(vjc_model::BlendMode::Normal),

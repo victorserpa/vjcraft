@@ -2648,6 +2648,7 @@ fn effect_preset_loads_onto_another_instance_and_undoes() {
     let dir = presets_tmp("fxp");
     let mut h = precise_slice_setup();
     let mk = |v: f64| vjc_model::Effect {
+        blend: Default::default(),
         id: uuid::Uuid::new_v4(),
         kind: "blur".into(),
         bypass: false,
@@ -3070,6 +3071,7 @@ fn col_sel_is_cleared_when_its_column_goes_or_the_deck_changes() {
     let extra = Uuid::new_v4();
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id: extra,
@@ -3084,6 +3086,7 @@ fn col_sel_is_cleared_when_its_column_goes_or_the_deck_changes() {
     st.col_sel = Some(0);
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id: extra,
@@ -3429,6 +3432,7 @@ fn dirty_project_autosaves_a_recoverable_file_after_the_interval() {
     assert!(!file.exists(), "clean project writes nothing");
     st.exec(Command::AddColumn {
         column: vjc_model::Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id: Uuid::new_v4(),
@@ -6342,4 +6346,170 @@ fn deleted_shortcut_stops_firing() {
     assert_eq!(air_of(&h, top), Some((deck, 2)), "control still fires");
     key(&mut h, egui::Key::W);
     assert_eq!(air_of(&h, top), Some((deck, 2)), "deleted row stays silent");
+}
+
+// Wave J: colours, clip extras, paste effects, folds, nudge range, monitors, snapshots.
+fn clip_extras(h: &Harness<'_, State>, lid: LayerId, col: u32) -> vjc_model::ClipExtras {
+    let deck = h.state().project.composition.current_deck;
+    vjc_core::clip_in(&h.state().project, deck, lid, col)
+        .unwrap()
+        .extras
+        .clone()
+}
+
+#[test]
+fn clip_menu_strip_toggles_and_color_are_undoable() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Strip audio");
+    assert!(clip_extras(&h, lid, 1).strip_audio);
+    assert!(!clip_extras(&h, lid, 1).strip_video);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert!(!clip_extras(&h, lid, 1).strip_audio);
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Color \u{23f5}");
+    click(&mut h, "Colour 3");
+    assert_eq!(clip_extras(&h, lid, 1).color, Some(3));
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(clip_extras(&h, lid, 1).color, None);
+}
+
+#[test]
+fn copy_and_paste_effects_between_clips() {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let fx_id = vjc_fx::BUILTIN[0].0;
+    h.state_mut().exec(Command::AddEffect {
+        target: vjc_core::effects::EffectTarget::Clip {
+            deck,
+            layer: lid,
+            column: 1,
+        },
+        effect: vjc_fx::new_effect(fx_id).unwrap(),
+        index: usize::MAX,
+    });
+    let (_, _) = (lid, 0);
+    // Second clip to paste into.
+    let (gen_id, _) = vjc_fx::GENERATORS[1];
+    let (_, pos) = cell_center(&h, 0, 2);
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    right_click_cell(&mut h, 0, 1);
+    click(&mut h, "Copy effects");
+    right_click_cell(&mut h, 0, 2);
+    click(&mut h, "Paste effects");
+    let chain = |h: &Harness<'_, State>, col| {
+        vjc_core::clip_in(&h.state().project, deck, lid, col)
+            .unwrap()
+            .track
+            .effects
+            .clone()
+    };
+    assert_eq!(chain(&h, 2).len(), 1);
+    assert_eq!(chain(&h, 2)[0].kind, fx_id);
+    assert_ne!(chain(&h, 2)[0].id, chain(&h, 1)[0].id, "fresh ids");
+    h.state_mut().undo();
+    settle(&mut h);
+    assert!(chain(&h, 2).is_empty(), "paste undone");
+}
+
+#[test]
+fn layer_fold_hides_the_cells_and_unfolds() {
+    let mut h = app();
+    let lid = h.state().project.composition.layers[0].id;
+    assert!(exists(&h, "Trigger column 1"));
+    let before = h.query_all_by_role(egui::accesskit::Role::Button).count();
+    h.state_mut().exec(Command::SetLayerFolded {
+        layer: lid,
+        folded: true,
+    });
+    settle(&mut h);
+    let name = h.state().project.composition.layers[0].name.clone();
+    assert!(exists(&h, &format!("Unfold layer {name}")));
+    assert!(h.query_all_by_role(egui::accesskit::Role::Button).count() < before + 1);
+    click(&mut h, &format!("Unfold layer {name}"));
+    assert!(!h.state().project.composition.layers[0].folded);
+}
+
+#[test]
+fn nudge_range_pref_drives_the_clock() {
+    let mut h = app();
+    h.state_mut().prefs.control.nudge_percent = 30;
+    settle(&mut h);
+    assert!((h.state().clock.nudge_rate() - 0.3).abs() < 1e-9);
+    h.state_mut().prefs.control.nudge_percent = 999;
+    settle(&mut h);
+    assert!((h.state().clock.nudge_rate() - 0.5).abs() < 1e-9, "clamped");
+}
+
+#[test]
+fn monitors_log_incoming_messages_with_middle_c_naming() {
+    let mut h = app();
+    let (midi, midi_tx) = midi_io::Midi::idle_fed();
+    let (osc, osc_tx) = osc_io::Osc::idle_fed();
+    h.state_mut().midi = midi;
+    h.state_mut().osc = osc;
+    midi_tx
+        .send(midi_io::In::Msg(
+            "pad".into(),
+            vec![0x90, 60, 100],
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+    osc_tx
+        .send(vjc_core::osc::Event {
+            address: "/comp/master/opacity".into(),
+            value: Some(0.25),
+        })
+        .unwrap();
+    h.state_mut().midi_pump();
+    h.state_mut().osc_pump();
+    h.state_mut().midi_monitor_open = true;
+    h.state_mut().osc_monitor_open = true;
+    settle(&mut h);
+    assert!(
+        h.query_all_by_label_contains("Note on C3 (60)")
+            .next()
+            .is_some()
+    );
+    assert!(
+        h.query_all_by_label_contains("/comp/master/opacity  0.250")
+            .next()
+            .is_some()
+    );
+    h.state_mut().prefs.midi.middle_c = vjc_io::prefs::MiddleC::C4;
+    h.state_mut().midi_log.clear();
+    midi_tx
+        .send(midi_io::In::Msg(
+            "pad".into(),
+            vec![0x90, 60, 100],
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+    h.state_mut().midi_pump();
+    settle(&mut h);
+    assert!(
+        h.query_all_by_label_contains("Note on C4 (60)")
+            .next()
+            .is_some()
+    );
+}
+
+#[test]
+fn snapshot_writes_a_png_into_the_chosen_folder() {
+    let mut h = app();
+    let dir = std::env::temp_dir().join(format!("vjc-ui-snap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    h.state_mut().prefs.general.snapshot_folder = Some(dir.clone());
+    h.state_mut()
+        .write_snapshot("Clip A", Some((2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255])));
+    let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+    assert_eq!(files.len(), 1);
+    assert!(h.state().status.starts_with("Snapshot saved"));
+    h.state_mut().write_snapshot("Clip A", None);
+    assert!(h.state().status.contains("nothing to capture"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

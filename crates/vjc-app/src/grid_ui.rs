@@ -356,6 +356,7 @@ pub fn composition_header(
     {
         cmds.push(Command::AddColumn {
             column: vjc_model::Column {
+                color: None,
                 autopilot: Default::default(),
                 beat_snap: None,
                 id: uuid::Uuid::new_v4(),

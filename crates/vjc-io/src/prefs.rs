@@ -27,6 +27,8 @@ pub struct General {
     pub browser_grid: bool,
     /// Folder the output recorder writes into; `None` = `~/Movies/VJCraft`.
     pub record_folder: Option<PathBuf>,
+    /// Folder snapshot PNGs are saved into; `None` = ask on the first snapshot.
+    pub snapshot_folder: Option<PathBuf>,
     /// Ask before quitting even when the project has no unsaved changes.
     pub confirm_quit: bool,
     /// Blend mode of layers added from the toolbar.
@@ -90,6 +92,7 @@ impl Default for General {
             favorites: vec![],
             browser_grid: false,
             record_folder: None,
+            snapshot_folder: None,
             confirm_quit: false,
             default_blend: vjc_model::BlendMode::Normal,
         }
@@ -134,6 +137,8 @@ pub struct Control {
     pub offer_shortcuts: bool,
     /// Quantizes clip triggers and beat-loop starts to the tempo clock.
     pub beat_snap: vjc_model::BeatSnap,
+    /// Tempo nudge: speed change while the nudge buttons are held, in percent (1..=50).
+    pub nudge_percent: u32,
 }
 
 impl Default for Control {
@@ -142,6 +147,7 @@ impl Default for Control {
             default_shortcuts: true,
             offer_shortcuts: true,
             beat_snap: vjc_model::BeatSnap::Off,
+            nudge_percent: 10,
         }
     }
 }
@@ -153,6 +159,41 @@ impl Default for Control {
 pub struct Midi {
     pub disabled_inputs: Vec<String>,
     pub disabled_outputs: Vec<String>,
+    /// Which octave number note 60 gets in note names.
+    pub middle_c: MiddleC,
+}
+
+/// Naming of MIDI notes: note 60 is "C3" (Ableton, Arena) or "C4" (scientific pitch).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MiddleC {
+    #[default]
+    C3,
+    C4,
+}
+
+impl MiddleC {
+    pub fn label(self) -> &'static str {
+        match self {
+            MiddleC::C3 => "C3",
+            MiddleC::C4 => "C4",
+        }
+    }
+
+    /// "C#3" style name of a MIDI note under this convention.
+    pub fn note_name(self, note: u8) -> String {
+        const NAMES: [&str; 12] = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let base = match self {
+            MiddleC::C3 => 2,
+            MiddleC::C4 => 1,
+        };
+        format!(
+            "{}{}",
+            NAMES[usize::from(note % 12)],
+            i32::from(note / 12) - base
+        )
+    }
 }
 
 impl Midi {
@@ -784,6 +825,33 @@ mod tests {
         std::fs::remove_file(&f).ok();
         assert_eq!(back.general.favorites, ["fx:Blur"]);
         assert!(back.general.browser_grid);
+    }
+
+    #[test]
+    fn nudge_snapshot_and_middle_c_default_and_roundtrip() {
+        use super::{MiddleC, Prefs};
+        let (old, _) = Prefs::from_json(r#"{"control":{"default_shortcuts":false}}"#);
+        assert_eq!(old.control.nudge_percent, 10);
+        assert_eq!(old.midi.middle_c, MiddleC::C3);
+        assert_eq!(old.general.snapshot_folder, None);
+        let mut p = Prefs::default();
+        p.control.nudge_percent = 25;
+        p.midi.middle_c = MiddleC::C4;
+        p.general.snapshot_folder = Some("/tmp/x".into());
+        let back = Prefs::from_json(&serde_json::to_string(&p).unwrap()).0;
+        assert_eq!(back.control.nudge_percent, 25);
+        assert_eq!(back.midi.middle_c, MiddleC::C4);
+        assert_eq!(back.general.snapshot_folder, Some("/tmp/x".into()));
+    }
+
+    #[test]
+    fn middle_c_names_notes_in_both_conventions() {
+        use super::MiddleC;
+        assert_eq!(MiddleC::C3.note_name(60), "C3");
+        assert_eq!(MiddleC::C4.note_name(60), "C4");
+        assert_eq!(MiddleC::C3.note_name(61), "C#3");
+        assert_eq!(MiddleC::C3.note_name(0), "C-2");
+        assert_eq!(MiddleC::C4.note_name(127), "G9");
     }
 
     #[test]

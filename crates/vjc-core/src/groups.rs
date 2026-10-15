@@ -45,7 +45,11 @@ pub fn trigger_column_commands(
     members(p, id)
         .into_iter()
         .map(|i| &p.composition.layers[i])
-        .filter(|l| !l.ignore_column_trigger && !l.lock_content)
+        .filter(|l| {
+            let own =
+                crate::clip_in(p, deck, l.id, column).and_then(|k| k.extras.ignore_column_trigger);
+            !own.unwrap_or(l.ignore_column_trigger) && !l.lock_content
+        })
         .map(|l| {
             if crate::clip_in(p, deck, l.id, column).is_some() {
                 Command::TriggerClip {
@@ -214,6 +218,8 @@ mod tests {
 
     fn layer(name: &str) -> Layer {
         Layer {
+            color: None,
+            folded: false,
             id: Uuid::new_v4(),
             name: name.into(),
             track: Track::new(BlendMode::Normal),
@@ -590,6 +596,7 @@ mod tests {
         assert!(shortcuts::is_continuous("/comp/group/2/speed"));
         // Effect chain on the group.
         let fx = vjc_model::Effect {
+            blend: Default::default(),
             id: Uuid::new_v4(),
             kind: "invert".into(),
             bypass: false,

@@ -38,6 +38,50 @@ pub fn next_clip(mode: AutopilotMode, current: u32, playable: &[bool], rand: u64
     }
 }
 
+/// Like `next_clip`, with the layer autopilot's random kind and loop switch. Random reuses
+/// the composition autopilot's `pick` over the playable columns; `bag` is the layer's shuffle
+/// state. Next/Previous stop at the ends when `loop` is off.
+pub fn next_clip_ap(
+    ap: &vjc_model::Autopilot,
+    current: u32,
+    playable: &[bool],
+    rand: u64,
+    bag: &mut Vec<u32>,
+) -> Option<u32> {
+    match ap.mode {
+        AutopilotMode::Random => {
+            let cols: Vec<u32> = (0..playable.len() as u32)
+                .filter(|&i| playable[i as usize])
+                .collect();
+            let cur = cols
+                .iter()
+                .position(|&c| c == current)
+                .unwrap_or(cols.len()) as u32;
+            // Bag holds compact indices; keep it consistent with the playable list.
+            crate::comp_autopilot::pick(
+                vjc_model::ColumnTarget::Random,
+                ap.random,
+                true,
+                cur,
+                cols.len() as u32,
+                bag,
+                rand,
+            )
+            .and_then(|i| cols.get(i as usize).copied())
+        }
+        AutopilotMode::Next | AutopilotMode::Previous if !ap.looping => {
+            let r = next_clip(ap.mode, current, playable, rand)?;
+            let wrapped = if ap.mode == AutopilotMode::Next {
+                r <= current
+            } else {
+                r >= current
+            };
+            (!wrapped).then_some(r)
+        }
+        mode => next_clip(mode, current, playable, rand),
+    }
+}
+
 /// Time a clip has been running, for the beat/second autopilot units.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Elapsed {
@@ -504,6 +548,8 @@ mod tests {
     fn timed_autopilot_is_due_by_seconds_or_beats_only_for_its_unit() {
         use vjc_model::{Autopilot, AutopilotUnit};
         let ap = |unit, every| Autopilot {
+            looping: true,
+            random: vjc_model::RandomKind::Other,
             mode: AutopilotMode::Next,
             every_loops: 1,
             unit,
@@ -617,5 +663,61 @@ mod gen_bar_tests {
         assert_eq!(a, (7, 0));
         assert_eq!(gen_bars(Some(a), 7), (7, 0));
         assert_eq!(gen_bars(Some(a), 8), (8, 1));
+    }
+}
+
+#[cfg(test)]
+mod ap_tests {
+    use super::*;
+    use vjc_model::{Autopilot, RandomKind};
+
+    fn ap(mode: AutopilotMode) -> Autopilot {
+        Autopilot {
+            mode,
+            ..Autopilot::default()
+        }
+    }
+
+    #[test]
+    fn loop_off_stops_at_the_ends() {
+        let mut a = ap(AutopilotMode::Next);
+        a.looping = false;
+        let pl = [true, true, true];
+        let mut bag = vec![];
+        assert_eq!(next_clip_ap(&a, 1, &pl, 0, &mut bag), Some(2));
+        assert_eq!(next_clip_ap(&a, 2, &pl, 0, &mut bag), None);
+        a.looping = true;
+        assert_eq!(next_clip_ap(&a, 2, &pl, 0, &mut bag), Some(0));
+        let mut b = ap(AutopilotMode::Previous);
+        b.looping = false;
+        assert_eq!(next_clip_ap(&b, 0, &pl, 0, &mut bag), None);
+    }
+
+    #[test]
+    fn random_bag_plays_every_playable_clip_before_repeating() {
+        let mut a = ap(AutopilotMode::Random);
+        a.random = RandomKind::Bag;
+        let pl = [true, false, true, true];
+        let mut bag = vec![];
+        let mut cur = 0;
+        let mut seen = vec![];
+        for r in 0..2u64 {
+            cur = next_clip_ap(&a, cur, &pl, r + 7, &mut bag).unwrap();
+            assert!(pl[cur as usize]);
+            seen.push(cur);
+        }
+        seen.sort();
+        assert_eq!(seen, vec![2, 3]);
+    }
+
+    #[test]
+    fn random_any_may_repeat_and_other_never_does() {
+        let pl = [true, true];
+        let mut bag = vec![];
+        let mut a = ap(AutopilotMode::Random);
+        a.random = RandomKind::Other;
+        assert_eq!(next_clip_ap(&a, 0, &pl, 5, &mut bag), Some(1));
+        a.random = RandomKind::Any;
+        assert_eq!(next_clip_ap(&a, 0, &pl, 4, &mut bag), Some(0));
     }
 }

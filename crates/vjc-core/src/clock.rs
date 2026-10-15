@@ -13,8 +13,10 @@ pub const MAX_BPM: f64 = 999.0;
 pub const TAP_RESET: Duration = Duration::from_secs(2);
 /// Intervals averaged by `tap` (so up to 5 taps are remembered).
 const TAP_INTERVALS: usize = 4;
-/// Speed change while nudging (10 %).
+/// Default speed change while nudging (10 %); Preferences set the range per clock.
 pub const NUDGE_RATE: f64 = 0.1;
+/// Allowed nudge range: 1 % to 50 %.
+pub const NUDGE_RANGE: (f64, f64) = (0.01, 0.5);
 
 #[derive(Debug, Clone)]
 pub struct Clock {
@@ -23,6 +25,8 @@ pub struct Clock {
     anchor_phase: f64,
     anchor: Instant,
     nudge: i8,
+    /// Speed change while nudging (fraction of the tempo).
+    nudge_rate: f64,
     /// Phase is frozen at `anchor_phase` (Pause/Stop).
     paused: bool,
     taps: VecDeque<Instant>,
@@ -37,6 +41,7 @@ impl Clock {
             anchor_phase: 0.0,
             anchor: now,
             nudge: 0,
+            nudge_rate: NUDGE_RATE,
             paused: false,
             taps: VecDeque::new(),
             last_beat: -1,
@@ -48,7 +53,7 @@ impl Clock {
     }
 
     fn beats_per_sec(&self) -> f64 {
-        self.bpm / 60.0 * (1.0 + NUDGE_RATE * f64::from(self.nudge))
+        self.bpm / 60.0 * (1.0 + self.nudge_rate * f64::from(self.nudge))
     }
 
     /// Phase in beats at `now` (never before the anchor).
@@ -127,6 +132,17 @@ impl Clock {
         let span = now.saturating_duration_since(self.taps[0]).as_secs_f64();
         let mean = span / (self.taps.len() - 1) as f64;
         (mean > 0.0).then(|| (60.0 / mean).clamp(MIN_BPM, MAX_BPM))
+    }
+
+    /// Nudge range as a fraction of the tempo, clamped to `NUDGE_RANGE`. Keeps the phase.
+    pub fn set_nudge_rate(&mut self, rate: f64, now: Instant) {
+        let rate = if rate.is_finite() { rate } else { NUDGE_RATE };
+        self.reanchor(now);
+        self.nudge_rate = rate.clamp(NUDGE_RANGE.0, NUDGE_RANGE.1);
+    }
+
+    pub fn nudge_rate(&self) -> f64 {
+        self.nudge_rate
     }
 
     /// `dir` is -1, 0 or +1: runs slower/normal/faster until changed.
@@ -344,7 +360,7 @@ impl LinkSync {
         }
         if let Some(prev) = self.last_update {
             let dt = now.saturating_duration_since(prev).as_secs_f64();
-            self.offset += f64::from(self.nudge) * NUDGE_RATE * eff / 60.0 * dt;
+            self.offset += f64::from(self.nudge) * clock.nudge_rate() * eff / 60.0 * dt;
         }
         self.last_update = Some(now);
         self.last_beat = s.beat;
@@ -555,6 +571,23 @@ mod tests {
         assert!((c.phase(ms(t0, 2000)) - 4.2).abs() < 1e-9);
         c.nudge(-1, ms(t0, 2000));
         assert!((c.phase(ms(t0, 3000)) - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nudge_rate_is_configurable_clamped_and_keeps_the_phase() {
+        let t0 = Instant::now();
+        let mut c = Clock::new(120.0, t0);
+        c.set_nudge_rate(0.25, t0);
+        c.nudge(1, t0);
+        assert!((c.phase(ms(t0, 1000)) - 2.5).abs() < 1e-9);
+        // Changing the rate mid-nudge does not jump the phase.
+        let before = c.phase(ms(t0, 1000));
+        c.set_nudge_rate(0.05, ms(t0, 1000));
+        assert!((c.phase(ms(t0, 1000)) - before).abs() < 1e-9);
+        c.set_nudge_rate(9.0, ms(t0, 1000));
+        assert_eq!(c.nudge_rate(), NUDGE_RANGE.1);
+        c.set_nudge_rate(f64::NAN, ms(t0, 1000));
+        assert_eq!(c.nudge_rate(), NUDGE_RATE);
     }
 
     struct Fake {

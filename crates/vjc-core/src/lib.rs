@@ -22,6 +22,8 @@ pub mod slice_geom;
 pub mod timecode;
 pub mod transform;
 pub mod transition;
+#[cfg(test)]
+mod wave_j_tests;
 
 pub use effects::EffectTarget;
 use std::path::PathBuf;
@@ -35,6 +37,18 @@ use vjc_model::{
 
 /// Continuous commands on the same target within this window merge into one undo step.
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(500);
+
+/// What a palette colour is set on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorTarget {
+    Layer(LayerId),
+    Column(uuid::Uuid),
+    Clip {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -509,6 +523,43 @@ pub enum Command {
         layer: LayerId,
         column: ColumnIdx,
         snap: Option<vjc_model::BeatSnap>,
+    },
+    /// Free-text description of the composition. Undoable.
+    SetCompDescription {
+        text: String,
+    },
+    /// Palette colour (1..=PALETTE_LEN, None = none) of a layer, column or clip. Undoable.
+    SetColor {
+        target: ColorTarget,
+        color: Option<u8>,
+    },
+    /// Per-clip extras: colour, ignore-column / fader-start overrides, strip toggles. Undoable.
+    SetClipExtras {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        extras: vjc_model::ClipExtras,
+    },
+    /// Replaces a whole effect chain (paste effects). Undoable.
+    ReplaceEffects {
+        target: effects::EffectTarget,
+        effects: Vec<vjc_model::Effect>,
+    },
+    /// Blend mode of one effect's mix over its input. Undoable.
+    SetEffectBlend {
+        target: effects::EffectTarget,
+        effect: EffectId,
+        blend: vjc_model::BlendMode,
+    },
+    /// Collapses a layer in the grid. Undoable.
+    SetLayerFolded {
+        layer: LayerId,
+        folded: bool,
+    },
+    /// Collapses a layer group in the grid. Undoable.
+    SetGroupFolded {
+        group: GroupId,
+        folded: bool,
     },
     /// Clip target of the composition. Undoable.
     SetCompClipTarget {
@@ -1364,6 +1415,7 @@ pub fn clip_from_path(path: PathBuf) -> Clip {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     Clip {
+        extras: Default::default(),
         id: Uuid::new_v4(),
         name,
         source: Source::File { path },
@@ -1765,12 +1817,10 @@ fn trigger_column(p: &Project, deck: DeckId, column: ColumnIdx) -> Result<Applie
     }
     deck_idx(p, deck)?;
     let mut events = vec![];
-    for l in p
-        .composition
-        .layers
-        .iter()
-        .filter(|l| !l.ignore_column_trigger && !l.lock_content)
-    {
+    for l in p.composition.layers.iter().filter(|l| {
+        let own = clip_in(p, deck, l.id, column).and_then(|k| k.extras.ignore_column_trigger);
+        !own.unwrap_or(l.ignore_column_trigger) && !l.lock_content
+    }) {
         match trigger_event(p, deck, l.id, column) {
             Ok(e) => events.push(e),
             Err(Error::NoClip) => events.push(Event::LayerCleared { layer: l.id }),
@@ -1820,7 +1870,15 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             .layers
             .iter()
             .find(|l| l.id == *layer)
-            .filter(|l| l.fader_start && !l.lock_content)
+            .filter(|l| {
+                !l.lock_content
+                    && (l.fader_start
+                        || p.composition.decks.iter().any(|d| {
+                            d.clips
+                                .iter()
+                                .any(|c| c.layer == l.id && c.clip.extras.fader_start == Some(true))
+                        }))
+            })
             .is_some_and(|l| number(&l.track.opacity.value) <= 0.0 && *value > 0.0)
             .then_some(*layer),
         _ => None,
@@ -3090,6 +3148,96 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.trigger_style, style);
             undoable(Command::SetCompTriggerStyle { style: prev }, vec![])
         }
+        Command::SetCompDescription { text } => {
+            let prev = std::mem::replace(&mut p.composition.description, text);
+            undoable(Command::SetCompDescription { text: prev }, vec![])
+        }
+        Command::SetColor { target, color } => {
+            if color.is_some_and(|c| c == 0 || c > vjc_model::PALETTE_LEN) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = match target {
+                ColorTarget::Layer(l) => {
+                    let i = layer_idx(p, l)?;
+                    std::mem::replace(&mut p.composition.layers[i].color, color)
+                }
+                ColorTarget::Column(id) => {
+                    let c = p
+                        .composition
+                        .columns
+                        .iter_mut()
+                        .find(|c| c.id == id)
+                        .ok_or(Error::NoColumn)?;
+                    std::mem::replace(&mut c.color, color)
+                }
+                ColorTarget::Clip {
+                    deck,
+                    layer,
+                    column,
+                } => {
+                    let k = clip_mut(p, deck, layer, column)?;
+                    std::mem::replace(&mut k.extras.color, color)
+                }
+            };
+            undoable(
+                Command::SetColor {
+                    target,
+                    color: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetClipExtras {
+            deck,
+            layer,
+            column,
+            extras,
+        } => {
+            if extras
+                .color
+                .is_some_and(|c| c == 0 || c > vjc_model::PALETTE_LEN)
+            {
+                return Err(Error::InvalidValue);
+            }
+            let k = clip_mut(p, deck, layer, column)?;
+            let prev = std::mem::replace(&mut k.extras, extras);
+            undoable(
+                Command::SetClipExtras {
+                    deck,
+                    layer,
+                    column,
+                    extras: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetLayerFolded { layer, folded } => {
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].folded, folded);
+            undoable(
+                Command::SetLayerFolded {
+                    layer,
+                    folded: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetGroupFolded { group, folded } => {
+            let g = p
+                .composition
+                .groups
+                .iter_mut()
+                .find(|g| g.id == group)
+                .ok_or(Error::NoGroup)?;
+            let prev = std::mem::replace(&mut g.folded, folded);
+            undoable(
+                Command::SetGroupFolded {
+                    group,
+                    folded: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetCompClipTarget { target } => {
             let prev = std::mem::replace(&mut p.composition.clip_target, target);
             undoable(Command::SetCompClipTarget { target: prev }, vec![])
@@ -3800,6 +3948,8 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::MoveEffect { .. }
         | Command::SetEffectBypass { .. }
         | Command::SetEffectDryWet { .. }
+        | Command::SetEffectBlend { .. }
+        | Command::ReplaceEffects { .. }
         | Command::SetEffectParam { .. }
         | Command::SetEffectParams { .. } => effects::apply(p, cmd),
         Command::CreateGroup { .. }
@@ -4178,6 +4328,8 @@ mod tests {
 
     fn layer(n: usize) -> Layer {
         Layer {
+            color: None,
+            folded: false,
             id: Uuid::new_v4(),
             name: format!("L{n}"),
             track: Track::new(BlendMode::Normal),
@@ -4209,6 +4361,7 @@ mod tests {
         let id = l.id;
         p.composition.layers.push(l);
         p.composition.columns.push(Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id: Uuid::new_v4(),
@@ -4276,6 +4429,7 @@ mod tests {
         let mut h = History::new();
         let id = Uuid::new_v4();
         p.composition.columns.push(Column {
+            color: None,
             autopilot: Default::default(),
             beat_snap: None,
             id,
@@ -5222,6 +5376,7 @@ mod tests {
             &mut p,
             Command::AddColumn {
                 column: Column {
+                    color: None,
                     autopilot: Default::default(),
                     beat_snap: None,
                     id: Uuid::new_v4(),
@@ -5857,6 +6012,7 @@ mod tests {
 
     fn fx(kind: &str) -> Effect {
         Effect {
+            blend: Default::default(),
             id: Uuid::new_v4(),
             kind: kind.into(),
             bypass: false,
@@ -6354,6 +6510,7 @@ mod tests {
         p.composition.layers.push(l2);
         for n in 2..=3 {
             p.composition.columns.push(Column {
+                color: None,
                 autopilot: Default::default(),
                 beat_snap: None,
                 id: Uuid::new_v4(),
@@ -6792,6 +6949,7 @@ mod tests {
     fn fx_project() -> (Project, EffectId, EffectId, EffectId) {
         let (mut p, l1, l2) = grid();
         let mk = |kind: &str| Effect {
+            blend: Default::default(),
             id: Uuid::new_v4(),
             kind: kind.into(),
             bypass: false,
@@ -7971,6 +8129,7 @@ mod tests {
         let (mut p, l1) = setup();
         for n in 2..=3 {
             p.composition.columns.push(Column {
+                color: None,
                 autopilot: Default::default(),
                 beat_snap: None,
                 id: Uuid::new_v4(),
@@ -8592,6 +8751,7 @@ mod tests {
         let (mut p, [l1, l2, _]) = three_layers();
         gen_cell(&mut p, l2, 0);
         let fx = vjc_model::Effect {
+            blend: Default::default(),
             id: Uuid::new_v4(),
             kind: "Invert".into(),
             bypass: false,

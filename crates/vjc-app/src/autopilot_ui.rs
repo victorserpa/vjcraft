@@ -51,6 +51,52 @@ const DURATIONS: [ColumnDuration; 6] = [
 ];
 const RANDOMS: [RandomKind; 3] = [RandomKind::Any, RandomKind::Other, RandomKind::Bag];
 
+/// Random kind and loop switch of a layer's autopilot (same options as the composition's).
+pub fn layer_extras(
+    ui: &mut egui::Ui,
+    layer: vjc_model::LayerId,
+    ap: &vjc_model::Autopilot,
+    cmds: &mut Vec<Command>,
+) {
+    use vjc_model::AutopilotMode as M;
+    if ap.mode == M::Random
+        && let Some(random) = params::combo(
+            ui,
+            ("laprk", layer),
+            "Random",
+            &ap.random,
+            &opts(&RANDOMS, random_label),
+        )
+    {
+        cmds.push(Command::SetLayerAutopilot {
+            layer,
+            autopilot: vjc_model::Autopilot {
+                random,
+                ..ap.clone()
+            },
+        });
+    }
+    if matches!(ap.mode, M::Next | M::Previous) {
+        let mut looping = ap.looping;
+        let changed = ui
+            .horizontal(|ui| {
+                params::row_label(ui, "Loop");
+                crate::widgets::toggle(ui, &mut looping, "").changed()
+            })
+            .inner;
+        if changed {
+            cmds.push(Command::SetLayerAutopilot {
+                layer,
+                autopilot: vjc_model::Autopilot {
+                    looping,
+                    ..ap.clone()
+                },
+            });
+        }
+        widgets::help(ui, "Loop off stops at the first or last clip.");
+    }
+}
+
 fn opts<T: Copy>(all: &[T], label: fn(T) -> &'static str) -> Vec<(T, String)> {
     all.iter().map(|v| (*v, label(*v).to_string())).collect()
 }

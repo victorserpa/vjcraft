@@ -25,6 +25,7 @@ pub mod audio_fx;
 pub mod capture;
 pub mod ltc_in;
 pub mod sequence;
+pub mod snapshot;
 
 /// A decoded RGBA8 frame (tightly packed, `width * 4` bytes per row).
 #[derive(Clone)]

@@ -16,7 +16,24 @@ pub const TEXT: Color32 = Color32::from_rgb(0xd6, 0xda, 0xe2);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x96, 0xa0, 0xb2);
 pub const ON_ACCENT: Color32 = Color32::from_rgb(0x10, 0x12, 0x16);
 pub const SCRIM: Color32 = Color32::from_black_alpha(140);
+/// Height of a folded layer row in the grid.
+pub const FOLDED_ROW_H: f32 = 20.0;
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x80, 0x80);
+
+/// Colour chips of layers, columns and clips (token `palette`; `Option<u8>` index 1..=6).
+pub const PALETTE: [Color32; 6] = [
+    Color32::from_rgb(0xe0, 0x6c, 0x75),
+    Color32::from_rgb(0xe6, 0xaa, 0x32),
+    Color32::from_rgb(0xe5, 0xe0, 0x7a),
+    Color32::from_rgb(0x46, 0xbe, 0x78),
+    Color32::from_rgb(0x6e, 0xaa, 0xf0),
+    Color32::from_rgb(0xc7, 0x92, 0xea),
+];
+
+/// Colour of palette index `i` (1-based); out-of-range indices have none.
+pub fn palette(i: Option<u8>) -> Option<Color32> {
+    i.and_then(|i| PALETTE.get(usize::from(i).checked_sub(1)?).copied())
+}
 
 /// Spacing scale (token `space`).
 pub const SP_1: f32 = 2.0;
@@ -399,6 +416,19 @@ mod tests {
         ] {
             assert_eq!(j["color"][name], hex(c).as_str(), "color {name}");
         }
+        let pal: Vec<&str> = j["palette"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(pal.len(), usize::from(vjc_model::PALETTE_LEN));
+        for (i, c) in PALETTE.iter().enumerate() {
+            assert_eq!(pal[i], hex(*c).as_str(), "palette {i}");
+        }
+        assert_eq!(palette(Some(1)), Some(PALETTE[0]));
+        assert_eq!(palette(Some(0)), None);
+        assert_eq!(palette(Some(7)), None);
         let l = &j["layout"];
         for (name, v) in [
             ("layer_head_w", LAYER_HEAD_W),

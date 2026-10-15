@@ -223,6 +223,7 @@ mod tests {
     fn cols(n: usize) -> Vec<Column> {
         (0..n)
             .map(|i| Column {
+                color: None,
                 id: Uuid::new_v4(),
                 name: format!("c{i}"),
                 autopilot: Default::default(),

@@ -389,6 +389,10 @@ pub struct EffectDraw {
     pub uniforms: vjc_fx::Uniforms,
     /// 1 = effect only, 0 = input only (effect skipped), between = mix(in, out, dry_wet).
     pub dry_wet: f32,
+    /// Blend of the effect output over its input (`vjc_core::blend::fx_mix_id`; 0 = Normal).
+    pub blend: u32,
+    /// LUT of a `lut3d` effect (the effect is skipped without one).
+    pub lut: Option<std::sync::Arc<vjc_fx::lut::Lut>>,
     /// Set for ML effects: the effect reads a mask produced by an ML worker and is skipped
     /// until the first one arrives.
     pub ml: Option<MlDraw>,
@@ -426,19 +430,38 @@ enum MixPlan {
     Blend(f32),
 }
 
-fn mix_plan(dry_wet: f32) -> MixPlan {
+fn mix_plan(dry_wet: f32, blend: u32) -> MixPlan {
     if dry_wet.is_nan() || dry_wet <= 0.0 {
         MixPlan::Skip
-    } else if dry_wet >= 1.0 {
+    } else if dry_wet >= 1.0 && blend == 0 {
         MixPlan::Wet
     } else {
-        MixPlan::Blend(dry_wet)
+        MixPlan::Blend(dry_wet.min(1.0))
     }
 }
 
 /// Mixes the effect input (`a`, dry) with its output (`b`, wet) by `t.x`.
 const MIX_FS: &str = r#"
 struct U { t: vec4<f32> };
+// Blend of base `b` (effect input) and source `s` (effect output), ids as
+// `vjc_core::blend::FX_MIX_MODES`.
+fn ch(m: u32, b: f32, s: f32) -> f32 {
+    switch m {
+        case 1u: { return min(b + s, 1.0); }
+        case 2u: { return b * s; }
+        case 3u: { return 1.0 - (1.0 - b) * (1.0 - s); }
+        case 4u: { if (b < 0.5) { return 2.0 * b * s; } return 1.0 - 2.0 * (1.0 - b) * (1.0 - s); }
+        case 5u: { return abs(b - s); }
+        case 6u: { return min(b, s); }
+        case 7u: { return max(b, s); }
+        case 8u: { return max(b - s, 0.0); }
+        case 9u: { return b + s - 2.0 * b * s; }
+        case 10u: { if (s < 0.5) { return 2.0 * b * s; } return 1.0 - 2.0 * (1.0 - b) * (1.0 - s); }
+        case 11u: { if (s >= 1.0) { return 1.0; } return min(b / (1.0 - s), 1.0); }
+        case 12u: { if (s <= 0.0) { return 0.0; } return 1.0 - min((1.0 - b) / s, 1.0); }
+        default: { return s; }
+    }
+}
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var dry: texture_2d<f32>;
 @group(0) @binding(2) var wet: texture_2d<f32>;
@@ -447,7 +470,14 @@ struct U { t: vec4<f32> };
 fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     // `uv` is ISF-style (y up); textures are stored top row first.
     let p = vec2(uv.x, 1.0 - uv.y);
-    return mix(textureSample(dry, samp, p), textureSample(wet, samp, p), u.t.x);
+    let d = textureSample(dry, samp, p);
+    let w = textureSample(wet, samp, p);
+    let m = u32(u.t.y + 0.5);
+    var c = w.rgb;
+    if (m != 0u) {
+        c = vec3(ch(m, d.r, w.r), ch(m, d.g, w.g), ch(m, d.b, w.b));
+    }
+    return vec4(mix(d.rgb, c, u.t.x), mix(d.a, w.a, u.t.x));
 }
 "#;
 
@@ -467,6 +497,8 @@ struct Fx {
     mix_bufs: Vec<wgpu::Buffer>,
     mix_next: usize,
     ml: MlStore,
+    /// Uploaded LUT strips by LUT identity (the `Arc` keeps the address unique).
+    luts: HashMap<usize, LutTex>,
     /// Previous output of each persistent effect instance.
     persist: PersistStore<(wgpu::Texture, wgpu::TextureView)>,
     /// Last tick each ticking persistent instance was drawn at (see `vjc_fx::tick_flag`).
@@ -483,6 +515,63 @@ struct Fx {
     pass_targets: Pool<(u32, u32, usize), (wgpu::Texture, wgpu::TextureView)>,
     /// Where a targeted pass renders before the result is copied to its buffer.
     pass_tmp: Pool<(u32, u32), (wgpu::Texture, wgpu::TextureView)>,
+}
+
+/// A LUT uploaded as a strip texture (see `vjc_fx::lut`).
+struct LutTex {
+    _lut: std::sync::Arc<vjc_fx::lut::Lut>,
+    _tex: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+/// View of the strip texture of `lut`, uploaded on first use.
+fn lut_view<'a>(
+    luts: &'a mut HashMap<usize, LutTex>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    lut: &std::sync::Arc<vjc_fx::lut::Lut>,
+) -> &'a wgpu::TextureView {
+    if luts.len() > 16 {
+        luts.clear();
+    }
+    let key = std::sync::Arc::as_ptr(lut) as usize;
+    &luts
+        .entry(key)
+        .or_insert_with(|| {
+            let (w, h, px) = lut.strip_rgba8();
+            let size = wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            };
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("lut_strip"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                tex.as_image_copy(),
+                &px,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                size,
+            );
+            let view = tex.create_view(&Default::default());
+            LutTex {
+                _lut: lut.clone(),
+                _tex: tex,
+                view,
+            }
+        })
+        .view
 }
 
 /// Key part that separates the persistent histories of the outputs (see `persist_scope`).
@@ -742,7 +831,7 @@ impl Fx {
         let size = (size.0.max(1), size.1.max(1));
         let mut cur: Option<usize> = None;
         for e in effects {
-            let plan = mix_plan(e.dry_wet);
+            let plan = mix_plan(e.dry_wet, e.blend);
             if plan == MixPlan::Skip {
                 continue;
             }
@@ -762,6 +851,14 @@ impl Fx {
                     Some(v) => Some(v),
                     None => continue,
                 },
+            };
+            let mask = match (&e.lut, mask) {
+                (Some(l), None) => Some(lut_view(&mut self.luts, device, queue, l)),
+                (None, m) if e.kind == "lut3d" => {
+                    let _ = m;
+                    continue;
+                }
+                (_, m) => m,
             };
             let scratch = self.scratch.acquire(size, || make_scratch(device, size));
             if self.bufs.len() <= self.next {
@@ -944,7 +1041,11 @@ impl Fx {
                 }
                 let mbuf = &self.mix_bufs[self.mix_next];
                 self.mix_next += 1;
-                queue.write_buffer(mbuf, 0, bytemuck::cast_slice(&[t, 0.0, 0.0, 0.0]));
+                queue.write_buffer(
+                    mbuf,
+                    0,
+                    bytemuck::cast_slice(&[t, e.blend as f32, 0.0, 0.0]),
+                );
                 let dst = (0..3).find(|&i| Some(i) != cur && i != out).unwrap_or(0);
                 let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("mix_bg"),
@@ -1491,6 +1592,7 @@ impl Compositor {
             mix_pipe,
             mix_bufs: vec![],
             mix_next: 0,
+            luts: HashMap::new(),
             persist: PersistStore::default(),
             ticks: HashMap::new(),
             persist_scope: 0,
@@ -1585,6 +1687,51 @@ impl Compositor {
     #[cfg(test)]
     pub fn evict_scratch(&mut self) -> usize {
         self.fx.scratch.clear()
+    }
+
+    /// Blocking readback of the composition output as tight RGBA8 (a one-off, for snapshots).
+    pub fn read_rgba(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let (w, h) = (self.target.width(), self.target.height());
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("snapshot"),
+            size: u64::from(row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            self.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        {
+            let data = buf.slice(..).get_mapped_range().ok()?;
+            for y in 0..h as usize {
+                out.extend_from_slice(&data[y * row as usize..][..(w * 4) as usize]);
+            }
+        }
+        buf.unmap();
+        Some((w, h, out))
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) -> bool {
@@ -2868,6 +3015,8 @@ mod tests {
         assert_eq!(idle.pool, 0);
         assert!(idle.fixed >= 2 * 8 * 8 * 4, "target and base: {idle:?}");
         let fx = EffectDraw {
+            lut: None,
+            blend: Default::default(),
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (8, 8)),
             dry_wet: 1.0,
@@ -3062,6 +3211,8 @@ mod tests {
         let mut comp = Compositor::new(&device, 1, 1);
         comp.add_effect(&device, "invert", &wgsl).unwrap();
         let fx = EffectDraw {
+            lut: None,
+            blend: Default::default(),
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet: 1.0,
@@ -3150,6 +3301,8 @@ mod tests {
             effects: vec![],
             frame: None,
             generator: Some(EffectDraw {
+                lut: None,
+                blend: Default::default(),
                 kind: "solid_color".into(),
                 uniforms: isf.pack(&params, 0.0, (1, 1)),
                 dry_wet: 1.0,
@@ -3222,6 +3375,8 @@ mod tests {
             effects: vec![],
             frame: None,
             generator: Some(EffectDraw {
+                lut: None,
+                blend: Default::default(),
                 kind: "spectrum_bars".into(),
                 uniforms: isf.pack(&isf.default_params(), 0.0, (w, h)),
                 dry_wet: 1.0,
@@ -3335,6 +3490,8 @@ mod tests {
             effects: vec![],
             frame: None,
             generator: Some(EffectDraw {
+                lut: None,
+                blend: Default::default(),
                 kind: "solid_color".into(),
                 uniforms: isf.pack(&params, 0.0, (w, h)),
                 dry_wet: 1.0,
@@ -3522,6 +3679,8 @@ mod tests {
                     continue;
                 }
                 let draw = EffectDraw {
+                    lut: None,
+                    blend: Default::default(),
                     kind: id.to_string(),
                     uniforms: isf.pack(&isf.default_params(), 0.1, (w, h)),
                     dry_wet: 1.0,
@@ -3581,12 +3740,15 @@ mod tests {
 
     #[test]
     fn mix_plan_cases() {
-        assert_eq!(mix_plan(0.0), MixPlan::Skip);
-        assert_eq!(mix_plan(-1.0), MixPlan::Skip);
-        assert_eq!(mix_plan(f32::NAN), MixPlan::Skip);
-        assert_eq!(mix_plan(1.0), MixPlan::Wet);
-        assert_eq!(mix_plan(2.0), MixPlan::Wet);
-        assert_eq!(mix_plan(0.5), MixPlan::Blend(0.5));
+        assert_eq!(mix_plan(0.0, 0), MixPlan::Skip);
+        assert_eq!(mix_plan(-1.0, 0), MixPlan::Skip);
+        assert_eq!(mix_plan(f32::NAN, 0), MixPlan::Skip);
+        assert_eq!(mix_plan(1.0, 0), MixPlan::Wet);
+        assert_eq!(mix_plan(2.0, 0), MixPlan::Wet);
+        assert_eq!(mix_plan(0.5, 0), MixPlan::Blend(0.5));
+        // A blend other than Normal needs the mix pass even at full strength.
+        assert_eq!(mix_plan(1.0, 2), MixPlan::Blend(1.0));
+        assert_eq!(mix_plan(0.0, 2), MixPlan::Skip);
     }
 
     /// Invert on a white pixel at several dry/wet values, in a two-effect chain too.
@@ -3608,6 +3770,8 @@ mod tests {
         let mut comp = Compositor::new(&device, 1, 1);
         comp.add_effect(&device, "invert", &wgsl).unwrap();
         let fx = |dry_wet| EffectDraw {
+            lut: None,
+            blend: Default::default(),
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet,
@@ -3676,6 +3840,177 @@ mod tests {
         }
     }
 
+    /// Renders a 1x1 `src` pixel through `effects` and reads it back.
+    fn render_pixel(
+        comp: &mut Compositor,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        effects: Vec<EffectDraw>,
+        src: [u8; 4],
+    ) -> Vec<u8> {
+        // A new frame version each call, so the source is uploaded again.
+        static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let version = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let layer = [LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects,
+            frame: Some((1, 1, &src, version)),
+            generator: None,
+            transition: None,
+            transform: Affine::IDENTITY,
+            channels: Default::default(),
+            mask: Default::default(),
+        }];
+        comp.render(device, queue, &layer, &[], 1.0);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            comp.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got = buf.slice(..).get_mapped_range().expect("map")[..4].to_vec();
+        buf.unmap();
+        got
+    }
+
+    /// `read_rgba` returns the tight pixels of the rendered output. Skipped without a GPU.
+    #[test]
+    fn gpu_read_rgba_returns_the_rendered_pixels() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = Compositor::new(&device, 3, 2);
+        let px: Vec<u8> = (0..3 * 2).flat_map(|i| [i * 40, 100, 200, 255]).collect();
+        let layer = [LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: vec![],
+            frame: Some((3, 2, &px, 1)),
+            generator: None,
+            transition: None,
+            transform: Affine::IDENTITY,
+            channels: Default::default(),
+            mask: Default::default(),
+        }];
+        comp.render(&device, &queue, &layer, &[], 1.0);
+        let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
+        assert_eq!((w, h, got.len()), (3, 2, 24));
+        for (g, want) in got.iter().zip(&px) {
+            assert!(g.abs_diff(*want) <= 2, "{got:?} vs {px:?}");
+        }
+    }
+
+    /// Invert on mid grey with each effect blend: matches the CPU twin. Skipped without a GPU.
+    #[test]
+    fn gpu_effect_blend_matches_cpu_twin() {
+        let Some((device, queue)) = gpu() else { return };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("invert").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.add_effect(&device, "invert", &wgsl).unwrap();
+        let src = [128u8, 128, 128, 255];
+        for mode in vjc_core::blend::FX_MIX_MODES.iter() {
+            for dry_wet in [1.0f32, 0.5] {
+                let fx = EffectDraw {
+                    lut: None,
+                    blend: vjc_core::blend::fx_mix_id(mode),
+                    kind: "invert".into(),
+                    uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
+                    dry_wet,
+                    ml: None,
+                    persistent: None,
+                    ticking: false,
+                };
+                let got = render_pixel(&mut comp, &device, &queue, vec![fx], src);
+                let d = 128.0 / 255.0;
+                let want = vjc_core::blend::fx_mix_pixel(
+                    mode,
+                    [d, d, d, 1.0],
+                    [1.0 - d, 1.0 - d, 1.0 - d, 1.0],
+                    dry_wet,
+                )[0] * 255.0;
+                assert!(
+                    (f32::from(got[0]) - want).abs() <= 3.0,
+                    "{mode:?} @{dry_wet}: got {got:?}, want {want}"
+                );
+            }
+        }
+    }
+
+    /// An identity LUT leaves colours alone; a channel-swap LUT swaps them; strength 0 is
+    /// passthrough. Skipped without a GPU.
+    #[test]
+    fn gpu_lut3d_identity_is_passthrough_and_swap_swaps() {
+        let Some((device, queue)) = gpu() else { return };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("lut3d").unwrap()).unwrap();
+        let mut comp = Compositor::new(&device, 1, 1);
+        comp.add_effect(&device, "lut3d", &wgsl).unwrap();
+        let fx = |lut: &std::sync::Arc<vjc_fx::lut::Lut>, strength: f64| {
+            let mut params = isf.default_params();
+            for p in &mut params {
+                if p.name == "strength" {
+                    p.value = vjc_model::Value::Number(strength);
+                }
+            }
+            EffectDraw {
+                blend: 0,
+                lut: Some(lut.clone()),
+                kind: "lut3d".into(),
+                uniforms: isf.pack(&params, 0.0, (1, 1)),
+                dry_wet: 1.0,
+                ml: None,
+                persistent: None,
+                ticking: false,
+            }
+        };
+        let id = std::sync::Arc::new(vjc_fx::lut::Lut::identity(17));
+        let mut swap = vjc_fx::lut::Lut::identity(17);
+        for c in &mut swap.data {
+            c.swap(0, 2);
+        }
+        let swap = std::sync::Arc::new(swap);
+        for src in [[200u8, 100, 30, 255], [0, 255, 128, 255], [17, 17, 17, 255]] {
+            let got = render_pixel(&mut comp, &device, &queue, vec![fx(&id, 1.0)], src);
+            for k in 0..3 {
+                assert!(got[k].abs_diff(src[k]) <= 3, "identity {src:?} -> {got:?}");
+            }
+            let got = render_pixel(&mut comp, &device, &queue, vec![fx(&swap, 1.0)], src);
+            assert!(
+                got[0].abs_diff(src[2]) <= 3 && got[2].abs_diff(src[0]) <= 3,
+                "swap {src:?} -> {got:?}"
+            );
+            let got = render_pixel(&mut comp, &device, &queue, vec![fx(&swap, 0.0)], src);
+            assert!(
+                got[0].abs_diff(src[0]) <= 3,
+                "strength 0 {src:?} -> {got:?}"
+            );
+        }
+    }
+
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
@@ -3712,6 +4047,8 @@ mod tests {
             let mut comp = Compositor::new(&device, 1, 1);
             comp.add_effect(&device, "trails", &wgsl).unwrap();
             let fx = EffectDraw {
+                lut: None,
+                blend: Default::default(),
                 kind: "trails".into(),
                 uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
                 dry_wet: 1.0,
@@ -3763,6 +4100,8 @@ mod tests {
         let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("trails").unwrap()).unwrap();
         let lid = uuid::Uuid::from_u128(1);
         let fx = EffectDraw {
+            lut: None,
+            blend: Default::default(),
             kind: "trails".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet: 1.0,
@@ -3886,6 +4225,8 @@ mod tests {
             params.iter_mut().find(|p| p.name == *n).unwrap().value = v.clone();
         }
         let fx = EffectDraw {
+            lut: None,
+            blend: Default::default(),
             kind: kind.into(),
             uniforms: isf.pack(&params, time, (16, 16)),
             dry_wet: 1.0,
@@ -4333,6 +4674,8 @@ mod tests {
                     blend: BlendMode::Normal,
                     fit: FitMode::Stretch,
                     effects: vec![EffectDraw {
+                        lut: None,
+                        blend: Default::default(),
                         kind: "remove_bg".into(),
                         // Default params: Transparent mode, threshold 0.5.
                         uniforms: isf.pack(&isf.default_params(), 0.0, (2, 1)),
@@ -4439,6 +4782,8 @@ mod tests {
                 blend: BlendMode::Normal,
                 fit: FitMode::Stretch,
                 effects: vec![EffectDraw {
+                    lut: None,
+                    blend: Default::default(),
                     kind: "invert".into(),
                     uniforms: isf.pack(&isf.default_params(), 0.0, (1, 4)),
                     dry_wet,
@@ -4700,6 +5045,8 @@ mod tests {
                     blend: BlendMode::Normal,
                     fit: FitMode::Stretch,
                     effects: vec![EffectDraw {
+                        lut: None,
+                        blend: Default::default(),
                         kind: "remove_bg".into(),
                         uniforms: isf.pack(&isf.default_params(), 0.0, (1, 4)),
                         dry_wet: 1.0,
@@ -4937,6 +5284,8 @@ mod tests {
         let mut comp = Compositor::new(&device, 1, 1);
         comp.add_effect(&device, "invert", &wgsl).unwrap();
         let fx = EffectDraw {
+            lut: None,
+            blend: Default::default(),
             kind: "invert".into(),
             uniforms: isf.pack(&isf.default_params(), 0.0, (1, 1)),
             dry_wet: 1.0,
@@ -5220,6 +5569,8 @@ mod tests {
                 let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(k).unwrap()).unwrap();
                 comp.add_effect(&device, k, &wgsl).unwrap();
                 EffectDraw {
+                    lut: None,
+                    blend: Default::default(),
                     kind: (*k).into(),
                     uniforms: isf.pack(&isf.default_params(), 0.0, (w, h)),
                     dry_wet: 0.7,
