@@ -441,9 +441,21 @@ pub fn frame_packets(
     seq: u8,
     black: bool,
 ) -> Vec<Vec<u8>> {
+    frame_packets_with(fixtures, start, seq, black, |f| map_pixels(f, rgba, w, h))
+}
+
+/// Like `frame_packets`, but `data` supplies each fixture's channel bytes (so a caller that
+/// already reduced the picture to the fixture grids can use `map_pixels` on those).
+pub fn frame_packets_with(
+    fixtures: &[Fixture],
+    start: u16,
+    seq: u8,
+    black: bool,
+    mut data_of: impl FnMut(&Fixture) -> Vec<u8>,
+) -> Vec<Vec<u8>> {
     let mut unis: std::collections::BTreeMap<u16, Vec<u8>> = Default::default();
     for f in fixtures {
-        let mut data = map_pixels(f, rgba, w, h);
+        let mut data = data_of(f);
         if black {
             data.fill(0);
         }

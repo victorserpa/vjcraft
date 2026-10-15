@@ -1,5 +1,6 @@
 mod api_io;
 mod artnet_out;
+mod artnet_reduce;
 mod artnet_scan;
 mod audio_react;
 mod autopilot_ui;

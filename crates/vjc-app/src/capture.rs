@@ -167,6 +167,11 @@ pub(crate) fn start_readback_into(
         },
     );
     queue.submit(Some(enc.finish()));
+    map_read(buf)
+}
+
+/// Starts the asynchronous read map of `buf` (never waits); the state settles on completion.
+pub(crate) fn map_read(buf: &wgpu::Buffer) -> MapState {
     let state: MapState = Arc::new(AtomicU8::new(PENDING));
     let flag = state.clone();
     buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {

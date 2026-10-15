@@ -8,14 +8,17 @@
 //! reads the full-size buffer directly, so there is no separate downsample pass), and owns
 //! the UDP socket. Readback buffers are pooled: the worker unmaps and returns them.
 //!
-//! Not done: shrinking the texture on the GPU before readback. The copy GPU->CPU still moves
-//! the whole screen (async, no stall); a reduce pass needs its own pipeline and was left out.
+//! GPU reduction (`artnet_reduce`): a compute pass averages each fixture's input rectangle
+//! onto its pixel grid and only that (sum of fixture pixels x 4 bytes) is read back. The
+//! whole-screen readback above stays as the fallback (no compute, too many or invalid
+//! fixtures, texture not sampleable).
 //!
 //! A sender is recreated only when the socket target (`ip`) changes; universe and fixture
 //! changes go to the running worker over a channel.
 
+use crate::artnet_reduce::{self, Reducer};
 use crate::capture::{
-    Inflight, MAX_INFLIGHT, blacken, readback_buffer, start_readback_into, unpad_into,
+    Inflight, MAX_INFLIGHT, blacken, padded_row, readback_buffer, start_readback_into, unpad_into,
 };
 use eframe::egui_wgpu::wgpu;
 use std::collections::{HashMap, VecDeque};
@@ -78,6 +81,9 @@ enum Src {
     /// Tight RGBA (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     Cpu(Vec<u8>),
+    /// Mapped buffer of GPU-reduced fixture grids (tight RGBA, `artnet_reduce::Plan` layout),
+    /// with the fixtures it was reduced for.
+    Reduced(wgpu::Buffer, Vec<Fixture>),
 }
 
 struct Frame {
@@ -159,10 +165,8 @@ struct Pub {
     worker: Option<std::thread::JoinHandle<()>>,
     err: Arc<Mutex<Option<String>>>,
     reported: bool,
-    inflight: Inflight<wgpu::Buffer>,
+    inflight: Inflight<(wgpu::Buffer, Vec<Fixture>)>,
     size: (u32, u32),
-    /// Byte size of the pooled buffers for `size`; others are dropped.
-    buf_size: Option<u64>,
     next_due: Instant,
     /// Global black-out: zeros keep going out (a processor would hold the last frame).
     black: bool,
@@ -212,11 +216,19 @@ impl Pub {
                     match got {
                         Ok(f) => {
                             let mut ready = true;
-                            if let Src::Gpu(b) = &f.src {
-                                match b.slice(..).get_mapped_range() {
+                            match &f.src {
+                                Src::Gpu(b) => match b.slice(..).get_mapped_range() {
                                     Ok(m) => unpad_into(&m, f.w, f.h, &mut scratch),
                                     Err(_) => ready = false,
-                                }
+                                },
+                                Src::Reduced(b, _) => match b.slice(..).get_mapped_range() {
+                                    Ok(m) => {
+                                        scratch.clear();
+                                        scratch.extend_from_slice(&m);
+                                    }
+                                    Err(_) => ready = false,
+                                },
+                                Src::Cpu(_) => {}
                             }
                             if f.black {
                                 match &f.src {
@@ -224,7 +236,7 @@ impl Pub {
                                         scratch.clear();
                                         scratch.extend_from_slice(v);
                                     }
-                                    Src::Gpu(_) => {}
+                                    Src::Gpu(_) | Src::Reduced(..) => {}
                                 }
                                 blacken(&mut scratch);
                             }
@@ -248,14 +260,23 @@ impl Pub {
                                     seq = dmx::next_seq(seq);
                                     // The black-out zeroes the channels too (a fixture colour
                                     // with contrast < 1 would lift black to grey).
-                                    let packets = dmx::frame_packets(
-                                        &set.fixtures,
-                                        set.universe,
-                                        rgba,
-                                        (f.w, f.h),
-                                        seq,
-                                        f.black,
-                                    );
+                                    let packets = match &f.src {
+                                        Src::Reduced(_, fx) => artnet_reduce::packets(
+                                            fx,
+                                            set.universe,
+                                            rgba,
+                                            seq,
+                                            f.black,
+                                        ),
+                                        _ => dmx::frame_packets(
+                                            &set.fixtures,
+                                            set.universe,
+                                            rgba,
+                                            (f.w, f.h),
+                                            seq,
+                                            f.black,
+                                        ),
+                                    };
                                     // Black goes out at once and drops what was still waiting.
                                     let delay = if f.black { 0 } else { set.delay_ms };
                                     if f.black {
@@ -265,7 +286,7 @@ impl Pub {
                                     held.push_back((due, packets));
                                 }
                             }
-                            if let Src::Gpu(b) = f.src {
+                            if let Src::Gpu(b) | Src::Reduced(b, _) = f.src {
                                 b.unmap();
                                 let _ = ret.send(b);
                             }
@@ -296,7 +317,6 @@ impl Pub {
             reported: false,
             inflight: Inflight::new(),
             size: (0, 0),
-            buf_size: None,
             next_due: Instant::now(),
             black: false,
         }
@@ -327,6 +347,11 @@ impl Drop for Pub {
 #[derive(Default)]
 pub struct ArtNetOut {
     pubs: HashMap<Uuid, Pub>,
+    /// GPU reducer, created on the first feed; `None` inside = no compute support.
+    reducer: Option<Option<Reducer>>,
+    /// Never reduce on the GPU (tests of the fallback).
+    #[cfg(test)]
+    cpu_only: bool,
 }
 
 impl ArtNetOut {
@@ -367,23 +392,28 @@ impl ArtNetOut {
                 p.pool.push(b);
             }
             let (w, h) = p.size;
-            for (buf, ok) in p.inflight.take_settled() {
+            for ((buf, fixtures), ok) in p.inflight.take_settled() {
                 if !ok {
                     p.pool.push(buf);
                     continue;
                 }
+                let src = if fixtures.is_empty() {
+                    Src::Gpu(buf)
+                } else {
+                    Src::Reduced(buf, fixtures)
+                };
                 let sent = match &p.tx {
                     Some(tx) => tx.try_send(Frame {
                         w,
                         h,
-                        src: Src::Gpu(buf),
+                        src,
                         black: p.black,
                     }),
                     None => continue,
                 };
                 // Worker busy: the frame is dropped, the buffer goes back to the pool.
                 if let Err(mpsc::TrySendError::Full(f) | mpsc::TrySendError::Disconnected(f)) = sent
-                    && let Src::Gpu(b) = f.src
+                    && let Src::Gpu(b) | Src::Reduced(b, _) = f.src
                 {
                     b.unmap();
                     p.pool.push(b);
@@ -426,21 +456,65 @@ impl ArtNetOut {
             return;
         }
         if p.size != size {
-            p.buf_size = None;
             p.pool.clear(); // wrong size for the new screen
             p.size = size;
         }
-        // Buffers still with the worker during a resize come back with the old size.
-        let buf = match take_matching(&mut p.pool, wgpu::Buffer::size, p.buf_size) {
-            Some(b) => b,
-            None => {
-                let b = readback_buffer(device, size, "art-net readback");
-                p.buf_size = Some(b.size());
-                b
-            }
+        #[cfg(test)]
+        let allow = !self.cpu_only;
+        #[cfg(not(test))]
+        let allow = true;
+        let reducer = if allow {
+            self.reducer
+                .get_or_insert_with(|| Reducer::new(device))
+                .as_mut()
+        } else {
+            None
         };
-        let state = start_readback_into(device, queue, tex, size, &buf);
-        p.inflight.push(buf, state);
+        let plan = reducer
+            .as_ref()
+            .filter(|_| tex.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING))
+            .and_then(|_| artnet_reduce::plan(&p.want.fixtures))
+            .filter(|pl| artnet_reduce::gpu_ok(&p.want.fixtures, pl, size, tex.format()));
+        let need = plan
+            .as_ref()
+            .map_or(u64::from(padded_row(size.0)) * u64::from(size.1), |pl| {
+                pl.bytes()
+            });
+        // Buffers still with the worker during a resize come back with another size.
+        let buf = match take_matching(&mut p.pool, wgpu::Buffer::size, Some(need)) {
+            Some(b) => b,
+            None => match &plan {
+                Some(_) => device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("art-net reduced readback"),
+                    size: need,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                None => readback_buffer(device, size, "art-net readback"),
+            },
+        };
+        match (reducer, plan) {
+            (Some(r), Some(pl)) => {
+                let fx = p.want.fixtures.clone();
+                let state = r.reduce_into(device, queue, tex, size, &fx, &pl, &buf);
+                p.inflight.push((buf, fx), state);
+            }
+            _ => {
+                let state = start_readback_into(device, queue, tex, size, &buf);
+                p.inflight.push((buf, vec![]), state);
+            }
+        }
+    }
+
+    /// Bytes the next readback of `fixtures` moves from a `size` screen, and what the whole
+    /// screen would move. Used to report the saving.
+    #[cfg(test)]
+    fn readback_bytes(fixtures: &[Fixture], size: (u32, u32)) -> (u64, u64) {
+        let full = artnet_reduce::full_bytes(size);
+        (
+            artnet_reduce::plan(fixtures).map_or(full, |p| p.bytes()),
+            full,
+        )
     }
 }
 
@@ -860,5 +934,223 @@ mod tests {
         })
         .unwrap();
         assert!(recv_dmx(&rx).data.iter().all(|&v| v == 0));
+    }
+
+    fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return None;
+        };
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// Known pattern, not smooth, so a wrong cell or flip shows.
+    fn pattern(w: u32, h: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                v.extend_from_slice(&[
+                    (x * 255 / w) as u8,
+                    (y * 255 / h) as u8,
+                    ((x * 7 + y * 13) % 256) as u8,
+                    255,
+                ]);
+            }
+        }
+        v
+    }
+
+    fn texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32) -> wgpu::Texture {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            tex.as_image_copy(),
+            &pattern(w, h),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        tex
+    }
+
+    fn fixtures_for_compare() -> Vec<Fixture> {
+        let mut a = fixture(8, 6, PixelFormat::Rgb);
+        a.flip_h = true;
+        a.serpentine = true;
+        a.gamma = 2.2;
+        let mut b = fixture(5, 4, PixelFormat::Rgbw);
+        b.start_channel = 200;
+        b.input.x = 0.4;
+        b.input.y = 0.55;
+        b.input.w = 0.5;
+        b.input.h = 0.6;
+        b.input.rotation = 30.0;
+        let mut c = fixture(7, 3, PixelFormat::W);
+        c.start_channel = 300;
+        c.color.brightness = 0.8;
+        vec![a, b, c]
+    }
+
+    #[test]
+    fn gpu_gate_sends_huge_cells_and_other_formats_to_the_cpu() {
+        use wgpu::TextureFormat::{Bgra8Unorm, Rgba8Unorm, Rgba8UnormSrgb};
+        let par = [fixture(1, 1, PixelFormat::Rgb)];
+        let p = artnet_reduce::plan(&par).unwrap();
+        // A 1x1 par on a 4K screen would average 8.3M texels on one thread.
+        assert!(!artnet_reduce::gpu_ok(&par, &p, (3840, 2160), Rgba8Unorm));
+        let wall = [fixture(168, 168, PixelFormat::Rgb)];
+        let p = artnet_reduce::plan(&wall).unwrap();
+        assert!(artnet_reduce::gpu_ok(&wall, &p, (1920, 1080), Rgba8Unorm));
+        assert!(!artnet_reduce::gpu_ok(&wall, &p, (1920, 1080), Bgra8Unorm));
+        assert!(!artnet_reduce::gpu_ok(
+            &wall,
+            &p,
+            (1920, 1080),
+            Rgba8UnormSrgb
+        ));
+    }
+
+    #[test]
+    fn gpu_reduce_matches_cpu_within_tolerance() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (w, h) = (97, 61); // awkward size: cells of different widths
+        let tex = texture(&device, &queue, w, h);
+        let fx = fixtures_for_compare();
+        let plan = artnet_reduce::plan(&fx).unwrap();
+        let mut red = Reducer::new(&device).expect("compute");
+        let dst = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: plan.bytes(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        red.reduce_into(&device, &queue, &tex, (w, h), &fx, &plan, &dst);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let bytes = dst.slice(..).get_mapped_range().unwrap().to_vec();
+        let gpu_pk = artnet_reduce::packets(&fx, 0, &bytes, 1, false);
+        let cpu_pk = dmx::frame_packets(&fx, 0, &pattern(w, h), (w, h), 1, false);
+        assert_eq!(gpu_pk.len(), cpu_pk.len());
+        let mut worst = 0u8;
+        for (g, c) in gpu_pk.iter().zip(&cpu_pk) {
+            let (Some(Packet::Dmx(g)), Some(Packet::Dmx(c))) = (decode(g), decode(c)) else {
+                panic!("not ArtDmx");
+            };
+            assert_eq!((g.universe, g.data.len()), (c.universe, c.data.len()));
+            for (a, b) in g.data.iter().zip(&c.data) {
+                worst = worst.max(a.abs_diff(*b));
+            }
+        }
+        // Box-averaged fixtures are exact up to rounding; the rotated one samples points
+        // (float rounding at a pixel edge can pick a neighbour).
+        assert!(worst <= 40, "worst diff {worst}");
+        // Negative control: the check does see differences.
+        let wrong = artnet_reduce::packets(&fx, 0, &vec![0u8; bytes.len()], 1, false);
+        assert_ne!(wrong, cpu_pk);
+        // Plain fixture alone: exact.
+        let one = &fx[2..];
+        let p1 = artnet_reduce::plan(one).unwrap();
+        let d1 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: p1.bytes(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        red.reduce_into(&device, &queue, &tex, (w, h), one, &p1, &d1);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let b1 = d1.slice(..).get_mapped_range().unwrap().to_vec();
+        assert_eq!(
+            artnet_reduce::packets(one, 0, &b1, 1, false),
+            dmx::frame_packets(one, 0, &pattern(w, h), (w, h), 1, false)
+        );
+    }
+
+    /// Feeds a real texture through `ArtNetOut` (GPU path unless `cpu_only`) until a packet
+    /// arrives.
+    fn run_feed(cpu_only: bool, black: bool) -> dmx::ArtDmx {
+        let (device, queue) = gpu().expect("gpu");
+        let (rx, addr) = local();
+        let tex = texture(&device, &queue, 64, 48);
+        let mut out = ArtNetOut {
+            cpu_only,
+            ..Default::default()
+        };
+        let mut w = want(addr, fixture(4, 3, PixelFormat::Rgb), 0);
+        w.fixtures[0].order = ChannelOrder::Rgb;
+        let id = w.id;
+        out.sync(&[w]);
+        rx.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut b = [0u8; 1024];
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            out.feed(&device, &queue, id, &tex, (64, 48), black);
+            out.poll(&device);
+            if let Ok(n) = rx.recv(&mut b)
+                && let Some(Packet::Dmx(d)) = decode(&b[..n])
+            {
+                return d;
+            }
+        }
+        panic!("no packet");
+    }
+
+    #[test]
+    fn end_to_end_gpu_and_cpu_paths_agree() {
+        if gpu().is_none() {
+            return;
+        }
+        let g = run_feed(false, false);
+        let c = run_feed(true, false);
+        assert_eq!(g.data, c.data);
+        assert!(g.data.iter().any(|&v| v != 0));
+    }
+
+    #[test]
+    fn blackout_on_the_gpu_path_is_all_zeros() {
+        if gpu().is_none() {
+            return;
+        }
+        let d = run_feed(false, true);
+        assert_eq!(d.data.len(), 36);
+        assert!(d.data.iter().all(|&v| v == 0));
+        // Control: the same texture without black-out is not zero.
+        assert!(run_feed(false, false).data.iter().any(|&v| v != 0));
+    }
+
+    #[test]
+    fn readback_bytes_before_and_after() {
+        // 1920x1080 screen, two 168x168 fixtures: before = whole screen, after = grids.
+        let fx = vec![
+            fixture(168, 168, PixelFormat::Rgb),
+            fixture(168, 168, PixelFormat::Rgb),
+        ];
+        let (after, before) = ArtNetOut::readback_bytes(&fx, (1920, 1080));
+        assert_eq!(before, 1920 * 4 * 1080); // 8_294_400
+        assert_eq!(after, 2 * 168 * 168 * 4); // 225_792
+        assert!(after * 36 < before);
     }
 }
