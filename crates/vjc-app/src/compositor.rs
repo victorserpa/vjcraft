@@ -3081,6 +3081,8 @@ mod tests {
     #[test]
     fn gpu_every_bundled_effect_and_generator_renders_visible_output() {
         const MAY_BE_DARK: &[&str] = &[];
+        /// Effects whose output on a flat frame is legitimately partly black.
+        const PARTIAL_BLACK_OK: &[&str] = &["vignette", "crt"];
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no wgpu adapter: skipped");
@@ -3165,6 +3167,23 @@ mod tests {
                     .count();
                 if lit == 0 && !MAY_BE_DARK.contains(id) {
                     bad.push(format!("{id}: output is entirely black"));
+                }
+                // Partial NaN/inf: a few exactly-black pixels among lit ones. Only checked
+                // for effects fed a flat bright frame, where the output should be smooth.
+                if !generator && lit > 0 {
+                    let flat: Vec<u8> = [150u8, 130, 180, 255].repeat((w * h) as usize);
+                    let mut l = layer;
+                    l[0].frame = Some((w, h, &flat[..], 2));
+                    comp.render(&device, &queue, &l, &[], 1.0);
+                    let d = read_target(&device, &queue, &comp);
+                    let black = d
+                        .chunks(4)
+                        .filter(|p| p[..3].iter().all(|v| *v == 0))
+                        .count();
+                    let total = d.len() / 4;
+                    if black > 0 && black * 2 < total && !PARTIAL_BLACK_OK.contains(id) {
+                        bad.push(format!("{id}: {black}/{total} pixels black (partial NaN?)"));
+                    }
                 }
             }
         }
