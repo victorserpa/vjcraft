@@ -660,15 +660,9 @@ impl Browser {
                 crate::theme::BROWSER_SEARCH_MIN_W,
                 crate::theme::BROWSER_SEARCH_MAX_W,
             );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .hint_text("Search")
-                    .desired_width(w),
-            );
+            crate::widgets::field_text_hint(ui, &mut self.query, w, "Search");
             let grid = general.browser_grid;
-            let r = ui
-                .selectable_label(grid, "Grid")
-                .on_hover_text("Grid or list view");
+            let r = crate::widgets::choice(ui, grid, "Grid").on_hover_text("Grid or list view");
             if r.clicked() {
                 general.browser_grid = !grid;
                 changed = true;
@@ -682,7 +676,7 @@ impl Browser {
         match self.tab {
             Tab::Files => {
                 ui.horizontal(|ui| {
-                    if ui.button("Up").clicked()
+                    if crate::widgets::btn(ui, "Up", crate::widgets::Kind::Secondary).clicked()
                         && let Some(p) = self.dir.parent()
                     {
                         let p = p.to_path_buf();
@@ -761,7 +755,8 @@ impl Browser {
             }
             Tab::Record => {
                 ui.horizontal(|ui| {
-                    if ui.button("Refresh").clicked() {
+                    if crate::widgets::btn(ui, "Refresh", crate::widgets::Kind::Secondary).clicked()
+                    {
                         self.rec_at = None;
                     }
                     ui.weak(self.rec_dir.display().to_string());
@@ -844,7 +839,8 @@ impl Browser {
             Tab::Files | Tab::Compositions | Tab::Record | Tab::Effects | Tab::Generators => {}
             Tab::Network => {
                 ui.horizontal(|ui| {
-                    if ui.button("Refresh").clicked() {
+                    if crate::widgets::btn(ui, "Refresh", crate::widgets::Kind::Secondary).clicked()
+                    {
                         self.net_at = None;
                     }
                     if self.net_rx.is_some() {
@@ -1052,7 +1048,7 @@ impl Browser {
                         id,
                         th,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        crate::theme::IMAGE_TINT,
                     ),
                     None => ui
                         .painter()
@@ -1067,7 +1063,7 @@ impl Browser {
                         tex,
                         th,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        crate::theme::IMAGE_TINT,
                     ),
                     None => ui
                         .painter()

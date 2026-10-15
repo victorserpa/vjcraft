@@ -160,23 +160,20 @@ pub fn param_slider_anim_step(
 /// Loop mode and direction combos; true when either changed.
 fn motion_controls(ui: &mut egui::Ui, id: egui::Id, m: &mut vjc_model::Motion) -> bool {
     let before = *m;
-    egui::ComboBox::from_id_salt(id.with("mode"))
-        .selected_text(m.mode.label())
-        .show_ui(ui, |ui| {
-            for l in vjc_model::LoopMode::ALL {
-                ui.selectable_value(&mut m.mode, l, l.label());
-            }
-        });
+    crate::widgets::combo(ui, id.with("mode"), m.mode.label(), None, |ui| {
+        for l in vjc_model::LoopMode::ALL {
+            ui.selectable_value(&mut m.mode, l, l.label());
+        }
+    });
     let back = m.direction == vjc_model::AnimDirection::Backward;
-    if ui.selectable_label(back, "Backward").clicked() {
+    if crate::widgets::choice(ui, back, "Backward").clicked() {
         m.direction = if back {
             vjc_model::AnimDirection::Forward
         } else {
             vjc_model::AnimDirection::Backward
         };
     }
-    if ui
-        .selectable_label(m.follow_clip, "Follow clip")
+    if crate::widgets::choice(ui, m.follow_clip, "Follow clip")
         .on_hover_text("Count from the clip's trigger instead of the global clock")
         .clicked()
     {
@@ -259,20 +256,18 @@ fn band_name(b: &FftBand) -> &'static str {
 }
 
 fn curve_combo(ui: &mut egui::Ui, id: egui::Id, curve: &mut Curve) {
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(format!("{curve:?}"))
-        .show_ui(ui, |ui| {
-            for c in [
-                Curve::Linear,
-                Curve::Sine,
-                Curve::Saw,
-                Curve::Square,
-                Curve::Random,
-            ] {
-                let n = format!("{c:?}");
-                ui.selectable_value(curve, c, n);
-            }
-        });
+    crate::widgets::combo(ui, id, format!("{curve:?}"), None, |ui| {
+        for c in [
+            Curve::Linear,
+            Curve::Sine,
+            Curve::Saw,
+            Curve::Square,
+            Curve::Random,
+        ] {
+            let n = format!("{c:?}");
+            ui.selectable_value(curve, c, n);
+        }
+    });
 }
 
 /// Draws one cycle of a Timeline/Beats/Envelope animation as a curve; nothing for other kinds.
@@ -419,9 +414,12 @@ fn envelope_editor(ui: &mut egui::Ui, id: egui::Id, e: EnvEdit) -> bool {
             }
         }
         let before = curves[i];
-        egui::ComboBox::from_id_salt(id.with("seg-curve"))
-            .selected_text(format!("Segment {}: {}", i + 1, before.label()))
-            .show_ui(ui, |ui| {
+        crate::widgets::combo(
+            ui,
+            id.with("seg-curve"),
+            format!("Segment {}: {}", i + 1, before.label()),
+            None,
+            |ui| {
                 for c in [
                     vjc_model::EnvCurve::Linear,
                     vjc_model::EnvCurve::Hold,
@@ -431,11 +429,12 @@ fn envelope_editor(ui: &mut egui::Ui, id: egui::Id, e: EnvEdit) -> bool {
                     vjc_model::EnvCurve::Bezier([0.42, 0.0, 0.58, 1.0]),
                 ] {
                     let on = std::mem::discriminant(&c) == std::mem::discriminant(&curves[i]);
-                    if ui.selectable_label(on, c.label()).clicked() && !on {
+                    if crate::widgets::choice(ui, on, c.label()).clicked() && !on {
                         curves[i] = c;
                     }
                 }
-            });
+            },
+        );
         changed |= curves[i] != before;
     } else {
         ui.weak("Click a point to pick its curve");
@@ -444,24 +443,28 @@ fn envelope_editor(ui: &mut egui::Ui, id: egui::Id, e: EnvEdit) -> bool {
         vjc_model::EnvUnit::Beats => "beats",
         vjc_model::EnvUnit::Seconds => "s",
     };
-    egui::ComboBox::from_id_salt(id.with("grid"))
-        .selected_text(if grid > 0.0 {
+    crate::widgets::combo(
+        ui,
+        id.with("grid"),
+        if grid > 0.0 {
             format!("Snap {grid} {unit_name}")
         } else {
             "Snap off".to_string()
-        })
-        .show_ui(ui, |ui| {
+        },
+        None,
+        |ui| {
             for g in SNAP_GRIDS {
                 let n = if g > 0.0 {
                     format!("{g} {unit_name}")
                 } else {
                     "Off".to_string()
                 };
-                if ui.selectable_label(g == grid, n).clicked() {
+                if crate::widgets::choice(ui, g == grid, n).clicked() {
                     ui.data_mut(|d| d.insert_temp(grid_id, g));
                 }
             }
-        });
+        },
+    );
     changed
 }
 
@@ -488,7 +491,7 @@ fn anim_menu(
     let mut a = cur.clone();
     let mut changed = false;
     for k in ["Off", "Timeline", "Beats", "Envelope", "Audio", "Dashboard"] {
-        if ui.selectable_label(anim_kind(cur) == k, k).clicked() && anim_kind(cur) != k {
+        if crate::widgets::choice(ui, anim_kind(cur) == k, k).clicked() && anim_kind(cur) != k {
             a = default_animation(k);
             changed = true;
         }
@@ -500,13 +503,8 @@ fn anim_menu(
             curve,
             motion,
         }) => {
-            changed |= ui
-                .add(
-                    egui::DragValue::new(duration_secs)
-                        .range(0.1..=600.0)
-                        .suffix(" s"),
-                )
-                .changed();
+            changed |=
+                crate::widgets::field_int(ui, duration_secs, 0.1..=600.0, "", " s").changed();
             changed |= motion_controls(ui, id.with("m"), motion);
             let before = curve.clone();
             curve_combo(ui, id.with("c"), curve);
@@ -525,13 +523,7 @@ fn anim_menu(
             curve,
             motion,
         }) => {
-            changed |= ui
-                .add(
-                    egui::DragValue::new(beats)
-                        .range(0.25..=64.0)
-                        .suffix(" beats"),
-                )
-                .changed();
+            changed |= crate::widgets::field_int(ui, beats, 0.25..=64.0, "", " beats").changed();
             changed |= motion_controls(ui, id.with("m"), motion);
             let before = curve.clone();
             curve_combo(ui, id.with("c"), curve);
@@ -553,26 +545,31 @@ fn anim_menu(
             unit,
         }) => {
             let before = *unit;
-            egui::ComboBox::from_id_salt(id.with("unit"))
-                .selected_text(match unit {
+            crate::widgets::combo(
+                ui,
+                id.with("unit"),
+                match unit {
                     vjc_model::EnvUnit::Beats => "Beats",
                     vjc_model::EnvUnit::Seconds => "Seconds",
-                })
-                .show_ui(ui, |ui| {
+                },
+                None,
+                |ui| {
                     ui.selectable_value(unit, vjc_model::EnvUnit::Beats, "Beats");
                     ui.selectable_value(unit, vjc_model::EnvUnit::Seconds, "Seconds");
-                });
+                },
+            );
             changed |= *unit != before;
-            changed |= ui
-                .add(
-                    egui::DragValue::new(beats)
-                        .range(0.25..=600.0)
-                        .suffix(match unit {
-                            vjc_model::EnvUnit::Beats => " beats",
-                            vjc_model::EnvUnit::Seconds => " s",
-                        }),
-                )
-                .changed();
+            changed |= crate::widgets::field_int(
+                ui,
+                beats,
+                0.25..=600.0,
+                "",
+                match unit {
+                    vjc_model::EnvUnit::Beats => " beats",
+                    vjc_model::EnvUnit::Seconds => " s",
+                },
+            )
+            .changed();
             changed |= motion_controls(ui, id.with("m"), motion);
             changed |= envelope_editor(
                 ui,
@@ -587,7 +584,9 @@ fn anim_menu(
             );
             ui.menu_button("Preset", |ui| {
                 for pre in vjc_core::anim::EnvPreset::ALL {
-                    if ui.button(pre.label()).clicked() {
+                    if crate::widgets::btn(ui, pre.label(), crate::widgets::Kind::Secondary)
+                        .clicked()
+                    {
                         *points = pre.points();
                         curves.clear();
                         changed = true;
@@ -598,12 +597,8 @@ fn anim_menu(
             let mut remove = None;
             for (i, (x, y)) in points.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.01))
-                        .changed();
-                    changed |= ui
-                        .add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.01))
-                        .changed();
+                    changed |= crate::widgets::field_drag(ui, x, 0.0..=1.0, 0.01, "", "").changed();
+                    changed |= crate::widgets::field_drag(ui, y, 0.0..=1.0, 0.01, "", "").changed();
                     if crate::icons::button(ui, crate::icons::i::X, "Remove point").clicked() {
                         remove = Some(i);
                     }
@@ -623,28 +618,17 @@ fn anim_menu(
             max,
         }) => {
             let before = *scope;
-            egui::ComboBox::from_id_salt(id.with("scope"))
-                .selected_text(scope.label())
-                .show_ui(ui, |ui| {
-                    for s in vjc_model::DialScope::ALL {
-                        ui.selectable_value(scope, s, s.label());
-                    }
-                });
+            crate::widgets::combo(ui, id.with("scope"), scope.label(), None, |ui| {
+                for s in vjc_model::DialScope::ALL {
+                    ui.selectable_value(scope, s, s.label());
+                }
+            });
             changed |= *scope != before;
             let mut n = *dial + 1;
-            changed |= ui
-                .add(egui::DragValue::new(&mut n).range(1..=8).prefix("Dial "))
-                .changed();
+            changed |= crate::widgets::field_int(ui, &mut n, 1..=8, "Dial ", "").changed();
             *dial = n - 1;
             for (v, p) in [(&mut *min, "Min "), (&mut *max, "Max ")] {
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(v)
-                            .range(0.0..=1.0)
-                            .speed(0.01)
-                            .prefix(p),
-                    )
-                    .changed();
+                changed |= crate::widgets::field_drag(ui, v, 0.0..=1.0, 0.01, p, "").changed();
             }
         }
         Some(Animation::Audio {
@@ -657,26 +641,22 @@ fn anim_menu(
             max,
         }) => {
             let before = band.clone();
-            egui::ComboBox::from_id_salt(id.with("band"))
-                .selected_text(band_name(band))
-                .show_ui(ui, |ui| {
-                    for b in [
-                        FftBand::Low,
-                        FftBand::LowMid,
-                        FftBand::Mid,
-                        FftBand::High,
-                        FftBand::Level,
-                    ] {
-                        let n = band_name(&b);
-                        ui.selectable_value(band, b, n);
-                    }
-                });
+            crate::widgets::combo(ui, id.with("band"), band_name(band), None, |ui| {
+                for b in [
+                    FftBand::Low,
+                    FftBand::LowMid,
+                    FftBand::Mid,
+                    FftBand::High,
+                    FftBand::Level,
+                ] {
+                    let n = band_name(&b);
+                    ui.selectable_value(band, b, n);
+                }
+            });
             changed |= *band != before;
             let mut f =
                 |ui: &mut egui::Ui, v: &mut f32, r: std::ops::RangeInclusive<f32>, p: &str| {
-                    changed |= ui
-                        .add(egui::DragValue::new(v).range(r).speed(0.01).prefix(p))
-                        .changed();
+                    changed |= crate::widgets::field_drag(ui, v, r, 0.01, p, "").changed();
                 };
             f(ui, gain, 0.0..=16.0, "Gain ");
             f(ui, threshold, 0.0..=1.0, "Threshold ");
@@ -868,15 +848,13 @@ pub fn combo<T: PartialEq + Clone>(
             .iter()
             .find(|(v, _)| v == current)
             .map_or("?", |(_, n)| n.as_str());
-        egui::ComboBox::from_id_salt(ui.id().with(id))
-            .selected_text(text)
-            .show_ui(ui, |ui| {
-                for (v, n) in options {
-                    if ui.selectable_label(v == current, n).clicked() {
-                        out = Some(v.clone());
-                    }
+        crate::widgets::combo(ui, ui.id().with(id), text, None, |ui| {
+            for (v, n) in options {
+                if crate::widgets::choice(ui, v == current, n).clicked() {
+                    out = Some(v.clone());
                 }
-            });
+            }
+        });
     });
     out
 }

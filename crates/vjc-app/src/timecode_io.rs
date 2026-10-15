@@ -225,14 +225,11 @@ pub fn tc_editor(
                     .custom_formatter(|v, _| format!("{v:02}")),
             )
             .changed();
-        egui::ComboBox::from_id_salt("fps")
-            .selected_text(tc.fps.label())
-            .width(70.0)
-            .show_ui(ui, |ui| {
-                for f in TcFps::ALL {
-                    changed |= ui.selectable_value(&mut tc.fps, f, f.label()).changed();
-                }
-            });
+        crate::widgets::combo(ui, "fps", tc.fps.label(), Some(70.0), |ui| {
+            for f in TcFps::ALL {
+                changed |= ui.selectable_value(&mut tc.fps, f, f.label()).changed();
+            }
+        });
     });
     if changed {
         tc.f = tc.f.min(tc.fps.nominal() as u8 - 1);

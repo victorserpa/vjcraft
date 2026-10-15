@@ -675,7 +675,7 @@ fn group_header(
             *panel_tab = PanelTab::Group;
         }
         name.context_menu(|ui| {
-            if ui.button("Ungroup").clicked() {
+            if crate::widgets::btn(ui, "Ungroup", crate::widgets::Kind::Secondary).clicked() {
                 cmds.push(Command::Ungroup { group: gid });
                 ui.close();
             }
@@ -725,19 +725,16 @@ fn group_header(
         .iter()
         .find(|(m, _)| *m == g.track.blend)
         .map_or("Normal", |(_, n)| *n);
-    egui::ComboBox::from_id_salt(("gblend", gid))
-        .selected_text(label)
-        .width(90.0)
-        .show_ui(ui, |ui| {
-            for (b, name) in vjc_core::blend::COMPOSITION_MODES {
-                if ui.selectable_label(g.track.blend == *b, *name).clicked() {
-                    cmds.push(Command::SetGroupBlend {
-                        group: gid,
-                        blend: b.clone(),
-                    });
-                }
+    crate::widgets::combo(ui, ("gblend", gid), label, Some(90.0), |ui| {
+        for (b, name) in vjc_core::blend::COMPOSITION_MODES {
+            if crate::widgets::choice(ui, g.track.blend == *b, *name).clicked() {
+                cmds.push(Command::SetGroupBlend {
+                    group: gid,
+                    blend: b.clone(),
+                });
             }
-        });
+        }
+    });
     for _ in 0..ncols.saturating_sub(2) {
         ui.label("");
     }
@@ -751,7 +748,7 @@ fn add_effect_menu(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Comma
 /// The bundled effects as menu entries; a click appends the effect to the target's chain.
 fn add_effect_list(ui: &mut egui::Ui, target: EffectTarget, cmds: &mut Vec<Command>) {
     for (id, _) in vjc_fx::BUILTIN {
-        if ui.button(fx_label(id)).clicked()
+        if crate::widgets::btn(ui, &fx_label(id), crate::widgets::Kind::Secondary).clicked()
             && let Some(effect) = vjc_fx::new_effect(id)
         {
             cmds.push(Command::AddEffect {
@@ -1090,7 +1087,7 @@ fn generator_menu(
 ) {
     ui.menu_button("New generator", |ui| {
         for (id, _) in vjc_fx::GENERATORS {
-            if ui.button(fx_label(id)).clicked() {
+            if crate::widgets::btn(ui, &fx_label(id), crate::widgets::Kind::Secondary).clicked() {
                 cmds.push(Command::SetGenerator {
                     deck,
                     layer,
@@ -1200,7 +1197,7 @@ fn param_widget(
             }
             (K::Bool { .. }, V::Bool(b)) => {
                 let mut x = *b;
-                if ui.checkbox(&mut x, "").changed() {
+                if crate::widgets::toggle(ui, &mut x, "").changed() {
                     out = Some(V::Bool(x));
                 }
             }
@@ -1238,13 +1235,17 @@ fn param_widget(
             }
             (K::Long { labels, .. }, V::Choice { selected, options }) => {
                 let mut sel = *selected;
-                egui::ComboBox::from_id_salt(("fxlong", name))
-                    .selected_text(labels.get(sel as usize).map_or("", String::as_str))
-                    .show_ui(ui, |ui| {
+                crate::widgets::combo(
+                    ui,
+                    ("fxlong", name),
+                    labels.get(sel as usize).map_or("", String::as_str),
+                    None,
+                    |ui| {
                         for (i, l) in labels.iter().enumerate() {
                             ui.selectable_value(&mut sel, i as u32, l);
                         }
-                    });
+                    },
+                );
                 if sel != *selected {
                     out = Some(V::Choice {
                         selected: sel,
@@ -1509,28 +1510,32 @@ fn layer_ops_menu(
         return;
     };
     let layer = &c.layers[i];
-    if ui.button("Duplicate layer").clicked() {
+    if crate::widgets::btn(ui, "Duplicate layer", crate::widgets::Kind::Secondary).clicked() {
         cmds.extend(vjc_core::duplicate_layer_command(project, lid));
         ui.close();
     }
     for (label, at) in [("Insert layer above", i), ("Insert layer below", i + 1)] {
-        if ui.button(label).clicked() {
+        if crate::widgets::btn(ui, label, crate::widgets::Kind::Secondary).clicked() {
             let mut layer = new_layer(c.layers.len() + 1);
             layer.group = vjc_core::insert_group_at(project, at);
             cmds.push(Command::AddLayer { layer, index: at });
             ui.close();
         }
     }
-    if ui
-        .add_enabled(!layer.lock_content, egui::Button::new("Clear clips"))
-        .on_disabled_hover_text("The layer content is locked")
-        .clicked()
+    if crate::widgets::btn_if(
+        ui,
+        !layer.lock_content,
+        "Clear clips",
+        crate::widgets::Kind::Secondary,
+    )
+    .on_disabled_hover_text("The layer content is locked")
+    .clicked()
     {
         cmds.push(Command::ClearLayerClips { deck, layer: lid });
         ui.close();
     }
     let mut lock = layer.lock_content;
-    if ui.checkbox(&mut lock, "Lock content").changed() {
+    if crate::widgets::toggle(ui, &mut lock, "Lock content").changed() {
         cmds.push(Command::SetLayerLock {
             layer: lid,
             locked: lock,
@@ -1549,10 +1554,7 @@ fn layer_ops_menu(
     }
     ui.menu_button("Mask mode", |ui| {
         for mode in vjc_model::MaskMode::ALL {
-            if ui
-                .selectable_label(layer.mask_mode == mode, mode.label())
-                .clicked()
-            {
+            if crate::widgets::choice(ui, layer.mask_mode == mode, mode.label()).clicked() {
                 cmds.push(Command::SetLayerMaskMode { layer: lid, mode });
                 ui.close();
             }
@@ -1975,13 +1977,13 @@ impl State {
             .map(|l| l.name)
             .collect();
         for n in &names {
-            if ui.selectable_label(&cur == n, n).clicked() {
+            if crate::widgets::choice(ui, &cur == n, n).clicked() {
                 ui.close();
                 self.apply_layout_named(n);
             }
         }
         ui.separator();
-        if ui.button("Save layout as...").clicked() {
+        if crate::widgets::btn(ui, "Save layout as...", crate::widgets::Kind::Secondary).clicked() {
             ui.close();
             self.save_layout = Some(String::new());
         }
@@ -1997,7 +1999,7 @@ impl State {
                 .map(|l| l.name.clone())
                 .collect::<Vec<_>>()
             {
-                if ui.button(&n).clicked() {
+                if crate::widgets::btn(ui, &n, crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.delete_layout(&n);
                 }
@@ -2150,20 +2152,19 @@ impl State {
             return;
         };
         let (mut yes, mut no) = (false, false);
-        let m = egui::Modal::new(egui::Id::new("remove_layer_modal")).show(ctx, |ui| {
-            ui.heading("Remove layer?");
+        let esc = widgets::dialog(ctx, "Remove layer?", true, |ui| {
             ui.label(format!(
                 "\"{name}\" is playing. Remove it with all its clips? You can undo this."
             ));
             ui.horizontal(|ui| {
-                yes = ui.button("Yes").clicked();
-                no = ui.button("No").clicked();
+                yes = widgets::btn(ui, "Yes", widgets::Kind::Danger).clicked();
+                no = widgets::btn(ui, "No", widgets::Kind::Secondary).clicked();
             });
         });
         if yes {
             self.remove_layer_confirm = None;
             self.remove_layer_now(layer);
-        } else if no || m.should_close() {
+        } else if no || esc {
             self.remove_layer_confirm = None;
         }
     }
@@ -5726,21 +5727,21 @@ impl State {
                     ui.close();
                     self.save();
                 }
-                if ui.button("Save As...").clicked() {
+                if crate::widgets::btn(ui, "Save As...", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.save_as();
                 }
                 ui.separator();
-                if ui.button("Relink missing media...").clicked() {
+                if crate::widgets::btn(ui, "Relink missing media...", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.relink_media();
                 }
-                if ui.button("Collect media...").clicked() {
+                if crate::widgets::btn(ui, "Collect media...", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.collect_media();
                 }
                 ui.separator();
-                if ui.button("Import .avc...").clicked() {
+                if crate::widgets::btn(ui, "Import .avc...", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.import();
                 }
@@ -5754,7 +5755,7 @@ impl State {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.button("Shortcuts...").clicked() {
+                if crate::widgets::btn(ui, "Shortcuts...", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.sc_ed.open = true;
                 }
@@ -5781,8 +5782,7 @@ impl State {
             });
             ui.menu_button("Layer", |ui| {
                 let sel = self.selected.map(|s| s.0);
-                if ui
-                    .add_enabled(sel.is_some(), egui::Button::new("Remove layer"))
+                if crate::widgets::btn_if(ui, sel.is_some(), "Remove layer", crate::widgets::Kind::Secondary)
                     .clicked()
                     && let Some(l) = sel
                 {
@@ -5808,7 +5808,7 @@ impl State {
             ui.menu_button("Shortcuts", |ui| {
                 for (midi, label) in [(false, "Edit keyboard"), (true, "Edit MIDI")] {
                     let on = self.learn && self.learn_midi == midi;
-                    if ui.selectable_label(on, label).clicked() {
+                    if crate::widgets::choice(ui, on, label).clicked() {
                         ui.close();
                         self.learn = !on;
                         self.learn_midi = midi && self.learn;
@@ -5827,15 +5827,14 @@ impl State {
                 }
                 for m in self.monitors.clone() {
                     let on = self.output == Some(m.id);
-                    if ui
-                        .selectable_label(on, format!("Fullscreen on {}", m.label()))
+                    if crate::widgets::choice(ui, on, format!("Fullscreen on {}", m.label()))
                         .clicked()
                     {
                         ui.close();
                         self.choose_fullscreen(m.id);
                     }
                 }
-                if ui.button("Setup...").clicked() {
+                if crate::widgets::btn(ui, "Setup...", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.output_setup_open = true;
                 }
@@ -5858,10 +5857,10 @@ impl State {
                         let mut tile = self.pixel_grids.get(&s.id).copied();
                         let mut on = tile.is_some();
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut on, &s.name);
+                            crate::widgets::toggle(ui, &mut on, &s.name);
                             let mut t = tile.unwrap_or((128, 128));
-                            ui.add(egui::DragValue::new(&mut t.0).range(output_overlay::MIN_TILE..=16384).prefix("W "));
-                            ui.add(egui::DragValue::new(&mut t.1).range(output_overlay::MIN_TILE..=16384).prefix("H "));
+                            crate::widgets::field_int(ui, &mut t.0, output_overlay::MIN_TILE..=16384, "W ", "");
+                            crate::widgets::field_int(ui, &mut t.1, output_overlay::MIN_TILE..=16384, "H ", "");
                             tile = on.then_some(t);
                         });
                         match tile {
@@ -5876,7 +5875,7 @@ impl State {
                     }
                     for s in self.project.output.screens.clone() {
                         let mut on = self.test_cards.contains(&s.id);
-                        if ui.checkbox(&mut on, &s.name).changed() {
+                        if crate::widgets::toggle(ui, &mut on, &s.name).changed() {
                             if on {
                                 self.test_cards.insert(s.id);
                             } else {
@@ -5885,7 +5884,7 @@ impl State {
                         }
                     }
                 });
-                if ui.button("Identify displays").clicked() {
+                if crate::widgets::btn(ui, "Identify displays", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.identify_at = Some(std::time::Instant::now());
                     // Repaint once more when it expires, even if nothing else animates.
@@ -5893,16 +5892,12 @@ impl State {
                         output_overlay::IDENTIFY_FOR + std::time::Duration::from_millis(50),
                     );
                 }
-                ui.checkbox(&mut self.show_fps, "Show FPS");
-                if ui.button("Display info").clicked() {
+                crate::widgets::toggle(ui, &mut self.show_fps, "Show FPS");
+                if crate::widgets::btn(ui, "Display info", crate::widgets::Kind::Secondary).clicked() {
                     ui.close();
                     self.display_info_open = true;
                 }
-                if ui
-                    .add_enabled(
-                        self.output.is_some() || !self.open_screens().is_empty(),
-                        egui::Button::new("Close output"),
-                    )
+                if crate::widgets::btn_if(ui, self.output.is_some() || !self.open_screens().is_empty(), "Close output", crate::widgets::Kind::Secondary)
                     .clicked()
                 {
                     ui.close();
@@ -6521,7 +6516,13 @@ impl State {
                             let col_ap = comp.columns[ci].autopilot.clone();
                             let col_snap = comp.columns[ci].beat_snap;
                             nr.context_menu(|ui| {
-                                if ui.button("Rename column").clicked() {
+                                if crate::widgets::btn(
+                                    ui,
+                                    "Rename column",
+                                    crate::widgets::Kind::Secondary,
+                                )
+                                .clicked()
+                                {
                                     self.col_renaming = Some((*cid, n.clone()));
                                     ui.close();
                                 }
@@ -6542,7 +6543,13 @@ impl State {
                             );
                             ghost_hit |= resp.clicked();
                             egui::Popup::menu(&resp).show(|ui| {
-                                if ui.button("Add column").clicked() {
+                                if crate::widgets::btn(
+                                    ui,
+                                    "Add column",
+                                    crate::widgets::Kind::Secondary,
+                                )
+                                .clicked()
+                                {
                                     cmds.push(Command::AddColumn {
                                         column: vjc_model::Column {
                                             autopilot: Default::default(),
@@ -6659,7 +6666,13 @@ impl State {
                                     self.preview_target = PreviewTarget::Layer(lid);
                                 }
                                 name.context_menu(|ui| {
-                                    if ui.button("Remove layer").clicked() {
+                                    if crate::widgets::btn(
+                                        ui,
+                                        "Remove layer",
+                                        crate::widgets::Kind::Secondary,
+                                    )
+                                    .clicked()
+                                    {
                                         remove_layer_req = Some(lid);
                                         ui.close();
                                     }
@@ -6671,7 +6684,13 @@ impl State {
                                         .map(|(_, c)| c);
                                     for (label, delta) in [("Previous clip", -1), ("Next clip", 1)]
                                     {
-                                        if ui.button(label).clicked() {
+                                        if crate::widgets::btn(
+                                            ui,
+                                            label,
+                                            crate::widgets::Kind::Secondary,
+                                        )
+                                        .clicked()
+                                        {
                                             cmds.push(Command::StepClip {
                                                 deck: cur,
                                                 layer: lid,
@@ -6744,12 +6763,12 @@ impl State {
                                             .show_ui(ui, |ui| {
                                                 for (b, name) in vjc_core::blend::COMPOSITION_MODES
                                                 {
-                                                    if ui
-                                                        .selectable_label(
-                                                            layer.track.blend == *b,
-                                                            *name,
-                                                        )
-                                                        .clicked()
+                                                    if crate::widgets::choice(
+                                                        ui,
+                                                        layer.track.blend == *b,
+                                                        *name,
+                                                    )
+                                                    .clicked()
                                                     {
                                                         cmds.push(Command::SetBlend {
                                                             layer: lid,
@@ -6960,18 +6979,36 @@ impl State {
                                             ("Cut", CellAct::Cut),
                                             ("Copy", CellAct::Copy),
                                         ] {
-                                            if ui.button(txt).clicked() {
+                                            if crate::widgets::btn(
+                                                ui,
+                                                txt,
+                                                crate::widgets::Kind::Secondary,
+                                            )
+                                            .clicked()
+                                            {
                                                 acts.push((lid, ci, act));
                                                 ui.close();
                                             }
                                         }
                                         ui.add_enabled_ui(has_clipboard, |ui| {
-                                            if ui.button("Paste").clicked() {
+                                            if crate::widgets::btn(
+                                                ui,
+                                                "Paste",
+                                                crate::widgets::Kind::Secondary,
+                                            )
+                                            .clicked()
+                                            {
                                                 acts.push((lid, ci, CellAct::Paste));
                                                 ui.close();
                                             }
                                         });
-                                        if ui.button("Clear").clicked() {
+                                        if crate::widgets::btn(
+                                            ui,
+                                            "Clear",
+                                            crate::widgets::Kind::Secondary,
+                                        )
+                                        .clicked()
+                                        {
                                             acts.push((lid, ci, CellAct::Clear));
                                             ui.close();
                                         }
@@ -6980,9 +7017,8 @@ impl State {
                                             let mut buf: String = ui
                                                 .data_mut(|d| d.get_temp(key))
                                                 .unwrap_or_else(|| label.to_owned());
-                                            let e = ui.add(
-                                                egui::TextEdit::singleline(&mut buf)
-                                                    .desired_width(140.0),
+                                            let e = crate::widgets::field_text_hint(
+                                                ui, &mut buf, 140.0, "",
                                             );
                                             e.widget_info(|| {
                                                 egui::WidgetInfo::labeled(
@@ -7027,12 +7063,24 @@ impl State {
                                 if clip.is_none() {
                                     r.context_menu(|ui| {
                                         ui.add_enabled_ui(has_clipboard, |ui| {
-                                            if ui.button("Paste").clicked() {
+                                            if crate::widgets::btn(
+                                                ui,
+                                                "Paste",
+                                                crate::widgets::Kind::Secondary,
+                                            )
+                                            .clicked()
+                                            {
                                                 acts.push((lid, ci, CellAct::Paste));
                                                 ui.close();
                                             }
                                         });
-                                        if ui.button("Import file...").clicked() {
+                                        if crate::widgets::btn(
+                                            ui,
+                                            "Import file...",
+                                            crate::widgets::Kind::Secondary,
+                                        )
+                                        .clicked()
+                                        {
                                             pick = Some((lid, ci));
                                             ui.close();
                                         }
@@ -7138,7 +7186,13 @@ impl State {
                                 );
                                 ghost_hit |= resp.clicked();
                                 egui::Popup::menu(&resp).show(|ui| {
-                                    if ui.button("Add column").clicked() {
+                                    if crate::widgets::btn(
+                                        ui,
+                                        "Add column",
+                                        crate::widgets::Kind::Secondary,
+                                    )
+                                    .clicked()
+                                    {
                                         cmds.push(Command::AddColumn {
                                             column: vjc_model::Column {
                                                 autopilot: Default::default(),
@@ -7326,7 +7380,7 @@ impl State {
                         id,
                         monitor::picture_rect(rect, (cw, ch), self.mon_views[i]),
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        crate::theme::IMAGE_TINT,
                     );
                 }
                 None => {
@@ -7334,7 +7388,7 @@ impl State {
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "No signal",
-                        egui::FontId::proportional(12.0),
+                        egui::FontId::proportional(theme::FS_SM),
                         ui.visuals().weak_text_color(),
                     );
                 }
@@ -7559,18 +7613,13 @@ impl State {
             }
             ui.horizontal(|ui| {
                 params::row_label(ui, "Crossfader curve");
-                egui::ComboBox::from_id_salt("cfcurve")
-                    .selected_text(cf_curve.label())
-                    .show_ui(ui, |ui| {
-                        for curve in vjc_core::crossfader::CrossfadeCurve::ALL {
-                            if ui
-                                .selectable_label(cf_curve == curve, curve.label())
-                                .clicked()
-                            {
-                                cmds.push(Command::SetCrossfaderCurve { curve });
-                            }
+                crate::widgets::combo(ui, "cfcurve", cf_curve.label(), None, |ui| {
+                    for curve in vjc_core::crossfader::CrossfadeCurve::ALL {
+                        if crate::widgets::choice(ui, cf_curve == curve, curve.label()).clicked() {
+                            cmds.push(Command::SetCrossfaderCurve { curve });
                         }
-                    });
+                    }
+                });
             });
             let behaviours = [
                 (vjc_model::CrossfadeBehaviour::Fade, "Fade".to_string()),
@@ -7633,10 +7682,7 @@ impl State {
                 ui.label("col");
                 let mut col = cue.column + 1;
                 let max = comp.columns.len().max(1) as u32;
-                if ui
-                    .add(egui::DragValue::new(&mut col).range(1..=max))
-                    .changed()
-                {
+                if crate::widgets::field_int(ui, &mut col, 1..=max, "", "").changed() {
                     cue.column = col - 1;
                     changed = true;
                 }
@@ -7644,18 +7690,16 @@ impl State {
                     l.and_then(|id| comp.layers.iter().find(|x| x.id == id))
                         .map_or("All layers".to_owned(), |x| x.name.clone())
                 };
-                egui::ComboBox::from_id_salt(("cuelayer", i))
-                    .selected_text(name(cue.layer))
-                    .show_ui(ui, |ui| {
+                crate::widgets::combo(ui, ("cuelayer", i), name(cue.layer), None, |ui| {
+                    changed |= ui
+                        .selectable_value(&mut cue.layer, None, "All layers")
+                        .changed();
+                    for l in &comp.layers {
                         changed |= ui
-                            .selectable_value(&mut cue.layer, None, "All layers")
+                            .selectable_value(&mut cue.layer, Some(l.id), &l.name)
                             .changed();
-                        for l in &comp.layers {
-                            changed |= ui
-                                .selectable_value(&mut cue.layer, Some(l.id), &l.name)
-                                .changed();
-                        }
-                    });
+                    }
+                });
                 if icons::button(ui, icons::i::X, "Remove cue").clicked() {
                     remove = Some(i);
                 }
@@ -7666,7 +7710,7 @@ impl State {
             changed = true;
         }
         ui.horizontal(|ui| {
-            if ui.button("Add cue").clicked() {
+            if crate::widgets::btn(ui, "Add cue", crate::widgets::Kind::Secondary).clicked() {
                 let time = self.tc.last.unwrap_or(vjc_model::Timecode::new(
                     0,
                     0,
@@ -7953,7 +7997,7 @@ impl State {
                 if icons::toggle(ui, &mut bypass, icons::i::POWER, "Bypass").changed() {
                     cmds.push(Command::SetGroupBypass { group: gid, bypass });
                 }
-                if ui.button("Ungroup").clicked() {
+                if crate::widgets::btn(ui, "Ungroup", crate::widgets::Kind::Secondary).clicked() {
                     cmds.push(Command::Ungroup { group: gid });
                 }
                 if ui
@@ -8063,11 +8107,7 @@ impl State {
             vjc_model::Source::Sequence { pattern, fps } => {
                 ui.label(format!("Image sequence: {}", pattern.display()));
                 let mut f = *fps;
-                let r = ui.add(
-                    egui::DragValue::new(&mut f)
-                        .range(1.0..=240.0)
-                        .suffix(" fps"),
-                );
+                let r = crate::widgets::field_int(ui, &mut f, 1.0..=240.0, "", " fps");
                 if r.changed() {
                     let mut clip = k.clone();
                     clip.source = vjc_model::Source::Sequence {
@@ -8086,7 +8126,7 @@ impl State {
                 ui.strong(format!("Source: generator {}", fx_label(kind)));
                 let inputs = self.fx.isf(kind).map(|f| f.inputs.clone());
                 if inputs.is_none() {
-                    ui.colored_label(egui::Color32::LIGHT_RED, "unknown generator (not rendered)");
+                    ui.colored_label(crate::theme::ERROR_TEXT, "unknown generator (not rendered)");
                 }
                 for (pi, p) in params.iter().enumerate() {
                     let Some(ik) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
@@ -8126,7 +8166,7 @@ impl State {
                 {
                     match (p.error(), p.latest_frame()) {
                         (Some(e), _) => {
-                            ui.colored_label(egui::Color32::LIGHT_RED, e);
+                            ui.colored_label(crate::theme::ERROR_TEXT, e);
                         }
                         (None, None) => {
                             ui.weak("Waiting for the source...");
@@ -8280,12 +8320,13 @@ impl State {
                             start: Some(start),
                         });
                     }
-                    if ui
-                        .add_enabled(
-                            self.tc.last.is_some(),
-                            egui::Button::new("Set from current"),
-                        )
-                        .clicked()
+                    if crate::widgets::btn_if(
+                        ui,
+                        self.tc.last.is_some(),
+                        "Set from current",
+                        crate::widgets::Kind::Secondary,
+                    )
+                    .clicked()
                         && let Some(cur) = self.tc.last
                     {
                         cmds.push(Command::SetTimecodeStart {
@@ -8322,7 +8363,9 @@ impl State {
             }
             ui.horizontal(|ui| {
                 ui.label("Cues");
-                if ui.add_enabled(playing, egui::Button::new("Set")).clicked() {
+                if crate::widgets::btn_if(ui, playing, "Set", crate::widgets::Kind::Secondary)
+                    .clicked()
+                {
                     cmds.push(Command::AddCue {
                         deck,
                         layer,
@@ -8331,8 +8374,12 @@ impl State {
                     });
                 }
                 for (i, c) in t.cue_points.iter().enumerate() {
-                    let jump =
-                        ui.add_enabled(playing, egui::Button::new(format!("Jump {}", i + 1)));
+                    let jump = crate::widgets::btn_if(
+                        ui,
+                        playing,
+                        &format!("Jump {}", i + 1),
+                        crate::widgets::Kind::Secondary,
+                    );
                     if let Some(a) = vjc_core::shortcuts::cue_address(&self.project, layer, i) {
                         self.targets.push((jump.rect, a));
                     }
@@ -8756,11 +8803,11 @@ impl State {
             r.response.context_menu(|ui| {
                 let key = egui::Id::new(("dial-name", id));
                 let mut buf: String = ui.data(|d| d.get_temp(key)).unwrap_or_else(|| name.clone());
-                let e = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+                let e = crate::widgets::field_text_hint(ui, &mut buf, 120.0, "");
                 let (mut nlo, mut nhi) = (lo, hi);
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut nlo).speed(0.1).prefix("Min "));
-                    ui.add(egui::DragValue::new(&mut nhi).speed(0.1).prefix("Max "));
+                    crate::widgets::field_drag(ui, &mut nlo, f64::MIN..=f64::MAX, 0.1, "Min ", "");
+                    crate::widgets::field_drag(ui, &mut nhi, f64::MIN..=f64::MAX, 0.1, "Max ", "");
                 });
                 let commit_name = e.lost_focus() && !buf.trim().is_empty();
                 ui.data_mut(|d| d.insert_temp(key, buf.clone()));
@@ -8950,9 +8997,13 @@ impl State {
                     ui.horizontal(|ui| {
                         let name = ui.strong(fx_label(&e.kind));
                         name.context_menu(|ui| {
-                            if ui
-                                .add_enabled(i > 0, egui::Button::new("Move up"))
-                                .clicked()
+                            if crate::widgets::btn_if(
+                                ui,
+                                i > 0,
+                                "Move up",
+                                crate::widgets::Kind::Secondary,
+                            )
+                            .clicked()
                             {
                                 cmds.push(Command::MoveEffect {
                                     target,
@@ -8961,9 +9012,13 @@ impl State {
                                 });
                                 ui.close();
                             }
-                            if ui
-                                .add_enabled(i + 1 < n, egui::Button::new("Move down"))
-                                .clicked()
+                            if crate::widgets::btn_if(
+                                ui,
+                                i + 1 < n,
+                                "Move down",
+                                crate::widgets::Kind::Secondary,
+                            )
+                            .clicked()
                             {
                                 cmds.push(Command::MoveEffect {
                                     target,
@@ -9156,7 +9211,7 @@ impl State {
             for (i, (id, name, nclips)) in decks.iter().enumerate() {
                 if let Some((rid, buf)) = self.renaming.as_mut().filter(|(r, _)| r == id) {
                     let rid = *rid;
-                    let e = ui.add(egui::TextEdit::singleline(buf).desired_width(90.0));
+                    let e = crate::widgets::field_text_hint(ui, buf, 90.0, "");
                     e.request_focus();
                     if e.lost_focus() {
                         let ok = ui.input(|i| !i.key_pressed(egui::Key::Escape));
@@ -9195,11 +9250,14 @@ impl State {
                     cmds.push(Command::SelectDeck { deck: *id });
                 }
                 r.context_menu(|ui| {
-                    if ui.button("Rename").clicked() {
+                    if crate::widgets::btn(ui, "Rename", crate::widgets::Kind::Secondary).clicked()
+                    {
                         self.renaming = Some((*id, name.clone()));
                         ui.close();
                     }
-                    if ui.button("Duplicate").clicked() {
+                    if crate::widgets::btn(ui, "Duplicate", crate::widgets::Kind::Secondary)
+                        .clicked()
+                    {
                         if let Some(deck) = vjc_core::duplicate_deck(&self.project, *id) {
                             let new = deck.id;
                             cmds.push(Command::AddDeck {
@@ -9211,9 +9269,13 @@ impl State {
                         }
                         ui.close();
                     }
-                    if ui
-                        .add_enabled(i > 0, egui::Button::new("Move left"))
-                        .clicked()
+                    if crate::widgets::btn_if(
+                        ui,
+                        i > 0,
+                        "Move left",
+                        crate::widgets::Kind::Secondary,
+                    )
+                    .clicked()
                     {
                         cmds.push(Command::MoveDeck {
                             deck: *id,
@@ -9221,9 +9283,13 @@ impl State {
                         });
                         ui.close();
                     }
-                    if ui
-                        .add_enabled(i + 1 < decks.len(), egui::Button::new("Move right"))
-                        .clicked()
+                    if crate::widgets::btn_if(
+                        ui,
+                        i + 1 < decks.len(),
+                        "Move right",
+                        crate::widgets::Kind::Secondary,
+                    )
+                    .clicked()
                     {
                         cmds.push(Command::MoveDeck {
                             deck: *id,
@@ -9231,7 +9297,9 @@ impl State {
                         });
                         ui.close();
                     }
-                    if ui.add_enabled(!last, egui::Button::new("Remove")).clicked() {
+                    if crate::widgets::btn_if(ui, !last, "Remove", crate::widgets::Kind::Secondary)
+                        .clicked()
+                    {
                         ui.close();
                         if confirm_remove_deck(name, *nclips) {
                             cmds.push(Command::RemoveDeck {
@@ -9414,7 +9482,8 @@ impl State {
                 |ui, _class| {
                     let ctx = ui.ctx().clone();
                     let full = ui.max_rect();
-                    ui.painter().rect_filled(full, 0.0, egui::Color32::BLACK);
+                    ui.painter()
+                        .rect_filled(full, 0.0, crate::theme::MONITOR_BG);
                     // Physical pixels: the window's own scale factor (Retina, mixed monitors).
                     let rect = match &info {
                         Some(s) => monitors::present_rect(
@@ -9430,7 +9499,7 @@ impl State {
                         tex,
                         rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        crate::theme::IMAGE_TINT,
                     );
                     if let Some(s) = &info {
                         let now = std::time::Instant::now();
@@ -10066,7 +10135,7 @@ fn fx_preset_menu(
         }
         for n in &names {
             ui.horizontal(|ui| {
-                if ui.button(n).clicked() {
+                if crate::widgets::btn(ui, n, crate::widgets::Kind::Secondary).clicked() {
                     match fp::load(root, &e.kind, n) {
                         Ok(p) => {
                             cmds.push(Command::SetEffectParams {
@@ -10091,14 +10160,14 @@ fn fx_preset_menu(
     let id = ui.id().with(("fx-preset-name", e.id));
     let mut name: String = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut name)
-                .hint_text("Preset name")
-                .desired_width(120.0),
-        );
-        let ok = ui
-            .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
-            .clicked();
+        crate::widgets::field_text_hint(ui, &mut name, 120.0, "Preset name");
+        let ok = crate::widgets::btn_if(
+            ui,
+            !name.trim().is_empty(),
+            "Save",
+            crate::widgets::Kind::Secondary,
+        )
+        .clicked();
         if ok {
             match fp::save(root, &e.kind, &name, &e.params) {
                 Ok(_) => {

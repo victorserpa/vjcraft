@@ -120,7 +120,7 @@ pub fn comp_section(ui: &mut egui::Ui, a: &CompAutopilot, cmds: &mut Vec<Command
     }
     ui.horizontal(|ui| {
         params::row_label(ui, "Loop");
-        edited |= ui.checkbox(&mut n.looping, "").changed();
+        edited |= crate::widgets::toggle(ui, &mut n.looping, "").changed();
     });
     widgets::help(ui, "Loop off stops at the first or last column.");
     if edited {

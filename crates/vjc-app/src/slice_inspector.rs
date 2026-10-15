@@ -221,7 +221,7 @@ impl State {
             .selected_text(current)
             .show_ui(ui, |ui| {
                 for (label, source) in choices {
-                    if ui.selectable_label(sl.source == source, label).clicked()
+                    if crate::widgets::choice(ui, sl.source == source, label).clicked()
                         && sl.source != source
                     {
                         cmds.push(Command::SetSliceSource {
@@ -339,7 +339,7 @@ impl State {
                         .selected_text("Choose")
                         .show_ui(ui, |ui| {
                             for (id, name, n) in &others {
-                                if ui.selectable_label(false, name).clicked() {
+                                if crate::widgets::choice(ui, false, name).clicked() {
                                     cmds.push(Command::MoveSlice {
                                         from: scr.id,
                                         to: *id,

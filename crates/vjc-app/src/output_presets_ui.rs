@@ -143,22 +143,22 @@ impl State {
         let sel = self.preset_sel.clone().filter(|s| names.contains(s));
         ui.horizontal_wrapped(|ui| {
             ui.strong("Preset");
-            egui::ComboBox::from_id_salt("out-preset")
-                .selected_text(sel.clone().unwrap_or_else(|| "(none)".into()))
-                .show_ui(ui, |ui| {
+            crate::widgets::combo(
+                ui,
+                "out-preset",
+                sel.clone().unwrap_or_else(|| "(none)".into()),
+                None,
+                |ui| {
                     for n in &names {
-                        if ui.selectable_label(sel.as_ref() == Some(n), n).clicked() {
+                        if crate::widgets::choice(ui, sel.as_ref() == Some(n), n).clicked() {
                             self.preset_sel = Some(n.clone());
                             self.preset_text = n.clone();
                             self.preset_confirm_delete = false;
                         }
                     }
-                });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.preset_text)
-                    .hint_text("name")
-                    .desired_width(120.0),
+                },
             );
+            crate::widgets::field_text_hint(ui, &mut self.preset_text, 120.0, "name");
             let text = self.preset_text.clone();
             let valid = presets::clean_name(&text).is_some();
             if btn_if(ui, valid, "Save preset", Kind::Primary).clicked() {

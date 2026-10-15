@@ -99,7 +99,7 @@ impl State {
     ) {
         ui.menu_button("Add audio effect", |ui| {
             for k in FxKind::ALL {
-                if ui.button(k.label()).clicked() {
+                if crate::widgets::btn(ui, k.label(), crate::widgets::Kind::Secondary).clicked() {
                     cmds.push(Command::AddEffect {
                         target,
                         effect: new_effect(k),
@@ -131,7 +131,14 @@ impl State {
                                 ("Move up", i > 0, i.wrapping_sub(1)),
                                 ("Move down", i + 1 < n, i + 1),
                             ] {
-                                if ui.add_enabled(ok, egui::Button::new(text)).clicked() {
+                                if crate::widgets::btn_if(
+                                    ui,
+                                    ok,
+                                    text,
+                                    crate::widgets::Kind::Secondary,
+                                )
+                                .clicked()
+                                {
                                     cmds.push(Command::MoveEffect {
                                         target,
                                         effect: e.id,

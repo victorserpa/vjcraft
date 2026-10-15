@@ -348,19 +348,17 @@ impl State {
             }
         });
         widgets::field_text(ui, &mut s.target, Width::Lg, None);
-        egui::ComboBox::from_id_salt(("sc_mode", s.id))
-            .selected_text(mode_name(&s.mode))
-            .show_ui(ui, |ui| {
-                for m in [
-                    ShortcutMode::Trigger,
-                    ShortcutMode::Toggle,
-                    ShortcutMode::Absolute,
-                    ShortcutMode::Relative,
-                ] {
-                    let l = mode_name(&m);
-                    ui.selectable_value(&mut s.mode, m, l);
-                }
-            });
+        crate::widgets::combo(ui, ("sc_mode", s.id), mode_name(&s.mode), None, |ui| {
+            for m in [
+                ShortcutMode::Trigger,
+                ShortcutMode::Toggle,
+                ShortcutMode::Absolute,
+                ShortcutMode::Relative,
+            ] {
+                let l = mode_name(&m);
+                ui.selectable_value(&mut s.mode, m, l);
+            }
+        });
         let (mut lo, mut hi) = (s.range.0 as f32, s.range.1 as f32);
         if widgets::field_num(ui, &mut lo, -1.0e6..=1.0e6, 0.01).changed() {
             s.range.0 = f64::from(lo);

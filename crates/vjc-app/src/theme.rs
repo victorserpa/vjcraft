@@ -288,6 +288,10 @@ pub const CLOCK_TEXT: Color32 = Color32::from_rgb(170, 178, 192);
 pub const BEAT_DOWN: Color32 = Color32::YELLOW;
 pub const BEAT_OTHER: Color32 = ACCENT;
 pub const ERROR_TEXT: Color32 = Color32::LIGHT_RED;
+/// Multiplier for painted textures: white leaves the pixels untouched.
+pub const IMAGE_TINT: Color32 = Color32::WHITE;
+/// Faint sheen over a tile picture.
+pub const TILE_SHEEN: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
 
 /// Tile color for a generator, stable per kind.
 pub fn tile_color(key: &str) -> Color32 {

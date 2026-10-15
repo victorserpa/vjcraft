@@ -66,6 +66,18 @@ pub fn field_int<T: egui::emath::Numeric>(
     prefix: &str,
     suffix: &str,
 ) -> egui::Response {
+    field_drag(ui, value, range, 1.0, prefix, suffix)
+}
+
+/// Like `field_int` with an explicit drag `speed`.
+pub fn field_drag<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    range: std::ops::RangeInclusive<T>,
+    speed: f64,
+    prefix: &str,
+    suffix: &str,
+) -> egui::Response {
     let bad = !range.contains(value);
     ui.scope(|ui| {
         if bad {
@@ -77,6 +89,7 @@ pub fn field_int<T: egui::emath::Numeric>(
         ui.add(
             egui::DragValue::new(value)
                 .range(range)
+                .speed(speed)
                 .prefix(prefix)
                 .suffix(suffix),
         )
@@ -159,6 +172,44 @@ pub fn field_text(
         ui.label(RichText::new(e).size(FS_XS).color(DANGER));
     }
     r
+}
+
+/// Single-line text field with a placeholder shown while empty and an explicit pixel width.
+pub fn field_text_hint(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    width: f32,
+    hint: &str,
+) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text(hint)
+            .desired_width(width),
+    )
+}
+
+/// Selectable row/toggle button (combo entries, view switches).
+pub fn choice(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.selectable_label(selected, label)
+}
+
+/// Drop-down: `id` keys it, `selected` is the closed text, `width` an optional fixed width.
+pub fn combo<R>(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected: impl Into<egui::WidgetText>,
+    width: Option<f32>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let mut c = egui::ComboBox::from_id_salt(id).selected_text(selected);
+    if let Some(w) = width {
+        c = c.width(w);
+    }
+    c.show_ui(ui, body).inner
 }
 
 /// Numeric field (drag or type). The value is clamped to `range`; a value that arrived
@@ -622,5 +673,57 @@ mod tests {
             .unwrap();
         assert_eq!(q.len(), TOAST_MAX);
         assert_eq!(q.iter().filter(|t| t.msg == "Save failed").count(), 0);
+    }
+
+    #[test]
+    fn field_text_hint_edits() {
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut String| {
+                field_text_hint(ui, s, 100.0, "name");
+            },
+            String::new(),
+        );
+        h.run();
+        assert!(h.state().is_empty());
+    }
+
+    #[test]
+    fn choice_reports_selected_and_click() {
+        let mut h = Harness::new_ui_state(
+            |ui, n: &mut u32| {
+                if choice(ui, true, "Pick").clicked() {
+                    *n += 1;
+                }
+            },
+            0,
+        );
+        h.run();
+        h.get_by_label("Pick").click();
+        h.run();
+        assert_eq!(*h.state(), 1);
+    }
+
+    #[test]
+    fn combo_is_closed_until_clicked() {
+        let mut h = Harness::new_ui_state(
+            |ui, ran: &mut bool| {
+                combo(ui, "cb", "Closed", Some(80.0), |_| *ran = true);
+            },
+            false,
+        );
+        h.run();
+        assert!(!*h.state(), "body must not run while closed");
+    }
+
+    #[test]
+    fn field_drag_clamps_to_range() {
+        let mut h = Harness::new_ui_state(
+            |ui, v: &mut f32| {
+                field_drag(ui, v, 0.0..=1.0, 0.01, "", "");
+            },
+            5.0_f32,
+        );
+        h.run();
+        assert_eq!(*h.state(), 1.0);
     }
 }

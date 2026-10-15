@@ -110,7 +110,7 @@ pub fn cell(
                 id,
                 pic,
                 cover_uv(aspect, pic.aspect_ratio()),
-                egui::Color32::WHITE,
+                theme::IMAGE_TINT,
             );
         }
         Tile::Color(key) => {
@@ -119,7 +119,7 @@ pub fn cell(
                 pic.center(),
                 Align2::CENTER_CENTER,
                 key,
-                FontId::proportional(12.0),
+                FontId::proportional(theme::FS_SM),
                 theme::CELL_NAME_TEXT,
             );
         }
@@ -152,7 +152,7 @@ pub fn cell(
     let p = ui.painter();
     let strip_hot = strip_r.as_ref().is_some_and(|s| s.hovered());
     if r.hovered() && filled {
-        p.rect_filled(pic, round, egui::Color32::from_white_alpha(22));
+        p.rect_filled(pic, round, theme::TILE_SHEEN);
     }
     if playing && filled {
         let badge = egui::Rect::from_min_size(
