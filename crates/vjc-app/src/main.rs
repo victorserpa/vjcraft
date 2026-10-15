@@ -791,6 +791,16 @@ fn repaint_fps(fps: impl Into<f64>) -> f64 {
     }
 }
 
+/// Render rate: the composition fps, lowered to the "Max frame rate" pref (0 = no cap).
+fn effective_fps(comp_fps: f32, max_pref: u32) -> f64 {
+    let f = repaint_fps(comp_fps);
+    if max_pref == 0 {
+        f
+    } else {
+        f.min(f64::from(max_pref))
+    }
+}
+
 /// Render limiter: extra vsync ticks (120 Hz monitor, 60 fps comp) reuse the last frame.
 /// Frames follow a fixed schedule (`next` advances by one interval), so any vsync rate,
 /// integer multiple or not, averages to the composition fps.
@@ -862,6 +872,16 @@ fn repaint_interval_is_capped_by_composition_fps() {
 }
 
 #[test]
+fn max_fps_pref_lowers_the_render_rate() {
+    assert_eq!(effective_fps(60.0, 0), 60.0);
+    assert_eq!(effective_fps(60.0, 30), 30.0);
+    // Never raises above the composition fps.
+    assert_eq!(effective_fps(30.0, 120), 30.0);
+    // 60 Hz vsync with a 30 fps cap renders every other tick.
+    assert_eq!(gate_renders(60.0, effective_fps(60.0, 30), 120), 60);
+}
+
+#[test]
 fn repaint_fps_never_panics_on_bad_project_values() {
     assert_eq!(repaint_fps(f64::NAN), 60.0);
     assert_eq!(repaint_fps(f64::INFINITY), 60.0);
@@ -886,11 +906,16 @@ const MAX_DROP: usize = 128;
 /// Loose files are kept whatever their extension (the decoder decides, as before); inside a
 /// folder only known media counts and hidden files (`._x.mp4` sidecars) are skipped.
 /// Returns the files and how many entries were left out.
-fn expand_drop(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+fn expand_drop(paths: Vec<PathBuf>, sequences: bool) -> (Vec<PathBuf>, usize) {
     let mut files = Vec::new();
     let mut ignored = 0;
     for p in paths {
         if p.is_dir() {
+            // A pure numbered image folder stays as the folder itself: one sequence clip.
+            if sequences && vjc_media::sequence::scan_dir(&p).is_some() {
+                files.push(p);
+                continue;
+            }
             let Ok(rd) = std::fs::read_dir(&p) else {
                 continue;
             };
@@ -3910,7 +3935,7 @@ impl State {
     /// range is on air (then each live cell reloads, on its own destination). Returns
     /// (placed, ignored).
     fn drop_many(&mut self, layer: LayerId, column: u32, paths: Vec<PathBuf>) -> (usize, usize) {
-        let (files, ignored) = expand_drop(paths);
+        let (files, ignored) = expand_drop(paths, self.prefs.video.folder_sequence);
         if files.is_empty() {
             return (0, ignored);
         }
@@ -3931,7 +3956,12 @@ impl State {
             });
         }
         for (i, path) in files.iter().enumerate() {
-            let mut clip = vjc_core::clip_from_path(path.clone());
+            let mut clip = match vjc_media::sequence::scan_dir(path).filter(|_| path.is_dir()) {
+                Some(s) => {
+                    vjc_core::clip_from_sequence(s.pattern, vjc_media::sequence::DEFAULT_FPS)
+                }
+                None => vjc_core::clip_from_path(path.clone()),
+            };
             clip.fit = self.prefs.video.fit;
             commands.push(Command::SetClip {
                 deck,
@@ -6767,6 +6797,9 @@ impl State {
                                     Some((_, vjc_model::Source::Generator { kind, .. })) => {
                                         grid_ui::Tile::Color(kind)
                                     }
+                                    Some((_, vjc_model::Source::Sequence { .. })) => {
+                                        grid_ui::Tile::Color("sequence")
+                                    }
                                     Some((_, vjc_model::Source::Capture { .. })) => {
                                         grid_ui::Tile::Color("capture")
                                     }
@@ -7893,6 +7926,28 @@ impl State {
                 }
                 let line = source_info::describe(path, info);
                 ui.label(line).on_hover_text(path.display().to_string());
+            }
+            vjc_model::Source::Sequence { pattern, fps } => {
+                ui.label(format!("Image sequence: {}", pattern.display()));
+                let mut f = *fps;
+                let r = ui.add(
+                    egui::DragValue::new(&mut f)
+                        .range(1.0..=240.0)
+                        .suffix(" fps"),
+                );
+                if r.changed() {
+                    let mut clip = k.clone();
+                    clip.source = vjc_model::Source::Sequence {
+                        pattern: pattern.clone(),
+                        fps: f,
+                    };
+                    cmds.push(Command::SetClip {
+                        deck,
+                        layer,
+                        column,
+                        clip,
+                    });
+                }
             }
             vjc_model::Source::Generator { kind, params } => {
                 ui.strong(format!("Source: generator {}", fx_label(kind)));
@@ -9266,7 +9321,10 @@ impl eframe::App for State {
         self.tick_clock();
         self.audio_react.refresh(&self.project.composition);
         // Extra vsync ticks (120 Hz output) keep the last composition frame.
-        if self.render_gate.due(t0, self.project.composition.fps) {
+        if self.render_gate.due(
+            t0,
+            effective_fps(self.project.composition.fps, self.prefs.video.max_fps),
+        ) {
             self.compose(frame);
         }
         if self.frames.is_multiple_of(30) {
@@ -9290,7 +9348,10 @@ impl eframe::App for State {
         // at a low rate (input events still repaint at once).
         if self.is_live() {
             // Paced at the composition rate; input events still repaint at once.
-            ctx.request_repaint_after(repaint_interval(self.project.composition.fps));
+            ctx.request_repaint_after(repaint_interval(effective_fps(
+                self.project.composition.fps,
+                self.prefs.video.max_fps,
+            )));
         } else {
             ctx.request_repaint_after(IDLE_REPAINT);
         }
@@ -9839,4 +9900,30 @@ fn fx_preset_menu(
         }
     });
     ui.data_mut(|d| d.insert_temp(id, name));
+}
+
+#[test]
+fn numbered_image_folder_drops_as_one_sequence_clip() {
+    let d = std::env::temp_dir().join(format!("vjc-seqdrop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 1..=3 {
+        std::fs::write(d.join(format!("shot_{i:04}.png")), b"x").unwrap();
+    }
+    // Option on: the folder stays whole (one clip); option off: one file per frame.
+    let (on, _) = expand_drop(vec![d.clone()], true);
+    assert_eq!(on, vec![d.clone()]);
+    let (off, _) = expand_drop(vec![d.clone()], false);
+    assert_eq!(off.len(), 3);
+    // Negative control: another file in the folder makes it an ordinary folder drop.
+    std::fs::write(d.join("clip.mp4"), b"x").unwrap();
+    let (mixed, _) = expand_drop(vec![d.clone()], true);
+    assert_eq!(mixed.len(), 4);
+    // The clip built from a scanned folder plays frames at the default fps.
+    std::fs::remove_file(d.join("clip.mp4")).unwrap();
+    let s = vjc_media::sequence::scan_dir(&d).unwrap();
+    let c = vjc_core::clip_from_sequence(s.pattern.clone(), 30.0);
+    assert_eq!(c.name, "shot");
+    assert!(matches!(c.source, vjc_model::Source::Sequence { fps, .. } if fps == 30.0));
+    let _ = std::fs::remove_dir_all(&d);
 }

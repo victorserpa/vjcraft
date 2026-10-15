@@ -767,7 +767,11 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
             points.sort_by(|a, b| a.0.total_cmp(&b.0));
             let beats = sp.children.iter().find_map(beats_of).unwrap_or(4.0);
             w.mapped_anim.insert(node_id(env));
-            return Some(Animation::Envelope { points, beats });
+            return Some(Animation::Envelope {
+                motion: Default::default(),
+                points,
+                beats,
+            });
         }
     }
     if let Some(d) = sp.child("PhaseSourceDashboardLink")
@@ -788,10 +792,12 @@ fn param_animation(sp: &Node, w: &mut Warns) -> Option<Animation> {
             .filter(|m| *m >= MIN_TIMELINE_MS);
         let anim = match (ms, beats_of(t)) {
             (Some(ms), _) => Animation::Timeline {
+                motion: Default::default(),
                 duration_secs: ms / 1000.0,
                 curve: Curve::Linear,
             },
             (None, Some(beats)) => Animation::Beats {
+                motion: Default::default(),
                 beats,
                 curve: Curve::Linear,
             },
@@ -851,6 +857,7 @@ mod tests {
         assert_eq!(
             a,
             Some(Animation::Envelope {
+                motion: Default::default(),
                 points: vec![(0.0, 1.0), (1.0, 0.0)],
                 beats: 4.0
             })
@@ -888,6 +895,7 @@ mod tests {
         assert_eq!(
             a,
             Some(Animation::Timeline {
+                motion: Default::default(),
                 duration_secs: 2.5,
                 curve: Curve::Linear
             })
@@ -898,6 +906,7 @@ mod tests {
         assert_eq!(
             a,
             Some(Animation::Beats {
+                motion: Default::default(),
                 beats: 8.0,
                 curve: Curve::Linear
             })
@@ -913,6 +922,7 @@ mod tests {
         assert_eq!(
             a,
             Some(Animation::Beats {
+                motion: Default::default(),
                 beats: 4.0,
                 curve: Curve::Linear
             })

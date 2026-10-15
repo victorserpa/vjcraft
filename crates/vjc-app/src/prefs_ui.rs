@@ -161,6 +161,25 @@ impl State {
                                     ui.selectable_value(&mut p.video.fit, f, f.label());
                                 }
                             });
+                        egui::ComboBox::from_label("Max frame rate")
+                            .selected_text(match p.video.max_fps {
+                                0 => "Unlimited (display)".to_string(),
+                                n => format!("{n} fps"),
+                            })
+                            .show_ui(ui, |ui| {
+                                for n in [30u32, 50, 60, 120, 0] {
+                                    let l = if n == 0 {
+                                        "Unlimited (display)".to_string()
+                                    } else {
+                                        format!("{n} fps")
+                                    };
+                                    ui.selectable_value(&mut p.video.max_fps, n, l);
+                                }
+                            });
+                        ui.checkbox(
+                            &mut p.video.folder_sequence,
+                            "Dropped folder of numbered images becomes one sequence clip",
+                        );
                         ui.checkbox(&mut p.video.vsync, "VSync (applies on next launch)");
                     }
                     PrefsTab::Control => {

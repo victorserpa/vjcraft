@@ -157,6 +157,27 @@ pub fn param_slider_anim_step(
     slider_inner(ui, id, label, value, default, range, Some(anim), Some(step))
 }
 
+/// Loop mode and direction combos; true when either changed.
+fn motion_controls(ui: &mut egui::Ui, id: egui::Id, m: &mut vjc_model::Motion) -> bool {
+    let before = *m;
+    egui::ComboBox::from_id_salt(id.with("mode"))
+        .selected_text(m.mode.label())
+        .show_ui(ui, |ui| {
+            for l in vjc_model::LoopMode::ALL {
+                ui.selectable_value(&mut m.mode, l, l.label());
+            }
+        });
+    let back = m.direction == vjc_model::AnimDirection::Backward;
+    if ui.selectable_label(back, "Backward").clicked() {
+        m.direction = if back {
+            vjc_model::AnimDirection::Forward
+        } else {
+            vjc_model::AnimDirection::Backward
+        };
+    }
+    *m != before
+}
+
 /// Short name of the animation kind, "Off" for none.
 pub fn anim_kind(a: &Option<Animation>) -> &'static str {
     match a {
@@ -173,14 +194,17 @@ pub fn anim_kind(a: &Option<Animation>) -> &'static str {
 pub fn default_animation(kind: &str) -> Option<Animation> {
     match kind {
         "Timeline" => Some(Animation::Timeline {
+            motion: Default::default(),
             duration_secs: 4.0,
             curve: Curve::Sine,
         }),
         "Beats" => Some(Animation::Beats {
+            motion: Default::default(),
             beats: 4.0,
             curve: Curve::Sine,
         }),
         "Envelope" => Some(Animation::Envelope {
+            motion: Default::default(),
             points: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
             beats: 4.0,
         }),
@@ -254,6 +278,7 @@ fn curve_graph(ui: &mut egui::Ui, a: &Animation) -> egui::Rect {
 /// space to add one. Returns true when the points changed.
 fn envelope_editor(ui: &mut egui::Ui, points: &mut Vec<(f64, f64)>, beats: f64) -> bool {
     let a = Animation::Envelope {
+        motion: Default::default(),
         points: points.clone(),
         beats,
     };
@@ -333,6 +358,7 @@ fn anim_menu(
         Some(Animation::Timeline {
             duration_secs,
             curve,
+            motion,
         }) => {
             changed |= ui
                 .add(
@@ -341,18 +367,24 @@ fn anim_menu(
                         .suffix(" s"),
                 )
                 .changed();
+            changed |= motion_controls(ui, id.with("m"), motion);
             let before = curve.clone();
             curve_combo(ui, id.with("c"), curve);
             changed |= *curve != before;
             curve_graph(
                 ui,
                 &Animation::Timeline {
+                    motion: *motion,
                     duration_secs: *duration_secs,
                     curve: curve.clone(),
                 },
             );
         }
-        Some(Animation::Beats { beats, curve }) => {
+        Some(Animation::Beats {
+            beats,
+            curve,
+            motion,
+        }) => {
             changed |= ui
                 .add(
                     egui::DragValue::new(beats)
@@ -360,18 +392,24 @@ fn anim_menu(
                         .suffix(" beats"),
                 )
                 .changed();
+            changed |= motion_controls(ui, id.with("m"), motion);
             let before = curve.clone();
             curve_combo(ui, id.with("c"), curve);
             changed |= *curve != before;
             curve_graph(
                 ui,
                 &Animation::Beats {
+                    motion: *motion,
                     beats: *beats,
                     curve: curve.clone(),
                 },
             );
         }
-        Some(Animation::Envelope { points, beats }) => {
+        Some(Animation::Envelope {
+            points,
+            beats,
+            motion,
+        }) => {
             changed |= ui
                 .add(
                     egui::DragValue::new(beats)
@@ -379,6 +417,7 @@ fn anim_menu(
                         .suffix(" beats"),
                 )
                 .changed();
+            changed |= motion_controls(ui, id.with("m"), motion);
             changed |= envelope_editor(ui, points, *beats);
             ui.menu_button("Preset", |ui| {
                 for pre in vjc_core::anim::EnvPreset::ALL {

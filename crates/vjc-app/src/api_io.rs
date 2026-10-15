@@ -263,6 +263,7 @@ fn kind_of(s: &Source) -> &'static str {
     match s {
         Source::File { .. } => "file",
         Source::Generator { .. } => "generator",
+        Source::Sequence { .. } => "sequence",
         Source::Capture { .. } => "capture",
         Source::Network { .. } => "network",
         Source::LayerRouter { .. } => "layer",

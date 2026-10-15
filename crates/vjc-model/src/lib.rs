@@ -472,11 +472,28 @@ impl FitMode {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Source {
-    File { path: PathBuf },
-    Generator { kind: String, params: Vec<Param> },
-    Capture { device: String },
-    Network { protocol: NetProtocol, name: String },
-    LayerRouter { layer: LayerId },
+    File {
+        path: PathBuf,
+    },
+    Generator {
+        kind: String,
+        params: Vec<Param>,
+    },
+    /// Numbered image files played as one clip: `pattern` is `dir/prefix%04d.ext`.
+    Sequence {
+        pattern: PathBuf,
+        fps: f32,
+    },
+    Capture {
+        device: String,
+    },
+    Network {
+        protocol: NetProtocol,
+        name: String,
+    },
+    LayerRouter {
+        layer: LayerId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1000,10 +1017,14 @@ pub enum Animation {
     Timeline {
         duration_secs: f64,
         curve: Curve,
+        #[serde(default)]
+        motion: Motion,
     },
     Beats {
         beats: f64,
         curve: Curve,
+        #[serde(default)]
+        motion: Motion,
     },
     Audio {
         band: FftBand,
@@ -1024,6 +1045,8 @@ pub enum Animation {
     Envelope {
         points: Vec<(f64, f64)>,
         beats: f64,
+        #[serde(default)]
+        motion: Motion,
     },
     Dashboard {
         dial: u32,
@@ -1031,6 +1054,41 @@ pub enum Animation {
         #[serde(default)]
         scope: DialScope,
     },
+}
+
+/// What an animation does after its first cycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopMode {
+    /// Repeats forever.
+    #[default]
+    Loop,
+    /// Alternates forward and backward cycles.
+    PingPong,
+}
+
+impl LoopMode {
+    pub const ALL: [LoopMode; 2] = [LoopMode::Loop, LoopMode::PingPong];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LoopMode::Loop => "Loop",
+            LoopMode::PingPong => "PingPong",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnimDirection {
+    #[default]
+    Forward,
+    Backward,
+}
+
+/// Loop mode and direction of a Timeline, Beats or Envelope animation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Motion {
+    pub mode: LoopMode,
+    pub direction: AnimDirection,
 }
 
 /// Which dashboard a `Animation::Dashboard` reads. Layer and Clip mean the layer or clip
@@ -2126,6 +2184,24 @@ mod tests {
         t.as_object_mut().unwrap().remove("timecode_start");
         let t: Transport = serde_json::from_value(t).unwrap();
         assert_eq!(t.timecode_start, None);
+    }
+
+    #[test]
+    fn old_animation_without_motion_loads_as_loop_forward() {
+        let a: Animation =
+            serde_json::from_str(r#"{"Beats":{"beats":4.0,"curve":"Sine"}}"#).unwrap();
+        assert!(matches!(a, Animation::Beats { motion, .. } if motion == Motion::default()));
+        let m = Motion {
+            mode: LoopMode::PingPong,
+            direction: AnimDirection::Backward,
+        };
+        let b = Animation::Beats {
+            beats: 2.0,
+            curve: Curve::Saw,
+            motion: m,
+        };
+        let back: Animation = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back, b);
     }
 
     fn audio_anim() -> Animation {

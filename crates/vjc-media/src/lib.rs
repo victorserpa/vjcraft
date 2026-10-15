@@ -23,6 +23,7 @@ pub mod analysis;
 pub mod audio;
 pub mod capture;
 pub mod ltc_in;
+pub mod sequence;
 
 /// A decoded RGBA8 frame (tightly packed, `width * 4` bytes per row).
 #[derive(Clone)]
@@ -128,6 +129,10 @@ impl Player {
         let thread = std::thread::Builder::new()
             .name("vjc-decode".into())
             .spawn(move || {
+                if let Some((pattern, fps)) = sequence::parse_label(&p) {
+                    run_sequence(&pattern, fps, &s);
+                    return;
+                }
                 if is_image(&p) {
                     match load_image(&p) {
                         Ok(f) => *s.latest.lock().unwrap() = Some(f),
@@ -280,7 +285,57 @@ impl Drop for Player {
 /// Camera and network players carry a `camera:`/`net:` label as path, not a file.
 fn is_live_label(path: &Path) -> bool {
     let s = path.to_string_lossy();
-    s.starts_with("camera:") || s.starts_with("net:")
+    s.starts_with("camera:") || s.starts_with("net:") || sequence::parse_label(path).is_some()
+}
+
+/// Plays an image sequence: shows the frame for the wanted position (0..1 over n/fps
+/// seconds). Decoded frames are kept up to a byte budget so loops do not re-decode.
+fn run_sequence(pattern: &Path, fps: f32, shared: &Shared) {
+    let files = sequence::resolve_pattern(pattern);
+    if files.is_empty() {
+        *shared.error.lock().unwrap() = Some("no frames match the sequence".into());
+        return;
+    }
+    let n = files.len();
+    let mut cache: Vec<Option<Frame>> = vec![None; n];
+    let (mut used, budget) = (0u64, 256u64 * 1024 * 1024);
+    let (mut seq, mut shown) = (0u64, usize::MAX);
+    let mut announced = false;
+    while !shared.stop.load(Ordering::Relaxed) {
+        let pos = f64::from_bits(shared.position.load(Ordering::Relaxed));
+        let i = sequence::frame_index(pos, n);
+        if i != shown {
+            let f = match &cache[i] {
+                Some(f) => Some(f.clone()),
+                None => match load_image(&files[i]) {
+                    Ok(f) => {
+                        if used + f.data.len() as u64 <= budget {
+                            used += f.data.len() as u64;
+                            cache[i] = Some(f.clone());
+                        }
+                        Some(f)
+                    }
+                    Err(e) => {
+                        *shared.error.lock().unwrap() = Some(e);
+                        None
+                    }
+                },
+            };
+            if let Some(f) = f {
+                seq += 1;
+                *shared.latest.lock().unwrap() = Some(Frame { seq, ..f });
+                shown = i;
+                if !announced {
+                    announced = true;
+                    let d = n as f64 / f64::from(fps);
+                    shared.duration.store(d.to_bits(), Ordering::Relaxed);
+                }
+            } else {
+                shown = i;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
 }
 
 fn is_image(path: &Path) -> bool {

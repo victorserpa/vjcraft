@@ -99,6 +99,10 @@ pub struct Video {
     pub fit: FitMode,
     /// Read at startup only.
     pub vsync: bool,
+    /// Render rate ceiling in fps; 0 = unlimited (the composition fps and the display decide).
+    pub max_fps: u32,
+    /// A dropped folder that is a pure numbered image sequence becomes one clip.
+    pub folder_sequence: bool,
 }
 
 impl Default for Video {
@@ -109,6 +113,8 @@ impl Default for Video {
             fps: 60.0,
             fit: FitMode::Fit,
             vsync: true,
+            max_fps: 0,
+            folder_sequence: true,
         }
     }
 }
@@ -786,5 +792,17 @@ mod tests {
             Prefs::from_json(&json).0.control.beat_snap,
             vjc_model::BeatSnap::Bar
         );
+    }
+
+    #[test]
+    fn max_fps_persists_and_defaults_to_unlimited() {
+        let v: Video = serde_json::from_str("{}").unwrap();
+        assert_eq!(v.max_fps, 0);
+        let v = Video {
+            max_fps: 30,
+            ..Video::default()
+        };
+        let back: Video = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back.max_fps, 30);
     }
 }

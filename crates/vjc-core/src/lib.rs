@@ -1266,6 +1266,23 @@ fn number(v: &Value) -> f64 {
     }
 }
 
+/// A clip that plays the numbered images named by `pattern` at `fps`.
+pub fn clip_from_sequence(pattern: PathBuf, fps: f32) -> Clip {
+    let mut c = clip_from_path(pattern.clone());
+    c.name = pattern
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .and_then(|n| {
+            n.split('%')
+                .next()
+                .map(|h| h.trim_end_matches(['_', '-', '.', ' ']).to_string())
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "sequence".into());
+    c.source = Source::Sequence { pattern, fps };
+    c
+}
+
 pub fn clip_from_path(path: PathBuf) -> Clip {
     let name = path
         .file_stem()
@@ -1426,6 +1443,13 @@ fn trigger_event(
             layer,
             column,
             path: path.clone(),
+        }),
+        // The player recognises `pattern@fps` as an image sequence.
+        Source::Sequence { pattern, fps } => Ok(Event::ClipStarted {
+            deck,
+            layer,
+            column,
+            path: PathBuf::from(format!("{}@{}", pattern.display(), fps)),
         }),
         Source::Capture { device } => Ok(Event::CaptureStarted {
             deck,
@@ -4770,6 +4794,7 @@ mod tests {
             roundtrip(
                 &mut p,
                 anim(Some(vjc_model::Animation::Beats {
+                    motion: Default::default(),
                     beats: 4.0,
                     curve: vjc_model::Curve::Sine,
                 })),

@@ -2,7 +2,9 @@
 //! value is computed per frame from beat phase, time, FFT bands and dashboard dials, so
 //! animating never dirties the project nor enters the history.
 
-use vjc_model::{Animation, Curve, DialScope, FftBand, Param, Value};
+use vjc_model::{
+    AnimDirection, Animation, Curve, DialScope, FftBand, LoopMode, Motion, Param, Value,
+};
 
 /// Dials per composition.
 pub const DIALS: usize = 8;
@@ -291,14 +293,37 @@ pub fn env_insert(points: &mut Vec<(f64, f64)>, x: f64, y: f64) -> Option<usize>
     Some(at)
 }
 
+/// Applies loop mode and direction to a position in cycles (`x` grows with the clock).
+/// Loop keeps the continuous position (backward = negated); PingPong folds it into 0..1.
+pub fn motion_phase(m: Motion, x: f64) -> f64 {
+    let back = m.direction == AnimDirection::Backward;
+    let p = match m.mode {
+        LoopMode::Loop => return if back { -x } else { x },
+        LoopMode::PingPong => 1.0 - ((x.rem_euclid(2.0)) - 1.0).abs(),
+    };
+    let p = p.min(1.0 - 1e-9);
+    if back { 1.0 - p } else { p }
+}
+
 /// Normalised 0..=1 output of the animation.
 fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
     let t = match anim {
         Animation::Timeline {
             duration_secs,
             curve,
-        } => shape(curve, safe_div(ctx.time_secs, *duration_secs)),
-        Animation::Beats { beats, curve } => shape(curve, safe_div(ctx.beat_phase, *beats)),
+            motion,
+        } => shape(
+            curve,
+            motion_phase(*motion, safe_div(ctx.time_secs, *duration_secs)),
+        ),
+        Animation::Beats {
+            beats,
+            curve,
+            motion,
+        } => shape(
+            curve,
+            motion_phase(*motion, safe_div(ctx.beat_phase, *beats)),
+        ),
         Animation::Audio {
             band: b,
             gain,
@@ -343,7 +368,14 @@ fn unit(anim: &Animation, ctx: &AnimCtx) -> f64 {
             };
             f64::from(*min) + level * f64::from(*max - *min)
         }
-        Animation::Envelope { points, beats } => envelope(points, safe_div(ctx.beat_phase, *beats)),
+        Animation::Envelope {
+            points,
+            beats,
+            motion,
+        } => envelope(
+            points,
+            motion_phase(*motion, safe_div(ctx.beat_phase, *beats)),
+        ),
         Animation::Dashboard { dial, scope } => {
             let dials = match scope {
                 DialScope::Comp => ctx.dashboard,
@@ -428,6 +460,7 @@ mod tests {
     }
     fn beats(c: Curve) -> Animation {
         Animation::Beats {
+            motion: Default::default(),
             beats: 4.0,
             curve: c,
         }
@@ -495,6 +528,7 @@ mod tests {
     #[test]
     fn preview_samples_one_cycle_of_each_curve() {
         let tl = |curve| Animation::Timeline {
+            motion: Default::default(),
             duration_secs: 3.0,
             curve,
         };
@@ -503,6 +537,7 @@ mod tests {
         let sq = preview(&tl(Curve::Square), 4);
         assert_eq!(sq, vec![1.0, 1.0, 0.0, 0.0]);
         let b = Animation::Beats {
+            motion: Default::default(),
             beats: 4.0,
             curve: Curve::Saw,
         };
@@ -512,6 +547,7 @@ mod tests {
             "cycle length does not change the shape"
         );
         let env = Animation::Envelope {
+            motion: Default::default(),
             points: vec![(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
             beats: 8.0,
         };
@@ -549,6 +585,7 @@ mod tests {
         assert_eq!(pts, before);
         // The dragged envelope changes the evaluated value.
         let mut a = Animation::Envelope {
+            motion: Default::default(),
             points: vec![(0.0, 0.0), (1.0, 1.0)],
             beats: 2.0,
         };
@@ -583,6 +620,7 @@ mod tests {
     #[test]
     fn timeline_uses_seconds() {
         let a = Animation::Timeline {
+            motion: Default::default(),
             duration_secs: 2.0,
             curve: Curve::Saw,
         };
@@ -592,6 +630,7 @@ mod tests {
     #[test]
     fn envelope_interpolates() {
         let a = Animation::Envelope {
+            motion: Default::default(),
             points: vec![(1.0, 0.0), (0.0, 1.0)],
             beats: 2.0,
         };
@@ -646,6 +685,7 @@ mod tests {
         assert_eq!(effective_number(&pr, &c), 3.0);
         assert_eq!(pr.value, Value::Number(2.0));
         let bad = Animation::Beats {
+            motion: Default::default(),
             beats: 0.0,
             curve: Curve::Saw,
         };
@@ -720,6 +760,7 @@ mod tests {
     fn envelope_presets_shape_the_cycle() {
         let at = |pre: EnvPreset, x: f64| {
             let a = Animation::Envelope {
+                motion: Default::default(),
                 points: pre.points(),
                 beats: 4.0,
             };
@@ -797,5 +838,26 @@ mod tests {
         assert_eq!(v.len(), DIALS);
         assert_eq!(v[0], 0.5);
         assert!(v[1..].iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn motion_modes_and_direction() {
+        let at = |mode, direction, b: f64| {
+            let a = Animation::Beats {
+                beats: 4.0,
+                curve: Curve::Saw,
+                motion: Motion { mode, direction },
+            };
+            evaluate(&p((0.0, 1.0)), &a, &ctx(b, 1.0, &[], &[]))
+        };
+        use AnimDirection::{Backward, Forward};
+        use LoopMode::{Loop, PingPong};
+        // Loop wraps; backward runs the ramp down.
+        assert!((at(Loop, Forward, 5.0) - 0.25).abs() < 1e-9);
+        assert!((at(Loop, Backward, 1.0) - 0.75).abs() < 1e-9);
+        // PingPong goes up then down.
+        assert!((at(PingPong, Forward, 1.0) - 0.25).abs() < 1e-9);
+        assert!((at(PingPong, Forward, 6.0) - 0.5).abs() < 1e-9);
+        assert!((at(PingPong, Backward, 1.0) - 0.75).abs() < 1e-9);
     }
 }
