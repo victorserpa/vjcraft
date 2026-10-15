@@ -1,7 +1,11 @@
 //! ISF effects: header parser and GLSL -> WGSL translation through naga.
 //!
 //! An ISF file is a JSON header in a `/*{ ... }*/` comment followed by a GLSL fragment
-//! body. Only single-pass image filters are supported (no PASSES); `"PERSISTENT": true` gives the shader its previous output as `PREV_PIXEL`.
+//! body. `"PERSISTENT": true` gives the shader its previous output as `PREV_PIXEL`.
+//! `"PASSES"` runs the shader several times per frame: a pass with a `TARGET` renders into
+//! a named buffer (optionally `PERSISTENT` across frames, sized by `WIDTH`/`HEIGHT`
+//! expressions) that the shader reads as an image under that name; the pass index is
+//! `PASSINDEX`.
 //! Everything here is pure CPU work and returns errors instead of panicking, so the app
 //! can run it on a worker thread and disable the effect on failure.
 
@@ -167,6 +171,14 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("wave", include_str!("../../../assets/effects/wave.fs")),
     ("trails", include_str!("../../../assets/effects/trails.fs")),
     ("echo", include_str!("../../../assets/effects/echo.fs")),
+    (
+        "blur_separable",
+        include_str!("../../../assets/effects/blur_separable.fs"),
+    ),
+    (
+        "feedback_trail",
+        include_str!("../../../assets/effects/feedback_trail.fs"),
+    ),
     ("crop", include_str!("../../../assets/effects/crop.fs")),
     (
         "keystone",
@@ -329,8 +341,260 @@ pub struct Isf {
     /// `"TICK_INPUT": "fps"`. The runtime then tells the shader, per instance, whether
     /// this frame starts a new tick (`NEW_TICK`).
     pub tick_input: Option<String>,
+    /// ISF `PASSES`, in order (empty = one ordinary pass).
+    pub passes: Vec<Pass>,
     /// GLSL after the header.
     pub body: String,
+}
+
+/// Named buffers a multipass effect may declare (bindings `TARGET_BINDING..`).
+pub const MAX_TARGETS: usize = 4;
+/// First bind group slot of the named targets.
+pub const TARGET_BINDING: u32 = 5;
+/// Most passes one effect may run per frame.
+pub const MAX_PASSES: usize = 8;
+/// Largest target side in pixels.
+pub const MAX_TARGET_SIDE: u32 = 8192;
+
+/// One entry of the ISF `PASSES` array.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pass {
+    /// Named buffer the pass renders into (None = the effect output).
+    pub target: Option<String>,
+    /// The target keeps its content across frames (needs a `target`).
+    pub persistent: bool,
+    /// ISF asks for a float buffer. Buffers are 8-bit here, so this is only recorded.
+    pub float: bool,
+    /// Size expressions (`$WIDTH`, `$HEIGHT`, numbers, `+ - * /`, parentheses).
+    pub width: Option<String>,
+    pub height: Option<String>,
+}
+
+impl Pass {
+    /// Pixel size of this pass's buffer for a render size.
+    pub fn size(&self, render: (u32, u32)) -> (u32, u32) {
+        let side = |e: &Option<String>, r: u32| match e {
+            None => r,
+            Some(e) => eval_size(e, render)
+                .map(|v| v.round().clamp(1.0, MAX_TARGET_SIDE as f32) as u32)
+                .unwrap_or(r),
+        };
+        (side(&self.width, render.0), side(&self.height, render.1))
+    }
+}
+
+/// Evaluates a pass size expression for a render size. Variables: `$WIDTH`, `$HEIGHT`.
+pub fn eval_size(expr: &str, (w, h): (u32, u32)) -> Result<f32, String> {
+    struct P<'a> {
+        c: Vec<char>,
+        i: usize,
+        vars: (f32, f32),
+        src: &'a str,
+    }
+    impl P<'_> {
+        fn ws(&mut self) {
+            while self.c.get(self.i).is_some_and(|c| c.is_whitespace()) {
+                self.i += 1;
+            }
+        }
+        fn expr(&mut self) -> Result<f32, String> {
+            let mut v = self.term()?;
+            loop {
+                self.ws();
+                match self.c.get(self.i) {
+                    Some('+') => {
+                        self.i += 1;
+                        v += self.term()?;
+                    }
+                    Some('-') => {
+                        self.i += 1;
+                        v -= self.term()?;
+                    }
+                    _ => return Ok(v),
+                }
+            }
+        }
+        fn term(&mut self) -> Result<f32, String> {
+            let mut v = self.atom()?;
+            loop {
+                self.ws();
+                match self.c.get(self.i) {
+                    Some('*') => {
+                        self.i += 1;
+                        v *= self.atom()?;
+                    }
+                    Some('/') => {
+                        self.i += 1;
+                        let d = self.atom()?;
+                        if d == 0.0 {
+                            return Err(format!("division by zero in size \"{}\"", self.src));
+                        }
+                        v /= d;
+                    }
+                    _ => return Ok(v),
+                }
+            }
+        }
+        fn atom(&mut self) -> Result<f32, String> {
+            self.ws();
+            let bad = |s: &str| format!("bad size expression \"{s}\"");
+            match self.c.get(self.i).copied() {
+                Some('(') => {
+                    self.i += 1;
+                    let v = self.expr()?;
+                    self.ws();
+                    if self.c.get(self.i) != Some(&')') {
+                        return Err(bad(self.src));
+                    }
+                    self.i += 1;
+                    Ok(v)
+                }
+                Some('-') => {
+                    self.i += 1;
+                    Ok(-self.atom()?)
+                }
+                Some('$') => {
+                    let st = self.i + 1;
+                    self.i = st;
+                    while self.c.get(self.i).is_some_and(|c| c.is_ascii_alphabetic()) {
+                        self.i += 1;
+                    }
+                    match self.c[st..self.i].iter().collect::<String>().as_str() {
+                        "WIDTH" => Ok(self.vars.0),
+                        "HEIGHT" => Ok(self.vars.1),
+                        other => Err(format!(
+                            "unknown variable ${other} in size \"{}\" (only $WIDTH and $HEIGHT)",
+                            self.src
+                        )),
+                    }
+                }
+                Some(c) if c.is_ascii_digit() || c == '.' => {
+                    let st = self.i;
+                    while self
+                        .c
+                        .get(self.i)
+                        .is_some_and(|c| c.is_ascii_digit() || *c == '.')
+                    {
+                        self.i += 1;
+                    }
+                    let t: String = self.c[st..self.i].iter().collect();
+                    t.parse().map_err(|_| bad(self.src))
+                }
+                _ => Err(bad(self.src)),
+            }
+        }
+    }
+    let mut p = P {
+        c: expr.chars().collect(),
+        i: 0,
+        vars: (w as f32, h as f32),
+        src: expr,
+    };
+    let v = p.expr()?;
+    p.ws();
+    if p.i != p.c.len() || !v.is_finite() {
+        return Err(format!("bad size expression \"{expr}\""));
+    }
+    Ok(v)
+}
+
+/// Distinct `TARGET` names of `passes` in first-use order.
+pub fn targets_of(passes: &[Pass]) -> Vec<&str> {
+    let mut v: Vec<&str> = vec![];
+    for t in passes.iter().filter_map(|p| p.target.as_deref()) {
+        if !v.contains(&t) {
+            v.push(t);
+        }
+    }
+    v
+}
+
+fn valid_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && !RESERVED.contains(&name)
+        && !name.starts_with("isf_")
+        && !name.starts_with("vjc_")
+        && !name.starts_with("gl_")
+}
+
+fn parse_passes(json: &serde_json::Value, inputs: &[Input]) -> Result<Vec<Pass>, FxError> {
+    let Some(list) = json.get("PASSES") else {
+        return Ok(vec![]);
+    };
+    let Some(list) = list.as_array() else {
+        return err("PASSES must be an array");
+    };
+    if list.is_empty() {
+        return err("PASSES is empty");
+    }
+    if list.len() > MAX_PASSES {
+        return err(format!("too many PASSES ({} > {MAX_PASSES})", list.len()));
+    }
+    let mut out = vec![];
+    let mut targets: Vec<&str> = vec![];
+    for (n, p) in list.iter().enumerate() {
+        let Some(o) = p.as_object() else {
+            return err(format!("pass {n} is not an object"));
+        };
+        let target = match o.get("TARGET") {
+            None => None,
+            Some(serde_json::Value::String(t)) => {
+                if !valid_ident(t) || inputs.iter().any(|i| i.name == *t) || t == "inputImage" {
+                    return err(format!("pass {n}: invalid TARGET name \"{t}\""));
+                }
+                if !targets.contains(&t.as_str()) {
+                    targets.push(t);
+                }
+                Some(t.clone())
+            }
+            Some(_) => return err(format!("pass {n}: TARGET must be a string")),
+        };
+        let flag = |k: &str| match o.get(k) {
+            None => Ok(false),
+            Some(serde_json::Value::Bool(b)) => Ok(*b),
+            Some(v) => v
+                .as_f64()
+                .map(|x| x != 0.0)
+                .ok_or_else(|| FxError(format!("pass {n}: {k} must be a boolean"))),
+        };
+        let persistent = flag("PERSISTENT")?;
+        let float = flag("FLOAT")?;
+        if persistent && target.is_none() {
+            return err(format!("pass {n}: PERSISTENT needs a TARGET"));
+        }
+        let size = |k: &str| -> Result<Option<String>, FxError> {
+            let e = match o.get(k) {
+                None => return Ok(None),
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(v) if v.is_number() => v.to_string(),
+                Some(_) => return err(format!("pass {n}: {k} must be an expression")),
+            };
+            match eval_size(&e, (100, 100)) {
+                Ok(v) if v >= 0.5 => Ok(Some(e)),
+                Ok(_) => err(format!("pass {n}: {k} \"{e}\" is not a positive size")),
+                Err(m) => err(format!("pass {n}: {k}: {m}")),
+            }
+        };
+        out.push(Pass {
+            target,
+            persistent,
+            float,
+            width: size("WIDTH")?,
+            height: size("HEIGHT")?,
+        });
+    }
+    if out.last().is_some_and(|p| p.target.is_some()) {
+        return err("the last pass renders the effect output and cannot have a TARGET");
+    }
+    if targets.len() > MAX_TARGETS {
+        return err(format!(
+            "too many TARGET buffers ({} > {MAX_TARGETS})",
+            targets.len()
+        ));
+    }
+    Ok(out)
 }
 
 fn nums(v: Option<&serde_json::Value>) -> Option<Vec<f64>> {
@@ -476,9 +740,17 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
                 .any(|i| i.name == *n && matches!(i.kind, InputKind::Float { .. }))
         })
         .map(str::to_string);
+    let passes = parse_passes(&json, &inputs)?;
+    if !passes.is_empty() && persistent {
+        return err("PERSISTENT with PASSES: mark the pass TARGET persistent instead");
+    }
+    if !passes.is_empty() && tick_input.is_some() {
+        return err("TICK_INPUT cannot be combined with PASSES");
+    }
     Ok(Isf {
         persistent,
         tick_input,
+        passes,
         description: str_of("DESCRIPTION"),
         categories,
         inputs,
@@ -844,13 +1116,24 @@ pub fn glsl_source(isf: &Isf) -> String {
          #define PREV_THIS_PIXEL PREV_PIXEL(isf_FragNormCoord)\n\
          #define gl_FragColor isf_FragColor\n\
          #define TIME isf_u.p[0].x\n\
-         #define NEW_TICK isf_u.p[0].w\n\
          #define RENDERSIZE isf_u.p[0].yz\n\
          #define IMG_NORM_PIXEL(img, uv) textureLod(sampler2D(img, isf_smp), vec2((uv).x, 1.0 - (uv).y), 0.0)\n\
          #define IMG_THIS_PIXEL(img) IMG_NORM_PIXEL(img, isf_FragNormCoord)\n\
          #define IMG_PIXEL(img, px) IMG_NORM_PIXEL(img, (px) / RENDERSIZE)\n\
          #define IMG_SIZE(img) RENDERSIZE\n",
     );
+    if isf.passes.is_empty() {
+        s.push_str("#define NEW_TICK isf_u.p[0].w\n#define PASSINDEX 0\n");
+    } else {
+        // Slot 0 .w carries the pass index instead of the tick flag.
+        s.push_str("#define NEW_TICK 0.0\n#define PASSINDEX int(isf_u.p[0].w + 0.5)\n");
+        for (k, t) in isf.targets().iter().enumerate() {
+            s.push_str(&format!(
+                "layout(set = 0, binding = {}) uniform texture2D {t};\n",
+                TARGET_BINDING as usize + k
+            ));
+        }
+    }
     for (n, i) in isf.inputs_iter() {
         let slot = format!("isf_u.p[{n}]");
         let expr = match &i.kind {
@@ -869,6 +1152,16 @@ pub fn glsl_source(isf: &Isf) -> String {
 }
 
 impl Isf {
+    /// Distinct `TARGET` names in first-use order; index k is bound at `TARGET_BINDING + k`.
+    pub fn targets(&self) -> Vec<&str> {
+        targets_of(&self.passes)
+    }
+
+    /// The effect needs a per-instance id: a persistent flag or a persistent target.
+    pub fn needs_instance(&self) -> bool {
+        self.persistent || self.passes.iter().any(|p| p.persistent)
+    }
+
     /// First uniform slot of every input (slot 0 is TIME/RENDERSIZE).
     fn first_slots(&self) -> Vec<usize> {
         let mut n = 1;
@@ -888,7 +1181,7 @@ impl Isf {
 }
 
 /// Translates ISF to a WGSL fragment module (entry point `main`; bindings: 0 uniform
-/// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects), 4 previous output of this instance (persistent effects only; blank otherwise); `@location(0)` input is the ISF y-up uv).
+/// block, 1 input texture, 2 sampler, 3 ML mask texture (R8, only used by ML effects), 4 previous output of this instance (persistent effects only; blank otherwise), 5.. named PASSES targets (`targets()` order); `@location(0)` input is the ISF y-up uv).
 pub fn translate(isf: &Isf) -> Result<String, FxError> {
     use naga::{back::wgsl, front::glsl, valid};
     let names: Vec<&str> = isf.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -1257,5 +1550,111 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
         assert!(translate(&on).is_ok());
         let off = parse(r#"/*{}*/ void main(){ gl_FragColor = vec4(1.0); }"#).unwrap();
         assert!(!off.persistent);
+    }
+
+    fn passes_src(passes: &str) -> String {
+        format!(
+            r#"/*{{"INPUTS":[{{"NAME":"inputImage","TYPE":"image"}},{{"NAME":"amt","TYPE":"float"}}],"PASSES":{passes}}}*/
+void main() {{ gl_FragColor = PASSINDEX == 0 ? IMG_THIS_PIXEL(inputImage) : IMG_THIS_PIXEL(buf); }}"#
+        )
+    }
+
+    #[test]
+    fn passes_are_parsed_with_sizes_and_flags() {
+        let isf = parse(&passes_src(
+            r#"[{"TARGET":"buf","PERSISTENT":true,"FLOAT":true,"WIDTH":"$WIDTH/2","HEIGHT":"($HEIGHT + 2) * 0.5"},{}]"#,
+        ))
+        .unwrap();
+        assert_eq!(isf.passes.len(), 2);
+        let p = &isf.passes[0];
+        assert_eq!(p.target.as_deref(), Some("buf"));
+        assert!(p.persistent && p.float);
+        assert_eq!(p.size((640, 480)), (320, 241));
+        assert_eq!(isf.passes[1].target, None);
+        assert_eq!(isf.passes[1].size((640, 480)), (640, 480));
+        assert_eq!(isf.targets(), ["buf"]);
+        assert!(isf.needs_instance());
+        let plain = parse(&passes_src(r#"[{"TARGET":"buf"},{}]"#)).unwrap();
+        assert!(!plain.passes[0].persistent && !plain.needs_instance());
+        assert!(parse("/*{}*/ void main(){}").unwrap().passes.is_empty());
+    }
+
+    #[test]
+    fn size_expressions() {
+        assert_eq!(eval_size("$WIDTH", (100, 50)), Ok(100.0));
+        assert_eq!(eval_size("$HEIGHT/2 + 1", (100, 50)), Ok(26.0));
+        assert_eq!(eval_size("2 * (3 + 4) - 1", (1, 1)), Ok(13.0));
+        assert_eq!(eval_size("-$WIDTH + 10", (4, 1)), Ok(6.0));
+        for bad in ["", "$FOO", "1 +", "(1", "1 / 0", "abc", "1 2"] {
+            assert!(eval_size(bad, (10, 10)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn bad_pass_specs_are_rejected_with_a_clear_error() {
+        for (passes, needle) in [
+            ("{}", "must be an array"),
+            ("[]", "empty"),
+            (r#"[1]"#, "not an object"),
+            (r#"[{"TARGET":3},{}]"#, "TARGET must be a string"),
+            (r#"[{"TARGET":"a b"},{}]"#, "invalid TARGET"),
+            (r#"[{"TARGET":"amt"},{}]"#, "invalid TARGET"),
+            (r#"[{"TARGET":"inputImage"},{}]"#, "invalid TARGET"),
+            (r#"[{"PERSISTENT":true},{}]"#, "needs a TARGET"),
+            (
+                r#"[{"TARGET":"buf","WIDTH":"$NOPE"},{}]"#,
+                "unknown variable",
+            ),
+            (r#"[{"TARGET":"buf","WIDTH":"1 +"},{}]"#, "WIDTH"),
+            (r#"[{"TARGET":"buf","HEIGHT":"0"},{}]"#, "not a positive"),
+            (r#"[{"TARGET":"buf"}]"#, "last pass"),
+            (
+                r#"[{"TARGET":"a"},{"TARGET":"b"},{"TARGET":"c"},{"TARGET":"d"},{"TARGET":"e"},{}]"#,
+                "too many TARGET",
+            ),
+        ] {
+            let e = parse(&passes_src(passes)).unwrap_err().to_string();
+            assert!(e.contains(needle), "{passes}: {e}");
+        }
+        let many = format!("[{}{{}}]", r#"{"TARGET":"a"},"#.repeat(MAX_PASSES));
+        assert!(
+            parse(&passes_src(&many))
+                .unwrap_err()
+                .0
+                .contains("too many PASSES")
+        );
+        let e = parse(r#"/*{"PERSISTENT":true,"PASSES":[{}]}*/ void main(){}"#).unwrap_err();
+        assert!(e.0.contains("PERSISTENT with PASSES"), "{e}");
+        let e = parse(
+            r#"/*{"TICK_INPUT":"f","INPUTS":[{"NAME":"f","TYPE":"float"}],"PASSES":[{}]}*/ void main(){}"#,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("TICK_INPUT"), "{e}");
+    }
+
+    #[test]
+    fn passindex_and_named_targets_translate() {
+        let isf = parse(&passes_src(r#"[{"TARGET":"buf"},{}]"#)).unwrap();
+        let g = glsl_source(&isf);
+        assert!(g.contains("binding = 5) uniform texture2D buf;"), "{g}");
+        assert!(g.contains("#define PASSINDEX int(isf_u.p[0].w"));
+        let wgsl = translate(&isf).unwrap();
+        assert!(wgsl.contains("@binding(5)"), "{wgsl}");
+        // Single-pass effects see PASSINDEX 0 and keep NEW_TICK.
+        let one =
+            parse(r#"/*{}*/ void main(){ gl_FragColor = vec4(float(PASSINDEX) + NEW_TICK); }"#)
+                .unwrap();
+        let g = glsl_source(&one);
+        assert!(g.contains("#define PASSINDEX 0") && g.contains("#define NEW_TICK isf_u.p[0].w"));
+        translate(&one).unwrap();
+    }
+
+    #[test]
+    fn bundled_multipass_effects_declare_passes() {
+        for (id, persistent) in [("blur_separable", false), ("feedback_trail", true)] {
+            let isf = parse(builtin_source(id).unwrap()).unwrap();
+            assert_eq!(isf.passes.len(), 2, "{id}");
+            assert_eq!(isf.needs_instance(), persistent, "{id}");
+        }
     }
 }

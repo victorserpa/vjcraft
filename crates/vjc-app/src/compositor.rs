@@ -474,6 +474,15 @@ struct Fx {
     /// Mixed into the persist key: 0 for the composition, one value per routed output, so
     /// an effect drawn in several outputs in one frame keeps one history for each.
     persist_scope: u128,
+    /// `PASSES` of each multipass effect kind (empty/absent = ordinary effect).
+    passes: HashMap<String, Vec<vjc_fx::Pass>>,
+    /// Persistent `TARGET` buffers, one per (instance, output, target name).
+    targets: PersistStore<(wgpu::Texture, wgpu::TextureView)>,
+    /// Non-persistent `TARGET` buffers, shared by size and target index (always written
+    /// before they are read).
+    pass_targets: Pool<(u32, u32, usize), (wgpu::Texture, wgpu::TextureView)>,
+    /// Where a targeted pass renders before the result is copied to its buffer.
+    pass_tmp: Pool<(u32, u32), (wgpu::Texture, wgpu::TextureView)>,
 }
 
 /// Key part that separates the persistent histories of the outputs (see `persist_scope`).
@@ -561,31 +570,68 @@ pub(crate) fn draw_pass(
     mask: &wgpu::TextureView,
     prev: &wgpu::TextureView,
 ) {
+    draw_pass_targets(
+        device,
+        enc,
+        bgl,
+        sampler,
+        pipe,
+        buf,
+        (src, dst, mask, prev),
+        &[],
+    );
+}
+
+/// `draw_pass` plus the named `PASSES` targets (binding `TARGET_BINDING + k`); slots
+/// without a target are bound to `prev` so the layout is always complete.
+#[allow(clippy::too_many_arguments)]
+fn draw_pass_targets(
+    device: &wgpu::Device,
+    enc: &mut wgpu::CommandEncoder,
+    bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    pipe: &wgpu::RenderPipeline,
+    buf: &wgpu::Buffer,
+    (src, dst, mask, prev): (
+        &wgpu::TextureView,
+        &wgpu::TextureView,
+        &wgpu::TextureView,
+        &wgpu::TextureView,
+    ),
+    targets: &[&wgpu::TextureView],
+) {
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buf.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(src),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::Sampler(sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: wgpu::BindingResource::TextureView(mask),
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: wgpu::BindingResource::TextureView(prev),
+        },
+    ];
+    for k in 0..vjc_fx::MAX_TARGETS {
+        entries.push(wgpu::BindGroupEntry {
+            binding: vjc_fx::TARGET_BINDING + k as u32,
+            resource: wgpu::BindingResource::TextureView(targets.get(k).copied().unwrap_or(prev)),
+        });
+    }
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("fx_bg"),
         layout: bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(src),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::TextureView(mask),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(prev),
-            },
-        ],
+        entries: &entries,
     });
     let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("fx"),
@@ -709,57 +755,163 @@ impl Fx {
                         mapped_at_creation: false,
                     }));
             }
-            let buf = &self.bufs[self.next];
-            self.next += 1;
-            // Persistent effect: its previous output is bound as PREV_PIXEL, and this
-            // frame's result is copied back after the pass.
-            let hist = e.persistent.map(|id| {
-                let key = persist_key(id, self.persist_scope);
-                let (tex, how) = self
-                    .persist
-                    .acquire(key, size, || make_history(device, size));
-                (key, tex, how)
-            });
-            let mut uniforms = e.uniforms;
-            // A ticking effect (freeze) learns per instance whether this draw starts a new
-            // tick: slot 0 carries its rate in, and the flag goes out in its place.
-            if let Some((key, _, how)) = &hist {
-                let last = (*how == crate::persist::Acquired::Kept)
-                    .then(|| self.ticks.get(key).copied())
-                    .flatten();
-                if let Some(tick) = apply_tick(e.ticking, &mut uniforms, last) {
-                    self.ticks.insert(*key, tick);
-                }
-            }
-            queue.write_buffer(buf, 0, bytemuck::cast_slice(&uniforms));
             let out = (0..3).find(|&i| Some(i) != cur).unwrap_or(0);
             let src = match cur {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
-            let hist = hist.map(|h| h.1);
-            draw_pass(
-                device,
-                enc,
-                bgl,
-                sampler,
-                pipe,
-                buf,
-                src,
-                &scratch[out].1,
-                mask.unwrap_or(src),
-                hist.map_or(src, |h| &h.1),
-            );
-            if let Some(h) = hist {
-                enc.copy_texture_to_texture(
-                    scratch[out].0.as_image_copy(),
-                    h.0.as_image_copy(),
-                    wgpu::Extent3d {
-                        width: size.0,
-                        height: size.1,
-                        depth_or_array_layers: 1,
-                    },
+            if let Some(passes) = self.passes.get(&e.kind) {
+                let base = e.persistent.map(|id| persist_key(id, self.persist_scope));
+                let names = vjc_fx::targets_of(passes);
+                // Buffer of each target name: persistent when any pass says so (and the
+                // draw has an instance id), else pooled.
+                let tsize: Vec<(u32, u32)> = names
+                    .iter()
+                    .map(|n| {
+                        passes
+                            .iter()
+                            .find(|p| p.target.as_deref() == Some(*n))
+                            .map_or(size, |p| p.size(size))
+                    })
+                    .collect();
+                let keys: Vec<Option<uuid::Uuid>> = names
+                    .iter()
+                    .map(|n| {
+                        let pers = passes
+                            .iter()
+                            .any(|p| p.persistent && p.target.as_deref() == Some(*n));
+                        base.filter(|_| pers).map(|b| {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            n.hash(&mut h);
+                            persist_key(b, u128::from(h.finish()))
+                        })
+                    })
+                    .collect();
+                for (k, key) in keys.iter().enumerate() {
+                    let sz = tsize[k];
+                    match key {
+                        Some(key) => {
+                            self.targets
+                                .acquire(*key, sz, || make_target(device, sz.0, sz.1));
+                        }
+                        None => {
+                            self.pass_targets
+                                .acquire((sz.0, sz.1, k), || make_target(device, sz.0, sz.1));
+                        }
+                    }
+                }
+                for p in passes.iter().filter(|p| p.target.is_some()) {
+                    let sz = p.size(size);
+                    self.pass_tmp
+                        .acquire(sz, || make_target(device, sz.0, sz.1));
+                }
+                let tex = |k: usize| -> &(wgpu::Texture, wgpu::TextureView) {
+                    match &keys[k] {
+                        Some(key) => self.targets.get(key).expect("target acquired"),
+                        None => &self.pass_targets[&(tsize[k].0, tsize[k].1, k)],
+                    }
+                };
+                for (pi, pass) in passes.iter().enumerate() {
+                    let psize = if pass.target.is_some() {
+                        pass.size(size)
+                    } else {
+                        size
+                    };
+                    if self.bufs.len() <= self.next {
+                        self.bufs
+                            .push(device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("fx_u"),
+                                size: std::mem::size_of::<vjc_fx::Uniforms>() as u64,
+                                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            }));
+                    }
+                    let buf = &self.bufs[self.next];
+                    self.next += 1;
+                    // Slot 0: TIME, this pass's RENDERSIZE, PASSINDEX.
+                    let mut u = e.uniforms;
+                    u[0][1] = psize.0 as f32;
+                    u[0][2] = psize.1 as f32;
+                    u[0][3] = pi as f32;
+                    queue.write_buffer(buf, 0, bytemuck::cast_slice(&u));
+                    let views: Vec<&wgpu::TextureView> =
+                        (0..names.len()).map(|k| &tex(k).1).collect();
+                    let dst = match pass.target {
+                        Some(_) => &self.pass_tmp[&psize].1,
+                        None => &scratch[out].1,
+                    };
+                    draw_pass_targets(
+                        device,
+                        enc,
+                        bgl,
+                        sampler,
+                        pipe,
+                        buf,
+                        (src, dst, mask.unwrap_or(src), src),
+                        &views,
+                    );
+                    if let Some(t) = &pass.target {
+                        let k = names.iter().position(|n| n == t).unwrap_or(0);
+                        enc.copy_texture_to_texture(
+                            self.pass_tmp[&psize].0.as_image_copy(),
+                            tex(k).0.as_image_copy(),
+                            wgpu::Extent3d {
+                                width: psize.0,
+                                height: psize.1,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
+                }
+            } else {
+                let buf = &self.bufs[self.next];
+                self.next += 1;
+                // Persistent effect: its previous output is bound as PREV_PIXEL, and this
+                // frame's result is copied back after the pass.
+                let hist = e.persistent.map(|id| {
+                    let key = persist_key(id, self.persist_scope);
+                    let (tex, how) = self
+                        .persist
+                        .acquire(key, size, || make_history(device, size));
+                    (key, tex, how)
+                });
+                let mut uniforms = e.uniforms;
+                // A ticking effect (freeze) learns per instance whether this draw starts a new
+                // tick: slot 0 carries its rate in, and the flag goes out in its place.
+                if let Some((key, _, how)) = &hist {
+                    let last = (*how == crate::persist::Acquired::Kept)
+                        .then(|| self.ticks.get(key).copied())
+                        .flatten();
+                    if let Some(tick) = apply_tick(e.ticking, &mut uniforms, last) {
+                        self.ticks.insert(*key, tick);
+                    }
+                }
+                queue.write_buffer(buf, 0, bytemuck::cast_slice(&uniforms));
+                let hist = hist.map(|h| h.1);
+                draw_pass(
+                    device,
+                    enc,
+                    bgl,
+                    sampler,
+                    pipe,
+                    buf,
+                    src,
+                    &scratch[out].1,
+                    mask.unwrap_or(src),
+                    hist.map_or(src, |h| &h.1),
                 );
+                if let Some(h) = hist {
+                    enc.copy_texture_to_texture(
+                        scratch[out].0.as_image_copy(),
+                        h.0.as_image_copy(),
+                        wgpu::Extent3d {
+                            width: size.0,
+                            height: size.1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
             if let MixPlan::Blend(t) = plan {
                 if self.mix_bufs.len() <= self.mix_next {
@@ -1061,7 +1213,7 @@ fn make_base(
 /// Bind group layout of every effect / generator pass (also used by the browser thumbnails).
 pub(crate) fn fx_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let mut e: Vec<wgpu::BindGroupLayoutEntry> = vec![];
-    for binding in 0..5u32 {
+    for binding in 0..vjc_fx::TARGET_BINDING + vjc_fx::MAX_TARGETS as u32 {
         e.push(wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1321,6 +1473,10 @@ impl Compositor {
             persist: PersistStore::default(),
             ticks: HashMap::new(),
             persist_scope: 0,
+            passes: HashMap::new(),
+            targets: PersistStore::default(),
+            pass_targets: Pool::new(),
+            pass_tmp: Pool::new(),
         };
         let (target, target_view) = make_target(device, w, h);
         let white = make_target(device, 1, 1);
@@ -1375,7 +1531,13 @@ impl Compositor {
                 .flat_map(|s| s.iter())
                 .map(|t| b(&t.0))
                 .sum(),
-            persist: self.fx.persist.values().map(|t| b(&t.0)).sum(),
+            persist: self
+                .fx
+                .persist
+                .values()
+                .chain(self.fx.targets.values())
+                .map(|t| b(&t.0))
+                .sum(),
             thumbs: 0,
         }
     }
@@ -1405,11 +1567,23 @@ impl Compositor {
 
     /// Installs a translated effect shader (WGSL from `vjc_fx::translate`). Returns the
     /// validation error instead of panicking, so a bad shader only disables its effect.
+    #[cfg(test)]
     pub fn add_effect(
         &mut self,
         device: &wgpu::Device,
         kind: &str,
         wgsl: &str,
+    ) -> Result<(), String> {
+        self.add_effect_passes(device, kind, wgsl, &[])
+    }
+
+    /// `add_effect` for an ISF with `PASSES` (empty = ordinary single-pass effect).
+    pub fn add_effect_passes(
+        &mut self,
+        device: &wgpu::Device,
+        kind: &str,
+        wgsl: &str,
+        passes: &[vjc_fx::Pass],
     ) -> Result<(), String> {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1445,6 +1619,11 @@ impl Compositor {
             Some(e) => Err(e.to_string()),
             None => {
                 self.fx.pipes.insert(kind.to_string(), pipe);
+                if passes.is_empty() {
+                    self.fx.passes.remove(kind);
+                } else {
+                    self.fx.passes.insert(kind.to_string(), passes.to_vec());
+                }
                 Ok(())
             }
         }
@@ -1831,6 +2010,8 @@ impl Compositor {
         self.fx.next = 0;
         self.fx.mix_next = 0;
         self.fx.scratch.begin_frame();
+        self.fx.pass_targets.begin_frame();
+        self.fx.pass_tmp.begin_frame();
         let live: Vec<LayerId> = all_layers
             .iter()
             .filter(|l| l.frame.is_some() || l.generator.is_some())
@@ -2094,7 +2275,10 @@ impl Compositor {
             );
         }
         self.fx.scratch.sweep();
+        self.fx.pass_targets.sweep();
+        self.fx.pass_tmp.sweep();
         self.fx.persist.sweep();
+        self.fx.targets.sweep();
         let persist = &self.fx.persist;
         self.fx.ticks.retain(|k, _| persist.contains(k));
         queue.submit(Some(enc.finish()));
@@ -3164,7 +3348,7 @@ mod tests {
                         continue;
                     }
                 };
-                if let Err(e) = comp.add_effect(&device, id, &wgsl) {
+                if let Err(e) = comp.add_effect_passes(&device, id, &wgsl, &isf.passes) {
                     bad.push(format!("{id}: GPU compile: {e}"));
                     continue;
                 }
@@ -3173,7 +3357,7 @@ mod tests {
                     uniforms: isf.pack(&isf.default_params(), 0.1, (w, h)),
                     dry_wet: 1.0,
                     ml: None,
-                    persistent: None,
+                    persistent: isf.needs_instance().then(|| uuid::Uuid::from_u128(77)),
                     ticking: false,
                 };
                 let (effects, gen_draw, fr) = if generator {
@@ -3546,10 +3730,105 @@ mod tests {
     }
 
     fn fx_comp(device: &wgpu::Device, kind: &str) -> Compositor {
-        let (_, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(kind).unwrap()).unwrap();
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(kind).unwrap()).unwrap();
         let mut comp = Compositor::new(device, 16, 16);
-        comp.add_effect(device, kind, &wgsl).unwrap();
+        comp.add_effect_passes(device, kind, &wgsl, &isf.passes)
+            .unwrap();
         comp
+    }
+
+    /// Two-pass separable blur against a CPU reference (9-tap box in x, then in y, taps one
+    /// pixel apart at radius 4). Interior pixels only: the edges depend on the sampler's
+    /// address mode. Skipped without a GPU.
+    #[test]
+    fn gpu_two_pass_blur_matches_cpu_reference() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = fx_comp(&device, "blur_separable");
+        let f = |x: usize, y: usize, c: usize| ((x * 37 + y * 91 + c * 53 + x * y * 7) % 256) as u8;
+        let mut data = vec![255u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                for c in 0..3 {
+                    data[(y * 16 + x) * 4 + c] = f(x, y, c);
+                }
+            }
+        }
+        let img = run_fx(
+            &device,
+            &queue,
+            &mut comp,
+            "blur_separable",
+            &[("radius", vjc_model::Value::Number(4.0))],
+            0.0,
+            None,
+            &data,
+            1,
+        );
+        let mut worst = 0i32;
+        for y in 4..12 {
+            for x in 4..12 {
+                for c in 0..3 {
+                    // Horizontal pass, stored as 8-bit, then vertical.
+                    let h = |yy: usize| {
+                        let s: f32 = (-4i32..=4)
+                            .map(|d| f((x as i32 + d) as usize, yy, c) as f32)
+                            .sum();
+                        (s / 9.0).round()
+                    };
+                    let v: f32 = (-4i32..=4).map(|d| h((y as i32 + d) as usize)).sum::<f32>() / 9.0;
+                    let got = px_at(&img, x, y)[c] as i32;
+                    worst = worst.max((got - v.round() as i32).abs());
+                }
+            }
+        }
+        assert!(worst <= 4, "worst deviation {worst}");
+        // Negative control: the blur changed the picture.
+        assert!((0..3).any(|c| px_at(&img, 8, 8)[c] != f(8, 8, c)));
+    }
+
+    /// A persistent PASSES target keeps its content across frames, is separate per effect
+    /// instance, and is reset once the instance stops being drawn (retrigger). Skipped
+    /// without a GPU.
+    #[test]
+    fn gpu_persistent_target_keeps_state_and_resets() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = fx_comp(&device, "feedback_trail");
+        let (white, black) = (vec![255u8; 16 * 16 * 4], {
+            let mut b = vec![0u8; 16 * 16 * 4];
+            b.chunks_mut(4).for_each(|p| p[3] = 255);
+            b
+        });
+        let id = Some(uuid::Uuid::from_u128(5));
+        let go = |comp: &mut Compositor, id, data: &[u8], n| {
+            px_at(
+                &run_fx(
+                    &device,
+                    &queue,
+                    comp,
+                    "feedback_trail",
+                    &[],
+                    0.0,
+                    id,
+                    data,
+                    n,
+                ),
+                8,
+                8,
+            )[0]
+        };
+        assert_eq!(go(&mut comp, id, &white, 1), 255);
+        // 255 * 0.85 - 1 = 215.75
+        let kept = go(&mut comp, id, &black, 2);
+        assert!(kept.abs_diff(216) <= 3, "{kept}");
+        let kept2 = go(&mut comp, id, &black, 3);
+        assert!(kept2 < kept && kept2 > 150, "{kept2}");
+        // Another instance does not see that history.
+        let other = Some(uuid::Uuid::from_u128(6));
+        assert_eq!(go(&mut comp, other, &black, 4), 0);
+        // Not drawn for a frame: buffers are freed, same id starts from black again.
+        comp.render(&device, &queue, &[], &[], 1.0);
+        assert_eq!(comp.fx.targets.len(), 0);
+        assert_eq!(go(&mut comp, id, &black, 5), 0);
     }
 
     /// Every blend added after the original 19 (except Displace/LoRez, tested apart)

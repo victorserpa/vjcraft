@@ -549,7 +549,7 @@ fn draw_chain(
                 uniforms: isf.pack(&vjc_core::anim::resolve(&e.params, ctx), time, size),
                 dry_wet: e.dry_wet,
                 ml: ml_draw,
-                persistent: isf.persistent.then_some(e.id),
+                persistent: isf.needs_instance().then_some(e.id),
                 ticking: isf.tick_input.is_some(),
             });
         }
@@ -4214,7 +4214,12 @@ impl State {
         // Shaders compile on worker threads; install the ones that finished.
         for done in self.fx.poll() {
             let st = match done.result {
-                Ok(wgsl) => match comp.add_effect(&rs.device, &done.kind, &wgsl) {
+                Ok(wgsl) => match comp.add_effect_passes(
+                    &rs.device,
+                    &done.kind,
+                    &wgsl,
+                    self.fx.isf(&done.kind).map_or(&[][..], |i| &i.passes),
+                ) {
                     Ok(()) => fx::Status::Ready,
                     Err(e) => fx::Status::Failed(e),
                 },

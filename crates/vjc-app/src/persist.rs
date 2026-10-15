@@ -62,6 +62,10 @@ impl<T> PersistStore<T> {
         before - self.slots.len()
     }
 
+    pub fn get(&self, id: &Uuid) -> Option<&T> {
+        self.slots.get(id).map(|(_, v)| v)
+    }
+
     pub fn contains(&self, id: &Uuid) -> bool {
         self.slots.contains_key(id)
     }
