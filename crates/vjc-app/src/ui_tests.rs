@@ -8337,3 +8337,45 @@ fn view_menu_toggle_hides_its_panel_and_persists_in_the_layout() {
     settle(&mut h);
     assert!(exists(&h, "Crossfader (expanded)"));
 }
+
+/// Opens a submenu of an open menu by hovering its button.
+fn open_sub(h: &mut Harness<'_, State>, label: &str) {
+    h.get_by_label(&format!("{label} \u{23f5}")).click();
+    h.run_steps(8);
+}
+
+#[test]
+fn clip_menu_entries_run_the_clip_commands() {
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().load_file(layer, 0, "/x/menu.mp4".into());
+    h.state_mut().selected = Some((layer, 0));
+    let deck = h.state().project.composition.current_deck;
+    let clip = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, layer, 0)
+            .expect("clip")
+            .clone()
+    };
+    settle(&mut h);
+    click(&mut h, "Clip menu");
+    snap(&mut h, "44-clip-menu");
+    open_sub(&mut h, "Target");
+    click(&mut h, "Free layer");
+    assert_eq!(clip(&h).target, vjc_model::ClipTarget::Free);
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Trigger style");
+    click(&mut h, "Toggle");
+    assert_eq!(clip(&h).trigger_style, vjc_model::TriggerStyle::Toggle);
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Transport");
+    click(&mut h, "BPM sync");
+    assert!(clip(&h).transport.beat_sync.is_some());
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Fader start: layer (off)");
+    click(&mut h, "On");
+    assert_eq!(clip(&h).extras.fader_start, Some(true));
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Ignore column: layer (off)");
+    click(&mut h, "Off");
+    assert_eq!(clip(&h).extras.ignore_column_trigger, Some(false));
+}

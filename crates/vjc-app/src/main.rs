@@ -6911,6 +6911,44 @@ impl State {
             .widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Layer menu")
             });
+            ui.menu_button("Clip", |ui| {
+                let deck = self.project.composition.current_deck;
+                let sel = self.selected.and_then(|(l, c)| {
+                    let k = vjc_core::clip_in(&self.project, deck, l, c)?;
+                    let flags = self
+                        .project
+                        .composition
+                        .layers
+                        .iter()
+                        .find(|x| x.id == l)
+                        .map_or((false, false), |x| (x.ignore_column_trigger, x.fader_start));
+                    Some((l, c, k.clone(), flags))
+                });
+                match sel {
+                    Some((l, c, clip, flags)) => {
+                        let seed = self.tc.last.unwrap_or(vjc_model::Timecode::new(
+                            0,
+                            0,
+                            0,
+                            0,
+                            vjc_model::TcFps::F25,
+                        ));
+                        let mut cmds = vec![];
+                        wave_ui::clip_bar_menu(ui, (deck, l, c), &clip, flags, seed, &mut cmds);
+                        for cmd in cmds {
+                            self.exec(cmd);
+                        }
+                    }
+                    None => {
+                        ui.weak("No clip selected");
+                    }
+                }
+            })
+            .response
+            // The panel tab is also called "Clip".
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Clip menu")
+            });
             ui.menu_button("View", |ui| self.view_menu(ui));
             ui.menu_button("Shortcuts", |ui| {
                 for (midi, label) in [(false, "Edit keyboard"), (true, "Edit MIDI")] {

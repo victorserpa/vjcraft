@@ -124,7 +124,12 @@ pub fn fresh(effects: &[Effect]) -> Vec<Effect> {
 }
 
 /// Three-way override: layer's setting, forced on, forced off.
-fn tri(ui: &mut egui::Ui, label: &str, cur: Option<bool>, layer_on: bool) -> Option<Option<bool>> {
+pub(crate) fn tri(
+    ui: &mut egui::Ui,
+    label: &str,
+    cur: Option<bool>,
+    layer_on: bool,
+) -> Option<Option<bool>> {
     let mut pick = None;
     let shown = match cur {
         None => format!("{label}: layer ({})", if layer_on { "on" } else { "off" }),
@@ -237,6 +242,85 @@ pub fn clip_menu(
         ui.close();
     }
     act
+}
+
+/// The menu-bar Clip menu for the selected clip: transport mode, target, trigger style, fader
+/// start and ignore column. Every edit is the same command the clip panel sends.
+pub fn clip_bar_menu(
+    ui: &mut egui::Ui,
+    (deck, layer, column): (DeckId, LayerId, u32),
+    clip: &Clip,
+    layer_flags: (bool, bool),
+    seed: vjc_model::Timecode,
+    cmds: &mut Vec<Command>,
+) {
+    use vjc_core::playback::TransportMode;
+    let t = &clip.transport;
+    ui.menu_button("Transport", |ui| {
+        let cur = TransportMode::of(t);
+        for m in TransportMode::ALL {
+            if choice(ui, cur == m, m.label()).clicked() {
+                let (beat_sync, timecode_start) = m.sync_for(t, seed);
+                cmds.push(Command::SetClipSync {
+                    deck,
+                    layer,
+                    column,
+                    beat_sync,
+                    timecode_start,
+                });
+                ui.close();
+            }
+        }
+    });
+    ui.menu_button("Target", |ui| {
+        for m in std::iter::once(vjc_model::ClipTarget::Composition)
+            .chain(vjc_model::ClipTarget::CHOICES)
+        {
+            if choice(ui, clip.target == m, m.label()).clicked() {
+                cmds.push(Command::SetClipTarget {
+                    deck,
+                    layer,
+                    column,
+                    target: m,
+                });
+                ui.close();
+            }
+        }
+    });
+    ui.menu_button("Trigger style", |ui| {
+        for m in std::iter::once(vjc_model::TriggerStyle::Composition)
+            .chain(vjc_model::TriggerStyle::CHOICES)
+        {
+            if choice(ui, clip.trigger_style == m, m.label()).clicked() {
+                cmds.push(Command::SetClipTriggerStyle {
+                    deck,
+                    layer,
+                    column,
+                    style: m,
+                });
+                ui.close();
+            }
+        }
+    });
+    let x = &clip.extras;
+    let set = |extras: ClipExtras| Command::SetClipExtras {
+        deck,
+        layer,
+        column,
+        extras,
+    };
+    if let Some(v) = tri(ui, "Fader start", x.fader_start, layer_flags.1) {
+        cmds.push(set(ClipExtras {
+            fader_start: v,
+            ..x.clone()
+        }));
+    }
+    if let Some(v) = tri(ui, "Ignore column", x.ignore_column_trigger, layer_flags.0) {
+        cmds.push(set(ClipExtras {
+            ignore_column_trigger: v,
+            ..x.clone()
+        }));
+    }
 }
 
 #[cfg(test)]
