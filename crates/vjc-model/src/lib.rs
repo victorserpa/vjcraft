@@ -1032,6 +1032,12 @@ pub enum BlendMode {
     /// Transition-style blend: the opacity is the progress of a luma wipe that reveals the
     /// source from its darkest pixels to its brightest.
     Bumper,
+    /// Brighter source pixels weigh more than the base ones (a luma morph).
+    MetaMix,
+    /// The source tiled 2 x 2, each tile showing the whole picture.
+    MultiTask,
+    /// Faceted look: cells drawn as cube corners with three shades.
+    Cube,
     #[serde(other)]
     Unknown,
 }

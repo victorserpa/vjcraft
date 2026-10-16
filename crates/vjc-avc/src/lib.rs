@@ -804,6 +804,9 @@ fn blend_from_name(name: &str) -> BlendMode {
         "Luma Key I" => BlendMode::LumaKeyInverse,
         "JitterBug" => BlendMode::Jitter,
         "Video Bumper" => BlendMode::Bumper,
+        "Meta Mix" => BlendMode::MetaMix,
+        "Multi Task" => BlendMode::MultiTask,
+        "Cube" => BlendMode::Cube,
         "RGB" => BlendMode::Rgb,
         "B&W" => BlendMode::BlackWhite,
         // In .avc files "Alpha" is the default alpha-over mixer, i.e. our Normal.
@@ -1127,6 +1130,9 @@ mod tests {
             ("Luma Key I", BlendMode::LumaKeyInverse),
             ("JitterBug", BlendMode::Jitter),
             ("Video Bumper", BlendMode::Bumper),
+            ("Meta Mix", BlendMode::MetaMix),
+            ("Multi Task", BlendMode::MultiTask),
+            ("Cube", BlendMode::Cube),
         ] {
             assert_eq!(super::blend_from_name(n), m);
         }

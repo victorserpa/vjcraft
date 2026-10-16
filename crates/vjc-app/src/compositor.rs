@@ -213,6 +213,10 @@ fn per_channel(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
 // Full-colour modes appended after the original 19 (mirrors blend.rs `color_mode`).
 fn color_mode(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
     if (id == 36u) { return vec3(1.0) - abs(b - s); }
+    if (id == 40u) {
+        let w = clamp(0.5 + luma(s) - luma(b), 0.0, 1.0);
+        return b + (s - b) * w;
+    }
     if (id == 19u) {
         return select(min(b / s, vec3(1.0)), vec3(1.0), s <= vec3(0.0));
     }
@@ -425,7 +429,16 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         let o = vec2<f32>(f32(i32(h & 7u) - 4), f32(i32((h >> 8u) & 7u) - 4));
         q = clamp(q + o / td, vec2(0.5) / td, vec2(1.0) - vec2(0.5) / td);
     }
+    if (u.mode == 41u) {
+        // Multi Task: the source tiled 2 x 2 (mirrors blend.rs `multitask_uv`).
+        q = fract(q * 2.0);
+    }
     var s = textureSample(tex, smp, q);
+    if (u.mode == 42u) {
+        // Cube: three face shades per 16 px cell (mirrors blend.rs `cube_shade`).
+        let cp = vec2<u32>(in.pos.xy) % vec2<u32>(16u);
+        s = vec4(s.rgb * select(select(0.45, 0.7, cp.x < 8u), 1.0, cp.y < 8u), s.a);
+    }
     // pad bit 4: the source is premultiplied; blending wants straight colour.
     if ((u.pad & 16u) != 0u && s.a > 0.0) { s = vec4(min(s.rgb / s.a, vec3(1.0)), s.a); }
     // pad = channel mask: bit 0..3 set = R, G, B, A off (off alpha means opaque).
@@ -470,7 +483,7 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         let off = vec2<i32>(round((s.rg - vec2(0.5)) * 32.0));
         let bp = clamp(vec2<i32>(in.pos.xy) + off, vec2<i32>(0), bs);
         rgb = textureLoad(base_tex, bp, 0).rgb;
-    } else if (id == 25u) {
+    } else if (id == 25u || id == 41u || id == 42u) {
         rgb = s.rgb;
     } else if (id >= 19u) {
         rgb = color_mode(id, b.rgb, s.rgb);
@@ -4644,7 +4657,11 @@ mod tests {
             // Jitter reads other texels: tested apart (a flat colour can't tell it from Normal).
             if matches!(
                 mode,
-                BlendMode::Displace | BlendMode::LoRez | BlendMode::Jitter
+                BlendMode::Displace
+                    | BlendMode::LoRez
+                    | BlendMode::Jitter
+                    | BlendMode::MultiTask
+                    | BlendMode::Cube
             ) {
                 continue;
             }
@@ -4755,6 +4772,43 @@ mod tests {
             [80, 80],
             "control: Normal is unshifted"
         );
+    }
+
+    /// Multi Task tiles the source 2 x 2 and Cube shades it per face. Controls: Normal
+    /// keeps the plain picture.
+    #[test]
+    fn gpu_multitask_and_cube() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = Compositor::new(&device, 16, 16);
+        let base = [0u8, 0, 0, 255].repeat(256);
+        let ramp: Vec<u8> = (0..256)
+            .flat_map(|i| [(i % 16 * 16) as u8, 0, 200, 255])
+            .collect();
+        let mut draw = |mode: BlendMode, s: u64| {
+            let ls = [
+                layer(1, 1.0, BlendMode::Normal, vec![], &base, 1),
+                layer(2, 1.0, mode, vec![], &ramp, s),
+            ];
+            comp.render(&device, &queue, &ls, &[], 1.0);
+            read16(&device, &queue, &comp)
+        };
+        let img = draw(BlendMode::MultiTask, 1);
+        // x = 8 is the start of the second tile: it shows source x = 0 again.
+        assert!(
+            px_at(&img, 9, 4)[0] <= 64,
+            "tile repeats: {:?}",
+            px_at(&img, 9, 4)
+        );
+        assert!(px_at(&img, 7, 4)[0] >= 96);
+        let img = draw(BlendMode::Cube, 2);
+        for (x, y) in [(2usize, 2usize), (2, 12), (12, 12)] {
+            let f = vjc_core::blend::cube_shade(x as u32, y as u32);
+            let want = (200.0 * f) as i32;
+            let got = px_at(&img, x, y)[2] as i32;
+            assert!((got - want).abs() <= 3, "{x},{y}: {got} vs {want}");
+        }
+        let img = draw(BlendMode::Normal, 3);
+        assert_eq!(px_at(&img, 12, 12)[2], 200, "control: Normal is unshaded");
     }
 
     /// Crop clears everything outside the box. Control: zero crop leaves the picture.
