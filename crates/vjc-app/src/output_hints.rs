@@ -51,6 +51,24 @@ pub(crate) fn shown(ctx: &egui::Context) -> &'static str {
     shown_key(ctx).and_then(text).unwrap_or(IDLE)
 }
 
+/// Title of the help panel for the control the pointer is over: what part of the window it
+/// belongs to, "Help" when it is over nothing.
+pub(crate) fn title(ctx: &egui::Context) -> &'static str {
+    match shown_key(ctx) {
+        None => "Help",
+        Some(k) if k.starts_with("tree") => "Screens and slices",
+        Some("mode-transform") => "Transform",
+        Some("mode-points") => "Edit points",
+        Some("tab-input") => "Input selection",
+        Some("tab-output") => "Output transformation",
+        Some("canvas") => "Canvas",
+        Some(k) if k.starts_with("screen") => "Screen properties",
+        Some(k) if k.starts_with("slice") || k == "multi" => "Slice properties",
+        Some("cancel" | "save") => "Window",
+        Some(_) => "Toolbar",
+    }
+}
+
 /// Description of the control `key`, in plain words.
 pub(crate) fn text(key: &str) -> Option<&'static str> {
     Some(match key {
