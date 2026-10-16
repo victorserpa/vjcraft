@@ -6353,10 +6353,16 @@ impl State {
                         if !p.parent().is_some_and(|d| d.is_dir()) {
                             return bad(422, "the parent directory does not exist");
                         }
-                        self.save_to(p)
+                        match api_ext::save_target(&p) {
+                            Ok(p) => self.save_to(p),
+                            Err(m) => return bad(422, m),
+                        }
                     }
                     None if body["path"].is_null() && self.file.is_some() => {
-                        self.save_to(self.file.clone().unwrap_or_default())
+                        match api_ext::save_target(&self.file.clone().unwrap_or_default()) {
+                            Ok(p) => self.save_to(p),
+                            Err(m) => return bad(422, m),
+                        }
                     }
                     None => return bad(422, "no file yet: pass an absolute \"path\""),
                 };

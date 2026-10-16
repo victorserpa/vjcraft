@@ -1025,3 +1025,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Where an API save may write: the canonical path, and only when the target is
+/// a regular file or does not exist yet (no symlinks, no directories, no devices).
+pub(crate) fn save_target(p: &std::path::Path) -> Result<std::path::PathBuf, &'static str> {
+    let name = p.file_name().ok_or("path must name a file")?;
+    let parent = p
+        .parent()
+        .and_then(|d| d.canonicalize().ok())
+        .ok_or("the parent directory does not exist")?;
+    let full = parent.join(name);
+    match std::fs::symlink_metadata(&full) {
+        Ok(m) if m.file_type().is_file() => Ok(full),
+        Ok(_) => Err("the target must be a regular file (no symlinks or directories)"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(full),
+        Err(_) => Err("the target cannot be inspected"),
+    }
+}

@@ -7230,6 +7230,22 @@ fn rest_save_refuses_other_extensions_and_missing_dirs() {
     assert!(r.is_ok());
 }
 
+#[cfg(unix)]
+#[test]
+fn rest_save_refuses_symlinks_and_directories() {
+    let d = multi_dir("rest-save-link");
+    let real = d.join("real.txt");
+    std::fs::write(&real, "keep").unwrap();
+    std::os::unix::fs::symlink(&real, d.join("link.vjc")).unwrap();
+    std::fs::create_dir(d.join("dir.vjc")).unwrap();
+    let mut h = app();
+    let r = rest_save(h.state_mut(), d.join("link.vjc").to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "keep");
+    let r = rest_save(h.state_mut(), d.join("dir.vjc").to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+}
+
 fn top_layer_no(h: &Harness<'_, State>) -> usize {
     h.state().project.composition.layers.len()
 }
