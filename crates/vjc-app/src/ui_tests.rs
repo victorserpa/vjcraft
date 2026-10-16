@@ -7232,3 +7232,27 @@ fn rest_open_clips_rejects_bad_input() {
         422
     );
 }
+
+#[test]
+fn audio_prefs_reach_the_engine_config_on_save() {
+    let mut st = State::headless(prefs());
+    assert_eq!(st.audio_cfg, vjc_media::audio::OutConfig::default());
+    st.prefs.audio.output_device = Some("USB".into());
+    st.prefs.audio.sample_rate = Some(96_000);
+    st.prefs.audio.buffer_size = Some(256);
+    st.prefs.audio.channels = Some(2);
+    st.save_prefs();
+    assert_eq!(
+        st.audio_cfg,
+        vjc_media::audio::OutConfig {
+            device: Some("USB".into()),
+            sample_rate: Some(96_000),
+            buffer_frames: Some(256),
+            channels: Some(2),
+        }
+    );
+    // Saving again without a change leaves it alone.
+    let before = st.audio_cfg.clone();
+    st.save_prefs();
+    assert_eq!(st.audio_cfg, before);
+}

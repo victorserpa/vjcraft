@@ -221,11 +221,78 @@ impl Midi {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// FFT sizes the analysis accepts (powers of two).
+pub const FFT_SIZES: [usize; 5] = [256, 512, 1024, 2048, 4096];
+
+/// Audio devices and engine settings. `None` means "what the device offers by default".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Audio {
-    /// Chosen output device name (placeholder: not used by the engine yet).
+    /// Chosen output device name (None = system default).
     pub output_device: Option<String>,
+    /// Input device for audio-reactive animation and the FFT (None = system default).
+    pub input_device: Option<String>,
+    /// 0-based channel of the input device that feeds the analysis.
+    pub input_channel: u16,
+    /// Output sample rate in Hz, if the device supports it.
+    pub sample_rate: Option<u32>,
+    /// Output buffer size in frames, clamped to what the device supports.
+    pub buffer_size: Option<u32>,
+    /// Output channel count (1 = mono mix; more than 2 leaves the extra channels silent).
+    pub channels: Option<u16>,
+    /// Samples per FFT block of the input analysis; one of `FFT_SIZES`.
+    pub fft_size: usize,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Audio {
+            output_device: None,
+            input_device: None,
+            input_channel: 0,
+            sample_rate: None,
+            buffer_size: None,
+            channels: None,
+            fft_size: 1024,
+        }
+    }
+}
+
+impl Audio {
+    /// Drops values no device could use, so a hand-edited file cannot wedge the engine.
+    fn sanitize(&mut self) {
+        self.sample_rate = self.sample_rate.filter(|r| (8_000..=384_000).contains(r));
+        self.buffer_size = self.buffer_size.filter(|b| (16..=16_384).contains(b));
+        self.channels = self.channels.filter(|c| (1..=32).contains(c));
+        self.input_channel = self.input_channel.min(63);
+        if !FFT_SIZES.contains(&self.fft_size) {
+            self.fft_size = Audio::default().fft_size;
+        }
+        for d in [&mut self.output_device, &mut self.input_device] {
+            if d.as_deref().is_some_and(|n| n.trim().is_empty()) {
+                *d = None;
+            }
+        }
+    }
+}
+
+/// Output recording: codec id (see `vjc_media::record::RecCodec::id`) and quality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Record {
+    /// "h264", "hevc", "prores" or "png"; an id the build cannot encode falls back to h264.
+    pub codec: String,
+    /// 1 (small) to 100 (best); ignored by the lossless PNG sequence.
+    pub quality: u8,
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        Record {
+            codec: "h264".into(),
+            quality: 70,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -480,6 +547,7 @@ pub struct Prefs {
     pub video: Video,
     pub control: Control,
     pub audio: Audio,
+    pub record: Record,
     pub midi: Midi,
     pub osc: Osc,
     pub dmx: Dmx,
@@ -498,6 +566,7 @@ impl Default for Prefs {
             video: Video::default(),
             control: Control::default(),
             audio: Audio::default(),
+            record: Record::default(),
             midi: Midi::default(),
             osc: Osc::default(),
             dmx: Dmx::default(),
@@ -529,6 +598,8 @@ impl Prefs {
         self.dmx.universes = self.dmx.universes.clamp(1, 64);
         self.dmx.interface = self.dmx.interface.trim().to_owned();
         self.layouts.sanitize();
+        self.audio.sanitize();
+        self.record.quality = self.record.quality.clamp(1, 100);
     }
 
     pub fn from_json(text: &str) -> (Prefs, Option<String>) {
@@ -719,6 +790,51 @@ mod tests {
             .0
             .general;
         assert!(!g.autosave && g.autosave_secs == 120);
+    }
+
+    #[test]
+    fn audio_and_record_prefs_roundtrip_and_old_files_load() {
+        // A file from before these fields existed.
+        let (p, w) = Prefs::from_json(r#"{"audio":{"output_device":"Built-in"},"general":{}}"#);
+        assert!(w.is_none());
+        assert_eq!(p.audio.output_device.as_deref(), Some("Built-in"));
+        assert_eq!(p.audio.fft_size, 1024);
+        assert_eq!(
+            (p.audio.sample_rate, p.audio.buffer_size, p.audio.channels),
+            (None, None, None)
+        );
+        assert_eq!((p.record.codec.as_str(), p.record.quality), ("h264", 70));
+        let mut q = p.clone();
+        q.audio = Audio {
+            output_device: Some("USB".into()),
+            input_device: Some("Mic".into()),
+            input_channel: 1,
+            sample_rate: Some(96_000),
+            buffer_size: Some(256),
+            channels: Some(2),
+            fft_size: 2048,
+        };
+        q.record = Record {
+            codec: "prores".into(),
+            quality: 90,
+        };
+        let (back, w) = Prefs::from_json(&serde_json::to_string(&q).unwrap());
+        assert!(w.is_none());
+        assert_eq!(back.audio, q.audio);
+        assert_eq!(back.record, q.record);
+    }
+
+    #[test]
+    fn nonsense_audio_values_are_dropped_on_load() {
+        let (p, _) = Prefs::from_json(
+            r#"{"audio":{"sample_rate":5,"buffer_size":1,"channels":0,"fft_size":1000,"input_device":" "},"record":{"quality":0}}"#,
+        );
+        assert_eq!(
+            (p.audio.sample_rate, p.audio.buffer_size, p.audio.channels),
+            (None, None, None)
+        );
+        assert_eq!((p.audio.fft_size, p.audio.input_device), (1024, None));
+        assert_eq!(p.record.quality, 1);
     }
 
     #[test]

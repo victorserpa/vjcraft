@@ -419,7 +419,62 @@ pub struct AudioEngine {
     tap: Arc<Tap>,
     buses: Arc<Buses>,
     rate: Arc<AtomicU32>,
+    /// What the stream is (re)opened with; `reconfigure` changes it and raises `failed`.
+    cfg: Arc<Mutex<OutConfig>>,
+    failed: Arc<AtomicBool>,
     _guard: Arc<Guard>,
+}
+
+/// Output stream wishes. `None` fields use what the device offers by default; a wish the
+/// device cannot satisfy falls back to the nearest supported value (see `choose`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OutConfig {
+    /// Device name; the default device when None or not found.
+    pub device: Option<String>,
+    pub sample_rate: Option<u32>,
+    /// Buffer size in frames.
+    pub buffer_frames: Option<u32>,
+    pub channels: Option<u16>,
+}
+
+/// One supported (channels, rate range) of a device: the part of a cpal config range that
+/// `choose` looks at, so the choice can be tested without a device.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Range {
+    pub channels: u16,
+    pub min_rate: u32,
+    pub max_rate: u32,
+}
+
+/// (channels, rate) to open: the wishes when a range holds them, else the closest the
+/// device supports. `default` is the device default, used for any wish left open.
+pub fn choose(ranges: &[Range], default: (u16, u32), want: &OutConfig) -> (u16, u32) {
+    let ch = want.channels.unwrap_or(default.0);
+    let rate = want.sample_rate.unwrap_or(default.1);
+    let clamp_in = |r: &Range| rate.clamp(r.min_rate, r.max_rate);
+    // The wished channel count, with the rate clamped into the nearest range for it.
+    let nearest = |ch: u16| {
+        ranges
+            .iter()
+            .filter(|r| r.channels == ch)
+            .map(clamp_in)
+            .min_by_key(|c| c.abs_diff(rate))
+    };
+    if let Some(r) = nearest(ch) {
+        return (ch, r);
+    }
+    // No such channel count: keep the device's, still honouring the rate.
+    match nearest(default.0) {
+        Some(r) => (default.0, r),
+        None => default,
+    }
+}
+
+/// The buffer size to request: the wish clamped into the supported range, or None (host
+/// default) when nothing was asked or the device does not say what it supports.
+pub fn buffer_choice(want: Option<u32>, supported: Option<(u32, u32)>) -> Option<u32> {
+    let (min, max) = supported?;
+    want.map(|w| w.clamp(min, max))
 }
 
 impl AudioEngine {
@@ -430,7 +485,18 @@ impl AudioEngine {
 
     /// Opens the output device called `device` (the default one if None or not found).
     pub fn start_on(device: Option<&str>) -> Result<AudioEngine, String> {
-        let device = device.map(str::to_owned);
+        Self::start_with(OutConfig {
+            device: device.map(str::to_owned),
+            ..Default::default()
+        })
+    }
+
+    /// Opens the output with the wishes in `cfg`.
+    pub fn start_with(cfg: OutConfig) -> Result<AudioEngine, String> {
+        let cfg = Arc::new(Mutex::new(cfg));
+        let cfg_thread = cfg.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let failed_thread = failed.clone();
         let voices: VoiceList = Arc::new(Mutex::new(Vec::new()));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -445,15 +511,10 @@ impl AudioEngine {
             .name("vjc-audio-out".into())
             .spawn(move || {
                 // The cpal stream is not Send: it lives and dies on this thread.
-                let failed = Arc::new(AtomicBool::new(false));
+                let failed = failed_thread;
                 let open = || {
-                    open_stream(
-                        v.clone(),
-                        t.clone(),
-                        bs.clone(),
-                        failed.clone(),
-                        device.as_deref(),
-                    )
+                    let want = cfg_thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    open_stream(v.clone(), t.clone(), bs.clone(), failed.clone(), &want)
                 };
                 match open() {
                     Ok((stream, rate)) => {
@@ -476,11 +537,19 @@ impl AudioEngine {
             tap,
             buses,
             rate: shared_rate,
+            cfg,
+            failed,
             _guard: Arc::new(Guard {
                 stop: Some(stop_tx),
                 thread: Some(thread),
             }),
         })
+    }
+
+    /// Reopens the output with new wishes while running: voices, bus effects and the
+    /// recording tap stay, decoders follow the new rate. False when nothing changed.
+    pub fn reconfigure(&self, cfg: OutConfig) -> bool {
+        swap_cfg(&self.cfg, &self.failed, cfg)
     }
 
     /// The recording tap of the master output.
@@ -579,6 +648,17 @@ impl Drop for Metronome {
     }
 }
 
+/// Stores `cfg` and raises `failed` (the supervisor then reopens) when it differs.
+fn swap_cfg(slot: &Mutex<OutConfig>, failed: &AtomicBool, cfg: OutConfig) -> bool {
+    let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if *g == cfg {
+        return false;
+    }
+    *g = cfg;
+    failed.store(true, Ordering::Relaxed);
+    true
+}
+
 /// Pause between attempts to reopen a lost output device.
 const REOPEN: Duration = Duration::from_secs(2);
 /// How often the supervisor looks at the stream's error flag.
@@ -645,13 +725,40 @@ fn open_stream(
     tap: Arc<Tap>,
     buses: Arc<Buses>,
     failed: Arc<AtomicBool>,
-    device: Option<&str>,
+    want: &OutConfig,
 ) -> Result<(cpal::Stream, u32), String> {
-    let device = pick_output(device).ok_or("No audio output device")?;
-    let supported = device
+    let device = pick_output(want.device.as_deref()).ok_or("No audio output device")?;
+    let default = device
         .default_output_config()
         .map_err(|e| format!("Audio output config: {e}"))?;
-    let cfg = supported.config();
+    let mut ranges: Vec<cpal::SupportedStreamConfigRange> = device
+        .supported_output_configs()
+        .map(|r| r.collect())
+        .unwrap_or_default();
+    // The device's own sample formats first: F32 where offered.
+    ranges.sort_by_key(|r| r.sample_format() != cpal::SampleFormat::F32);
+    let plain: Vec<Range> = ranges
+        .iter()
+        .map(|r| Range {
+            channels: r.channels(),
+            min_rate: r.min_sample_rate(),
+            max_rate: r.max_sample_rate(),
+        })
+        .collect();
+    let (ch, rate) = choose(&plain, (default.channels(), default.sample_rate()), want);
+    let supported = ranges
+        .into_iter()
+        .find(|r| r.channels() == ch && r.contains_rate(rate))
+        .and_then(|r| r.try_with_sample_rate(rate))
+        .unwrap_or(default);
+    let mut cfg = supported.config();
+    let range = match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => Some((*min, *max)),
+        cpal::SupportedBufferSize::Unknown => None,
+    };
+    if let Some(n) = buffer_choice(want.buffer_frames, range) {
+        cfg.buffer_size = cpal::BufferSize::Fixed(n);
+    }
     let rate = cfg.sample_rate;
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => build::<f32>(&device, cfg, voices, tap, buses, failed),
@@ -1245,6 +1352,118 @@ mod tests {
         assert_eq!(opens.load(Ordering::SeqCst), 2); // failed once, retried, opened
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(opens.load(Ordering::SeqCst), 2); // and stays open
+        drop(stop_tx);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn choose_honours_wishes_and_falls_back_to_the_nearest_supported() {
+        let r = |channels, min_rate, max_rate| Range {
+            channels,
+            min_rate,
+            max_rate,
+        };
+        let ranges = [r(2, 44_100, 96_000), r(8, 48_000, 48_000)];
+        let want = |sample_rate, channels| OutConfig {
+            sample_rate,
+            channels,
+            ..Default::default()
+        };
+        let d = (2, 48_000);
+        assert_eq!(
+            choose(&ranges, d, &want(None, None)),
+            (2, 48_000),
+            "no wish = default"
+        );
+        assert_eq!(choose(&ranges, d, &want(Some(96_000), None)), (2, 96_000));
+        assert_eq!(
+            choose(&ranges, d, &want(Some(192_000), None)),
+            (2, 96_000),
+            "clamped"
+        );
+        assert_eq!(choose(&ranges, d, &want(Some(22_050), None)), (2, 44_100));
+        assert_eq!(choose(&ranges, d, &want(None, Some(8))), (8, 48_000));
+        assert_eq!(
+            choose(&ranges, d, &want(Some(96_000), Some(8))),
+            (8, 48_000)
+        );
+        assert_eq!(
+            choose(&ranges, d, &want(Some(96_000), Some(5))),
+            (2, 96_000),
+            "no 5 ch: keep 2"
+        );
+        assert_eq!(
+            choose(&[], d, &want(Some(96_000), Some(5))),
+            d,
+            "device lists nothing"
+        );
+        assert_eq!(buffer_choice(Some(64), Some((128, 4096))), Some(128));
+        assert_eq!(buffer_choice(Some(9999), Some((128, 4096))), Some(4096));
+        assert_eq!(buffer_choice(None, Some((128, 4096))), None);
+        assert_eq!(
+            buffer_choice(Some(256), None),
+            None,
+            "unknown range: host default"
+        );
+    }
+
+    #[test]
+    fn changed_config_reopens_the_running_stream_with_the_new_wishes() {
+        use std::sync::atomic::AtomicUsize;
+        let slot = Arc::new(Mutex::new(OutConfig::default()));
+        let failed = Arc::new(AtomicBool::new(false));
+        let opened: Arc<Mutex<Vec<OutConfig>>> = Arc::default();
+        let n = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (s2, f2, o2, n2) = (slot.clone(), failed.clone(), opened.clone(), n.clone());
+        let h = std::thread::spawn(move || {
+            supervise(
+                0u32,
+                || {
+                    o2.lock().unwrap().push(s2.lock().unwrap().clone());
+                    n2.fetch_add(1, Ordering::SeqCst);
+                    Ok((1u32, 48_000))
+                },
+                &AtomicU32::new(0),
+                &f2,
+                &stop_rx,
+                Duration::from_millis(10),
+                Duration::from_millis(5),
+            )
+        });
+        let wait = |want: usize| {
+            for _ in 0..300 {
+                if n.load(Ordering::SeqCst) >= want {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let same = OutConfig::default();
+        assert!(
+            !swap_cfg(&slot, &failed, same),
+            "nothing changed: no reopen"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        let wish = OutConfig {
+            device: Some("USB".into()),
+            sample_rate: Some(96_000),
+            buffer_frames: Some(128),
+            channels: Some(2),
+        };
+        assert!(swap_cfg(&slot, &failed, wish.clone()));
+        wait(1);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            std::slice::from_ref(&wish)
+        );
+        assert!(
+            !swap_cfg(&slot, &failed, wish),
+            "same wishes again: stays open"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(n.load(Ordering::SeqCst), 1);
         drop(stop_tx);
         h.join().unwrap();
     }

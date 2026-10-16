@@ -4,6 +4,7 @@ mod artnet_out;
 mod artnet_reduce;
 mod artnet_scan;
 mod audio_fx_ui;
+mod audio_prefs;
 mod audio_react;
 mod autopilot_ui;
 mod browser;
@@ -150,11 +151,14 @@ struct State {
     metro: Option<vjc_media::audio::Metronome>,
     audio_failed: bool,
     /// Output device `audio` was (or will be) opened on.
-    audio_device: Option<String>,
+    audio_cfg: vjc_media::audio::OutConfig,
     /// `audio_failed` came from a real open error (not from the UI-test setup).
     audio_error: bool,
     /// Names of the audio output devices listed in Preferences > Audio.
     audio_outputs: Option<Vec<String>>,
+    audio_inputs: Option<Vec<String>>,
+    /// Codecs this build can record with, checked on first use.
+    rec_codecs: Option<Vec<vjc_media::record::RecCodec>>,
     /// Writes prefs and the recovery file (false in UI tests).
     persist: bool,
     /// Playing generator clip per layer: (deck, column, own TIME in seconds). The time
@@ -1836,7 +1840,11 @@ impl State {
             fx: fx::FxLib::new(),
             ml: ml_fx::MlHub::new(),
             fx_epoch: std::time::Instant::now(),
-            audio_react: audio_react::AudioReact::default(),
+            audio_react: {
+                let mut r = audio_react::AudioReact::default();
+                r.set_config(audio_react::InCfg::from_prefs(&prefs.audio));
+                r
+            },
             panel_tab: PanelTab::Composition,
             comp_tex: None,
             prev_tex: None,
@@ -1855,9 +1863,11 @@ impl State {
             monitors_polled: (!live).then(std::time::Instant::now),
             persist: live,
             audio_failed: !live,
-            audio_device: prefs.audio.output_device.clone(),
+            audio_cfg: audio_prefs::out_config(&prefs.audio),
             audio_error: false,
             audio_outputs: None,
+            audio_inputs: None,
+            rec_codecs: None,
             cells: vec![],
             layer_rects: vec![],
             grid_rect: egui::Rect::NOTHING,
@@ -2003,7 +2013,7 @@ impl State {
     /// Audio output, opened lazily; a failure is reported once in the status line.
     fn audio_engine(&mut self) -> Option<AudioEngine> {
         if self.audio.is_none() && !self.audio_failed {
-            match AudioEngine::start_on(self.prefs.audio.output_device.as_deref()) {
+            match AudioEngine::start_with(self.audio_cfg.clone()) {
                 Ok(e) => self.audio = Some(e),
                 Err(e) => {
                     self.audio_failed = true;
@@ -2754,16 +2764,20 @@ impl State {
     }
 
     fn save_prefs(&mut self) {
-        // A new output device takes effect for clips started from now on.
-        if self.audio_device != self.prefs.audio.output_device {
-            self.audio_device = self.prefs.audio.output_device.clone();
-            // Retry only if audio was live (open, or failed on a real error).
+        // Output device, rate, buffer and channels reopen the running output in place;
+        // the analysis input restarts with its new device, channel and FFT size.
+        let new_out = audio_prefs::out_config(&self.prefs.audio);
+        let engine = self.audio.as_ref().map(|e| e as &dyn audio_prefs::Output);
+        if audio_prefs::apply(&mut self.audio_cfg, new_out, engine) != audio_prefs::Applied::Same {
             self.metro = None;
-            if self.audio.take().is_some() || self.audio_error {
+            // Audio that failed to open is given another try with the new settings.
+            if self.audio.is_none() && self.audio_error {
                 self.audio_failed = false;
                 self.audio_error = false;
             }
         }
+        self.audio_react
+            .set_config(audio_react::InCfg::from_prefs(&self.prefs.audio));
         let Some(p) = self.persist.then(prefs_path).flatten() else {
             self.prefs_dirty = false;
             return;
@@ -5366,11 +5380,23 @@ impl State {
                         tap: a.tap(),
                         rate: a.sample_rate(),
                     });
+                let have = self
+                    .rec_codecs
+                    .get_or_insert_with(vjc_media::record::available);
+                let settings = vjc_media::record::RecSettings::from_prefs(
+                    &self.prefs.record.codec,
+                    self.prefs.record.quality,
+                    have,
+                );
                 match capture::Capture::start(
-                    capture::default_path(self.prefs.general.record_folder.as_deref()),
+                    capture::default_path_for(
+                        self.prefs.general.record_folder.as_deref(),
+                        settings.codec.extension(),
+                    ),
                     size,
                     c.fps,
                     feed,
+                    settings,
                 ) {
                     Ok(cap) => {
                         self.status = format!("Recording to {}", cap.path().display());
