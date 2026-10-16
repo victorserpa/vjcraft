@@ -1472,7 +1472,10 @@ fn group_mask_plan(
     for (gi, g) in groups.iter().enumerate().filter(|(i, _)| src[*i]) {
         let top = g.start + g.len - 1;
         let hit = |j: usize, plan: &mut [Option<usize>]| {
-            if !in_group[j] && !is_src[j] && plan[j].is_none_or(|m| m < top) {
+            // The nearest mask above the layer wins: the group takes over only from a mask
+            // that sits above the whole group (a layer mask between them is nearer).
+            let pos = |m: usize| if m < n { m } else { groups[m - n].start };
+            if !in_group[j] && !is_src[j] && plan[j].is_none_or(|m| pos(m) > top) {
                 plan[j] = Some(n + gi);
             }
         };
@@ -4631,6 +4634,86 @@ mod tests {
         assert!(run("image_mask", &inv, pic([255, 255, 255, 255]), white) < 15);
     }
 
+    /// Mask effects on a 1x2 output: the polygon `sides` value is the number of sides, and
+    /// an image mask keeps the picture's orientation (first row on top). Skipped without a GPU.
+    #[test]
+    fn gpu_shape_sides_and_image_mask_orientation() {
+        let Some((device, queue)) = gpu() else { return };
+        let pick = |n: u32| vjc_model::Value::Choice {
+            selected: n,
+            options: vec![],
+        };
+        let mut comp = Compositor::new(&device, 1, 2);
+        let mut run = |kind: &str,
+                       set: &[(&str, vjc_model::Value)],
+                       lut: Option<std::sync::Arc<vjc_fx::lut::Lut>>| {
+            let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(kind).unwrap()).unwrap();
+            comp.add_effect(&device, kind, &wgsl).unwrap();
+            let mut params = isf.default_params();
+            for p in &mut params {
+                if let Some((_, v)) = set.iter().find(|(n, _)| *n == p.name) {
+                    p.value = v.clone();
+                }
+            }
+            let fx = EffectDraw {
+                blend: 0,
+                lut,
+                kind: kind.into(),
+                uniforms: isf.pack(&params, 0.0, (1, 2)),
+                dry_wet: 1.0,
+                ml: None,
+                persistent: None,
+                ticking: false,
+            };
+            let src = [255u8; 8];
+            let layer = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![fx],
+                frame: Some((1, 2, &src, 1)),
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            comp.read_rgba(&device, &queue).unwrap().2
+        };
+        use vjc_model::Value::Number;
+        // Shape 2 = polygon. A point 0.7 half-sizes right of the centre is outside a
+        // triangle (apothem 0.5) and inside an octagon (apothem 0.92). The shader used to
+        // read `sides` as an index, so the value 3 drew a hexagon.
+        let poly = |sides: u32| {
+            [
+                ("shape", pick(2)),
+                ("sides", pick(sides)),
+                ("center", vjc_model::Value::Color([0.15, 0.25, 0.0, 0.0])),
+                ("width", Number(1.0)),
+                ("height", Number(1.0)),
+                ("feather", Number(0.0)),
+            ]
+        };
+        let tri = run("shape_mask", &poly(0), None);
+        let oct = run("shape_mask", &poly(4), None);
+        assert!(
+            tri[0] < 15 && tri[4] < 15,
+            "triangle leaves the point out: {tri:?}"
+        );
+        assert!(oct[3] > 240 && oct[7] > 240, "octagon holds it: {oct:?}");
+        // Picture 1x2: white on top, black below. The output keeps that order.
+        let pic = Some(std::sync::Arc::new(vjc_fx::lut::Lut::picture(
+            1,
+            2,
+            vec![255, 255, 255, 255, 0, 0, 0, 255],
+        )));
+        let got = run("image_mask", &[], pic);
+        assert!(got[0] > 240, "top row shows: {got:?}");
+        assert!(got[4] < 15, "bottom row is cut: {got:?}");
+    }
+
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
@@ -6171,6 +6254,50 @@ mod tests {
             MaskMode::AllBelow,
         );
         assert_eq!(&got[..3], &[0, 255, 0], "{got:?}");
+    }
+
+    /// The nearest mask above a layer wins between a group mask and a layer mask.
+    #[test]
+    fn group_mask_plan_nearest_mask_wins() {
+        use vjc_model::MaskMode;
+        let white = [255u8; 4];
+        let masked = |n, mode| LayerDraw {
+            mask: mode,
+            ..solid(n, &white, 1.0)
+        };
+        let plan_of = |layers: Vec<LayerDraw>, start: usize, len: usize| {
+            let (mut plan, is_src) = mask_plan(&layers);
+            let g = GroupDraw {
+                mask: MaskMode::AllBelow,
+                ..group(start, len, 1.0, vec![])
+            };
+            group_mask_plan(&layers, &[g], &mut plan, &is_src);
+            plan
+        };
+        // Layer mask (1) sits between layer 0 and the group (2..4): the layer mask wins.
+        let plan = plan_of(
+            vec![
+                solid(1, &white, 1.0),
+                masked(2, MaskMode::OneBelow),
+                solid(3, &white, 1.0),
+                solid(4, &white, 1.0),
+            ],
+            2,
+            2,
+        );
+        assert_eq!(plan[0], Some(1), "layer mask nearer than the group");
+        // Layer mask above the group: the group is nearer to layer 0.
+        let plan = plan_of(
+            vec![
+                solid(1, &white, 1.0),
+                solid(2, &white, 1.0),
+                solid(3, &white, 1.0),
+                masked(4, MaskMode::AllBelow),
+            ],
+            1,
+            2,
+        );
+        assert_eq!(plan[0], Some(4), "group (index n + 0) is nearer");
     }
 
     /// The group chain runs over the composed group, not over the layers below it.
