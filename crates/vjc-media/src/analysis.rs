@@ -188,12 +188,27 @@ impl SharedBands {
 /// Builds the input sink: buffers samples and publishes levels each `FFT_SIZE` samples.
 /// Hand it to `LtcInput::start` (which opens the input stream and passes the rate).
 pub fn sink(shared: Arc<SharedBands>, rate: u32) -> impl FnMut(&[f32]) + Send + 'static {
-    let fft = FftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE);
-    let mut buf: Vec<f32> = Vec::with_capacity(FFT_SIZE);
+    sink_sized(shared, rate, FFT_SIZE)
+}
+
+/// Like `sink` with a chosen block size (a power of two from 64 to 16384; anything else
+/// becomes `FFT_SIZE`). Bigger blocks resolve bass better, smaller ones answer faster.
+pub fn sink_sized(
+    shared: Arc<SharedBands>,
+    rate: u32,
+    size: usize,
+) -> impl FnMut(&[f32]) + Send + 'static {
+    let size = if size.is_power_of_two() && (64..=16_384).contains(&size) {
+        size
+    } else {
+        FFT_SIZE
+    };
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(size);
+    let mut buf: Vec<f32> = Vec::with_capacity(size);
     move |data: &[f32]| {
         for &s in data {
             buf.push(s);
-            if buf.len() == FFT_SIZE {
+            if buf.len() == size {
                 let (bands, d) = detail_with(&*fft, &buf, rate);
                 shared.store_detail(&d);
                 shared.store(&bands);
@@ -232,6 +247,23 @@ mod tests {
         assert!(d.wave.iter().all(|w| (0.0..=1.0).contains(w)));
         assert!(d.wave.iter().any(|w| (w - 0.5).abs() > 0.1));
         assert_eq!(detail(&[], 48_000), Detail::default());
+    }
+
+    #[test]
+    fn sized_sink_publishes_once_per_chosen_block() {
+        let shared = Arc::new(SharedBands::default());
+        let mut s = sink_sized(shared.clone(), 48_000, 2048);
+        let x: Vec<f32> = (0..4096)
+            .map(|i| 0.8 * (std::f32::consts::TAU * 100.0 * i as f32 / 48_000.0).sin())
+            .collect();
+        s(&x[..2047]);
+        assert_eq!(shared.blocks(), 0);
+        s(&x[2047..]);
+        assert_eq!(shared.blocks(), 2, "4096 samples = two 2048 blocks");
+        assert!(shared.load()[0] > 0.5);
+        let mut bad = sink_sized(shared.clone(), 48_000, 1000);
+        bad(&x[..FFT_SIZE]);
+        assert_eq!(shared.blocks(), 3, "invalid size falls back to FFT_SIZE");
     }
 
     #[test]

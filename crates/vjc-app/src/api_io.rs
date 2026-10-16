@@ -42,7 +42,7 @@ pub struct ApiErr {
     pub msg: String,
 }
 
-fn err(status: u16, msg: impl Into<String>) -> ApiErr {
+pub(crate) fn err(status: u16, msg: impl Into<String>) -> ApiErr {
     ApiErr {
         status,
         msg: msg.into(),
@@ -63,6 +63,8 @@ pub enum Req {
     /// PNG thumbnail of the clip at (layer, column), 1-based. Answered by the app (it owns
     /// the thumbnail cache): `{"png": <bytes as chars 0..=255>}`.
     Thumb(u32, u32),
+    /// Extra routes (see `api_ext`): op name and JSON body (query for GET).
+    Ext(&'static str, Value),
 }
 
 pub struct Msg {
@@ -111,7 +113,7 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn query_param(query: &str, key: &str) -> Option<String> {
+pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
         (k == key).then(|| percent_decode(v)).flatten()
@@ -127,7 +129,7 @@ fn number(v: &Value, what: &str) -> Result<f64, ApiErr> {
     .ok_or_else(|| err(400, format!("{what} must be a finite number")))
 }
 
-fn index(v: &Value, what: &str) -> Result<u64, ApiErr> {
+pub(crate) fn index(v: &Value, what: &str) -> Result<u64, ApiErr> {
     v.as_u64()
         .filter(|n| (1..=100_000).contains(n))
         .ok_or_else(|| err(400, format!("{what} must be an integer >= 1")))
@@ -158,7 +160,7 @@ fn set_of(o: &Map<String, Value>, path: &Value) -> Result<Req, ApiErr> {
     Ok(Req::Set(path, number(v, "value")?))
 }
 
-fn json_body(body: &[u8]) -> Result<Value, ApiErr> {
+pub(crate) fn json_body(body: &[u8]) -> Result<Value, ApiErr> {
     if body.len() > MAX_BODY {
         return Err(err(413, "body too large"));
     }
@@ -168,6 +170,9 @@ fn json_body(body: &[u8]) -> Result<Value, ApiErr> {
 /// REST routing and validation. `url` includes the query string.
 pub fn parse_route(method: &str, url: &str, body: &[u8]) -> Result<Req, ApiErr> {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    if let Some(r) = crate::api_ext::parse(method, path, query, body) {
+        return r;
+    }
     match (method, path) {
         ("GET", "/api/v1/composition") => Ok(Req::Composition),
         ("GET", "/api/v1/address") => {
@@ -398,6 +403,7 @@ pub fn answer(p: &Project, ctx: &Ctx, active: Active, req: Req) -> (Option<Comma
             ),
         },
         Req::Thumb(..) => (None, Err(err(404, "thumbnail not available"))),
+        Req::Ext(op, body) => crate::api_ext::answer(p, op, &body),
         Req::Poll(paths) => {
             let values: Map<String, Value> = paths
                 .into_iter()
@@ -473,7 +479,12 @@ fn set_status(st: &SharedStatus, v: Status) {
     }
 }
 
-fn ask(link: &Link, req: Req) -> Reply {
+pub(crate) fn ask(link: &Link, req: Req) -> Reply {
+    // Probing files can block: answered here, on the server thread, not on the UI thread.
+    if let Req::Ext("can_open", body) = &req {
+        let paths = body["paths"].as_array().cloned().unwrap_or_default();
+        return Ok(crate::api_ext::can_open(&paths));
+    }
     let (reply, rx) = sync_channel(1);
     link.tx
         .send(Msg { req, reply })
@@ -603,6 +614,8 @@ enum Out {
     Json(Value),
     Page,
     Png(Vec<u8>),
+    /// Monitor snapshot: bytes and MIME type.
+    Image(Vec<u8>, &'static str),
 }
 
 /// The page may only load itself and talk to its own host (the socket is on the next port).
@@ -713,6 +726,14 @@ fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
             return Ok(Out::Json(json!({"pin_required": link.pin.is_some()})));
         }
         let mut body = Vec::new();
+        // can-open probes the filesystem, so it needs the PIN even as a GET.
+        if method == "GET" && path == "/api/v1/can-open" {
+            let given = request_pin(&rq, query);
+            let ip = rq.remote_addr().map(|a| a.ip());
+            if let Err((code, m)) = pin_gate(link, ip, given.as_deref()) {
+                return Err(err(code, m));
+            }
+        }
         if method == "POST" {
             let given = request_pin(&rq, query);
             let ip = rq.remote_addr().map(|a| a.ip());
@@ -740,7 +761,20 @@ fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
         }
         let req = parse_route(&method, &url, &body)?;
         let thumb = matches!(req, Req::Thumb(..));
+        let monitor = matches!(req, Req::Ext("monitor", _));
         let v = ask(link, req)?;
+        if monitor {
+            let bytes = v["image"]
+                .as_str()
+                .map(|s| s.chars().map(|c| c as u32 as u8).collect::<Vec<u8>>())
+                .ok_or_else(|| err(404, "snapshot not available"))?;
+            let mime = if v["mime"] == "image/png" {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            return Ok(Out::Image(bytes, mime));
+        }
         if !thumb {
             return Ok(Out::Json(v));
         }
@@ -761,6 +795,14 @@ fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
                 ("X-Content-Type-Options", "nosniff"),
                 ("Referrer-Policy", "no-referrer"),
                 ("X-Frame-Options", "DENY"),
+            ],
+        ),
+        Ok(Out::Image(b, mime)) => with_headers(
+            tiny_http::Response::from_data(b),
+            &[
+                ("Content-Type", mime),
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
             ],
         ),
         Ok(Out::Png(b)) => {
@@ -1680,6 +1722,97 @@ mod tests {
         let r = rig();
         let (st, _) = raw_get(r.server.http_addr, "/api/v1/clip/1/1/thumb");
         assert_eq!(st, 404);
+    }
+
+    #[test]
+    fn extra_routes_status_codes_and_pin() {
+        let r = rig_pin(Some("77"));
+        let a = r.server.http_addr;
+        let layers = |r: &Rig| r.project.lock().unwrap().composition.layers.len();
+        let n = layers(&r);
+        let add = r#"{"name":"Z"}"#;
+        assert_eq!(http(a, "POST", "/api/v1/layers/add", JSON, add).0, 401);
+        assert_eq!(
+            http(a, "POST", "/api/v1/layers/add?pin=1", JSON, add).0,
+            401
+        );
+        assert_eq!(http(a, "POST", "/api/v1/layers/add", None, add).0, 401);
+        assert_eq!(
+            http(a, "POST", "/api/v1/layers/add?pin=77", None, add).0,
+            415
+        );
+        assert_eq!(layers(&r), n, "refused calls change nothing");
+        assert_eq!(
+            http(a, "POST", "/api/v1/layers/add?pin=77", JSON, add).0,
+            200
+        );
+        assert_eq!(layers(&r), n + 1);
+        assert_eq!(http(a, "GET", "/api/v1/layers/add", None, "").0, 405);
+        assert_eq!(
+            http(a, "POST", "/api/v1/clips/add?pin=77", JSON, "{}").0,
+            400
+        );
+        assert_eq!(
+            http(
+                a,
+                "POST",
+                "/api/v1/effects/add?pin=77",
+                JSON,
+                r#"{"kind":"zz","scope":"master_audio"}"#
+            )
+            .0,
+            422
+        );
+        assert_eq!(
+            http(
+                a,
+                "POST",
+                "/api/v1/layers/remove?pin=77",
+                JSON,
+                r#"{"layer":99}"#
+            )
+            .0,
+            404
+        );
+        assert_eq!(
+            http(a, "GET", "/api/v1/effects?scope=master", None, "").0,
+            200
+        );
+        assert_eq!(http(a, "GET", "/api/v1/nothing", None, "").0, 404);
+        // Host rule is the same as for the old routes.
+        let (st, _) = http_host(
+            a,
+            "evil.example",
+            "GET",
+            "/api/v1/effects?scope=master",
+            None,
+            "",
+        );
+        assert_eq!(st, 403);
+        // can-open probes the filesystem: it needs the PIN, even as a GET.
+        let (st, _) = http(
+            a,
+            "GET",
+            "/api/v1/can-open?path=/no/such/file.mp4",
+            None,
+            "",
+        );
+        assert_eq!(st, 401);
+        let (st, v) = http(
+            a,
+            "GET",
+            "/api/v1/can-open?path=/no/such/file.mp4&pin=77",
+            None,
+            "",
+        );
+        assert_eq!((st, &v["results"][0]["ok"]), (200, &json!(false)));
+        // The MCP client talks to the same server: PIN in the header.
+        let (st, _) = crate::mcp::http(a, None, "POST", "/api/v1/layers/add", &json!({})).unwrap();
+        assert_eq!(st, 401);
+        let (st, _) =
+            crate::mcp::http(a, Some("77"), "POST", "/api/v1/layers/add", &json!({})).unwrap();
+        assert_eq!(st, 200);
+        assert_eq!(layers(&r), n + 2);
     }
 
     #[test]

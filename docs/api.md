@@ -92,6 +92,61 @@ curl -X POST -H 'Content-Type: application/json' \
 (number, name, opacity, bypass, solo, group, active_column, active_columns), `groups`, `columns` and `decks`
 (with their clips: layer, column, name, kind).
 
+## More routes
+
+All under `/api/v1`, JSON in and out. `POST` needs `Content-Type: application/json` and the PIN when one is
+set (see PIN); `GET` stays open. Layers are numbered from the bottom, columns, clips and effects from 1. Every
+change goes through the same commands as the UI (undo, dirty flag, locks); a command the app would refuse
+(for example removing a layer another layer routes) answers 422 with the reason. Unknown route 404, wrong method 405.
+
+| Route | Body / query | Does |
+| --- | --- | --- |
+| `POST /composition/load` | `{"path": "/abs/x.vjc", "force": false}` | Opens a project. 409 when there are unsaved changes unless `force` is true. |
+| `POST /composition/save` | `{"path": "/abs/x.vjc"}` (optional once the project has a file) | Saves. No extension becomes `.vjc`; any other extension, or a missing parent directory, is 422. |
+| `POST /clips/open` | `{"layer":1,"column":2,"paths":["/abs/a.mp4","/abs/dir"]}` | Like dropping files from that cell on: one per column in name order, missing columns are added, one undo step. **Never triggers a clip** unless a cell of the range is already on air (then that cell reloads). Black-out stays on. Max 128 files. |
+| `GET /can-open?path=/abs/a.mp4` or `POST /can-open {"paths":[...]}` | | `{"results":[{"path","ok","kind","codec","width","height","fps","duration","reason"}]}`; does not touch the project. Needs the PIN when one is set, GET included. |
+| `POST /clips/add` | `{"layer","column","path"}` | Puts one file in a cell without triggering it. |
+| `POST /clips/remove` | `{"layer","column"}` | Empties a cell. |
+| `POST /clips/move` | `{"from":{"layer","column"},"to":{...},"copy":false}` | Moves or copies a clip (reorder inside a layer or across layers). |
+| `POST /clips/swap` | `{"a":{"layer","column"},"b":{...}}` | Swaps two cells (one may be empty). |
+| `POST /columns/add` | `{"name":"x","index":2}` | Appends a column, or inserts at `index`. |
+| `POST /columns/remove` | `{"column":3}` | Removes a column and its clips. |
+| `POST /columns/move` | `{"columns":[4,5],"to":1}` | Moves columns so they start at position `to`. |
+| `POST /columns/reorder` | `{"order":[2,1,3]}` | Full new order (every column once). |
+| `POST /layers/add` | `{"name":"x","index":1}` | New layer on top, or at `index` from the bottom. |
+| `POST /layers/remove` | `{"layer":2}` | Removes the layer with its clips. |
+| `POST /layers/rename` | `{"layer":2,"name":"x"}` | |
+| `GET /effects?scope=master&layer=&column=` | scope: `master`, `layer`, `clip`, `master_audio`, `layer_audio`, `clip_audio` | `{"effects":[{"index","id","kind","bypass","dry_wet","params":[{"index","name","value","range","animation"}]}]}` |
+| `POST /effects/add` | `{"scope","layer","column","kind":"audio.gain","index":1}` | Video kinds are the bundled effect ids, audio kinds start with `audio.` (gain, pan, eq3, lowpass, highpass, delay, reverb, compressor, limiter, bitcrusher). 422 for unknown kinds. |
+| `POST /effects/remove` | `{"scope",...,"effect":1}` | |
+| `POST /effects/move` | `{"scope",...,"effect":1,"to":3}` | |
+| `POST /effects/set` | `{"scope",...,"effect":1,"bypass":true,"dry_wet":0.5,"params":[{"index":1,"value":0.25}]}` | One undo step. |
+| `GET /animation?kind=layer_opacity&layer=1` | kind: `layer_opacity`, `master_opacity`, `crossfader`, `effect` (+ scope fields, `effect`, `param`), `generator` (`layer`,`column`,`param`) | `{"animation": ...}` (null = none). |
+| `POST /animation` | same target fields + `"animation": {...}` | Sets the parameter animation (the project's own JSON shape, e.g. `{"Beats":{"beats":4.0,"curve":"Linear","motion":...}}`); no `animation` or null clears it. |
+| `GET /monitors/composition.jpg` (or `.png`, `output.jpg`) | | Snapshot of the composition, at most 640 px on the long side, `image/jpeg` or `image/png`. Black while black-out is on. Rate limited: 4 per second, 429 beyond; 503 when the frame is not ready within 1.4 s. `preview.*` answers 501 (not available). |
+
+```sh
+H='Content-Type: application/json'; B=http://127.0.0.1:8090/api/v1
+curl -X POST -H "$H" -d '{"layer":1,"column":2,"paths":["/Users/me/clips/a.mp4"]}' $B/clips/open
+curl "$B/can-open?path=/Users/me/clips/a.mp4"
+curl -X POST -H "$H" -d '{"name":"Bass"}' $B/layers/add
+curl -X POST -H "$H" -d '{"scope":"master_audio","kind":"audio.limiter"}' $B/effects/add
+curl -X POST -H "$H" -d '{"kind":"layer_opacity","layer":1,"animation":null}' $B/animation
+curl -o frame.jpg $B/monitors/composition.jpg
+```
+
+## MCP server
+
+`vjcraft --mcp [--port 8090] [--pin PIN]` (or `VJCRAFT_PORT` / `VJCRAFT_PIN`) speaks MCP (JSON-RPC 2.0, one message
+per line) on stdin/stdout and opens no window. It is a client of the running app's REST API on `127.0.0.1`, so
+the Remote API must be enabled in Preferences and the PIN and Host rules above apply unchanged. If the app is not
+running, tools return an error result. Configure it in a client as `{"command": "/path/to/vjcraft", "args": ["--mcp"]}`.
+
+Tools: `list_composition`, `trigger_clip {layer,column}`, `trigger_column {column}`, `add_layer {name?,index?}`,
+`add_column {name?,index?}`, `add_effect {scope?,kind,layer?,column?,index?}`, `list_effects {scope?,layer?,column?}`,
+`set_param {path,value}`, `load_file {layer,column,path}` (same rules as `clips/open`: nothing is triggered),
+`can_open {path}`, `load_composition {path,force?}`, `save_composition {path?}`.
+
 ## WebSocket
 
 `ws://127.0.0.1:8091/api/v1/ws` (the path must match). Client messages (JSON text):

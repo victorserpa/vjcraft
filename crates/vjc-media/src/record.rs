@@ -1,6 +1,8 @@
-//! Output recording: RGBA frames in, `.mp4` out. Encoding runs on its own thread behind a
-//! bounded queue; when the queue is full the frame is dropped and counted, so the render
-//! thread never blocks. H.264 (libx264) when available, otherwise mpeg4.
+//! Output recording: RGBA frames in, a video file (or a PNG sequence) out. Encoding runs on
+//! its own thread behind a bounded queue; when the queue is full the frame is dropped and
+//! counted, so the render thread never blocks. The codec is a choice (`RecCodec`); the
+//! list of what this build can encode is checked at runtime (`available`). H.264 falls back
+//! to mpeg4 when no H.264 encoder exists, as before.
 
 use ffmpeg_next as ff;
 use std::path::{Path, PathBuf};
@@ -8,6 +10,168 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// What to record with. Ids are stored in the preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecCodec {
+    H264,
+    Hevc,
+    ProRes,
+    /// One PNG per frame in a folder (lossless, no audio).
+    PngSeq,
+}
+
+impl RecCodec {
+    pub const ALL: [RecCodec; 4] = [
+        RecCodec::H264,
+        RecCodec::Hevc,
+        RecCodec::ProRes,
+        RecCodec::PngSeq,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            RecCodec::H264 => "h264",
+            RecCodec::Hevc => "hevc",
+            RecCodec::ProRes => "prores",
+            RecCodec::PngSeq => "png",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<RecCodec> {
+        Self::ALL.into_iter().find(|c| c.id() == id)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RecCodec::H264 => "H.264 (.mp4)",
+            RecCodec::Hevc => "HEVC / H.265 (.mp4)",
+            RecCodec::ProRes => "Apple ProRes 422 (.mov)",
+            RecCodec::PngSeq => "PNG sequence (folder)",
+        }
+    }
+
+    /// File extension of the output; empty for the PNG sequence, which is a folder.
+    pub fn extension(self) -> &'static str {
+        match self {
+            RecCodec::H264 | RecCodec::Hevc => "mp4",
+            RecCodec::ProRes => "mov",
+            RecCodec::PngSeq => "",
+        }
+    }
+
+    /// Encoders that produce this codec, best first. `legacy` adds the MPEG-4 stand-in
+    /// that H.264 recordings have always used when no H.264 encoder exists.
+    fn encoders(self, legacy: bool) -> Vec<&'static str> {
+        let mut v = match self {
+            RecCodec::H264 => vec!["libx264", "h264_videotoolbox"],
+            RecCodec::Hevc => vec!["libx265", "hevc_videotoolbox"],
+            RecCodec::ProRes => vec!["prores_ks", "prores_videotoolbox", "prores"],
+            RecCodec::PngSeq => vec!["png"],
+        };
+        if legacy && self == RecCodec::H264 {
+            v.push("mpeg4");
+        }
+        v
+    }
+
+    fn pixel(self) -> ff::format::Pixel {
+        match self {
+            RecCodec::H264 | RecCodec::Hevc => ff::format::Pixel::YUV420P,
+            RecCodec::ProRes => ff::format::Pixel::YUV422P10LE,
+            RecCodec::PngSeq => ff::format::Pixel::RGB24,
+        }
+    }
+}
+
+/// The codecs `has` (an encoder-name lookup) can encode.
+pub fn available_with(has: impl Fn(&str) -> bool) -> Vec<RecCodec> {
+    RecCodec::ALL
+        .into_iter()
+        .filter(|c| c.encoders(false).into_iter().any(&has))
+        .collect()
+}
+
+/// The codecs this ffmpeg build can encode, checked now.
+pub fn available() -> Vec<RecCodec> {
+    if ff::init().is_err() {
+        return vec![];
+    }
+    available_with(|n| ff::encoder::find_by_name(n).is_some())
+}
+
+/// Codec and quality of a recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecSettings {
+    pub codec: RecCodec,
+    /// 1 (small) to 100 (best); the PNG sequence ignores it.
+    pub quality: u8,
+}
+
+impl Default for RecSettings {
+    fn default() -> Self {
+        RecSettings {
+            codec: RecCodec::H264,
+            quality: 70,
+        }
+    }
+}
+
+impl RecSettings {
+    /// From stored preferences; an unknown or unavailable codec becomes H.264.
+    pub fn from_prefs(codec: &str, quality: u8, available: &[RecCodec]) -> Self {
+        let codec = RecCodec::from_id(codec)
+            .filter(|c| available.contains(c))
+            .unwrap_or(RecCodec::H264);
+        RecSettings {
+            codec,
+            quality: quality.clamp(1, 100),
+        }
+    }
+}
+
+/// Encoder options for `enc_name` at `quality`: (name, value) pairs, plus a bit rate for
+/// the encoders that take one instead of a constant-quality factor.
+pub fn encoder_options(
+    enc_name: &str,
+    quality: u8,
+    (w, h, fps): (u32, u32, u32),
+) -> (Vec<(&'static str, String)>, Option<usize>) {
+    let q = u32::from(quality.clamp(1, 100));
+    // x264 CRF: 70 -> 20 (the old fixed value), 100 -> 13, 1 -> 35.
+    let crf = 35 - q * 22 / 100;
+    let bits_per_pixel = 0.02 + f64::from(q) / 100.0 * 0.18;
+    let rate = (f64::from(w) * f64::from(h) * f64::from(fps) * bits_per_pixel) as usize;
+    match enc_name {
+        "libx264" => (
+            vec![("preset", "veryfast".into()), ("crf", crf.to_string())],
+            None,
+        ),
+        "libx265" => (
+            vec![
+                ("preset", "veryfast".into()),
+                ("crf", (crf + 4).to_string()),
+                ("x265-params", "log-level=error".into()),
+            ],
+            None,
+        ),
+        "h264_videotoolbox" | "hevc_videotoolbox" => (vec![], Some(rate)),
+        "prores_ks" => {
+            let profile = match q {
+                0..=24 => 0,
+                25..=49 => 1,
+                50..=79 => 2,
+                _ => 3,
+            };
+            (
+                vec![("profile", profile.to_string()), ("vendor", "apl0".into())],
+                None,
+            )
+        }
+        "mpeg4" => (vec![], Some(8_000_000)),
+        _ => (vec![], None),
+    }
+}
 
 /// Master audio to record next to the video: the mixer tap and the device sample rate it
 /// is mixed at.
@@ -239,48 +403,62 @@ struct Enc {
     src_w: u32,
     encoded: u64,
     audio: Option<AudioEnc>,
+    pix: ff::format::Pixel,
 }
 
 impl Enc {
     fn open(
         path: &Path,
-        w: u32,
-        h: u32,
-        fps: u32,
+        (w, h, fps): (u32, u32, u32),
         feed: Option<(&AudioFeed, u64)>,
+        st: RecSettings,
     ) -> Result<(Self, String), ff::Error> {
         ff::init()?;
         let (src_w, src_h) = (w, h);
         let (w, h) = (even(w), even(h));
-        let mut octx = ff::format::output(&path)?;
+        let pix = st.codec.pixel();
+        let mut octx = if st.codec == RecCodec::PngSeq {
+            std::fs::create_dir_all(path).map_err(|_| ff::Error::Unknown)?;
+            // The image2 muxer is chosen by the .png name and writes one file per frame.
+            ff::format::output(&path.join("frame_%06d.png"))?
+        } else {
+            ff::format::output(&path)?
+        };
         let global = octx
             .format()
             .flags()
             .contains(ff::format::Flags::GLOBAL_HEADER);
         let tb = ff::Rational(1, fps as i32);
         let mut last = ff::Error::EncoderNotFound;
-        for (name, codec) in [
-            ("libx264", ff::encoder::find_by_name("libx264")),
-            ("mpeg4", ff::encoder::find(ff::codec::Id::MPEG4)),
-        ] {
-            let Some(codec) = codec else { continue };
+        for name in st.codec.encoders(true) {
+            let Some(codec) = ff::encoder::find_by_name(name) else {
+                continue;
+            };
             let mut v = ff::codec::context::Context::new_with_codec(codec)
                 .encoder()
                 .video()?;
             v.set_width(w);
             v.set_height(h);
-            v.set_format(ff::format::Pixel::YUV420P);
+            v.set_format(pix);
             v.set_time_base(tb);
             v.set_frame_rate(Some(ff::Rational(fps as i32, 1)));
             if global {
                 v.set_flags(ff::codec::Flags::GLOBAL_HEADER);
             }
+            if st.codec == RecCodec::Hevc {
+                // QuickTime and Safari only play HEVC in mp4 tagged hvc1.
+                // SAFETY: plain field write on the encoder context we own, before open.
+                unsafe {
+                    (*v.as_mut_ptr()).codec_tag = u32::from_le_bytes(*b"hvc1");
+                }
+            }
+            let (pairs, bit_rate) = encoder_options(name, st.quality, (w, h, fps));
             let mut opts = ff::Dictionary::new();
-            if name == "libx264" {
-                opts.set("preset", "veryfast");
-                opts.set("crf", "20");
-            } else {
-                v.set_bit_rate(8_000_000);
+            for (k, val) in pairs {
+                opts.set(k, &val);
+            }
+            if let Some(b) = bit_rate {
+                v.set_bit_rate(b);
             }
             let enc = match v.open_as_with(codec, opts) {
                 Ok(e) => e,
@@ -293,8 +471,9 @@ impl Enc {
             stream.set_parameters(&enc);
             stream.set_time_base(tb);
             // No AAC encoder (or it refuses the rate): record video only.
-            let mut audio =
-                feed.and_then(|(f, rec_id)| AudioEnc::open(&mut octx, f, rec_id, global).ok());
+            let mut audio = feed
+                .filter(|_| st.codec != RecCodec::PngSeq)
+                .and_then(|(f, rec_id)| AudioEnc::open(&mut octx, f, rec_id, global).ok());
             octx.write_header()?;
             let out_tb = octx.stream(0).map_or(tb, |s| s.time_base());
             if let Some(a) = audio.as_mut() {
@@ -304,7 +483,7 @@ impl Enc {
                 ff::format::Pixel::RGBA,
                 src_w,
                 src_h,
-                ff::format::Pixel::YUV420P,
+                pix,
                 w,
                 h,
                 ff::software::scaling::Flags::BILINEAR,
@@ -321,6 +500,7 @@ impl Enc {
                     src_w,
                     encoded: 0,
                     audio,
+                    pix,
                 },
                 name.to_string(),
             ));
@@ -347,7 +527,7 @@ impl Enc {
         for y in 0..src_h as usize {
             dst[y * stride..y * stride + row].copy_from_slice(&job.data[y * row..(y + 1) * row]);
         }
-        let mut yuv = ff::frame::Video::new(ff::format::Pixel::YUV420P, self.w, self.h);
+        let mut yuv = ff::frame::Video::new(self.pix, self.w, self.h);
         self.scaler.run(&rgba, &mut yuv)?;
         yuv.set_pts(Some(job.pts));
         self.enc.send_frame(&yuv)?;
@@ -383,14 +563,13 @@ impl Enc {
 fn run(
     rx: Receiver<Job>,
     path: &Path,
-    w: u32,
-    h: u32,
-    fps: u32,
+    size: (u32, u32, u32),
     codec: &Mutex<String>,
     feed: Option<(AudioFeed, u64)>,
+    st: RecSettings,
 ) -> Result<(u64, bool), String> {
     let _stop = StopTap(feed.as_ref().map(|(f, g)| (f.tap.clone(), *g)));
-    let (mut e, name) = Enc::open(path, w, h, fps, feed.as_ref().map(|(f, g)| (f, *g)))
+    let (mut e, name) = Enc::open(path, size, feed.as_ref().map(|(f, g)| (f, *g)), st)
         .map_err(|e| e.to_string())?;
     *codec.lock().unwrap() = name;
     let audio = e.audio.is_some();
@@ -414,7 +593,13 @@ fn run(
         e.pump_audio(false).map_err(|e| e.to_string())?;
     }
     e.finish().map_err(|e| e.to_string())?;
-    Ok((e.encoded, audio))
+    let encoded = e.encoded;
+    drop(e);
+    if st.codec == RecCodec::PngSeq {
+        // ffmpeg opens the literal pattern name once; the frames are the numbered files.
+        let _ = std::fs::remove_file(path.join("frame_%06d.png"));
+    }
+    Ok((encoded, audio))
 }
 
 impl Recorder {
@@ -433,7 +618,27 @@ impl Recorder {
         fps: u32,
         feed: AudioFeed,
     ) -> Result<Self, String> {
-        Self::start_inner(path, width, height, fps, QUEUE_FRAMES, Some(feed))
+        Self::start_inner(
+            path,
+            width,
+            height,
+            fps,
+            QUEUE_FRAMES,
+            Some(feed),
+            RecSettings::default(),
+        )
+    }
+
+    /// Like `start_with_audio` with a chosen codec and quality; `feed` is optional. The PNG
+    /// sequence writes `path` as a folder and has no audio.
+    pub fn start_settings(
+        path: &Path,
+        (width, height, fps): (u32, u32, u32),
+        feed: Option<AudioFeed>,
+        settings: RecSettings,
+    ) -> Result<Self, String> {
+        let feed = feed.filter(|_| settings.codec != RecCodec::PngSeq);
+        Self::start_inner(path, width, height, fps, QUEUE_FRAMES, feed, settings)
     }
 
     pub fn start_with_queue(
@@ -443,7 +648,15 @@ impl Recorder {
         fps: u32,
         queue: usize,
     ) -> Result<Self, String> {
-        Self::start_inner(path, width, height, fps, queue, None)
+        Self::start_inner(
+            path,
+            width,
+            height,
+            fps,
+            queue,
+            None,
+            RecSettings::default(),
+        )
     }
 
     fn start_inner(
@@ -453,6 +666,7 @@ impl Recorder {
         fps: u32,
         queue: usize,
         feed: Option<AudioFeed>,
+        settings: RecSettings,
     ) -> Result<Self, String> {
         if width < 2 || height < 2 || fps == 0 {
             return Err("invalid recording size or fps".into());
@@ -463,7 +677,7 @@ impl Recorder {
             (f, rec_id)
         });
         Self::spawn(path, width, height, queue, move |rx, c| {
-            run(rx, &p, width, height, fps, c, feed)
+            run(rx, &p, (width, height, fps), c, feed, settings)
         })
     }
 
@@ -608,6 +822,126 @@ mod tests {
         std::env::temp_dir().join(format!("vjc-rec-{}-{name}", std::process::id()))
     }
 
+    #[test]
+    fn listing_only_offers_codecs_with_an_encoder() {
+        let only = |names: &'static [&'static str]| available_with(move |n| names.contains(&n));
+        assert_eq!(only(&[]), vec![]);
+        assert_eq!(only(&["libx264"]), vec![RecCodec::H264]);
+        assert_eq!(
+            only(&["hevc_videotoolbox", "prores_ks"]),
+            vec![RecCodec::Hevc, RecCodec::ProRes]
+        );
+        assert_eq!(only(&["mpeg4"]), vec![], "the mpeg4 stand-in is not H.264");
+        assert_eq!(only(&["png"]), vec![RecCodec::PngSeq]);
+        for c in RecCodec::ALL {
+            assert_eq!(RecCodec::from_id(c.id()), Some(c), "ids roundtrip");
+        }
+        // Whatever this build lists really has an encoder.
+        for c in available() {
+            assert!(
+                c.encoders(false)
+                    .iter()
+                    .any(|n| ff::encoder::find_by_name(n).is_some())
+            );
+        }
+        // Stored ids that cannot be used fall back to H.264.
+        let have = [RecCodec::ProRes];
+        assert_eq!(
+            RecSettings::from_prefs("prores", 80, &have).codec,
+            RecCodec::ProRes
+        );
+        assert_eq!(
+            RecSettings::from_prefs("hevc", 80, &have).codec,
+            RecCodec::H264
+        );
+        assert_eq!(RecSettings::from_prefs("zzz", 0, &have).quality, 1);
+    }
+
+    #[test]
+    fn quality_maps_to_encoder_options() {
+        let opt = |n, q| encoder_options(n, q, (1920, 1080, 30));
+        let crf = |q| {
+            opt("libx264", q)
+                .0
+                .iter()
+                .find(|(k, _)| *k == "crf")
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(crf(70), "20", "default quality keeps the old CRF");
+        assert!(crf(100).parse::<u32>().unwrap() < crf(70).parse::<u32>().unwrap());
+        assert!(crf(1).parse::<u32>().unwrap() > crf(70).parse::<u32>().unwrap());
+        let rate = |q| opt("hevc_videotoolbox", q).1.unwrap();
+        assert!(rate(90) > rate(30));
+        let prof = |q| {
+            opt("prores_ks", q)
+                .0
+                .iter()
+                .find(|(k, _)| *k == "profile")
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(
+            (prof(10).as_str(), prof(60).as_str(), prof(100).as_str()),
+            ("0", "2", "3")
+        );
+        assert_eq!(opt("png", 50), (vec![], None));
+    }
+
+    /// Each codec this build lists records a file that ffmpeg reads back with that codec.
+    #[test]
+    fn records_in_every_available_codec_and_plays_back() {
+        let avail = available();
+        assert!(!avail.is_empty(), "at least one codec on this build");
+        for codec in avail {
+            let path = tmp(&format!(
+                "codec-{}{}",
+                codec.id(),
+                if codec.extension().is_empty() {
+                    String::new()
+                } else {
+                    format!(".{}", codec.extension())
+                }
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_file(&path);
+            let st = RecSettings { codec, quality: 60 };
+            let mut r = Recorder::start_settings(&path, (64, 48, 10), None, st).unwrap();
+            for i in 0..6u8 {
+                assert!(r.push(vec![i * 30; 64 * 48 * 4]));
+            }
+            let sum = r.finish().unwrap_or_else(|e| panic!("{}: {e}", codec.id()));
+            assert_eq!(sum.encoded, 6, "{}", codec.id());
+            if codec == RecCodec::PngSeq {
+                let n = std::fs::read_dir(&path)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+                    .count();
+                assert_eq!(n, 6);
+                let _ = std::fs::remove_dir_all(&path);
+                continue;
+            }
+            let ictx = ff::format::input(&path).unwrap();
+            let v = ictx.streams().best(ff::media::Type::Video).unwrap();
+            let name = v.parameters().id().name().to_string();
+            let want = match codec {
+                RecCodec::H264 => "h264",
+                RecCodec::Hevc => "hevc",
+                _ => "prores",
+            };
+            assert_eq!(name, want, "{}", codec.id());
+            if codec == RecCodec::Hevc {
+                // SAFETY: reads a plain field of the stream's codec parameters.
+                let tag = unsafe { (*v.parameters().as_ptr()).codec_tag };
+                assert_eq!(tag, u32::from_le_bytes(*b"hvc1"), "QuickTime needs hvc1");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     /// Decodes the file: (video streams, audio streams, audio codec, audio seconds, audio RMS).
     fn probe(path: &Path) -> (usize, usize, Option<ff::codec::Id>, f64, f64) {
         let mut ictx = ff::format::input(&path).unwrap();
@@ -747,7 +1081,7 @@ mod tests {
     #[test]
     fn audio_flush_error_still_writes_the_trailer() {
         let path = tmp("audfail.mp4");
-        let (mut e, _) = Enc::open(&path, 16, 16, 10, None).unwrap();
+        let (mut e, _) = Enc::open(&path, (16, 16, 10), None, RecSettings::default()).unwrap();
         let job = Job {
             pts: 0,
             data: vec![0; 16 * 16 * 4],

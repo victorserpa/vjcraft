@@ -7126,3 +7126,164 @@ fn preview_widget_arrow_keys_nudge_when_focused() {
     settle(&mut h);
     assert_eq!(xf_val(&h, t, F::Y), 10.0);
 }
+
+// ---- REST open-clips: the on-air invariants (issue #13) ----
+
+/// POST /api/v1/clips/open as a client would, answered by the app on its UI thread.
+fn rest_open(
+    st: &mut State,
+    layer_no: usize,
+    column_no: usize,
+    paths: &[PathBuf],
+) -> api_io::Reply {
+    let body = serde_json::json!({
+        "layer": layer_no,
+        "column": column_no,
+        "paths": paths.iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>(),
+    });
+    let req =
+        api_io::parse_route("POST", "/api/v1/clips/open", body.to_string().as_bytes()).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    st.api_handle(req, tx);
+    rx.try_recv().expect("answered in the same call")
+}
+
+fn rest_save(st: &mut State, path: &str) -> api_io::Reply {
+    let body = serde_json::json!({ "path": path });
+    let req = api_io::parse_route(
+        "POST",
+        "/api/v1/composition/save",
+        body.to_string().as_bytes(),
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    st.api_handle(req, tx);
+    rx.try_recv().expect("answered in the same call")
+}
+
+#[test]
+fn rest_save_refuses_other_extensions_and_missing_dirs() {
+    let d = multi_dir("rest-save");
+    let txt = d.join("notes.txt");
+    std::fs::write(&txt, "keep").unwrap();
+    let mut h = app();
+    let r = rest_save(h.state_mut(), txt.to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+    assert_eq!(std::fs::read_to_string(&txt).unwrap(), "keep");
+    let r = rest_save(h.state_mut(), d.join("no/such/dir/a.vjc").to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+    let r = rest_save(h.state_mut(), d.join("plain").to_str().unwrap());
+    assert!(r.is_ok());
+    assert!(d.join("plain.vjc").is_file());
+    let r = rest_save(h.state_mut(), d.join("UP.VJC").to_str().unwrap());
+    assert!(r.is_ok());
+}
+
+fn top_layer_no(h: &Harness<'_, State>) -> usize {
+    h.state().project.composition.layers.len()
+}
+
+#[test]
+fn rest_open_clips_into_another_cell_keeps_on_air() {
+    let d = multi_dir("rest-air");
+    let ps = [touch(&d, "a.mp4"), touch(&d, "b.mp4")];
+    let mut h = app();
+    let lid = playing_generator(&mut h); // on air: top layer, column 2
+    let on_air = h.state().active(lid);
+    let no = top_layer_no(&h);
+    let r = rest_open(h.state_mut(), no, 4, &ps).unwrap();
+    assert_eq!(r["placed"], 2);
+    settle(&mut h);
+    assert_eq!(
+        h.state().active(lid),
+        on_air,
+        "loading elsewhere never changes what plays"
+    );
+    assert!(h.state().gens.contains_key(&lid) && h.state().players.is_empty());
+    assert_eq!(clip_name(h.state(), lid, 3).as_deref(), Some("a"));
+    assert_eq!(clip_name(h.state(), lid, 4).as_deref(), Some("b"));
+}
+
+#[test]
+fn rest_open_clips_over_the_on_air_cell_reloads_it() {
+    let d = multi_dir("rest-live");
+    let ps = [touch(&d, "live.mp4")];
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let on_air = h.state().active(lid);
+    let no = top_layer_no(&h);
+    rest_open(h.state_mut(), no, 2, &ps).unwrap();
+    settle(&mut h);
+    assert_eq!(h.state().active(lid), on_air, "same cell stays on air");
+    assert!(
+        h.state().players.contains_key(&lid),
+        "now playing the new file"
+    );
+}
+
+#[test]
+fn rest_open_clips_during_blackout_stays_black_and_silent() {
+    let d = multi_dir("rest-black");
+    let ps = [touch(&d, "a.mp4")];
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    h.state_mut()
+        .exec(Command::SetMasterBypass { bypass: true });
+    settle(&mut h);
+    assert!(h.state().master_bypass);
+    let on_air = h.state().active(lid);
+    let no = top_layer_no(&h);
+    rest_open(h.state_mut(), no, 4, &ps).unwrap();
+    settle(&mut h);
+    assert!(h.state().master_bypass, "black-out is still on");
+    assert_eq!(h.state().active(lid), on_air);
+    assert!(h.state().players.is_empty());
+}
+
+#[test]
+fn rest_open_clips_rejects_bad_input() {
+    let mut h = app();
+    let no = top_layer_no(&h);
+    assert_eq!(
+        rest_open(h.state_mut(), no + 5, 1, &[PathBuf::from("/x")])
+            .unwrap_err()
+            .status,
+        404
+    );
+    assert_eq!(
+        rest_open(h.state_mut(), no, 1, &[PathBuf::from("/no/such/file.mp4")])
+            .unwrap_err()
+            .status,
+        422
+    );
+    assert_eq!(
+        rest_open(h.state_mut(), no, 1, &[PathBuf::from("rel.mp4")])
+            .unwrap_err()
+            .status,
+        422
+    );
+}
+
+#[test]
+fn audio_prefs_reach_the_engine_config_on_save() {
+    let mut st = State::headless(prefs());
+    assert_eq!(st.audio_cfg, vjc_media::audio::OutConfig::default());
+    st.prefs.audio.output_device = Some("USB".into());
+    st.prefs.audio.sample_rate = Some(96_000);
+    st.prefs.audio.buffer_size = Some(256);
+    st.prefs.audio.channels = Some(2);
+    st.save_prefs();
+    assert_eq!(
+        st.audio_cfg,
+        vjc_media::audio::OutConfig {
+            device: Some("USB".into()),
+            sample_rate: Some(96_000),
+            buffer_frames: Some(256),
+            channels: Some(2),
+        }
+    );
+    // Saving again without a change leaves it alone.
+    let before = st.audio_cfg.clone();
+    st.save_prefs();
+    assert_eq!(st.audio_cfg, before);
+}

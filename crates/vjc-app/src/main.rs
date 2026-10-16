@@ -1,8 +1,10 @@
+mod api_ext;
 mod api_io;
 mod artnet_out;
 mod artnet_reduce;
 mod artnet_scan;
 mod audio_fx_ui;
+mod audio_prefs;
 mod audio_react;
 mod autopilot_ui;
 mod browser;
@@ -20,6 +22,7 @@ mod hold;
 mod icons;
 mod io_monitor;
 mod link_io;
+mod mcp;
 mod midi_io;
 mod ml_fx;
 mod ml_gpu;
@@ -148,11 +151,14 @@ struct State {
     metro: Option<vjc_media::audio::Metronome>,
     audio_failed: bool,
     /// Output device `audio` was (or will be) opened on.
-    audio_device: Option<String>,
+    audio_cfg: vjc_media::audio::OutConfig,
     /// `audio_failed` came from a real open error (not from the UI-test setup).
     audio_error: bool,
     /// Names of the audio output devices listed in Preferences > Audio.
     audio_outputs: Option<Vec<String>>,
+    audio_inputs: Option<Vec<String>>,
+    /// Codecs this build can record with, checked on first use.
+    rec_codecs: Option<Vec<vjc_media::record::RecCodec>>,
     /// Writes prefs and the recovery file (false in UI tests).
     persist: bool,
     /// Playing generator clip per layer: (deck, column, own TIME in seconds). The time
@@ -279,6 +285,8 @@ struct State {
     dmx_cfg: Option<dmx_io::Cfg>,
     api: api_io::Api,
     api_cfg: Option<api_io::Cfg>,
+    snap_jobs: Vec<api_ext::SnapJob>,
+    snap_last: Option<std::time::Instant>,
     /// Mappable widgets drawn this frame, for learn clicks and the key overlay.
     targets: Vec<(egui::Rect, String)>,
     /// Master bypass: black output (runtime only, not saved).
@@ -1832,7 +1840,11 @@ impl State {
             fx: fx::FxLib::new(),
             ml: ml_fx::MlHub::new(),
             fx_epoch: std::time::Instant::now(),
-            audio_react: audio_react::AudioReact::default(),
+            audio_react: {
+                let mut r = audio_react::AudioReact::default();
+                r.set_config(audio_react::InCfg::from_prefs(&prefs.audio));
+                r
+            },
             panel_tab: PanelTab::Composition,
             comp_tex: None,
             prev_tex: None,
@@ -1851,9 +1863,11 @@ impl State {
             monitors_polled: (!live).then(std::time::Instant::now),
             persist: live,
             audio_failed: !live,
-            audio_device: prefs.audio.output_device.clone(),
+            audio_cfg: audio_prefs::out_config(&prefs.audio),
             audio_error: false,
             audio_outputs: None,
+            audio_inputs: None,
+            rec_codecs: None,
             cells: vec![],
             layer_rects: vec![],
             grid_rect: egui::Rect::NOTHING,
@@ -1915,6 +1929,8 @@ impl State {
                 api_io::Api::idle()
             },
             api_cfg: None,
+            snap_jobs: Vec::new(),
+            snap_last: None,
             led_prev: HashMap::new(),
             targets: vec![],
             master_bypass: false,
@@ -1997,7 +2013,7 @@ impl State {
     /// Audio output, opened lazily; a failure is reported once in the status line.
     fn audio_engine(&mut self) -> Option<AudioEngine> {
         if self.audio.is_none() && !self.audio_failed {
-            match AudioEngine::start_on(self.prefs.audio.output_device.as_deref()) {
+            match AudioEngine::start_with(self.audio_cfg.clone()) {
                 Ok(e) => self.audio = Some(e),
                 Err(e) => {
                     self.audio_failed = true;
@@ -2748,16 +2764,20 @@ impl State {
     }
 
     fn save_prefs(&mut self) {
-        // A new output device takes effect for clips started from now on.
-        if self.audio_device != self.prefs.audio.output_device {
-            self.audio_device = self.prefs.audio.output_device.clone();
-            // Retry only if audio was live (open, or failed on a real error).
+        // Output device, rate, buffer and channels reopen the running output in place;
+        // the analysis input restarts with its new device, channel and FFT size.
+        let new_out = audio_prefs::out_config(&self.prefs.audio);
+        let engine = self.audio.as_ref().map(|e| e as &dyn audio_prefs::Output);
+        if audio_prefs::apply(&mut self.audio_cfg, new_out, engine) != audio_prefs::Applied::Same {
             self.metro = None;
-            if self.audio.take().is_some() || self.audio_error {
+            // Audio that failed to open is given another try with the new settings.
+            if self.audio.is_none() && self.audio_error {
                 self.audio_failed = false;
                 self.audio_error = false;
             }
         }
+        self.audio_react
+            .set_config(audio_react::InCfg::from_prefs(&self.prefs.audio));
         let Some(p) = self.persist.then(prefs_path).flatten() else {
             self.prefs_dirty = false;
             return;
@@ -5360,11 +5380,23 @@ impl State {
                         tap: a.tap(),
                         rate: a.sample_rate(),
                     });
+                let have = self
+                    .rec_codecs
+                    .get_or_insert_with(vjc_media::record::available);
+                let settings = vjc_media::record::RecSettings::from_prefs(
+                    &self.prefs.record.codec,
+                    self.prefs.record.quality,
+                    have,
+                );
                 match capture::Capture::start(
-                    capture::default_path(self.prefs.general.record_folder.as_deref()),
+                    capture::default_path_for(
+                        self.prefs.general.record_folder.as_deref(),
+                        settings.codec.extension(),
+                    ),
                     size,
                     c.fps,
                     feed,
+                    settings,
                 ) {
                     Ok(cap) => {
                         self.status = format!("Recording to {}", cap.path().display());
@@ -5402,6 +5434,14 @@ impl State {
                 cap.capture(&rs.device, &rs.queue, &comp.target);
             }
         }
+        api_ext::snap_service(
+            &mut self.snap_jobs,
+            &rs.device,
+            &rs.queue,
+            &comp.target,
+            comp.size,
+            self.master_bypass,
+        );
         self.render_screens(rs);
     }
 
@@ -6184,18 +6224,149 @@ impl State {
             let Ok(msg) = self.api.rx.try_recv() else {
                 break;
             };
-            let rt = self.rt_ctx();
-            let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
-            if let api_io::Req::Thumb(l, c) = &msg.req {
-                let reply = self.web_thumb(*l, *c);
-                let _ = msg.reply.send(reply);
-                continue;
+            self.api_handle(msg.req, msg.reply);
+        }
+    }
+
+    /// Answers one API request on the UI thread. Snapshots reply later (after the GPU
+    /// readback, see `api_ext::snap_service`); everything else replies right away.
+    fn api_handle(&mut self, req: api_io::Req, reply: std::sync::mpsc::SyncSender<api_io::Reply>) {
+        let rt = self.rt_ctx();
+        let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
+        match req {
+            api_io::Req::Thumb(l, c) => {
+                let r = self.web_thumb(l, c);
+                let _ = reply.send(r);
             }
-            let (cmd, reply) = api_io::answer(&self.project, &rt, &active, msg.req);
-            if let Some(c) = cmd {
-                self.exec(c);
+            api_io::Req::Ext(op, body) if api_ext::APP_OPS.contains(&op) => {
+                // None: the reply comes later (snapshot after the GPU readback).
+                if let Some(r) = self.api_app_op(op, &body, &reply) {
+                    let _ = reply.send(r);
+                }
             }
-            let _ = msg.reply.send(reply);
+            req => {
+                let (cmd, r) = api_io::answer(&self.project, &rt, &active, req);
+                if let Some(c) = cmd {
+                    self.exec(c);
+                }
+                let _ = reply.send(r);
+            }
+        }
+    }
+
+    /// Ops that need files or the GPU. None = the reply is sent later.
+    fn api_app_op(
+        &mut self,
+        op: &str,
+        body: &serde_json::Value,
+        reply: &std::sync::mpsc::SyncSender<api_io::Reply>,
+    ) -> Option<api_io::Reply> {
+        use serde_json::json;
+        let bad = |status, msg: &str| {
+            Some(Err(api_io::ApiErr {
+                status,
+                msg: msg.into(),
+            }))
+        };
+        let path_of = |k: &str| {
+            body[k]
+                .as_str()
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+        };
+        match op {
+            "load" => {
+                let Some(path) = path_of("path").filter(|p| p.is_file()) else {
+                    return bad(422, "path must be an absolute path of an existing file");
+                };
+                if self.dirty && body["force"] != true {
+                    return bad(409, "unsaved changes; pass \"force\": true to discard them");
+                }
+                if self.load(path) {
+                    Some(Ok(json!({"ok": true})))
+                } else {
+                    bad(422, "could not open the project (see the status bar)")
+                }
+            }
+            "save" => {
+                let ok = match path_of("path") {
+                    Some(mut p) => {
+                        match p.extension() {
+                            None => {
+                                p.set_extension("vjc");
+                            }
+                            Some(e) if e.eq_ignore_ascii_case("vjc") => {}
+                            Some(_) => return bad(422, "path must end in .vjc"),
+                        }
+                        if !p.parent().is_some_and(|d| d.is_dir()) {
+                            return bad(422, "the parent directory does not exist");
+                        }
+                        self.save_to(p)
+                    }
+                    None if body["path"].is_null() && self.file.is_some() => {
+                        self.save_to(self.file.clone().unwrap_or_default())
+                    }
+                    None => return bad(422, "no file yet: pass an absolute \"path\""),
+                };
+                if ok {
+                    Some(Ok(json!({"ok": true, "path": self.file})))
+                } else {
+                    bad(500, "save failed (see the status bar)")
+                }
+            }
+            "open_clips" => {
+                let c = &self.project.composition;
+                let layer = body["layer"]
+                    .as_u64()
+                    .and_then(|n| c.layers.len().checked_sub(n as usize))
+                    .and_then(|i| c.layers.get(i))
+                    .map(|l| l.id);
+                let col = body["column"]
+                    .as_u64()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|n| u32::try_from(n).ok());
+                let (Some(layer), Some(col)) = (layer, col) else {
+                    return bad(404, "no such layer");
+                };
+                // Past the last column is fine: the missing columns are added.
+                let paths: Vec<PathBuf> = body["paths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(PathBuf::from))
+                    .collect();
+                if paths.iter().any(|p| !p.is_absolute() || !p.exists()) {
+                    return bad(422, "every path must be absolute and exist");
+                }
+                if col as usize > c.columns.len() + api_ext::MAX_FILES {
+                    return bad(422, "column too far past the last one");
+                }
+                let (placed, ignored) = self.drop_many(layer, col, paths);
+                Some(Ok(
+                    json!({"ok": placed > 0, "placed": placed, "ignored": ignored}),
+                ))
+            }
+            "monitor" => {
+                let kind = body["kind"].as_str().unwrap_or("");
+                if kind == "preview" {
+                    return bad(501, "preview snapshots are not available; use composition");
+                }
+                let now = std::time::Instant::now();
+                if self.snap_jobs.len() >= api_ext::SNAP_QUEUE
+                    || self
+                        .snap_last
+                        .is_some_and(|t| now.duration_since(t) < api_ext::SNAP_EVERY)
+                {
+                    return bad(429, "snapshots are rate limited (4 per second)");
+                }
+                self.snap_last = Some(now);
+                self.snap_jobs.push(api_ext::SnapJob::new(
+                    body["format"] == "jpg",
+                    reply.clone(),
+                ));
+                None
+            }
+            _ => bad(404, "not found"),
         }
     }
 
@@ -11207,6 +11378,11 @@ fn tex_cap_from(limit: u32) -> u32 {
 }
 
 fn main() -> eframe::Result {
+    // MCP server mode: stdio client of the running app's REST API, no window.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp") {
+        std::process::exit(mcp::run(&args));
+    }
     let (prefs, warn) = match prefs_path() {
         Some(p) => Prefs::load(&p),
         None => (Prefs::default(), None),

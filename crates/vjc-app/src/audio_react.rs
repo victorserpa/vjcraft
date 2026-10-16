@@ -30,17 +30,48 @@ impl AudioInput for LtcInput {
     }
 }
 
-type Opener = Box<dyn FnMut(Arc<SharedBands>) -> Box<dyn AudioInput>>;
+/// Which input feeds the analysis, from the preferences.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InCfg {
+    /// Empty = the system default input.
+    pub device: String,
+    pub channel: u16,
+    pub fft_size: usize,
+}
 
-fn open_default(shared: Arc<SharedBands>) -> Box<dyn AudioInput> {
-    Box::new(LtcInput::start("", 0, move |rate| {
-        vjc_media::analysis::sink(shared, rate)
+impl Default for InCfg {
+    fn default() -> Self {
+        InCfg {
+            device: String::new(),
+            channel: 0,
+            fft_size: vjc_media::analysis::FFT_SIZE,
+        }
+    }
+}
+
+impl InCfg {
+    pub fn from_prefs(a: &vjc_io::prefs::Audio) -> Self {
+        InCfg {
+            device: a.input_device.clone().unwrap_or_default(),
+            channel: a.input_channel,
+            fft_size: a.fft_size,
+        }
+    }
+}
+
+type Opener = Box<dyn FnMut(Arc<SharedBands>, &InCfg) -> Box<dyn AudioInput>>;
+
+fn open_default(shared: Arc<SharedBands>, cfg: &InCfg) -> Box<dyn AudioInput> {
+    let size = cfg.fft_size;
+    Box::new(LtcInput::start(&cfg.device, cfg.channel, move |rate| {
+        vjc_media::analysis::sink_sized(shared, rate, size)
     }))
 }
 
 pub struct AudioReact {
     input: Option<Box<dyn AudioInput>>,
     opener: Opener,
+    cfg: InCfg,
     shared: Arc<SharedBands>,
     /// Levels of this frame (refreshed by `refresh`).
     pub levels: [f32; BANDS],
@@ -84,6 +115,7 @@ impl AudioReact {
         AudioReact {
             input: None,
             opener,
+            cfg: InCfg::default(),
             shared: Arc::default(),
             levels: [0.0; BANDS],
             detail: Default::default(),
@@ -95,6 +127,22 @@ impl AudioReact {
             seen_blocks: 0,
             last_block: None,
         }
+    }
+
+    /// Applies the input preferences. A change closes the running input (the next frame
+    /// reopens the new one at once, with the retry budget renewed); the same config does
+    /// nothing. True when the input was restarted.
+    pub fn set_config(&mut self, cfg: InCfg) -> bool {
+        if self.cfg == cfg {
+            return false;
+        }
+        self.cfg = cfg;
+        self.input = None;
+        self.failures = 0;
+        self.retry_at = None;
+        self.last_scan = None;
+        self.shared.store(&[0.0; BANDS]);
+        true
     }
 
     /// Once per frame: reads the published levels; every few seconds opens or closes the
@@ -159,7 +207,7 @@ impl AudioReact {
             self.shared.store(&[0.0; BANDS]);
             self.seen_blocks = self.shared.blocks();
             self.last_block = Some(now);
-            self.input = Some((self.opener)(self.shared.clone()));
+            self.input = Some((self.opener)(self.shared.clone(), &self.cfg));
         }
     }
 }
@@ -227,10 +275,60 @@ mod tests {
         c
     }
 
+    /// A fake opener that records the config of every open.
+    fn recording() -> (AudioReact, std::rc::Rc<std::cell::RefCell<Vec<InCfg>>>) {
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<InCfg>>> = Default::default();
+        let s2 = seen.clone();
+        let r = AudioReact::with_opener(Box::new(move |_, cfg| {
+            s2.borrow_mut().push(cfg.clone());
+            Box::new(Fake { failed: false })
+        }));
+        (r, seen)
+    }
+
+    #[test]
+    fn changed_input_prefs_reopen_the_input_with_the_new_config() {
+        let (mut r, seen) = recording();
+        let c = with_audio();
+        let t0 = Instant::now();
+        r.refresh_at(&c, t0);
+        assert_eq!(seen.borrow().as_slice(), &[InCfg::default()]);
+        // Same prefs: nothing happens, the input stays.
+        assert!(!r.set_config(InCfg::default()));
+        r.refresh_at(&c, t0 + Duration::from_millis(16));
+        assert_eq!(seen.borrow().len(), 1);
+        // New device, channel and FFT size: reopened on the very next frame.
+        let new = InCfg {
+            device: "Scarlett".into(),
+            channel: 1,
+            fft_size: 4096,
+        };
+        assert!(r.set_config(new.clone()));
+        assert!(r.input.is_none(), "old input closed at once");
+        r.refresh_at(&c, t0 + Duration::from_millis(32));
+        assert_eq!(seen.borrow().last(), Some(&new));
+        assert_eq!(seen.borrow().len(), 2);
+        // Prefs map to the config.
+        let a = vjc_io::prefs::Audio {
+            input_device: Some("Mic".into()),
+            input_channel: 3,
+            fft_size: 512,
+            ..Default::default()
+        };
+        assert_eq!(
+            InCfg::from_prefs(&a),
+            InCfg {
+                device: "Mic".into(),
+                channel: 3,
+                fft_size: 512
+            }
+        );
+    }
+
     fn counting(fail: bool) -> (AudioReact, std::rc::Rc<std::cell::Cell<u32>>) {
         let n = std::rc::Rc::new(std::cell::Cell::new(0));
         let n2 = n.clone();
-        let r = AudioReact::with_opener(Box::new(move |_| {
+        let r = AudioReact::with_opener(Box::new(move |_, _| {
             n2.set(n2.get() + 1);
             Box::new(Fake { failed: fail })
         }));
@@ -278,7 +376,7 @@ mod tests {
     fn stalled_input_levels_fall_to_zero_and_clear_on_reopen() {
         let slot: std::rc::Rc<std::cell::RefCell<Option<Arc<SharedBands>>>> = Default::default();
         let s2 = slot.clone();
-        let mut r = AudioReact::with_opener(Box::new(move |sh| {
+        let mut r = AudioReact::with_opener(Box::new(move |sh, _| {
             *s2.borrow_mut() = Some(sh);
             Box::new(Fake { failed: false })
         }));

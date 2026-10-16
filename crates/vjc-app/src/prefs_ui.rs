@@ -126,7 +126,37 @@ impl State {
                                 p.general.record_folder = Some(d);
                             }
                         });
-                        help(ui, "Empty = ~/Movies/VJCraft. Recordings have no audio yet.");
+                        help(
+                            ui,
+                            "Empty = ~/Movies/VJCraft. Recordings carry the master audio (not the PNG sequence).",
+                        );
+                        let have = self
+                            .rec_codecs
+                            .get_or_insert_with(vjc_media::record::available)
+                            .clone();
+                        let cur = vjc_media::record::RecSettings::from_prefs(
+                            &p.record.codec,
+                            p.record.quality,
+                            &have,
+                        );
+                        egui::ComboBox::from_label("Recording codec")
+                            .selected_text(cur.codec.label())
+                            .show_ui(ui, |ui| {
+                                for c in &have {
+                                    if ui.selectable_label(*c == cur.codec, c.label()).clicked() {
+                                        p.record.codec = c.id().into();
+                                    }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label("Quality");
+                            field_int(ui, &mut p.record.quality, 1..=100, "", "");
+                        });
+                        help(
+                            ui,
+                            "Only codecs this build can encode are listed. Quality 1 (small) to 100 (best); \
+                             ignored by the lossless PNG sequence. Applies to the next recording.",
+                        );
                     }
                     PrefsTab::Audio => {
                         let outputs = self
@@ -141,10 +171,46 @@ impl State {
                                     ui.selectable_value(&mut p.audio.output_device, Some(n.clone()), n);
                                 }
                             });
+                        opt_choice(ui, "Sample rate", &mut p.audio.sample_rate, &[44_100, 48_000, 88_200, 96_000, 192_000], " Hz");
+                        opt_choice(ui, "Buffer size", &mut p.audio.buffer_size, &[64, 128, 256, 512, 1024, 2048], " frames");
+                        opt_choice(ui, "Output channels", &mut p.audio.channels, &[1, 2, 4, 6, 8], "");
+                        ui.separator();
+                        let inputs = self
+                            .audio_inputs
+                            .get_or_insert_with(vjc_media::ltc_in::input_devices);
+                        let cur = p.audio.input_device.clone();
+                        egui::ComboBox::from_label("Input device (FFT)")
+                            .selected_text(cur.as_deref().unwrap_or("(default)"))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut p.audio.input_device, None, "(default)");
+                                for n in inputs.iter() {
+                                    ui.selectable_value(&mut p.audio.input_device, Some(n.clone()), n);
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label("Input channel");
+                            let mut ch = u32::from(p.audio.input_channel) + 1;
+                            field_int(ui, &mut ch, 1..=64, "", "");
+                            p.audio.input_channel = (ch.clamp(1, 64) - 1) as u16;
+                        });
+                        egui::ComboBox::from_label("FFT size")
+                            .selected_text(p.audio.fft_size.to_string())
+                            .show_ui(ui, |ui| {
+                                for n in vjc_io::prefs::FFT_SIZES {
+                                    ui.selectable_value(&mut p.audio.fft_size, n, n.to_string());
+                                }
+                            });
                         if btn(ui, "Refresh devices", Kind::Secondary).clicked() {
                             self.audio_outputs = None;
+                            self.audio_inputs = None;
                         }
-                        help(ui, "Applies to clips started after the change.");
+                        help(
+                            ui,
+                            "Output changes reopen the audio at once; clips keep playing. A rate, buffer or \
+                             channel count the device cannot do falls back to the nearest it supports. \
+                             The input feeds audio-reactive animation and spectrum generators; it opens only \
+                             while the project uses them.",
+                        );
                     }
                     PrefsTab::Video => {
                         ui.label("New composition");
@@ -521,4 +587,23 @@ fn web_remote_links(ui: &mut egui::Ui, a: &vjc_io::prefs::Api) {
             }
         }
     }
+}
+
+/// "(default)" plus fixed choices for an optional number.
+fn opt_choice<T: Copy + PartialEq + std::fmt::Display>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<T>,
+    choices: &[T],
+    unit: &str,
+) {
+    let text = value.map_or("(default)".to_owned(), |v| format!("{v}{unit}"));
+    egui::ComboBox::from_label(label)
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "(default)");
+            for c in choices {
+                ui.selectable_value(value, Some(*c), format!("{c}{unit}"));
+            }
+        });
 }

@@ -203,15 +203,13 @@ impl Capture {
         size: (u32, u32),
         fps: f32,
         audio: Option<vjc_media::record::AudioFeed>,
+        settings: vjc_media::record::RecSettings,
     ) -> Result<Self, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let fps = fps.round().clamp(1.0, 240.0) as u32;
-        let rec = match audio {
-            Some(feed) => Recorder::start_with_audio(&path, size.0, size.1, fps, feed)?,
-            None => Recorder::start(&path, size.0, size.1, fps)?,
-        };
+        let rec = Recorder::start_settings(&path, (size.0, size.1, fps), audio, settings)?;
         Ok(Self {
             rec,
             inflight: Inflight::new(),
@@ -344,11 +342,12 @@ impl Capture {
 }
 
 /// `<folder>/<UTC timestamp>.mp4`, the folder being the preference or `recordings_dir`.
-pub fn default_path(pref: Option<&std::path::Path>) -> PathBuf {
+/// The extension is the codec's (`RecCodec::extension`, empty = a folder).
+pub fn default_path_for(pref: Option<&std::path::Path>, ext: &str) -> PathBuf {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    unique_path(&recording_folder(pref), &timestamp(secs))
+    unique_path_ext(&recording_folder(pref), &timestamp(secs), ext)
 }
 
 /// A typed recording folder as an absolute path: `~/` and relative paths resolve against
@@ -413,14 +412,22 @@ pub fn recordings_dir() -> PathBuf {
         .join("VJCraft")
 }
 
-/// `<dir>/<stem>.mp4`, or `<stem>-2.mp4`, `-3`... when the name is taken (1 s resolution).
-pub(crate) fn unique_path(dir: &std::path::Path, stem: &str) -> PathBuf {
-    let first = dir.join(format!("{stem}.mp4"));
+/// `<dir>/<stem>.<ext>`, or `<stem>-2.<ext>`, `-3`... when the name is taken (1 s resolution).
+/// An empty `ext` names a folder (PNG sequence).
+pub(crate) fn unique_path_ext(dir: &std::path::Path, stem: &str, ext: &str) -> PathBuf {
+    let name = |s: &str| {
+        if ext.is_empty() {
+            dir.join(s)
+        } else {
+            dir.join(format!("{s}.{ext}"))
+        }
+    };
+    let first = name(stem);
     if !first.exists() {
         return first;
     }
     (2u32..)
-        .map(|n| dir.join(format!("{stem}-{n}.mp4")))
+        .map(|n| name(&format!("{stem}-{n}")))
         .find(|p| !p.exists())
         .unwrap()
 }
@@ -516,7 +523,8 @@ mod tests {
     #[test]
     fn shutdown_leaves_a_playable_file() {
         let path = std::env::temp_dir().join(format!("vjc-sd-{}.mp4", std::process::id()));
-        let mut cap = Capture::start(path.clone(), (64, 48), 30.0, None).unwrap();
+        let mut cap =
+            Capture::start(path.clone(), (64, 48), 30.0, None, Default::default()).unwrap();
         for pts in 0..5 {
             assert!(cap.rec.push_at(pts, vec![90; 64 * 48 * 4]));
         }
@@ -547,11 +555,29 @@ mod tests {
     fn unique_path_adds_suffix() {
         let d = std::env::temp_dir().join(format!("vjc-up-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        assert_eq!(unique_path(&d, "a"), d.join("a.mp4"));
+        assert_eq!(unique_path_ext(&d, "a", "mp4"), d.join("a.mp4"));
         std::fs::write(d.join("a.mp4"), b"").unwrap();
-        assert_eq!(unique_path(&d, "a"), d.join("a-2.mp4"));
+        assert_eq!(unique_path_ext(&d, "a", "mp4"), d.join("a-2.mp4"));
         std::fs::write(d.join("a-2.mp4"), b"").unwrap();
-        assert_eq!(unique_path(&d, "a"), d.join("a-3.mp4"));
+        assert_eq!(unique_path_ext(&d, "a", "mp4"), d.join("a-3.mp4"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn default_path_follows_the_codec_extension() {
+        let d = std::env::temp_dir().join(format!("vjc-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(
+            default_path_for(Some(&d), "mov").extension().unwrap(),
+            "mov"
+        );
+        // A PNG sequence is a folder: no extension, and a taken name gets a suffix.
+        let p = default_path_for(Some(&d), "");
+        assert!(p.extension().is_none() && p.parent() == Some(d.as_path()));
+        std::fs::create_dir_all(&p).unwrap();
+        let q = default_path_for(Some(&d), "");
+        assert_ne!(p, q);
+        assert!(q.file_name().unwrap().to_string_lossy().ends_with("-2"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -583,10 +609,10 @@ mod tests {
             recordings_dir()
         );
         let dir = std::env::temp_dir().join(format!("vjc-recdir-{}", std::process::id()));
-        let p = default_path(Some(&dir));
+        let p = default_path_for(Some(&dir), "mp4");
         assert_eq!(p.parent().unwrap(), dir);
         assert_eq!(p.extension().unwrap(), "mp4");
-        assert_ne!(default_path(None).parent().unwrap(), dir);
+        assert_ne!(default_path_for(None, "mp4").parent().unwrap(), dir);
     }
 
     #[test]
