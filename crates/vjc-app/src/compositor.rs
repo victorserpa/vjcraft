@@ -3821,7 +3821,7 @@ mod tests {
     }
 
     /// Effects whose output on a flat frame is legitimately partly black.
-    const PARTIAL_BLACK_OK: &[&str] = &["vignette", "crt"];
+    const PARTIAL_BLACK_OK: &[&str] = &["vignette", "crt", "cloner_grid", "video_wall"];
 
     #[test]
     fn partial_black_ok_lists_only_bundled_effects() {

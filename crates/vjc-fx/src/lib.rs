@@ -330,6 +330,26 @@ pub const BUILTIN: &[(&str, &str)] = &[
         include_str!("../../../assets/effects/rain_drops.fs"),
     ),
     ("lut3d", include_str!("../../../assets/effects/lut3d.fs")),
+    (
+        "cloner_grid",
+        include_str!("../../../assets/effects/cloner_grid.fs"),
+    ),
+    (
+        "cloner_linear",
+        include_str!("../../../assets/effects/cloner_linear.fs"),
+    ),
+    (
+        "cloner_radial",
+        include_str!("../../../assets/effects/cloner_radial.fs"),
+    ),
+    (
+        "video_wall",
+        include_str!("../../../assets/effects/video_wall.fs"),
+    ),
+    (
+        "strokes",
+        include_str!("../../../assets/effects/strokes.fs"),
+    ),
 ];
 
 /// Bundled generators: ISF without an image input, rendered at composition size.
@@ -437,6 +457,30 @@ pub const GENERATORS: &[(&str, &str)] = &[
         "lava_lamp",
         include_str!("../../../assets/generators/lava_lamp.fs"),
     ),
+    (
+        "text_block",
+        include_str!("../../../assets/generators/text_block.fs"),
+    ),
+    (
+        "text_animator",
+        include_str!("../../../assets/generators/text_animator.fs"),
+    ),
+    (
+        "test_card",
+        include_str!("../../../assets/generators/test_card.fs"),
+    ),
+    (
+        "abstract_field",
+        include_str!("../../../assets/generators/abstract_field.fs"),
+    ),
+    (
+        "stroboscope",
+        include_str!("../../../assets/generators/stroboscope.fs"),
+    ),
+    (
+        "shaper",
+        include_str!("../../../assets/generators/shaper.fs"),
+    ),
 ];
 
 /// Source of a bundled effect or generator.
@@ -515,7 +559,7 @@ pub enum InputKind {
 }
 
 /// Characters a text input carries.
-pub const TEXT_CHARS: usize = 16;
+pub const TEXT_CHARS: usize = 24;
 /// Uniform slots a text input takes (4 character codes per slot).
 pub const TEXT_SLOTS: usize = TEXT_CHARS / 4;
 
@@ -2037,6 +2081,48 @@ void main() {
         assert_eq!(u[2], [0.0; 4]);
     }
 
+    /// #12: new text sources carry rotation, the long text input packs 24 characters, and
+    /// the cloners / video wall / strokes / extra generators are registered.
+    #[test]
+    fn wave_o_sources_are_registered_with_their_params() {
+        for id in ["text", "text_block", "text_animator"] {
+            let (isf, _) = compile(builtin_source(id).unwrap()).unwrap();
+            assert!(isf.inputs.iter().any(|i| i.name == "rotation"), "{id}");
+        }
+        let (anim, _) = compile(builtin_source("text_animator").unwrap()).unwrap();
+        let preset = anim.inputs.iter().find(|i| i.name == "preset").unwrap();
+        assert!(matches!(&preset.kind, InputKind::Long { values, .. } if values.len() == 5));
+        let mut params = anim.default_params();
+        params[0].value = Value::Text("AB|".repeat(8));
+        let u = anim.pack(&params, 0.0, (64, 64));
+        assert_eq!(TEXT_CHARS, 24);
+        assert_eq!(
+            u[TEXT_SLOTS][3], 124.0,
+            "24th character reaches the last slot"
+        );
+        for id in [
+            "cloner_grid",
+            "cloner_linear",
+            "cloner_radial",
+            "video_wall",
+            "strokes",
+        ] {
+            assert!(BUILTIN.iter().any(|(k, _)| *k == id), "{id}");
+        }
+        for id in [
+            "test_card",
+            "abstract_field",
+            "stroboscope",
+            "shaper",
+            "text_block",
+            "text_animator",
+        ] {
+            assert!(generator_params(id).is_some(), "{id}");
+        }
+        // Negative control: an unregistered name is not found.
+        assert!(generator_params("cloner_grid").is_none());
+    }
+
     #[test]
     fn text_input_packs_character_codes_over_four_slots() {
         let (isf, _) = compile(builtin_source("text").unwrap()).unwrap();
@@ -2046,7 +2132,7 @@ void main() {
         let u = isf.pack(&params, 0.0, (64, 64));
         assert_eq!(u[1], [72.0, 105.0, 33.0, 32.0]);
         // Padding is spaces; the next input starts after the 4 text slots.
-        assert_eq!(u[4], [32.0; 4]);
+        assert_eq!(u[TEXT_SLOTS], [32.0; 4]);
         assert_eq!(u[1 + TEXT_SLOTS], [0.0, 0.0, 0.0, 1.0]);
         // Negative control: another string gives other codes.
         params[0].value = Value::Text("Z".into());
@@ -2054,7 +2140,7 @@ void main() {
         // Non-ASCII and over-long input never overflows or yields NaN.
         params[0].value = Value::Text("é".repeat(40));
         let u = isf.pack(&params, 0.0, (64, 64));
-        assert!(u[1..5].iter().flatten().all(|c| *c == 32.0));
+        assert!(u[1..=TEXT_SLOTS].iter().flatten().all(|c| *c == 32.0));
         // A mistyped value falls back to the default text.
         params[0].value = Value::Number(1.0);
         assert_eq!(isf.pack(&params, 0.0, (64, 64))[1][0], 86.0);
