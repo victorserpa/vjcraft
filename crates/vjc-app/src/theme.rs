@@ -18,6 +18,10 @@ pub const ON_ACCENT: Color32 = Color32::from_rgb(0x10, 0x12, 0x16);
 pub const SCRIM: Color32 = Color32::from_black_alpha(140);
 /// Height of a folded layer row in the grid.
 pub const FOLDED_ROW_H: f32 = 20.0;
+/// Channel tints for the R, G and B rows of colour panels.
+pub const CHANNEL_R: Color32 = Color32::from_rgb(0xe0, 0x4a, 0x4a);
+pub const CHANNEL_G: Color32 = Color32::from_rgb(0x4a, 0xc0, 0x5a);
+pub const CHANNEL_B: Color32 = Color32::from_rgb(0x4a, 0x7a, 0xe0);
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x80, 0x80);
 
 /// Colour chips of layers, columns and clips (token `palette`; `Option<u8>` index 1..=6).

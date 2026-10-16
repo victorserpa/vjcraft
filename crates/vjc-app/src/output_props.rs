@@ -50,12 +50,11 @@ fn num(
     (default, range, step): (f32, (f32, f32), f32),
 ) -> Option<f32> {
     let tint = match label {
-        "R" => Some(theme::palette(Some(1))),
-        "G" => Some(theme::palette(Some(4))),
-        "B" => Some(theme::palette(Some(5))),
+        "R" => Some(theme::CHANNEL_R),
+        "G" => Some(theme::CHANNEL_G),
+        "B" => Some(theme::CHANNEL_B),
         _ => None,
-    }
-    .flatten();
+    };
     widgets::prop_row_tint(ui, None, tint, |ui| {
         param_slider_step(
             ui,
@@ -539,6 +538,7 @@ impl State {
                     let mut ops = vec![];
                     for (label, icon, op) in [
                         ("Rotate 90", icons::i::ARROW_CLOCKWISE, Op::Rotate(1)),
+                        ("Rotate 180", icons::i::ARROWS_CLOCKWISE, Op::Rotate(2)),
                         (
                             "Rotate 270",
                             icons::i::ARROW_COUNTER_CLOCKWISE,

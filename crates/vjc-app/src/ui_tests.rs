@@ -8173,7 +8173,7 @@ fn output_canvas_lists_the_slices_of_the_selected_screen() {
 }
 
 #[test]
-fn output_toolbar_modes_sit_right_and_flip_is_four_icons() {
+fn output_toolbar_modes_sit_right_and_flip_is_icons() {
     let (mut h, _tex) = stage_setup();
     click(&mut h, "Centre");
     click_tab(&mut h, "Output");
@@ -8182,10 +8182,9 @@ fn output_toolbar_modes_sit_right_and_flip_is_four_icons() {
     let hand = h.get_by_label("Hand tool").rect();
     assert!(hand.max.x < t.min.x, "modes are right of the tools");
     assert!(t.max.x < e.min.x, "Edit points is the rightmost");
-    for l in ["Rotate 90", "Rotate 270", "Flip H", "Flip V"] {
+    for l in ["Rotate 90", "Rotate 180", "Rotate 270", "Flip H", "Flip V"] {
         assert!(exists(&h, l), "{l}");
     }
-    assert!(!exists(&h, "Rotate 180"));
 }
 
 #[test]
