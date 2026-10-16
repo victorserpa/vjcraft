@@ -585,6 +585,10 @@ pub enum Command {
     SetCompDescription {
         text: String,
     },
+    /// Bit depth (8 or 16) of the composition's render textures. Undoable.
+    SetCompBitDepth {
+        depth: u8,
+    },
     /// Palette colour (1..=PALETTE_LEN, None = none) of a layer, column or clip. Undoable.
     SetColor {
         target: ColorTarget,
@@ -3324,6 +3328,13 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         Command::SetCompDescription { text } => {
             let prev = std::mem::replace(&mut p.composition.description, text);
             undoable(Command::SetCompDescription { text: prev }, vec![])
+        }
+        Command::SetCompBitDepth { depth } => {
+            if !vjc_model::BIT_DEPTHS.contains(&depth) {
+                return Err(Error::InvalidValue);
+            }
+            let prev = std::mem::replace(&mut p.composition.bit_depth, depth);
+            undoable(Command::SetCompBitDepth { depth: prev }, vec![])
         }
         Command::SetColor { target, color } => {
             if color.is_some_and(|c| c == 0 || c > vjc_model::PALETTE_LEN) {

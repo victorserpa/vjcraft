@@ -76,6 +76,23 @@ fn colors_are_undoable_and_validated() {
 }
 
 #[test]
+fn bit_depth_command_roundtrips_rejects_bad_values_and_old_files_load_as_8() {
+    let (mut p, _) = with_clip();
+    assert_eq!(p.composition.bit_depth, 8);
+    undo_roundtrip(&mut p, Command::SetCompBitDepth { depth: 16 });
+    assert!(apply(&mut p, Command::SetCompBitDepth { depth: 10 }).is_err());
+    let mut v = serde_json::to_value(&p.composition).unwrap();
+    assert_eq!(v["bit_depth"], 8);
+    v.as_object_mut().unwrap().remove("bit_depth");
+    let old: vjc_model::Composition = serde_json::from_value(v).unwrap();
+    assert_eq!(old.bit_depth, 8);
+    p.composition.bit_depth = 16;
+    let back: vjc_model::Composition =
+        serde_json::from_value(serde_json::to_value(&p.composition).unwrap()).unwrap();
+    assert_eq!(back.bit_depth, 16);
+}
+
+#[test]
 fn description_and_folds_roundtrip_and_old_json_loads() {
     let (mut p, l) = with_clip();
     undo_roundtrip(&mut p, Command::SetCompDescription { text: "set".into() });

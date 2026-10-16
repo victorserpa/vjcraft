@@ -72,6 +72,16 @@ pub struct Composition {
     /// Free-text note about the composition.
     #[serde(default)]
     pub description: String,
+    /// Bits per channel of the composition's render textures: 8 or 16. Old files: 8.
+    #[serde(default = "default_bit_depth")]
+    pub bit_depth: u8,
+}
+
+/// Bit depths a composition may use.
+pub const BIT_DEPTHS: [u8; 2] = [8, 16];
+
+fn default_bit_depth() -> u8 {
+    8
 }
 
 /// Which column the composition autopilot plays when its time is up.
@@ -1941,6 +1951,7 @@ impl Project {
             format_version: 1,
             composition: Composition {
                 description: String::new(),
+                bit_depth: 8,
                 autopilot: Default::default(),
                 beat_snap: None,
                 id: Uuid::new_v4(),
