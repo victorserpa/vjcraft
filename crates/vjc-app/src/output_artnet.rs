@@ -106,7 +106,7 @@ impl State {
             for (i, f) in new_fx.iter_mut().enumerate() {
                 ui.push_id(("artnet_fixture", scr.id, i), |ui| {
                     ui.group(|ui| {
-                        if self.artnet_fixture(ui, f, scr.id, i, count > 1) {
+                        if self.artnet_fixture(ui, f, scr, i, count > 1) {
                             remove = Some(i);
                         }
                     });
@@ -154,7 +154,7 @@ impl State {
         &mut self,
         ui: &mut egui::Ui,
         f: &mut Fixture,
-        screen: uuid::Uuid,
+        scr: &Screen,
         index: usize,
         can_remove: bool,
     ) -> bool {
@@ -179,7 +179,7 @@ impl State {
                     }
                 }
             });
-        self.fixture_editor(ui, f, egui::Id::new(("artnet_fx_name", screen, index)));
+        self.fixture_editor(ui, f, egui::Id::new(("artnet_fx_name", scr.id, index)));
         let mut sc = f32::from(f.start_channel);
         ui.horizontal(|ui| {
             ui.label("Start channel");
@@ -213,19 +213,18 @@ impl State {
                 f.input = Default::default();
             }
         });
-        // Sample the area of one slice of this screen instead of typing numbers.
-        if let Some(scr) = self.project.output.screens.iter().find(|s| s.id == screen) {
-            ui.menu_button("Fit to slice", |ui| {
-                for (n, s) in scr.slices.iter().enumerate() {
-                    if ui.button(format!("Slice {}", n + 1)).clicked() {
-                        if let Some(i) = dmx::input_for_slice(s, scr.width, scr.height) {
-                            f.input = i;
-                        }
-                        ui.close();
+        // Sample the area of one slice of this screen instead of typing numbers. The slices
+        // are the working copy's (`scr`), not the project's, which lags while the window is open.
+        ui.menu_button("Fit to slice", |ui| {
+            for (n, s) in scr.slices.iter().enumerate() {
+                if ui.button(format!("Slice {}", n + 1)).clicked() {
+                    if let Some(i) = dmx::input_for_slice(s, scr.width, scr.height) {
+                        f.input = i;
                     }
+                    ui.close();
                 }
-            });
-        }
+            }
+        });
         widgets::slider(ui, &mut f.color.brightness, 0.0..=2.0, "Brightness");
         widgets::slider(ui, &mut f.color.contrast, 0.0..=2.0, "Contrast");
         widgets::slider(ui, &mut f.color.r, 0.0..=2.0, "Red");

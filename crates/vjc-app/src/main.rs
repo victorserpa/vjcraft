@@ -133,6 +133,8 @@ struct State {
     frame_ms: frame_stats::FrameStats,
     /// View > Show FPS & Stats: readout in the status bar (runtime only).
     show_stats: bool,
+    /// Last `ui_scale` pref pushed to egui (so the pref is not forced back every frame).
+    applied_ui_scale: Option<f32>,
     /// Cmd/Ctrl+K quick search.
     palette: palette::Palette,
     /// Animation presets already handed to the param popups (false: publish them).
@@ -509,14 +511,61 @@ fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -
 
 /// Rewrites the column of a queued command after columns moved; false when its column was
 /// removed (the command is dropped).
+/// The zoom to set when the `ui_scale` pref differs from the last one applied; None while
+/// it is unchanged, so a Cmd +/- zoom made meanwhile stays.
+fn scale_to_apply(applied: &mut Option<f32>, pref: f32) -> Option<f32> {
+    if applied.is_some_and(|a| (a - pref).abs() < 1e-3) {
+        return None;
+    }
+    *applied = Some(pref);
+    Some(pref)
+}
+
 fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
     match cmd {
-        Command::TriggerClip { column, .. }
+        Command::ImportMedia { column, .. }
+        | Command::SetClip { column, .. }
+        | Command::SetGenerator { column, .. }
+        | Command::SetGeneratorParam { column, .. }
+        | Command::ClearCell { column, .. }
+        | Command::TriggerClip { column, .. }
         | Command::TriggerClipOn { column, .. }
-        | Command::TriggerColumn { column, .. } => map(*column).is_some_and(|n| {
+        | Command::TriggerColumn { column, .. }
+        | Command::AddCue { column, .. }
+        | Command::RemoveCue { column, .. }
+        | Command::SeekClip { column, .. }
+        | Command::SetInOut { column, .. }
+        | Command::SetClipSync { column, .. }
+        | Command::SetClipDuration { column, .. }
+        | Command::RefreshClipThumb { column, .. }
+        | Command::JumpToCue { column, .. }
+        | Command::SetClipDial { column, .. }
+        | Command::SetClipChannels { column, .. }
+        | Command::RenameClip { column, .. }
+        | Command::SetFit { column, .. }
+        | Command::SetTriggerMode { column, .. }
+        | Command::SetClipBeatSnap { column, .. }
+        | Command::SetClipExtras { column, .. }
+        | Command::SetClipTarget { column, .. }
+        | Command::SetClipTriggerStyle { column, .. }
+        | Command::SetBlendOverride { column, .. }
+        | Command::SetClipTransition { column, .. }
+        | Command::SetBeatSync { column, .. }
+        | Command::SetTimecodeStart { column, .. }
+        | Command::SetPlayMode { column, .. }
+        | Command::SetDirection { column, .. }
+        | Command::SetSpeed { column, .. } => map(*column).is_some_and(|n| {
             *column = n;
             true
         }),
+        Command::MoveClip { from, to, .. } => match (map(from.1), map(to.1)) {
+            (Some(f), Some(t)) => {
+                from.1 = f;
+                to.1 = t;
+                true
+            }
+            _ => false,
+        },
         Command::StepColumn { from, .. } | Command::StepClip { from, .. } => match *from {
             Some(f) => map(f).is_some_and(|n| {
                 *from = Some(n);
@@ -524,6 +573,33 @@ fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
             }),
             None => true,
         },
+        Command::SetMediaPaths { changes } => {
+            changes.retain_mut(|(_, _, c, _)| {
+                map(*c).is_some_and(|n| {
+                    *c = n;
+                    true
+                })
+            });
+            !changes.is_empty()
+        }
+        Command::SetPaused { clips, .. } => {
+            clips.retain_mut(|(_, _, c)| {
+                map(*c).is_some_and(|n| {
+                    *c = n;
+                    true
+                })
+            });
+            !clips.is_empty()
+        }
+        Command::RestoreDirections { items } => {
+            items.retain_mut(|(_, _, c, _)| {
+                map(*c).is_some_and(|n| {
+                    *c = n;
+                    true
+                })
+            });
+            !items.is_empty()
+        }
         _ => true,
     }
 }
@@ -1832,6 +1908,7 @@ impl State {
             vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
             show_stats: false,
+            applied_ui_scale: None,
             palette: Default::default(),
             presets_published: false,
             stats: Default::default(),
@@ -2788,6 +2865,8 @@ impl State {
     }
 
     fn save_prefs(&mut self) {
+        // Out-of-range wishes (rate, buffer, channels) never reach the engine.
+        self.prefs.sanitize();
         // Output device, rate, buffer and channels reopen the running output in place;
         // the analysis input restarts with its new device, channel and FFT size.
         let new_out = audio_prefs::out_config(&self.prefs.audio);
@@ -2806,7 +2885,6 @@ impl State {
             self.prefs_dirty = false;
             return;
         };
-        self.prefs.sanitize();
         if let Err(e) = self.prefs.save(&p) {
             self.status = format!("Saving preferences failed: {e}");
         }
@@ -3328,8 +3406,8 @@ impl State {
             _ => None,
         };
         match self.history.exec(&mut self.project, cmd, now) {
-            Ok(events) => {
-                self.follow_columns(&col_ids);
+            Ok(mut events) => {
+                events.extend(self.follow_columns(&col_ids));
                 if let Some(st) = transport
                     && st != vjc_model::PlayState::Stop
                 {
@@ -3395,8 +3473,8 @@ impl State {
         let before = self.project.composition.tempo.bpm;
         let col_ids = self.column_ids();
         match self.history.undo(&mut self.project) {
-            Some(Ok(ev)) => {
-                self.follow_columns(&col_ids);
+            Some(Ok(mut ev)) => {
+                ev.extend(self.follow_columns(&col_ids));
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -3413,8 +3491,8 @@ impl State {
         let before = self.project.composition.tempo.bpm;
         let col_ids = self.column_ids();
         match self.history.redo(&mut self.project) {
-            Some(Ok(ev)) => {
-                self.follow_columns(&col_ids);
+            Some(Ok(mut ev)) => {
+                ev.extend(self.follow_columns(&col_ids));
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -3439,29 +3517,38 @@ impl State {
     /// After columns moved, were inserted or removed, what is playing, selected or queued
     /// keeps following its column: every column index kept per cell is rewritten to where
     /// the column is now (nothing on air changes). State of a removed column is dropped.
-    fn follow_columns(&mut self, old: &[Uuid]) {
+    /// Returns a `LayerCleared` for every layer whose playing clip was in a removed column,
+    /// so the per-layer playback state goes with it.
+    fn follow_columns(&mut self, old: &[Uuid]) -> Vec<Event> {
         let new = self.column_ids();
         if *old == new[..] {
-            return;
+            return vec![];
         }
+        let mut stopped: Vec<LayerId> = vec![];
         let map = |c: u32| -> Option<u32> {
             old.get(c as usize)
                 .and_then(|id| new.iter().position(|n| n == id))
                 .map(|n| n as u32)
         };
-        self.players.retain(|_, (_, c, _)| match map(*c) {
+        self.players.retain(|l, (_, c, _)| match map(*c) {
             Some(n) => {
                 *c = n;
                 true
             }
-            None => false,
+            None => {
+                stopped.push(*l);
+                false
+            }
         });
-        self.gens.retain(|_, (_, c, _)| match map(*c) {
+        self.gens.retain(|l, (_, c, _)| match map(*c) {
             Some(n) => {
                 *c = n;
                 true
             }
-            None => false,
+            None => {
+                stopped.push(*l);
+                false
+            }
         });
         self.origin.retain(|_, (_, _, c)| match map(*c) {
             Some(n) => {
@@ -3510,6 +3597,12 @@ impl State {
         for bag in self.layer_bags.borrow_mut().values_mut() {
             *bag = bag.iter().filter_map(|c| map(*c)).collect();
         }
+        stopped.sort();
+        stopped.dedup();
+        stopped
+            .into_iter()
+            .map(|layer| Event::LayerCleared { layer })
+            .collect()
     }
 
     /// The selected column index must point at a column that still exists.
@@ -3600,16 +3693,18 @@ impl State {
                             prev_local,
                         );
                         let offset = f64::from(self.prefs.general.clip_start_offset_ms) / 1000.0;
-                        if offset > 0.0 {
-                            let reg = self.region_of(layer);
-                            let dur = self.players.get(&layer).and_then(|(_, _, p)| p.duration());
-                            let from = start.unwrap_or(reg.0);
-                            let to = vjc_core::playback::offset_start(from, offset, dur, reg);
-                            if start.is_some() || to != from {
-                                self.seek(layer, to);
-                            }
-                        } else if let Some(start) = start {
-                            self.seek(layer, start);
+                        let reg = self.region_of(layer);
+                        // The new clip's own length (the player may not know it yet).
+                        let dur = self
+                            .players
+                            .get(&layer)
+                            .and_then(|(_, _, p)| p.duration())
+                            .or_else(|| {
+                                self.transport(deck, src, column)
+                                    .and_then(|t| t.duration_secs)
+                            });
+                        if let Some(to) = vjc_core::playback::first_seek(start, offset, dur, reg) {
+                            self.seek(layer, to);
                         }
                     } else {
                         self.notify(
@@ -4602,11 +4697,7 @@ impl State {
             let comp = &self.project.composition;
             // Longest layer transition: the next column fires that much early when asked.
             let bpm = self.project.composition.tempo.bpm;
-            let lead_secs = comp
-                .layers
-                .iter()
-                .map(|l| vjc_core::transition::duration_secs(&l.transition, bpm))
-                .fold(0.0, f64::max);
+            let lead_secs = vjc_core::comp_autopilot::lead_secs(&self.project, cur, bpm);
             if let Some(next) = self.comp_ap.tick(
                 &comp.autopilot,
                 &comp.columns,
@@ -6272,6 +6363,10 @@ impl State {
             self.api.configure(cfg.clone());
             self.api_cfg = Some(cfg);
         }
+        if let Some(e) = self.audio.as_ref().and_then(|a| a.take_reopen_error()) {
+            self.status = format!("Audio: could not use the new settings ({e}); kept the old ones");
+        }
+        api_ext::snap_expire(&mut self.snap_jobs);
         for _ in 0..api_io::MAX_PER_FRAME {
             let Ok(msg) = self.api.rx.try_recv() else {
                 break;
@@ -6353,10 +6448,16 @@ impl State {
                         if !p.parent().is_some_and(|d| d.is_dir()) {
                             return bad(422, "the parent directory does not exist");
                         }
-                        self.save_to(p)
+                        match api_ext::save_target(&p) {
+                            Ok(p) => self.save_to(p),
+                            Err(m) => return bad(422, m),
+                        }
                     }
                     None if body["path"].is_null() && self.file.is_some() => {
-                        self.save_to(self.file.clone().unwrap_or_default())
+                        match api_ext::save_target(&self.file.clone().unwrap_or_default()) {
+                            Ok(p) => self.save_to(p),
+                            Err(m) => return bad(422, m),
+                        }
                     }
                     None => return bad(422, "no file yet: pass an absolute \"path\""),
                 };
@@ -6785,8 +6886,9 @@ impl State {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        let scale = self.prefs.general.ui_scale;
-        if (ui.ctx().zoom_factor() - scale).abs() > 1e-3 {
+        // Only when the pref changes: egui's own Cmd +/- must keep working in between.
+        if let Some(scale) = scale_to_apply(&mut self.applied_ui_scale, self.prefs.general.ui_scale)
+        {
             ui.ctx().set_zoom_factor(scale);
         }
         params::set_hidden(ui.ctx(), &self.prefs.layouts.current.hidden);
@@ -11482,6 +11584,8 @@ impl eframe::App for State {
         if self.show_stats {
             let fps = effective_fps(self.project.composition.fps, self.prefs.video.max_fps);
             self.stats.frame(t0, self.is_live(), fps);
+        } else {
+            self.stats.reset();
         }
         self.output_window(&ctx);
         self.frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
@@ -12121,4 +12225,65 @@ fn numbered_image_folder_drops_as_one_sequence_clip() {
     assert_eq!(c.name, "shot");
     assert!(matches!(c.source, vjc_model::Source::Sequence { fps, .. } if fps == 30.0));
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use super::*;
+
+    #[test]
+    fn ui_scale_is_applied_only_when_the_pref_changes() {
+        let mut applied = None;
+        assert_eq!(scale_to_apply(&mut applied, 1.0), Some(1.0), "first frame");
+        assert_eq!(
+            scale_to_apply(&mut applied, 1.0),
+            None,
+            "unchanged: Cmd +/- survives"
+        );
+        assert_eq!(scale_to_apply(&mut applied, 1.25), Some(1.25));
+        assert_eq!(scale_to_apply(&mut applied, 1.25), None);
+    }
+
+    #[test]
+    fn remap_covers_every_column_bearing_command() {
+        let map = |c: u32| Some(c + 10);
+        let (d, l) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut clear = Command::ClearCell {
+            deck: d,
+            layer: l,
+            column: 1,
+        };
+        assert!(remap_command(&mut clear, &map));
+        assert!(matches!(clear, Command::ClearCell { column: 11, .. }));
+        let mut mv = Command::MoveClip {
+            deck: d,
+            from: (l, 1),
+            to: (l, 2),
+            copy: false,
+        };
+        assert!(remap_command(&mut mv, &map));
+        assert!(matches!(
+            mv,
+            Command::MoveClip {
+                from: (_, 11),
+                to: (_, 12),
+                ..
+            }
+        ));
+        let mut paused = Command::SetPaused {
+            clips: vec![(d, l, 3), (d, l, 4)],
+            paused: true,
+        };
+        assert!(remap_command(&mut paused, &|c| (c == 3).then_some(0)));
+        assert!(matches!(&paused, Command::SetPaused { clips, .. } if clips == &[(d, l, 0)]));
+        let mut gone = Command::ClearCell {
+            deck: d,
+            layer: l,
+            column: 5,
+        };
+        assert!(
+            !remap_command(&mut gone, &|_| None),
+            "removed column drops it"
+        );
+    }
 }

@@ -6773,6 +6773,24 @@ fn removing_a_column_drops_its_pending_trigger_and_state() {
 }
 
 #[test]
+fn removing_the_playing_column_stops_the_layer_state() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let col = st.gens[&lid].1 as usize;
+    let ids = st.column_ids();
+    st.flow.pos.insert(lid, 1.0);
+    st.exec(Command::RemoveColumns {
+        columns: vec![ids[col]],
+    });
+    assert!(!st.gens.contains_key(&lid));
+    assert!(
+        !st.flow.pos.contains_key(&lid),
+        "stop event cleared the layer"
+    );
+}
+
+#[test]
 fn a_clip_on_air_in_another_deck_counts_for_the_remove_guard() {
     let mut h = app();
     let lid = playing_generator(&mut h);
@@ -7228,6 +7246,35 @@ fn rest_save_refuses_other_extensions_and_missing_dirs() {
     assert!(d.join("plain.vjc").is_file());
     let r = rest_save(h.state_mut(), d.join("UP.VJC").to_str().unwrap());
     assert!(r.is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn rest_save_refuses_symlinks_and_directories() {
+    let d = multi_dir("rest-save-link");
+    let real = d.join("real.txt");
+    std::fs::write(&real, "keep").unwrap();
+    std::os::unix::fs::symlink(&real, d.join("link.vjc")).unwrap();
+    std::fs::create_dir(d.join("dir.vjc")).unwrap();
+    let mut h = app();
+    let r = rest_save(h.state_mut(), d.join("link.vjc").to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "keep");
+    let r = rest_save(h.state_mut(), d.join("dir.vjc").to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+}
+
+#[test]
+fn audio_prefs_are_sanitized_before_they_reach_the_engine() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.prefs.audio.sample_rate = Some(5);
+    st.prefs.audio.buffer_size = Some(1);
+    st.prefs.audio.channels = Some(500);
+    st.save_prefs();
+    assert_eq!(st.audio_cfg.sample_rate, None);
+    assert_eq!(st.audio_cfg.buffer_frames, None);
+    assert_eq!(st.audio_cfg.channels, None);
 }
 
 fn top_layer_no(h: &Harness<'_, State>) -> usize {

@@ -16,6 +16,33 @@ use vjc_core::slice_geom::{self, Field, Op, Side};
 use vjc_core::{Command, mapping};
 use vjc_model::{OutputDevice, Screen, Slice, SliceColor, SliceSource, SoftEdge};
 
+/// Turns the soft edge of the selected slices on or off. Turning on keeps the widths a
+/// slice already has; only a slice without an edge gets the default one.
+fn soft_edge_toggle(scr: &Screen, ids: &[Uuid], on: bool) -> Vec<Command> {
+    ids.iter()
+        .map(|slice| {
+            let own = scr
+                .slices
+                .iter()
+                .find(|s| s.id == *slice)
+                .and_then(|s| s.soft_edge.clone());
+            Command::SetSliceSoftEdge {
+                screen: scr.id,
+                slice: *slice,
+                soft_edge: on.then(|| {
+                    own.unwrap_or(SoftEdge {
+                        left: SOFT_EDGE_DEFAULT,
+                        right: SOFT_EDGE_DEFAULT,
+                        top: 0.0,
+                        bottom: 0.0,
+                        gamma: 1.0,
+                    })
+                }),
+            }
+        })
+        .collect()
+}
+
 /// A new soft edge starts 10% wide on the sides.
 const SOFT_EDGE_DEFAULT: f32 = 0.1;
 
@@ -708,20 +735,7 @@ impl State {
             },
         );
         if toggled {
-            let all = ids
-                .iter()
-                .map(|slice| Command::SetSliceSoftEdge {
-                    screen: scr.id,
-                    slice: *slice,
-                    soft_edge: on.then_some(SoftEdge {
-                        left: SOFT_EDGE_DEFAULT,
-                        right: SOFT_EDGE_DEFAULT,
-                        top: 0.0,
-                        bottom: 0.0,
-                        gamma: 1.0,
-                    }),
-                })
-                .collect();
+            let all = soft_edge_toggle(scr, ids, on);
             cmds.extend(one_command(all));
         }
     }
@@ -910,5 +924,42 @@ fn slice_bbox_norm(sl: &Slice, scr: &Screen) -> (f32, f32, f32, f32) {
         (x0, y0, x1, y1)
     } else {
         (0.0, 0.0, 1.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soft_edge_on_keeps_each_slices_own_widths() {
+        let mut scr = vjc_core::mapping::new_screen("s", 1920, 1080);
+        let mut b = vjc_core::mapping::new_slice(1920, 1080);
+        b.soft_edge = Some(SoftEdge {
+            left: 0.3,
+            right: 0.0,
+            top: 0.2,
+            bottom: 0.0,
+            gamma: 1.8,
+        });
+        let custom = b.soft_edge.clone();
+        let a = vjc_core::mapping::new_slice(1920, 1080);
+        let (a_id, b_id) = (a.id, b.id);
+        scr.slices.extend([a, b]);
+        let cmds = soft_edge_toggle(&scr, &[a_id, b_id], true);
+        let edge = |i: usize| match &cmds[i] {
+            Command::SetSliceSoftEdge { soft_edge, .. } => soft_edge.clone(),
+            c => panic!("{c:?}"),
+        };
+        assert_eq!(edge(0).map(|e| e.left), Some(SOFT_EDGE_DEFAULT), "new edge");
+        assert_eq!(edge(1), custom, "the custom widths stay");
+        let off = soft_edge_toggle(&scr, &[a_id, b_id], false);
+        assert!(off.iter().all(|c| matches!(
+            c,
+            Command::SetSliceSoftEdge {
+                soft_edge: None,
+                ..
+            }
+        )));
     }
 }

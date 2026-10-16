@@ -85,6 +85,12 @@ impl Sampler {
         }
     }
 
+    /// The bar was hidden: forget the last frame and the counters, so showing it again
+    /// does not count the hidden time as one huge dropped frame.
+    pub fn reset(&mut self) {
+        *self = Sampler::default();
+    }
+
     /// Rebuilds the text when the last sample is older than `EVERY`; returns the text.
     pub fn text(&mut self, now: Instant, inp: Inputs) -> &str {
         let Some(t0) = self.since else {
@@ -179,5 +185,15 @@ mod tests {
         s.frame(t0 + Duration::from_secs(5), false, 30.0);
         let t = s.text(t0 + Duration::from_secs(6), inp()).to_string();
         assert!(t.contains("dropped 1"), "{t}");
+    }
+
+    #[test]
+    fn hiding_the_bar_resets_so_showing_it_again_drops_nothing() {
+        let t0 = Instant::now();
+        let mut s = Sampler::default();
+        s.frame(t0, true, 60.0);
+        s.reset();
+        s.frame(t0 + Duration::from_secs(30), true, 60.0);
+        assert_eq!(s.dropped, 0);
     }
 }

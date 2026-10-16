@@ -7,7 +7,7 @@
     { "NAME": "center", "TYPE": "point2D", "MIN": [0.0, 0.0], "MAX": [1.0, 1.0], "DEFAULT": [0.5, 0.5] },
     { "NAME": "width", "TYPE": "float", "MIN": 0.0, "MAX": 1.0, "DEFAULT": 0.6 },
     { "NAME": "height", "TYPE": "float", "MIN": 0.0, "MAX": 1.0, "DEFAULT": 0.6 },
-    { "NAME": "sides", "TYPE": "long", "VALUES": [3, 4, 5, 6, 8], "LABELS": ["3", "4", "5", "6", "8"], "DEFAULT": 0 },
+    { "NAME": "sides", "TYPE": "long", "VALUES": [3, 4, 5, 6, 8], "LABELS": ["3", "4", "5", "6", "8"], "DEFAULT": 3 },
     { "NAME": "rotation", "TYPE": "float", "MIN": 0.0, "MAX": 360.0, "DEFAULT": 0.0 },
     { "NAME": "feather", "TYPE": "float", "MIN": 0.0, "MAX": 1.0, "DEFAULT": 0.05 },
     { "NAME": "invert", "TYPE": "bool", "DEFAULT": false }
@@ -26,7 +26,8 @@ void main() {
     } else if (shape == 1) {
         d = length(p) - 1.0;
     } else {
-        float n = float(sides == 0 ? 3 : sides == 1 ? 4 : sides == 2 ? 5 : sides == 3 ? 6 : 8);
+        // `sides` is the VALUES entry itself (3, 4, 5, 6 or 8), not its index.
+        float n = float(max(sides, 3));
         float seg = 6.2831853 / n;
         float t = mod(atan(p.y, p.x) + seg * 0.5, seg) - seg * 0.5;
         d = length(p) * cos(t) - cos(seg * 0.5);
