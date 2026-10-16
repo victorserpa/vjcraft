@@ -1175,7 +1175,7 @@ impl State {
 
     /// Loads an image file as the guide of `screen`.
     pub(crate) fn load_guide(&mut self, ctx: &egui::Context, screen: Uuid, path: &Path) {
-        match image::open(path) {
+        match crate::reliability::image_open(path) {
             Ok(img) => {
                 let img = if img.width().max(img.height()) > GUIDE_MAX_SIDE {
                     img.thumbnail(GUIDE_MAX_SIDE, GUIDE_MAX_SIDE)

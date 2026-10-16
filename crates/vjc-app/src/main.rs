@@ -47,6 +47,7 @@ mod pool;
 mod prefs_ui;
 mod preload;
 mod qr;
+mod reliability;
 mod shortcut_editor;
 mod slice_inspector;
 mod slice_render;
@@ -1653,7 +1654,33 @@ fn offer_recovery(s: &mut State) {
     s.recovery_offer = Some(r);
 }
 
+/// `--recover` (relaunch after a crash): restores the recovery file with no prompt. The
+/// project carries its screens, so the output windows reopen on the same monitors.
+fn auto_recover(s: &mut State) {
+    let Some(r) = recovery_path().filter(|r| r.exists()) else {
+        return;
+    };
+    if s.restore_recovery(r) {
+        s.status = "Recovered the autosaved project after a crash".into();
+    }
+}
+
 impl State {
+    /// Loads the recovery file `r` as an unsaved project. An unreadable file is kept aside
+    /// (never destroyed). Returns whether it was restored.
+    fn restore_recovery(&mut self, r: PathBuf) -> bool {
+        if self.load(r.clone()) {
+            self.file = None;
+            self.dirty = true;
+            // Restored state now lives in memory (and is re-autosaved while dirty).
+            clear_recovery(Some(r));
+            true
+        } else {
+            quarantine_recovery(&r);
+            false
+        }
+    }
+
     /// Restore/Discard dialog for `recovery_offer`.
     fn recovery_window(&mut self, ctx: &egui::Context) {
         let Some(r) = self.recovery_offer.clone() else {
@@ -1674,14 +1701,8 @@ impl State {
         });
         let Some(restore) = restore else { return };
         self.recovery_offer = None;
-        if restore && self.load(r.clone()) {
-            self.file = None;
-            self.dirty = true;
-            // Restored state now lives in memory (and is re-autosaved while dirty).
-            clear_recovery(Some(r));
-        } else if restore {
-            // Unreadable: do not offer it again, but do not destroy the user's work either.
-            quarantine_recovery(&r);
+        if restore {
+            self.restore_recovery(r);
         } else {
             clear_recovery(Some(r));
         }
@@ -8414,6 +8435,9 @@ impl State {
                                     grid_ui::CellState {
                                         playing: on,
                                         selected: self.selected == Some((lid, ci)),
+                                        failed: self.players.get(&lid).is_some_and(|(d, c, p)| {
+                                            *c == ci && *d == cur && p.error().is_some()
+                                        }),
                                     },
                                 );
                                 let r = help(
@@ -11545,6 +11569,7 @@ const BLACKOUT_KEY: (egui::Modifiers, egui::Key) = (
 
 impl eframe::App for State {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        reliability::beat();
         // Pace the UI: an unthrottled swapchain (vsync off, occluded window, output window
         // redrawing the parent) would otherwise run the whole UI thousands of times a second.
         let min_gap = ui_pace_gap(effective_fps(
@@ -11645,6 +11670,20 @@ fn tex_cap_from(limit: u32) -> u32 {
 fn main() -> eframe::Result {
     // MCP server mode: stdio client of the running app's REST API, no window.
     let args: Vec<String> = std::env::args().collect();
+    // Normal launch: a tiny supervisor runs the app as a child and relaunches it with
+    // --recover after a crash (docs/dev/reliability.md).
+    if reliability::should_supervise(&args, std::env::var("VJC_NO_SUPERVISOR").ok().as_deref()) {
+        std::process::exit(reliability::run_supervisor(&args));
+    }
+    if args.iter().any(|a| a == "--child") {
+        reliability::fake_child(&args);
+    }
+    reliability::install_panic_hook();
+    if args.iter().any(|a| a == "--panic-test") {
+        panic!("panic-test: deliberate panic for the crash report test");
+    }
+    let recover = args.iter().any(|a| a == "--recover");
+    reliability::start_watchdog();
     if args.iter().any(|a| a == "--mcp") {
         std::process::exit(mcp::run(&args));
     }
@@ -11691,7 +11730,11 @@ fn main() -> eframe::Result {
                 s.status = w.clone();
                 s.warnings.push(w);
             }
-            offer_recovery(&mut s);
+            if recover {
+                auto_recover(&mut s);
+            } else {
+                offer_recovery(&mut s);
+            }
             if s.file.is_none()
                 && !s.dirty
                 && s.recovery_offer.is_none()

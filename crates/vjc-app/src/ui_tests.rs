@@ -3892,6 +3892,7 @@ fn cell_widget_id_does_not_depend_on_the_scroll_offset() {
             let state = grid_ui::CellState {
                 playing: false,
                 selected: false,
+                failed: false,
             };
             let c = grid_ui::cell(ui, id, "a", "a", grid_ui::Tile::Pending, state);
             ids.push((c.pic.id, c.strip.map(|s| s.id)));

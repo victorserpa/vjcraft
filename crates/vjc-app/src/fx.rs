@@ -78,7 +78,7 @@ impl FxLib {
         {
             return l.clone();
         }
-        let lut = image::open(path).ok().map(|im| {
+        let lut = crate::reliability::image_open(path).ok().map(|im| {
             let im = if im.width().max(im.height()) > 1024 {
                 im.resize(1024, 1024, image::imageops::FilterType::Triangle)
             } else {

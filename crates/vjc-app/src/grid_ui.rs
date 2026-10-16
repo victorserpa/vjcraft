@@ -19,6 +19,8 @@ pub enum Tile<'a> {
 pub struct CellState {
     pub playing: bool,
     pub selected: bool,
+    /// The clip's player failed (decoder error or crash): draws an error badge.
+    pub failed: bool,
 }
 
 /// UV rectangle that fills a box of ratio `box_aspect` with an image of ratio `img_aspect`
@@ -80,7 +82,11 @@ pub fn cell(
     tile: Tile,
     state: CellState,
 ) -> CellResponse {
-    let CellState { playing, selected } = state;
+    let CellState {
+        playing,
+        selected,
+        failed,
+    } = state;
     let size = egui::vec2(theme::CELL_W, theme::THUMB_H + theme::NAME_H);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let filled = !matches!(tile, Tile::Empty);
@@ -164,6 +170,20 @@ pub fn cell(
             badge.center(),
             Align2::CENTER_CENTER,
             crate::icons::i::PLAY,
+            theme::icon_font(theme::FS_XS),
+            theme::ON_ACCENT,
+        );
+    }
+    if failed && filled {
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(pic.right() - theme::SP_1 - 14.0, pic.top() + theme::SP_1),
+            egui::vec2(14.0, 14.0),
+        );
+        p.rect_filled(badge, 2.0, theme::ERROR_TEXT);
+        p.text(
+            badge.center(),
+            Align2::CENTER_CENTER,
+            crate::icons::i::WARNING,
             theme::icon_font(theme::FS_XS),
             theme::ON_ACCENT,
         );
