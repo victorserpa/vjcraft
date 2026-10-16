@@ -6773,6 +6773,24 @@ fn removing_a_column_drops_its_pending_trigger_and_state() {
 }
 
 #[test]
+fn removing_the_playing_column_stops_the_layer_state() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let col = st.gens[&lid].1 as usize;
+    let ids = st.column_ids();
+    st.flow.pos.insert(lid, 1.0);
+    st.exec(Command::RemoveColumns {
+        columns: vec![ids[col]],
+    });
+    assert!(!st.gens.contains_key(&lid));
+    assert!(
+        !st.flow.pos.contains_key(&lid),
+        "stop event cleared the layer"
+    );
+}
+
+#[test]
 fn a_clip_on_air_in_another_deck_counts_for_the_remove_guard() {
     let mut h = app();
     let lid = playing_generator(&mut h);

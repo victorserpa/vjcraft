@@ -511,12 +511,49 @@ fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -
 /// removed (the command is dropped).
 fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
     match cmd {
-        Command::TriggerClip { column, .. }
+        Command::ImportMedia { column, .. }
+        | Command::SetClip { column, .. }
+        | Command::SetGenerator { column, .. }
+        | Command::SetGeneratorParam { column, .. }
+        | Command::ClearCell { column, .. }
+        | Command::TriggerClip { column, .. }
         | Command::TriggerClipOn { column, .. }
-        | Command::TriggerColumn { column, .. } => map(*column).is_some_and(|n| {
+        | Command::TriggerColumn { column, .. }
+        | Command::AddCue { column, .. }
+        | Command::RemoveCue { column, .. }
+        | Command::SeekClip { column, .. }
+        | Command::SetInOut { column, .. }
+        | Command::SetClipSync { column, .. }
+        | Command::SetClipDuration { column, .. }
+        | Command::RefreshClipThumb { column, .. }
+        | Command::JumpToCue { column, .. }
+        | Command::SetClipDial { column, .. }
+        | Command::SetClipChannels { column, .. }
+        | Command::RenameClip { column, .. }
+        | Command::SetFit { column, .. }
+        | Command::SetTriggerMode { column, .. }
+        | Command::SetClipBeatSnap { column, .. }
+        | Command::SetClipExtras { column, .. }
+        | Command::SetClipTarget { column, .. }
+        | Command::SetClipTriggerStyle { column, .. }
+        | Command::SetBlendOverride { column, .. }
+        | Command::SetClipTransition { column, .. }
+        | Command::SetBeatSync { column, .. }
+        | Command::SetTimecodeStart { column, .. }
+        | Command::SetPlayMode { column, .. }
+        | Command::SetDirection { column, .. }
+        | Command::SetSpeed { column, .. } => map(*column).is_some_and(|n| {
             *column = n;
             true
         }),
+        Command::MoveClip { from, to, .. } => match (map(from.1), map(to.1)) {
+            (Some(f), Some(t)) => {
+                from.1 = f;
+                to.1 = t;
+                true
+            }
+            _ => false,
+        },
         Command::StepColumn { from, .. } | Command::StepClip { from, .. } => match *from {
             Some(f) => map(f).is_some_and(|n| {
                 *from = Some(n);
@@ -524,6 +561,33 @@ fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
             }),
             None => true,
         },
+        Command::SetMediaPaths { changes } => {
+            changes.retain_mut(|(_, _, c, _)| {
+                map(*c).is_some_and(|n| {
+                    *c = n;
+                    true
+                })
+            });
+            !changes.is_empty()
+        }
+        Command::SetPaused { clips, .. } => {
+            clips.retain_mut(|(_, _, c)| {
+                map(*c).is_some_and(|n| {
+                    *c = n;
+                    true
+                })
+            });
+            !clips.is_empty()
+        }
+        Command::RestoreDirections { items } => {
+            items.retain_mut(|(_, _, c, _)| {
+                map(*c).is_some_and(|n| {
+                    *c = n;
+                    true
+                })
+            });
+            !items.is_empty()
+        }
         _ => true,
     }
 }
@@ -3329,8 +3393,8 @@ impl State {
             _ => None,
         };
         match self.history.exec(&mut self.project, cmd, now) {
-            Ok(events) => {
-                self.follow_columns(&col_ids);
+            Ok(mut events) => {
+                events.extend(self.follow_columns(&col_ids));
                 if let Some(st) = transport
                     && st != vjc_model::PlayState::Stop
                 {
@@ -3396,8 +3460,8 @@ impl State {
         let before = self.project.composition.tempo.bpm;
         let col_ids = self.column_ids();
         match self.history.undo(&mut self.project) {
-            Some(Ok(ev)) => {
-                self.follow_columns(&col_ids);
+            Some(Ok(mut ev)) => {
+                ev.extend(self.follow_columns(&col_ids));
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -3414,8 +3478,8 @@ impl State {
         let before = self.project.composition.tempo.bpm;
         let col_ids = self.column_ids();
         match self.history.redo(&mut self.project) {
-            Some(Ok(ev)) => {
-                self.follow_columns(&col_ids);
+            Some(Ok(mut ev)) => {
+                ev.extend(self.follow_columns(&col_ids));
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -3440,29 +3504,38 @@ impl State {
     /// After columns moved, were inserted or removed, what is playing, selected or queued
     /// keeps following its column: every column index kept per cell is rewritten to where
     /// the column is now (nothing on air changes). State of a removed column is dropped.
-    fn follow_columns(&mut self, old: &[Uuid]) {
+    /// Returns a `LayerCleared` for every layer whose playing clip was in a removed column,
+    /// so the per-layer playback state goes with it.
+    fn follow_columns(&mut self, old: &[Uuid]) -> Vec<Event> {
         let new = self.column_ids();
         if *old == new[..] {
-            return;
+            return vec![];
         }
+        let mut stopped: Vec<LayerId> = vec![];
         let map = |c: u32| -> Option<u32> {
             old.get(c as usize)
                 .and_then(|id| new.iter().position(|n| n == id))
                 .map(|n| n as u32)
         };
-        self.players.retain(|_, (_, c, _)| match map(*c) {
+        self.players.retain(|l, (_, c, _)| match map(*c) {
             Some(n) => {
                 *c = n;
                 true
             }
-            None => false,
+            None => {
+                stopped.push(*l);
+                false
+            }
         });
-        self.gens.retain(|_, (_, c, _)| match map(*c) {
+        self.gens.retain(|l, (_, c, _)| match map(*c) {
             Some(n) => {
                 *c = n;
                 true
             }
-            None => false,
+            None => {
+                stopped.push(*l);
+                false
+            }
         });
         self.origin.retain(|_, (_, _, c)| match map(*c) {
             Some(n) => {
@@ -3511,6 +3584,12 @@ impl State {
         for bag in self.layer_bags.borrow_mut().values_mut() {
             *bag = bag.iter().filter_map(|c| map(*c)).collect();
         }
+        stopped.sort();
+        stopped.dedup();
+        stopped
+            .into_iter()
+            .map(|layer| Event::LayerCleared { layer })
+            .collect()
     }
 
     /// The selected column index must point at a column that still exists.
@@ -12132,4 +12211,52 @@ fn numbered_image_folder_drops_as_one_sequence_clip() {
     assert_eq!(c.name, "shot");
     assert!(matches!(c.source, vjc_model::Source::Sequence { fps, .. } if fps == 30.0));
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use super::*;
+
+    #[test]
+    fn remap_covers_every_column_bearing_command() {
+        let map = |c: u32| Some(c + 10);
+        let (d, l) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut clear = Command::ClearCell {
+            deck: d,
+            layer: l,
+            column: 1,
+        };
+        assert!(remap_command(&mut clear, &map));
+        assert!(matches!(clear, Command::ClearCell { column: 11, .. }));
+        let mut mv = Command::MoveClip {
+            deck: d,
+            from: (l, 1),
+            to: (l, 2),
+            copy: false,
+        };
+        assert!(remap_command(&mut mv, &map));
+        assert!(matches!(
+            mv,
+            Command::MoveClip {
+                from: (_, 11),
+                to: (_, 12),
+                ..
+            }
+        ));
+        let mut paused = Command::SetPaused {
+            clips: vec![(d, l, 3), (d, l, 4)],
+            paused: true,
+        };
+        assert!(remap_command(&mut paused, &|c| (c == 3).then_some(0)));
+        assert!(matches!(&paused, Command::SetPaused { clips, .. } if clips == &[(d, l, 0)]));
+        let mut gone = Command::ClearCell {
+            deck: d,
+            layer: l,
+            column: 5,
+        };
+        assert!(
+            !remap_command(&mut gone, &|_| None),
+            "removed column drops it"
+        );
+    }
 }
