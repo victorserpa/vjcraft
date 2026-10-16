@@ -12,10 +12,19 @@ pub const MAX_LINES: usize = 64;
 #[derive(Debug, Default, Clone)]
 pub struct Log {
     lines: VecDeque<String>,
+    /// While paused, incoming messages are counted but not kept.
+    paused: bool,
+    missed: usize,
+    /// Text of the line the user clicked (what "Copy" puts on the clipboard).
+    selected: Option<String>,
 }
 
 impl Log {
     pub fn push(&mut self, line: String) {
+        if self.paused {
+            self.missed += 1;
+            return;
+        }
         if self.lines.len() == MAX_LINES {
             self.lines.pop_front();
         }
@@ -32,6 +41,35 @@ impl Log {
 
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.selected = None;
+        self.missed = 0;
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn set_paused(&mut self, on: bool) {
+        self.paused = on;
+        if !on {
+            self.missed = 0;
+        }
+    }
+
+    pub fn missed(&self) -> usize {
+        self.missed
+    }
+
+    pub fn select(&mut self, line: Option<String>) {
+        self.selected = line;
+    }
+
+    /// What Copy puts on the clipboard: the selected line, else every line.
+    pub fn copy_text(&self) -> String {
+        match &self.selected {
+            Some(l) => l.clone(),
+            None => self.lines.iter().cloned().collect::<Vec<_>>().join("\n"),
+        }
     }
 }
 
@@ -81,8 +119,27 @@ pub fn window(ctx: &egui::Context, title: &str, log: &mut Log, hint: &str) -> bo
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 help(ui, hint);
+                let label = if log.paused() { "Resume" } else { "Pause" };
+                if crate::widgets::btn(ui, label, crate::widgets::Kind::Secondary).clicked() {
+                    let p = !log.paused();
+                    log.set_paused(p);
+                }
+                if crate::widgets::btn_if(
+                    ui,
+                    log.len() > 0,
+                    "Copy",
+                    crate::widgets::Kind::Secondary,
+                )
+                .on_hover_text("Copy the selected message, or all when none is selected")
+                .clicked()
+                {
+                    ui.ctx().copy_text(log.copy_text());
+                }
                 if crate::widgets::btn(ui, "Clear", crate::widgets::Kind::Secondary).clicked() {
                     log.clear();
+                }
+                if log.paused() {
+                    help(ui, &format!("Paused, {} missed", log.missed()));
                 }
             });
             ui.separator();
@@ -93,13 +150,19 @@ pub fn window(ctx: &egui::Context, title: &str, log: &mut Log, hint: &str) -> bo
                     if log.len() == 0 {
                         help(ui, "Nothing received yet.");
                     }
+                    let mut pick = None;
                     for l in log.lines() {
-                        ui.label(
-                            egui::RichText::new(l)
-                                .monospace()
-                                .size(crate::theme::FS_XS)
-                                .color(crate::theme::TEXT),
-                        );
+                        let on = log.selected.as_deref() == Some(l.as_str());
+                        let t = egui::RichText::new(l)
+                            .monospace()
+                            .size(crate::theme::FS_XS)
+                            .color(crate::theme::TEXT);
+                        if ui.selectable_label(on, t).clicked() {
+                            pick = Some(if on { None } else { Some(l.clone()) });
+                        }
+                    }
+                    if let Some(p) = pick {
+                        log.select(p);
                     }
                 });
         });
@@ -119,6 +182,38 @@ mod tests {
         assert_eq!(l.len(), MAX_LINES);
         assert_eq!(l.lines().next().unwrap(), "5");
         assert_eq!(l.lines().last().unwrap(), &(MAX_LINES + 4).to_string());
+    }
+
+    #[test]
+    fn paused_log_ignores_messages_and_resume_keeps_the_old_ones() {
+        let mut l = Log::default();
+        l.push("a".into());
+        l.set_paused(true);
+        l.push("b".into());
+        assert_eq!((l.len(), l.missed()), (1, 1));
+        l.set_paused(false);
+        l.push("c".into());
+        assert_eq!(l.copy_text(), "a\nc");
+    }
+
+    #[test]
+    fn negative_control_unpaused_log_keeps_everything() {
+        let mut l = Log::default();
+        l.push("a".into());
+        l.push("b".into());
+        assert_eq!((l.len(), l.missed()), (2, 0));
+    }
+
+    #[test]
+    fn copy_text_is_the_selection_or_everything() {
+        let mut l = Log::default();
+        l.push("a".into());
+        l.push("b".into());
+        assert_eq!(l.copy_text(), "a\nb");
+        l.select(Some("b".into()));
+        assert_eq!(l.copy_text(), "b");
+        l.clear();
+        assert_eq!(l.copy_text(), "");
     }
 
     #[test]

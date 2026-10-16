@@ -30,6 +30,7 @@ mod osc_io;
 mod output_overlay;
 mod output_presets_ui;
 mod output_ui;
+mod palette;
 mod params;
 mod persist;
 mod pool;
@@ -40,6 +41,7 @@ mod shortcut_editor;
 mod slice_inspector;
 mod slice_render;
 mod source_info;
+mod stats_bar;
 mod theme;
 mod timecode_io;
 mod ui_stats;
@@ -118,6 +120,16 @@ struct State {
     /// Texture-memory limit in bytes (`VJC_VRAM_LIMIT_MB`).
     vram_limit: u64,
     frame_ms: frame_stats::FrameStats,
+    /// View > Show FPS & Stats: readout in the status bar (runtime only).
+    show_stats: bool,
+    /// Cmd/Ctrl+K quick search.
+    palette: palette::Palette,
+    /// Animation presets already handed to the param popups (false: publish them).
+    presets_published: bool,
+    stats: stats_bar::Sampler,
+    /// Estimated texture bytes (refreshed with the VRAM watchdog) and GPU adapter name.
+    vram_bytes: u64,
+    gpu_name: String,
     ui_stats: ui_stats::UiStats,
     last_ui: Option<std::time::Instant>,
     render_gate: FrameGate,
@@ -1781,6 +1793,12 @@ impl State {
             vram_dog: vram::Watchdog::default(),
             vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
+            show_stats: false,
+            palette: Default::default(),
+            presets_published: false,
+            stats: Default::default(),
+            vram_bytes: 0,
+            gpu_name: String::new(),
             ui_stats: ui_stats::UiStats::new(),
             last_ui: None,
             render_gate: FrameGate::default(),
@@ -2144,6 +2162,14 @@ impl State {
             }
         });
         ui.separator();
+        if crate::widgets::btn(ui, "Quick search... Cmd+K", crate::widgets::Kind::Secondary)
+            .clicked()
+        {
+            ui.close();
+            self.palette_open();
+        }
+        crate::widgets::toggle(ui, &mut self.show_stats, "Show FPS & Stats");
+        ui.separator();
         let l = self.prefs.layouts.current.clone();
         let mut new = l.clone();
         for (on, label, key) in [
@@ -2214,6 +2240,223 @@ impl State {
         }
         if ctx.input_mut(|i| i.consume_key(cmd, Key::Slash)) {
             self.set_help(!self.prefs.layouts.help);
+        }
+        if ctx.input_mut(|i| i.consume_key(cmd, Key::K)) {
+            if self.palette.open {
+                self.palette.close();
+            } else {
+                self.palette_open();
+            }
+        }
+    }
+
+    /// Opens the quick search with a fresh list of everything it can find.
+    fn palette_open(&mut self) {
+        use palette::{Act, Cmd, Entry, Kind};
+        let mut v = vec![];
+        for (id, _) in vjc_fx::BUILTIN {
+            v.push(Entry {
+                kind: Kind::Effect,
+                label: fx_label(id),
+                act: Act::AddEffect(id.to_string()),
+            });
+        }
+        for (id, _) in vjc_fx::GENERATORS {
+            v.push(Entry {
+                kind: Kind::Generator,
+                label: fx_label(id),
+                act: Act::Generator(id.to_string()),
+            });
+        }
+        let comp = &self.project.composition;
+        for l in &comp.layers {
+            v.push(Entry {
+                kind: Kind::Layer,
+                label: l.name.clone(),
+                act: Act::SelectLayer(l.id),
+            });
+        }
+        if let Some(d) = comp.decks.iter().find(|d| d.id == comp.current_deck) {
+            for cc in d.clips.iter().take(2000) {
+                let layer = comp
+                    .layers
+                    .iter()
+                    .find(|l| l.id == cc.layer)
+                    .map_or("", |l| l.name.as_str());
+                v.push(Entry {
+                    kind: Kind::Clip,
+                    label: format!("{} ({layer}, column {})", cc.clip.name, cc.column + 1),
+                    act: Act::SelectCell(d.id, cc.layer, cc.column),
+                });
+            }
+        }
+        for (c, name) in Cmd::ALL {
+            v.push(Entry {
+                kind: Kind::Command,
+                label: name.to_string(),
+                act: Act::Command(c),
+            });
+        }
+        self.palette = palette::Palette {
+            open: true,
+            entries: v,
+            focus: true,
+            ..Default::default()
+        };
+    }
+
+    /// Where "add effect" lands now: previewed clip or layer, else the selected cell's
+    /// clip, else Master.
+    fn palette_target(&self) -> EffectTarget {
+        let (pc, pl) = match self.preview_target {
+            PreviewTarget::Clip(d, l, c) => (Some((d, l, c)), None),
+            PreviewTarget::Layer(l) => (None, Some(l)),
+            PreviewTarget::Composition => (None, None),
+        };
+        let deck = self
+            .selected_deck
+            .unwrap_or(self.project.composition.current_deck);
+        match palette::pick_target(pc, pl, self.selected, deck) {
+            palette::Pick::Clip(deck, layer, column) => EffectTarget::Clip {
+                deck,
+                layer,
+                column,
+            },
+            palette::Pick::Layer(l) => EffectTarget::Layer(l),
+            palette::Pick::Master => EffectTarget::Master,
+        }
+    }
+
+    /// Runs a chosen entry of the quick search. Only selects, adds to a chain, fills an
+    /// empty cell or runs a menu command; never triggers a clip.
+    fn palette_run(&mut self, act: palette::Act) {
+        use palette::{Act, Cmd};
+        match act {
+            Act::AddEffect(id) => match vjc_fx::new_effect(&id) {
+                Some(effect) => {
+                    let target = self.palette_target();
+                    self.exec(Command::AddEffect {
+                        target,
+                        effect,
+                        index: usize::MAX,
+                    });
+                    self.status = format!("Added {}", fx_label(&id));
+                }
+                None => self.status = format!("Unknown effect {id}"),
+            },
+            Act::Generator(id) => {
+                let deck = self
+                    .selected_deck
+                    .unwrap_or(self.project.composition.current_deck);
+                match self.selected {
+                    Some((layer, column))
+                        if vjc_core::clip_in(&self.project, deck, layer, column).is_none() =>
+                    {
+                        self.exec(Command::SetGenerator {
+                            deck,
+                            layer,
+                            column,
+                            kind: id.clone(),
+                            name: fx_label(&id),
+                            params: vjc_fx::generator_params(&id).unwrap_or_default(),
+                        });
+                    }
+                    Some(_) => self.status = "Select an empty cell for the generator".into(),
+                    None => self.status = "Select a cell first".into(),
+                }
+            }
+            Act::SelectLayer(l) => self.preview_target = PreviewTarget::Layer(l),
+            Act::SelectCell(d, l, c) => {
+                self.selected = Some((l, c));
+                self.selected_deck = Some(d);
+                self.preview_target = PreviewTarget::Clip(d, l, c);
+            }
+            Act::Command(c) => match c {
+                Cmd::Undo => self.undo(),
+                Cmd::Redo => self.redo(),
+                Cmd::Blackout => self.toggle_blackout(),
+                Cmd::ToggleStats => self.show_stats = !self.show_stats,
+                Cmd::Preferences => self.prefs_open = true,
+                Cmd::MidiMonitor => self.midi_monitor_open = true,
+                Cmd::OscMonitor => self.osc_monitor_open = true,
+                Cmd::Shortcuts => self.sc_ed.open = true,
+            },
+        }
+    }
+
+    /// The quick search box: type, Up/Down, Enter or click runs, Esc closes.
+    fn palette_window(&mut self, ctx: &egui::Context) {
+        if !self.palette.open {
+            return;
+        }
+        use egui::Key;
+        const SHOWN: usize = 12;
+        let hits = palette::rank(&self.palette.entries, &self.palette.query, SHOWN);
+        let none = egui::Modifiers::NONE;
+        let (down, up, enter, esc) = ctx.input_mut(|i| {
+            (
+                i.consume_key(none, Key::ArrowDown),
+                i.consume_key(none, Key::ArrowUp),
+                i.consume_key(none, Key::Enter),
+                i.consume_key(none, Key::Escape),
+            )
+        });
+        if down && !hits.is_empty() {
+            self.palette.sel = (self.palette.sel + 1) % hits.len();
+        }
+        if up && !hits.is_empty() {
+            self.palette.sel = (self.palette.sel + hits.len() - 1) % hits.len();
+        }
+        self.palette.sel = self.palette.sel.min(hits.len().saturating_sub(1));
+        let mut run = None;
+        if enter {
+            run = hits.get(self.palette.sel).copied();
+        }
+        let target = match self.palette_target() {
+            EffectTarget::Clip { .. } => "the selected clip",
+            EffectTarget::Layer(_) => "the selected layer",
+            _ => "Master",
+        };
+        let mut changed = false;
+        widgets::panel_window(ctx, "Quick search")
+            .id(egui::Id::new("quick-search"))
+            .title_bar(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
+            .fixed_size([460.0, 0.0])
+            .show(ctx, |ui| {
+                let e = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette.query)
+                        .hint_text("Search effects, generators, layers, clips, commands")
+                        .desired_width(f32::INFINITY),
+                );
+                changed = e.changed();
+                if self.palette.focus {
+                    e.request_focus();
+                    self.palette.focus = false;
+                }
+                widgets::help(ui, &format!("Effects are added to {target}."));
+                ui.separator();
+                if hits.is_empty() {
+                    widgets::help(ui, "No match.");
+                }
+                for (row, i) in hits.iter().enumerate() {
+                    let en = &self.palette.entries[*i];
+                    let text = format!("{}   {}", en.label, en.kind.label());
+                    if ui.selectable_label(row == self.palette.sel, text).clicked() {
+                        run = Some(*i);
+                    }
+                }
+            });
+        if changed {
+            self.palette.sel = 0;
+        }
+        if let Some(i) = run {
+            let act = self.palette.entries[i].act.clone();
+            self.palette.close();
+            self.palette_run(act);
+        } else if esc {
+            self.palette.close();
         }
     }
 
@@ -2333,6 +2576,156 @@ impl State {
         let shown = self.help_shown.and_then(help::text).unwrap_or(help::IDLE);
         egui::Panel::bottom("help_bar").show(ui, |ui| {
             ui.label(shown);
+        });
+    }
+
+    /// Animation presets: answers the param popups' requests (save, delete, export, import)
+    /// and keeps the list they show in step with the prefs.
+    fn presets_frame(&mut self, ctx: &egui::Context) {
+        let mut changed = !self.presets_published;
+        for r in params::take_preset_reqs(ctx) {
+            match r {
+                params::PresetReq::Save(name, a) => {
+                    if self.prefs.presets.save_animation(&name, a) {
+                        self.status = format!("Saved animation preset {name}");
+                        changed = true;
+                    } else {
+                        self.status = "Animation preset not saved (empty name or list full)".into();
+                    }
+                }
+                params::PresetReq::Delete(name) => {
+                    self.prefs.presets.remove_animation(&name);
+                    changed = true;
+                }
+                params::PresetReq::Export => self.export_presets(),
+                params::PresetReq::Import => changed |= self.import_presets(),
+            }
+        }
+        if changed {
+            self.prefs_dirty = true;
+            self.presets_published = true;
+            let list = self
+                .prefs
+                .presets
+                .animations
+                .iter()
+                .map(|p| (p.name.clone(), p.animation.clone()))
+                .collect();
+            params::publish_presets(ctx, std::sync::Arc::new(list));
+        }
+    }
+
+    fn export_presets(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("VJCraft presets", &["vjcpresets"])
+            .set_file_name("presets.vjcpresets")
+            .save_file()
+        else {
+            return;
+        };
+        self.status = match std::fs::write(&path, self.prefs.presets.to_json()) {
+            Ok(()) => format!("Exported presets to {}", path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+    }
+
+    /// True when presets were added.
+    fn import_presets(&mut self) -> bool {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("VJCraft presets", &["vjcpresets", "json"])
+            .pick_file()
+        else {
+            return false;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("Import failed: {e}");
+                return false;
+            }
+        };
+        match self.prefs.presets.import_json(&text) {
+            Ok(n) => {
+                self.status = format!("Imported {n} presets");
+                true
+            }
+            Err(e) => {
+                self.status = format!("Import failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// "Presets" menu above a dashboard: save the dials (names, ranges, values) under a
+    /// name, or apply a saved set to this dashboard.
+    fn dash_presets_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        dial_ref: vjc_core::DialRef,
+        list: &[vjc_model::Param],
+        vals: &[f64],
+        set_dial: &dyn Fn(usize, f64) -> Command,
+        cmds: &mut Vec<Command>,
+    ) {
+        ui.menu_button("Dashboard presets", |ui| {
+            let saved = self.prefs.presets.dashboards.clone();
+            if saved.is_empty() {
+                ui.weak("No saved dashboards");
+            }
+            for p in &saved {
+                ui.horizontal(|ui| {
+                    if crate::widgets::btn(ui, &p.name, crate::widgets::Kind::Secondary).clicked() {
+                        for (i, d) in p.dials.iter().enumerate().take(vals.len()) {
+                            cmds.push(Command::SetDialInfo {
+                                owner: dial_ref,
+                                dial: i as u32,
+                                name: d.name.clone(),
+                                range: d.range,
+                            });
+                            cmds.push(set_dial(i, d.value));
+                        }
+                        ui.close();
+                    }
+                    if crate::icons::button(ui, icons::i::X, "Delete preset").clicked() {
+                        self.prefs.presets.remove_dashboard(&p.name);
+                        self.prefs_dirty = true;
+                    }
+                });
+            }
+            ui.separator();
+            let key = egui::Id::new("dash-preset-name");
+            let mut buf: String = ui.data(|d| d.get_temp(key)).unwrap_or_default();
+            crate::widgets::field_text_hint(ui, &mut buf, 140.0, "Preset name");
+            if crate::widgets::btn_if(
+                ui,
+                !buf.trim().is_empty(),
+                "Save dashboard",
+                crate::widgets::Kind::Secondary,
+            )
+            .clicked()
+            {
+                let dials = vals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let (name, range) = list.get(i).map_or_else(
+                            || (format!("Dial {}", i + 1), (0.0, 1.0)),
+                            |p| (p.name.clone(), p.range.unwrap_or((0.0, 1.0))),
+                        );
+                        vjc_io::param_presets::DialSlot {
+                            name,
+                            value: *v,
+                            range,
+                        }
+                    })
+                    .collect();
+                if self.prefs.presets.save_dashboard(&buf, dials) {
+                    self.prefs_dirty = true;
+                    self.status = format!("Saved dashboard preset {}", buf.trim());
+                    buf.clear();
+                }
+            }
+            ui.data_mut(|d| d.insert_temp(key, buf));
         });
     }
 
@@ -6415,6 +6808,22 @@ impl State {
                                 .monospace()
                                 .color(theme::CLOCK_TEXT),
                         );
+                        if self.show_stats {
+                            ui.separator();
+                            let txt = self.stats.text(
+                                std::time::Instant::now(),
+                                stats_bar::Inputs {
+                                    p99_ms: self.frame_ms.p99(),
+                                    vram_bytes: self.vram_bytes,
+                                    gpu: &self.gpu_name,
+                                    preload: self.preload.len(),
+                                },
+                            );
+                            ui.weak(egui::RichText::new(txt).monospace())
+                                .on_hover_text(
+                                    "UI frames per second, frame time p99, UI frames later than 2 periods while playing, process CPU, estimated texture memory, GPU, decoders preloaded",
+                                );
+                        }
                         if self.frame_ms.len() > 0 {
                             ui.separator();
                             let stale = self.frame_label.0.is_none_or(|t| {
@@ -6431,8 +6840,13 @@ impl State {
                 });
             });
         if self.persist {
-            // Live app only: keeps the clock ticking while idle.
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            // Live app only: keeps the clock ticking while idle (2 Hz with the stats bar).
+            let every = if self.show_stats {
+                stats_bar::EVERY
+            } else {
+                std::time::Duration::from_secs(1)
+            };
+            ctx.request_repaint_after(every);
         }
         let help_shown = self.help_shown.and_then(help::text).unwrap_or(help::IDLE);
         let help_on = self.prefs.layouts.help;
@@ -6596,6 +7010,8 @@ impl State {
             self.browser_drop((*item).clone(), pos);
         }
         self.layer_rects.clear();
+        self.presets_frame(&ctx);
+        self.palette_window(&ctx);
         self.shortcut_keys(&ctx);
         self.layout_keys(&ctx);
         self.collect_pump();
@@ -9651,6 +10067,25 @@ impl State {
                 .map(|k| k.track.dials.clone())
                 .unwrap_or_default(),
         };
+        let set_dial = |i: usize, value: f64| match owner {
+            DialOwner::Comp => Command::SetDashboardDial {
+                dial: i as u32,
+                value,
+            },
+            DialOwner::Layer(layer) => Command::SetLayerDial {
+                layer,
+                dial: i as u32,
+                value,
+            },
+            DialOwner::Clip(deck, layer, column) => Command::SetClipDial {
+                deck,
+                layer,
+                column,
+                dial: i as u32,
+                value,
+            },
+        };
+        self.dash_presets_menu(ui, dial_ref, &list, vals, &set_dial, cmds);
         for (i, v) in vals.iter().enumerate() {
             let n = i + 1;
             let id = match owner {
@@ -9690,24 +10125,7 @@ impl State {
                 }
             });
             if let Some(value) = r.inner {
-                cmds.push(match owner {
-                    DialOwner::Comp => Command::SetDashboardDial {
-                        dial: i as u32,
-                        value,
-                    },
-                    DialOwner::Layer(layer) => Command::SetLayerDial {
-                        layer,
-                        dial: i as u32,
-                        value,
-                    },
-                    DialOwner::Clip(deck, layer, column) => Command::SetClipDial {
-                        deck,
-                        layer,
-                        column,
-                        dial: i as u32,
-                        value,
-                    },
-                });
+                cmds.push(set_dial(i, value));
             }
             let addr = match owner {
                 DialOwner::Comp => Some(format!("/comp/dashboard/{n}")),
@@ -10019,41 +10437,59 @@ impl State {
                     crate::widgets::help(ui, &name);
                 });
             }
-            for (pi, p) in e.params.iter().enumerate() {
-                let Some(kind) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind) else {
-                    continue;
-                };
-                if e.kind == "lut3d" && p.name == "file" {
-                    continue;
+            let groups = inputs
+                .as_ref()
+                .map(|v| vjc_fx::param_groups(v))
+                .unwrap_or_default();
+            for (title, idxs) in groups {
+                if let Some(t) = &title {
+                    let open = ui
+                        .push_id((e.id, t.as_str()), |ui| params::section(ui, "fx-group", t))
+                        .inner;
+                    if !open {
+                        continue;
+                    }
                 }
-                // Scope ids per effect so equal param names do not share edit state.
-                let mut an = None;
-                let (r, prect) = ui
-                    .push_id((e.id, pi), |ui| {
-                        let r = param_widget(ui, p, kind, &actx, &mut an);
-                        (r, ui.min_rect())
-                    })
-                    .inner;
-                if !p.name.contains('/') && !p.name.contains(' ') {
-                    self.fx_target(prect, target, i, &format!("param/{}", p.name));
-                }
-                if let Some(animation) = an {
-                    cmds.push(Command::SetAnimation {
-                        target: vjc_core::AnimTarget::Effect {
+                for pi in idxs {
+                    let Some(p) = e.params.get(pi) else {
+                        continue;
+                    };
+                    let Some(kind) = inputs.as_ref().and_then(|v| v.get(pi)).map(|i| &i.kind)
+                    else {
+                        continue;
+                    };
+                    if e.kind == "lut3d" && p.name == "file" {
+                        continue;
+                    }
+                    // Scope ids per effect so equal param names do not share edit state.
+                    let mut an = None;
+                    let (r, prect) = ui
+                        .push_id((e.id, pi), |ui| {
+                            let r = param_widget(ui, p, kind, &actx, &mut an);
+                            (r, ui.min_rect())
+                        })
+                        .inner;
+                    if !p.name.contains('/') && !p.name.contains(' ') {
+                        self.fx_target(prect, target, i, &format!("param/{}", p.name));
+                    }
+                    if let Some(animation) = an {
+                        cmds.push(Command::SetAnimation {
+                            target: vjc_core::AnimTarget::Effect {
+                                target,
+                                effect: e.id,
+                                param: pi,
+                            },
+                            animation,
+                        });
+                    }
+                    if let Some(value) = r {
+                        cmds.push(Command::SetEffectParam {
                             target,
                             effect: e.id,
                             param: pi,
-                        },
-                        animation,
-                    });
-                }
-                if let Some(value) = r {
-                    cmds.push(Command::SetEffectParam {
-                        target,
-                        effect: e.id,
-                        param: pi,
-                        value,
-                    });
+                            value,
+                        });
+                    }
                 }
             }
         }
@@ -10068,6 +10504,11 @@ impl State {
         };
         let thumbs = std::cell::RefCell::new(&mut self.browser.fx_thumbs);
         let comp = std::cell::RefCell::new(comp);
+        self.vram_bytes = {
+            let mut u = comp.borrow().vram();
+            u.thumbs = thumbs.borrow().bytes();
+            u.total()
+        };
         self.vram_warn = self.vram_dog.step(
             self.vram_limit,
             || {
@@ -10525,6 +10966,9 @@ impl eframe::App for State {
             self.vram_watch();
         }
         if let Some(rs) = frame.wgpu_render_state() {
+            if self.gpu_name.is_empty() {
+                self.gpu_name = rs.adapter.get_info().name;
+            }
             self.browser
                 .fx_thumbs
                 .attach(rs.device.clone(), rs.queue.clone(), ui.ctx().clone());
@@ -10532,6 +10976,10 @@ impl eframe::App for State {
         State::ui(self, ui);
         let ctx = ui.ctx().clone();
         self.ui_stats.frame(&ctx);
+        if self.show_stats {
+            let fps = effective_fps(self.project.composition.fps, self.prefs.video.max_fps);
+            self.stats.frame(t0, self.is_live(), fps);
+        }
         self.output_window(&ctx);
         self.frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
         // VJC_FRAME_LOG=1 prints the counter every 120 frames (measuring N layers).

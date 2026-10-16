@@ -6768,3 +6768,240 @@ fn layer_and_clip_panels_show_the_wave_m_fields() {
     }
     assert!(exists(&h, "Refresh thumbnail") && exists(&h, "Freeze"));
 }
+
+#[test]
+fn view_menu_toggles_the_stats_bar() {
+    let mut h = app();
+    settle(&mut h);
+    assert!(!h.state().show_stats);
+    click(&mut h, "View");
+    click(&mut h, "Show FPS & Stats");
+    assert!(h.state().show_stats);
+    h.run_steps(2);
+    assert!(h.query_all_by_label_contains("fps").next().is_some());
+}
+
+#[test]
+fn midi_monitor_pause_holds_the_list_and_resume_takes_new_messages() {
+    let mut h = app();
+    h.state_mut().midi_monitor_open = true;
+    h.state_mut().midi_log.push("first".into());
+    settle(&mut h);
+    click(&mut h, "Pause");
+    assert!(h.state().midi_log.paused());
+    h.state_mut().midi_log.push("second".into());
+    assert_eq!(h.state().midi_log.len(), 1);
+    click(&mut h, "Resume");
+    h.state_mut().midi_log.push("third".into());
+    assert_eq!(h.state().midi_log.copy_text(), "first\nthird");
+}
+
+#[test]
+fn midi_monitor_click_selects_a_line_for_copy() {
+    let mut h = app();
+    h.state_mut().midi_monitor_open = true;
+    h.state_mut().midi_log.push("alpha".into());
+    h.state_mut().midi_log.push("beta".into());
+    settle(&mut h);
+    click(&mut h, "alpha");
+    assert_eq!(h.state().midi_log.copy_text(), "alpha");
+    click(&mut h, "Copy");
+}
+
+#[test]
+fn right_click_on_a_slider_resets_that_param() {
+    let mut h = comp_tab_speed_two();
+    let btn_y = h
+        .query_all_by_label("Reset to default")
+        .find(|n| !NodeT::accesskit_node(n).is_disabled())
+        .unwrap()
+        .rect()
+        .center()
+        .y;
+    let slider = h
+        .query_all_by_role(egui::accesskit::Role::Slider)
+        .find(|n| (n.rect().center().y - btn_y).abs() < 4.0)
+        .expect("slider on the same row");
+    let pos = slider.rect().center();
+    h.hover_at(pos);
+    h.run_steps(2);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(2);
+    }
+    settle(&mut h);
+    assert_eq!(master_speed(&h), 2.0, "opening the menu changes nothing");
+    let entries: Vec<_> = h
+        .query_all_by_label("Reset to default")
+        .filter(|n| !NodeT::accesskit_node(n).is_disabled())
+        .collect();
+    assert_eq!(entries.len(), 2, "icon button plus menu entry");
+    entries[1].click();
+    settle(&mut h);
+    assert_eq!(master_speed(&h), 1.0);
+}
+
+#[test]
+fn saved_animation_preset_is_published_and_applied_from_the_popup() {
+    let mut h = comp_tab_speed_two();
+    let anim = vjc_model::Animation::Beats {
+        beats: 2.0,
+        curve: vjc_model::Curve::Saw,
+        motion: Default::default(),
+    };
+    // What the popup's "Save current" asks for.
+    h.ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<Vec<params::PresetReq>>(egui::Id::new("anim-preset-req"))
+            .push(params::PresetReq::Save("Saw 2".into(), anim.clone()))
+    });
+    h.run_steps(2);
+    assert_eq!(h.state().prefs.presets.animations.len(), 1);
+    assert!(h.state().prefs_dirty);
+    // Survives a prefs round trip on disk.
+    let path = std::env::temp_dir().join(format!("vjc-presets-{}.json", std::process::id()));
+    h.state().prefs.save(&path).unwrap();
+    let back = Prefs::load(&path).0;
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(back.presets.animations[0].animation, anim);
+    // Apply it from the animation popup of the master speed.
+    h.query_all_by_label("Animate").next().unwrap().click();
+    settle(&mut h);
+    click_menu(&mut h, "Presets");
+    click(&mut h, "Saw 2");
+    let json = serde_json::to_string(&h.state().project).unwrap();
+    assert!(
+        json.contains(&serde_json::to_string(&anim).unwrap()),
+        "the preset animation sits on a param of the project"
+    );
+}
+
+#[test]
+fn dashboard_preset_saves_and_applies_dial_values() {
+    let mut h = app_sized(1400.0, 1500.0);
+    h.state_mut().apply_layout(Layout {
+        params_h: 1200.0,
+        ..Layout::default()
+    });
+    h.state_mut().exec(Command::SetDashboardDial {
+        dial: 0,
+        value: 0.75,
+    });
+    settle(&mut h);
+    let slots = vec![vjc_io::param_presets::DialSlot {
+        name: "Fader".into(),
+        value: 0.25,
+        range: (0.0, 1.0),
+    }];
+    assert!(h.state_mut().prefs.presets.save_dashboard("Mine", slots));
+    click(&mut h, "Dashboard presets");
+    click(&mut h, "Mine");
+    assert_eq!(h.state().project.composition.dashboard[0].name, "Fader");
+}
+
+fn press_with(h: &mut Harness<'_, State>, mods: egui::Modifiers, key: egui::Key) {
+    h.event(egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+    });
+    h.event(egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: false,
+        repeat: false,
+        modifiers: mods,
+    });
+    h.run_steps(2);
+}
+
+fn master_fx_count(h: &Harness<'_, State>) -> usize {
+    vjc_core::effects::chain(&h.state().project, EffectTarget::Master).map_or(0, |c| c.len())
+}
+
+#[test]
+fn cmd_k_opens_quick_search_and_enter_adds_the_effect_to_master() {
+    let mut h = app();
+    settle(&mut h);
+    assert!(!h.state().palette.open);
+    press_with(&mut h, egui::Modifiers::COMMAND, egui::Key::K);
+    assert!(h.state().palette.open);
+    h.event(egui::Event::Text("gaussian".into()));
+    h.run_steps(2);
+    let before = master_fx_count(&h);
+    press_with(&mut h, egui::Modifiers::NONE, egui::Key::Enter);
+    assert!(!h.state().palette.open, "Enter closes the box");
+    assert_eq!(master_fx_count(&h), before + 1, "top hit added to Master");
+    // Esc closes without adding.
+    press_with(&mut h, egui::Modifiers::COMMAND, egui::Key::K);
+    assert!(h.state().palette.open);
+    press_with(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert!(!h.state().palette.open);
+    assert_eq!(master_fx_count(&h), before + 1);
+}
+
+#[test]
+fn quick_search_adds_effect_to_the_previewed_layer_not_master() {
+    let mut h = app();
+    let l = h.state().project.composition.layers[0].id;
+    h.state_mut().preview_target = PreviewTarget::Layer(l);
+    let id = vjc_fx::BUILTIN[0].0;
+    h.state_mut()
+        .palette_run(palette::Act::AddEffect(id.to_string()));
+    assert_eq!(master_fx_count(&h), 0);
+    let chain = vjc_core::effects::chain(&h.state().project, EffectTarget::Layer(l)).unwrap();
+    assert_eq!(chain.len(), 1);
+}
+
+#[test]
+fn quick_search_generator_fills_an_empty_cell_without_putting_it_on_air() {
+    let mut h = app();
+    let deck = h.state().project.composition.current_deck;
+    let (layer, col) = {
+        let p = &h.state().project;
+        let c = &p.composition;
+        c.layers
+            .iter()
+            .flat_map(|l| (0..c.columns.len() as u32).map(move |i| (l.id, i)))
+            .find(|(l, i)| vjc_core::clip_in(p, deck, *l, *i).is_none())
+            .expect("an empty cell")
+    };
+    h.state_mut().selected = Some((layer, col));
+    let gen_id = vjc_fx::GENERATORS[0].0.to_string();
+    h.state_mut().palette_run(palette::Act::Generator(gen_id));
+    assert!(vjc_core::clip_in(&h.state().project, deck, layer, col).is_some());
+    assert!(
+        h.state().gens.is_empty() && h.state().players.is_empty(),
+        "loaded, not triggered"
+    );
+    // An occupied cell is left alone.
+    let before = vjc_core::clip_in(&h.state().project, deck, layer, col).cloned();
+    let other = vjc_fx::GENERATORS[1].0.to_string();
+    h.state_mut().palette_run(palette::Act::Generator(other));
+    assert_eq!(
+        vjc_core::clip_in(&h.state().project, deck, layer, col).cloned(),
+        before
+    );
+}
+
+#[test]
+fn quick_search_lists_layers_clips_and_commands() {
+    let mut h = app();
+    h.state_mut().palette_open();
+    let kinds: std::collections::HashSet<_> =
+        h.state().palette.entries.iter().map(|e| e.kind).collect();
+    for k in [
+        palette::Kind::Effect,
+        palette::Kind::Generator,
+        palette::Kind::Layer,
+        palette::Kind::Command,
+    ] {
+        assert!(kinds.contains(&k), "{k:?}");
+    }
+}

@@ -486,6 +486,8 @@ pub struct Prefs {
     pub api: Api,
     pub timecode: Timecode,
     pub layouts: Layouts,
+    /// Parameter-animation and dashboard presets of this user.
+    pub presets: crate::param_presets::Presets,
 }
 
 impl Default for Prefs {
@@ -502,6 +504,7 @@ impl Default for Prefs {
             api: Api::default(),
             timecode: Timecode::default(),
             layouts: Layouts::default(),
+            presets: Default::default(),
         }
     }
 }

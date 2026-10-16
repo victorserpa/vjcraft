@@ -53,7 +53,6 @@ pub struct Preload {
 }
 
 impl Preload {
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.players.len()
     }
