@@ -460,6 +460,11 @@ pub enum Command {
         black_bg: bool,
     },
     /// Screen output delay in ms (clamped to 0..=100). Coalesces.
+    /// Additive blend of overlapping slices, alpha 0 outside them (soft-edge blending).
+    SetScreenAdditive {
+        screen: Uuid,
+        on: bool,
+    },
     SetScreenDelay {
         screen: Uuid,
         delay_ms: u32,
@@ -694,6 +699,21 @@ pub enum Command {
     SetGroupSolo {
         group: GroupId,
         solo: bool,
+    },
+    /// Group-level mask mode (the composed group masks the layers below it).
+    SetGroupMaskMode {
+        group: GroupId,
+        mode: vjc_model::MaskMode,
+    },
+    /// A column trigger skips every layer of the group.
+    SetGroupIgnoreColumn {
+        group: GroupId,
+        ignore: bool,
+    },
+    /// Locks the content of every layer of the group.
+    SetGroupLock {
+        group: GroupId,
+        locked: bool,
     },
     /// Group speed 0..=4, multiplies the speed of its clips (coalesces).
     SetGroupSpeed {
@@ -1936,7 +1956,7 @@ fn trigger_column(p: &Project, deck: DeckId, column: ColumnIdx) -> Result<Applie
     let mut events = vec![];
     for l in p.composition.layers.iter().filter(|l| {
         let own = clip_in(p, deck, l.id, column).and_then(|k| k.extras.ignore_column_trigger);
-        !own.unwrap_or(l.ignore_column_trigger) && !l.lock_content
+        !own.unwrap_or(p.composition.ignores_column(l)) && !p.composition.locked(l)
     }) {
         match trigger_event(p, deck, l.id, column) {
             Ok(e) => events.push(e),
@@ -1988,7 +2008,7 @@ pub fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             .iter()
             .find(|l| l.id == *layer)
             .filter(|l| {
-                !l.lock_content
+                !p.composition.locked(l)
                     && (l.fader_start
                         || p.composition.decks.iter().any(|d| {
                             d.clips
@@ -2059,7 +2079,7 @@ pub fn is_locked(p: &Project, layer: LayerId) -> bool {
     p.composition
         .layers
         .iter()
-        .any(|l| l.id == layer && l.lock_content)
+        .any(|l| l.id == layer && p.composition.locked(l))
 }
 
 /// Layer number as shown to the user: the bottom layer is 1.
@@ -2457,7 +2477,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 .composition
                 .layers
                 .iter()
-                .filter(|l| !l.lock_content)
+                .filter(|l| !p.composition.locked(l))
                 .map(|l| Event::LayerCleared { layer: l.id })
                 .collect(),
         }),
@@ -2488,7 +2508,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 p.composition
                     .layers
                     .iter()
-                    .filter(|l| !l.lock_content)
+                    .filter(|l| !p.composition.locked(l))
                     .map(|l| Event::LayerCleared { layer: l.id })
                     .collect()
             } else {
@@ -3042,6 +3062,11 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 },
                 vec![],
             )
+        }
+        Command::SetScreenAdditive { screen, on } => {
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.additive_overlap, on);
+            undoable(Command::SetScreenAdditive { screen, on: prev }, vec![])
         }
         Command::SetScreenDelay { screen, delay_ms } => {
             let s = screen_mut(p, screen)?;
@@ -4224,6 +4249,9 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::SetGroupBlend { .. }
         | Command::SetGroupBypass { .. }
         | Command::SetGroupSolo { .. }
+        | Command::SetGroupMaskMode { .. }
+        | Command::SetGroupIgnoreColumn { .. }
+        | Command::SetGroupLock { .. }
         | Command::SetGroupBus { .. }
         | Command::SetGroupSpeed { .. }
         | Command::MoveLayerToGroup { .. }
@@ -8200,6 +8228,28 @@ mod tests {
     }
 
     #[test]
+    fn screen_additive_overlap_sets_undoes_and_rejects_unknown_screens() {
+        let (mut p, sid, _) = one_screen_slice();
+        let before = p.clone();
+        let mut h = History::new();
+        let now = Instant::now();
+        assert!(!p.output.screens[0].additive_overlap);
+        let on = Command::SetScreenAdditive {
+            screen: sid,
+            on: true,
+        };
+        h.exec(&mut p, on, now).unwrap();
+        assert!(p.output.screens[0].additive_overlap);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        let ghost = Command::SetScreenAdditive {
+            screen: uuid::Uuid::new_v4(),
+            on: true,
+        };
+        assert!(h.exec(&mut p, ghost, now).is_err());
+    }
+
+    #[test]
     fn slice_color_clamps_validates_and_undoes() {
         let (mut p, sid, lid) = one_screen_slice();
         let before = p.clone();
@@ -8998,6 +9048,83 @@ mod tests {
             ev2.iter()
                 .any(|e| matches!(e, Event::GeneratorStarted { layer, .. } if *layer == l2))
         );
+    }
+
+    #[test]
+    fn group_ignoring_column_triggers_still_runs_its_own_group_column() {
+        let (mut p, [_, l2, _]) = three_layers();
+        gen_cell(&mut p, l2, 0);
+        let mut g = vjc_model::LayerGroup::new("G");
+        g.ignore_column_trigger = true;
+        let gid = g.id;
+        p.composition.groups.push(g);
+        p.composition.layers[1].group = Some(gid);
+        let cmds = crate::groups::trigger_column_commands(&p, gid, A, 0);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::TriggerClip { layer, .. } if *layer == l2)),
+            "the group's own column trigger reaches its members"
+        );
+    }
+
+    #[test]
+    fn group_ignore_lock_and_mask_commands_undo_and_apply_to_members() {
+        let (mut p, [l1, l2, _]) = three_layers();
+        gen_cell(&mut p, l1, 0);
+        gen_cell(&mut p, l2, 0);
+        let g = vjc_model::LayerGroup::new("G");
+        let gid = g.id;
+        p.composition.groups.push(g);
+        p.composition.layers[1].group = Some(gid);
+        let before = p.clone();
+        let mut h = History::new();
+        let t = Instant::now();
+        for c in [
+            Command::SetGroupMaskMode {
+                group: gid,
+                mode: vjc_model::MaskMode::AllBelow,
+            },
+            Command::SetGroupIgnoreColumn {
+                group: gid,
+                ignore: true,
+            },
+            Command::SetGroupLock {
+                group: gid,
+                locked: true,
+            },
+        ] {
+            h.exec(&mut p, c, t).unwrap();
+        }
+        let g = &p.composition.groups[0];
+        assert!(g.ignore_column_trigger && g.lock_content);
+        assert_eq!(g.mask_mode, vjc_model::MaskMode::AllBelow);
+        // The member follows its group, the layer outside does not.
+        assert!(is_locked(&p, l2) && !is_locked(&p, l1));
+        let ev = apply(&mut p, Command::TriggerColumn { deck: A, column: 0 })
+            .unwrap()
+            .events;
+        let on = |l| {
+            ev.iter()
+                .any(|e| matches!(e, Event::GeneratorStarted { layer, .. } if *layer == l))
+        };
+        assert!(on(l1) && !on(l2));
+        for _ in 0..3 {
+            h.undo(&mut p).unwrap().unwrap();
+        }
+        assert_eq!(p.composition.groups, before.composition.groups);
+        assert!(!is_locked(&p, l2));
+        let ev = apply(&mut p, Command::TriggerColumn { deck: A, column: 0 })
+            .unwrap()
+            .events;
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, Event::GeneratorStarted { layer, .. } if *layer == l2))
+        );
+        let bad = Command::SetGroupLock {
+            group: uuid::Uuid::new_v4(),
+            locked: true,
+        };
+        assert!(h.exec(&mut p, bad, t).is_err());
     }
 
     #[test]

@@ -447,6 +447,43 @@ pub fn edit(scr: &Screen, sl: &Slice, side: Side, comp: (u32, u32), op: Op) -> O
     })
 }
 
+/// Items whose rectangle touches the box spanned by the corners `a` and `b` (any order).
+pub fn pick_box<T: Copy>(items: &[(T, Rect)], a: Pt, b: Pt) -> Vec<T> {
+    let (x0, x1) = (a.0.min(b.0), a.0.max(b.0));
+    let (y0, y1) = (a.1.min(b.1), a.1.max(b.1));
+    items
+        .iter()
+        .filter(|(_, r)| r.x <= x1 && r.x + r.w >= x0 && r.y <= y1 && r.y + r.h >= y0)
+        .map(|(t, _)| *t)
+        .collect()
+}
+
+/// Even-odd point in polygon test.
+pub fn point_in_polygon(poly: &[Pt], p: Pt) -> bool {
+    let mut inside = false;
+    let mut j = poly.len().wrapping_sub(1);
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a.1 > p.1) != (b.1 > p.1) && p.0 < (b.0 - a.0) * (p.1 - a.1) / (b.1 - a.1) + a.0 {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Items whose rectangle centre lies inside the lasso `poly` (at least 3 points).
+pub fn pick_lasso<T: Copy>(items: &[(T, Rect)], poly: &[Pt]) -> Vec<T> {
+    if poly.len() < 3 {
+        return vec![];
+    }
+    items
+        .iter()
+        .filter(|(_, r)| point_in_polygon(poly, r.center()))
+        .map(|(t, _)| *t)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +771,27 @@ mod tests {
             snap_to_guides((958.0, 538.0), &xs, &ys, 6.0),
             (960.0, 540.0)
         );
+    }
+
+    #[test]
+    fn box_and_lasso_pick_the_slices_they_cover() {
+        let r = |x, y| Rect {
+            x,
+            y,
+            w: 10.0,
+            h: 10.0,
+        };
+        let items = [(1, r(0.0, 0.0)), (2, r(50.0, 0.0)), (3, r(0.0, 50.0))];
+        // A box touching an edge counts; order of the corners does not matter.
+        assert_eq!(pick_box(&items, (60.0, 5.0), (8.0, -5.0)), vec![1, 2]);
+        assert_eq!(
+            pick_box(&items, (20.0, 20.0), (40.0, 40.0)),
+            Vec::<i32>::new()
+        );
+        // Lasso: a triangle around slices 1 and 3 centres, not 2.
+        let tri = [(-5.0, -20.0), (-5.0, 70.0), (30.0, 30.0)];
+        assert_eq!(pick_lasso(&items, &tri), vec![1, 3]);
+        assert!(pick_lasso(&items, &tri[..2]).is_empty());
+        assert!(point_in_polygon(&tri, (0.0, 30.0)) && !point_in_polygon(&tri, (40.0, 30.0)));
     }
 }

@@ -331,6 +331,18 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ),
     ("lut3d", include_str!("../../../assets/effects/lut3d.fs")),
     (
+        "auto_mask",
+        include_str!("../../../assets/effects/auto_mask.fs"),
+    ),
+    (
+        "shape_mask",
+        include_str!("../../../assets/effects/shape_mask.fs"),
+    ),
+    (
+        "image_mask",
+        include_str!("../../../assets/effects/image_mask.fs"),
+    ),
+    (
         "cloner_grid",
         include_str!("../../../assets/effects/cloner_grid.fs"),
     ),

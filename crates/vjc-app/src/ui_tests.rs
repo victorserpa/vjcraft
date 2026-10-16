@@ -43,7 +43,13 @@ fn styled_ui() -> impl FnMut(&mut egui::Ui, &mut State) {
 }
 
 fn app_with(state: State, size: egui::Vec2) -> Harness<'static, State> {
-    let mut b: HarnessBuilder<State> = Harness::builder().with_size(size);
+    app_with_dt(state, size, 1.0 / 4.0)
+}
+
+/// `dt` is the simulated time of one step; a short one keeps two clicks inside egui's
+/// double-click window.
+fn app_with_dt(state: State, size: egui::Vec2, dt: f32) -> Harness<'static, State> {
+    let mut b: HarnessBuilder<State> = Harness::builder().with_size(size).with_step_dt(dt);
     if gpu() {
         b = b.wgpu();
     }
@@ -7286,4 +7292,169 @@ fn audio_prefs_reach_the_engine_config_on_save() {
     let before = st.audio_cfg.clone();
     st.save_prefs();
     assert_eq!(st.audio_cfg, before);
+}
+
+/// Left column slices A (100..400 x 100..300) and B (100..400 x 700..900) plus C
+/// (800..1100 x 50..250) on a 1920x1080 screen, the Output setup window open.
+fn overview_setup() -> Harness<'static, State> {
+    overview_setup_dt(1.0 / 4.0)
+}
+
+fn overview_setup_dt(dt: f32) -> Harness<'static, State> {
+    let state = small_grid(State::headless(prefs()));
+    let mut h = app_with_dt(state, egui::vec2(1280.0, 800.0), dt);
+    let mut scr = vjc_core::mapping::new_screen("Wall", 1920, 1080);
+    for (x, y, w, hh) in [
+        (100.0, 100.0, 300.0, 200.0),
+        (100.0, 700.0, 300.0, 200.0),
+        (800.0, 50.0, 300.0, 200.0),
+    ] {
+        let mut sl = vjc_core::mapping::new_slice(1920, 1080);
+        sl.output_mesh = vec![(x, y), (x + w, y), (x, y + hh), (x + w, y + hh)];
+        scr.slices.push(sl);
+    }
+    h.state_mut().exec(Command::AddScreen {
+        screen: scr,
+        index: 0,
+    });
+    settle(&mut h);
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    h
+}
+
+fn overview_rect(h: &Harness<'_, State>) -> egui::Rect {
+    h.ctx
+        .data(|d| d.get_temp::<egui::Rect>(crate::slice_overview::rect_id()))
+        .expect("overview drawn")
+}
+
+/// Screen pixel (1920x1080 space) -> overview canvas point.
+fn ov(h: &Harness<'_, State>, x: f32, y: f32) -> egui::Pos2 {
+    let r = overview_rect(h);
+    egui::pos2(
+        r.min.x + x / 1920.0 * r.width(),
+        r.min.y + y / 1080.0 * r.height(),
+    )
+}
+
+/// Presses at the first point, walks the path, releases at the last, holding `mods`.
+fn path_drag(h: &mut Harness<'_, State>, path: &[egui::Pos2], mods: egui::Modifiers) {
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: mods,
+    };
+    h.event(egui::Event::ModifiersChanged(mods));
+    h.hover_at(path[0]);
+    h.step();
+    h.event(button(path[0], true));
+    h.step();
+    for w in path.windows(2) {
+        for i in 1..=12 {
+            h.event(egui::Event::PointerMoved(w[0].lerp(w[1], i as f32 / 12.0)));
+            h.step();
+        }
+    }
+    h.event(button(*path.last().unwrap(), false));
+    settle(h);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    settle(h);
+}
+
+fn selected_ids(h: &Harness<'_, State>) -> Vec<usize> {
+    let scr = &h.state().project.output.screens[0];
+    let st = h.state();
+    scr.slices
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            st.sel_slices.contains(&s.id)
+                || (st.sel_slices.is_empty() && st.sel_slice == Some(s.id))
+                || (st.sel_slice.is_none() && *i == 0)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[test]
+fn lasso_selects_slices_by_centre_and_box_by_touch() {
+    let mut h = overview_setup();
+    // A triangle around the centres of A and B whose bounding box also covers C.
+    let tri = [
+        ov(&h, 30.0, 30.0),
+        ov(&h, 30.0, 970.0),
+        ov(&h, 1200.0, 500.0),
+        ov(&h, 30.0, 30.0),
+    ];
+    path_drag(&mut h, &tri, egui::Modifiers::ALT);
+    assert_eq!(selected_ids(&h), vec![0, 1], "lasso keeps C out");
+    assert_eq!(h.state().sel_slices.len(), 2);
+    // Control: the same corners as a plain box touch all three slices.
+    let (a, b) = (ov(&h, 30.0, 30.0), ov(&h, 1200.0, 970.0));
+    path_drag(&mut h, &[a, b], egui::Modifiers::NONE);
+    assert_eq!(selected_ids(&h), vec![0, 1, 2]);
+    // A box around C alone replaces the selection; with Shift it adds to it.
+    let (c0, c1) = (ov(&h, 700.0, 20.0), ov(&h, 1200.0, 300.0));
+    path_drag(&mut h, &[c0, c1], egui::Modifiers::NONE);
+    assert_eq!(selected_ids(&h), vec![2]);
+    let (a0, a1) = (ov(&h, 20.0, 20.0), ov(&h, 500.0, 350.0));
+    path_drag(&mut h, &[a0, a1], egui::Modifiers::SHIFT);
+    assert_eq!(selected_ids(&h), vec![0, 2]);
+}
+
+#[test]
+fn double_clicking_a_slice_previews_its_layer() {
+    let mut h = overview_setup_dt(0.02);
+    let layer = h.state().project.composition.layers[0].id;
+    let scr_id = h.state().project.output.screens[0].id;
+    let slice_id = h.state().project.output.screens[0].slices[2].id;
+    h.state_mut().exec(Command::SetSliceSource {
+        screen: scr_id,
+        slice: slice_id,
+        source: vjc_model::SliceSource::Layer(layer),
+    });
+    settle(&mut h);
+    assert_eq!(h.state().preview_target, PreviewTarget::Composition);
+    let at = ov(&h, 950.0, 150.0);
+    double_click_at(&mut h, at);
+    assert_eq!(h.state().preview_target, PreviewTarget::Layer(layer));
+    assert_eq!(h.state().sel_slice, Some(slice_id));
+}
+
+#[test]
+fn shift_click_on_a_slice_section_folds_all_of_them() {
+    let mut h = overview_setup();
+    let header = |h: &Harness<'_, State>, t: &str| h.get_by_label(t).rect().center();
+    let click_at = |h: &mut Harness<'_, State>, at: egui::Pos2, mods: egui::Modifiers| {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: mods,
+        };
+        h.event(egui::Event::ModifiersChanged(mods));
+        h.hover_at(at);
+        h.step();
+        h.event(button(true));
+        h.step();
+        h.event(button(false));
+        settle(h);
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        settle(h);
+    };
+    assert!(exists(&h, "Rectangle") && exists(&h, "Enabled"));
+    // Plain click folds only its own section.
+    let at = header(&h, "Soft edge");
+    click_at(&mut h, at, egui::Modifiers::NONE);
+    assert!(exists(&h, "Rectangle") && !exists(&h, "Enabled"));
+    // Shift+click folds every section.
+    let at = header(&h, "Mask");
+    click_at(&mut h, at, egui::Modifiers::SHIFT);
+    assert!(!exists(&h, "Rectangle") && !exists(&h, "Enabled"));
+    // Shift+click again opens them all.
+    let at = header(&h, "Mask");
+    click_at(&mut h, at, egui::Modifiers::SHIFT);
+    assert!(exists(&h, "Rectangle") && exists(&h, "Enabled"));
 }

@@ -11,6 +11,9 @@ use crate::FxError;
 pub struct Lut {
     pub size: u32,
     pub data: Vec<[f32; 3]>,
+    /// A plain RGBA8 picture (width, height, pixels) travelling through the same texture
+    /// slot, for the image mask effect. `size` is 0 and `data` empty then.
+    pub image: Option<(u32, u32, Vec<u8>)>,
 }
 
 /// The LUT uploads as an n*n-wide strip: 64 gives 4096 px, inside every GPU's 2D limit (8192).
@@ -63,10 +66,23 @@ pub fn parse_cube(text: &str) -> Result<Lut, FxError> {
     if data.len() != want {
         return err(format!("expected {want} entries, found {}", data.len()));
     }
-    Ok(Lut { size, data })
+    Ok(Lut {
+        size,
+        data,
+        image: None,
+    })
 }
 
 impl Lut {
+    /// A picture (RGBA8, top row first) sent to the GPU like a LUT strip.
+    pub fn picture(w: u32, h: u32, rgba: Vec<u8>) -> Lut {
+        Lut {
+            size: 0,
+            data: vec![],
+            image: Some((w, h, rgba)),
+        }
+    }
+
     /// The LUT that maps every colour to itself.
     pub fn identity(size: u32) -> Lut {
         let s = size as usize;
@@ -79,11 +95,18 @@ impl Lut {
                 }
             }
         }
-        Lut { size, data }
+        Lut {
+            size,
+            data,
+            image: None,
+        }
     }
 
     /// RGBA8 strip: width `size * size`, height `size`; texel (b * size + r, g).
     pub fn strip_rgba8(&self) -> (u32, u32, Vec<u8>) {
+        if let Some((w, h, px)) = &self.image {
+            return (*w, *h, px.clone());
+        }
         let s = self.size as usize;
         let (w, h) = (s * s, s);
         let mut px = vec![255u8; w * h * 4];

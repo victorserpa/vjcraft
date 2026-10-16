@@ -752,8 +752,16 @@ mod tests {
     }
 
     /// Effects that clear alpha on purpose (keyers; remove_bg without a mask; crop at its
-    /// extremes cuts everything).
-    const KEYERS: [&str; 4] = ["chroma_key", "luma_key", "remove_bg", "crop"];
+    /// extremes cuts everything; the mask effects cut by design).
+    const KEYERS: [&str; 7] = [
+        "chroma_key",
+        "luma_key",
+        "remove_bg",
+        "crop",
+        "auto_mask",
+        "shape_mask",
+        "image_mask",
+    ];
 
     /// Every bundled shader at default, minimum and maximum parameters and at several
     /// times: no transparent-black holes (NaN) outside the keyers; at defaults, not a fully

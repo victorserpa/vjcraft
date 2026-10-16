@@ -48,7 +48,7 @@ pub fn trigger_column_commands(
         .filter(|l| {
             let own =
                 crate::clip_in(p, deck, l.id, column).and_then(|k| k.extras.ignore_column_trigger);
-            !own.unwrap_or(l.ignore_column_trigger) && !l.lock_content
+            !own.unwrap_or(l.ignore_column_trigger) && !p.composition.locked(l)
         })
         .map(|l| {
             if crate::clip_in(p, deck, l.id, column).is_some() {
@@ -174,6 +174,34 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let gi = check_group(p, group)?;
             let prev = std::mem::replace(&mut p.composition.groups[gi].solo, solo);
             undoable(Command::SetGroupSolo { group, solo: prev }, vec![])
+        }
+        Command::SetGroupMaskMode { group, mode } => {
+            let gi = check_group(p, group)?;
+            let prev = std::mem::replace(&mut p.composition.groups[gi].mask_mode, mode);
+            undoable(Command::SetGroupMaskMode { group, mode: prev }, vec![])
+        }
+        Command::SetGroupIgnoreColumn { group, ignore } => {
+            let gi = check_group(p, group)?;
+            let g = &mut p.composition.groups[gi];
+            let prev = std::mem::replace(&mut g.ignore_column_trigger, ignore);
+            undoable(
+                Command::SetGroupIgnoreColumn {
+                    group,
+                    ignore: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetGroupLock { group, locked } => {
+            let gi = check_group(p, group)?;
+            let prev = std::mem::replace(&mut p.composition.groups[gi].lock_content, locked);
+            undoable(
+                Command::SetGroupLock {
+                    group,
+                    locked: prev,
+                },
+                vec![],
+            )
         }
         Command::SetGroupSpeed { group, value } => {
             if !value.is_finite() || !(0.0..=4.0).contains(&value) {

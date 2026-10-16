@@ -346,6 +346,16 @@ pub struct LayerGroup {
     /// Crossfader bus of the group; layers without a bus of their own follow it.
     #[serde(default)]
     pub crossfader_bus: Option<Bus>,
+    /// Group-level mask: the composed group is not drawn, its luminance masks the
+    /// ungrouped layers below it.
+    #[serde(default)]
+    pub mask_mode: MaskMode,
+    /// A column trigger skips every layer of the group.
+    #[serde(default)]
+    pub ignore_column_trigger: bool,
+    /// Content lock for every layer of the group.
+    #[serde(default)]
+    pub lock_content: bool,
 }
 
 impl LayerGroup {
@@ -359,6 +369,9 @@ impl LayerGroup {
             speed: 1.0,
             folded: false,
             crossfader_bus: None,
+            mask_mode: MaskMode::Off,
+            ignore_column_trigger: false,
+            lock_content: false,
         }
     }
 }
@@ -1466,6 +1479,11 @@ pub struct Screen {
     /// Output delay in milliseconds (0..=100), to line screens up. 0 = no queue.
     #[serde(default)]
     pub delay_ms: u32,
+    /// Edge blending for projector overlap: slices are added where they overlap and the
+    /// area outside every slice has alpha 0 instead of black. Off = later slices cover
+    /// earlier ones over black.
+    #[serde(default)]
+    pub additive_overlap: bool,
 }
 
 fn default_true() -> bool {
@@ -2041,6 +2059,20 @@ impl Composition {
 
     pub fn group(&self, id: GroupId) -> Option<&LayerGroup> {
         self.groups.iter().find(|g| g.id == id)
+    }
+
+    fn layer_group(&self, l: &Layer) -> Option<&LayerGroup> {
+        l.group.and_then(|g| self.group(g))
+    }
+
+    /// Content of the layer is locked, by itself or by its group.
+    pub fn locked(&self, l: &Layer) -> bool {
+        l.lock_content || self.layer_group(l).is_some_and(|g| g.lock_content)
+    }
+
+    /// A column trigger leaves the layer alone (its own flag or its group's).
+    pub fn ignores_column(&self, l: &Layer) -> bool {
+        l.ignore_column_trigger || self.layer_group(l).is_some_and(|g| g.ignore_column_trigger)
     }
 
     fn any_solo(&self) -> bool {
@@ -2819,6 +2851,51 @@ mod tests {
             !serde_json::from_value::<Layer>(v)
                 .unwrap()
                 .ignore_column_trigger
+        );
+    }
+
+    #[test]
+    fn old_group_without_mask_ignore_lock_loads_with_defaults() {
+        let mut g = LayerGroup::new("G");
+        g.mask_mode = MaskMode::OneBelow;
+        g.ignore_column_trigger = true;
+        g.lock_content = true;
+        let mut v = serde_json::to_value(&g).unwrap();
+        assert_eq!(serde_json::from_value::<LayerGroup>(v.clone()).unwrap(), g);
+        for k in ["mask_mode", "ignore_column_trigger", "lock_content"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: LayerGroup = serde_json::from_value(v).unwrap();
+        assert_eq!(old.mask_mode, MaskMode::Off);
+        assert!(!old.ignore_column_trigger && !old.lock_content);
+    }
+
+    #[test]
+    fn old_screen_without_additive_overlap_loads_off() {
+        let scr = Screen {
+            id: Uuid::new_v4(),
+            name: "S".into(),
+            device: OutputDevice::Window,
+            width: 8,
+            height: 8,
+            slices: vec![],
+            pixel_perfect: false,
+            enabled: true,
+            color: Default::default(),
+            delay_ms: 0,
+            additive_overlap: true,
+        };
+        let mut v = serde_json::to_value(&scr).unwrap();
+        assert!(
+            serde_json::from_value::<Screen>(v.clone())
+                .unwrap()
+                .additive_overlap
+        );
+        v.as_object_mut().unwrap().remove("additive_overlap");
+        assert!(
+            !serde_json::from_value::<Screen>(v)
+                .unwrap()
+                .additive_overlap
         );
     }
 }

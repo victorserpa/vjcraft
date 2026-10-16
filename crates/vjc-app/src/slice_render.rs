@@ -123,6 +123,8 @@ pub type SliceSrc<'a> = (&'a wgpu::TextureView, (u32, u32));
 
 pub struct SliceRenderer {
     pipe: wgpu::RenderPipeline,
+    /// Same shader with additive blending, for screens with `additive_overlap`.
+    pipe_add: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     ubgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -175,35 +177,49 @@ impl SliceRenderer {
             immediate_size: 0,
         });
         let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x2];
-        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("slices_pipe"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 24,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &attrs,
-                })],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make = |blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("slices_pipe"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 24,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attrs,
+                    })],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: FORMAT,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let add = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let (pipe, pipe_add) = (
+            make(None),
+            make(Some(wgpu::BlendState {
+                color: add,
+                alpha: add,
+            })),
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -216,6 +232,7 @@ impl SliceRenderer {
         });
         Self {
             pipe,
+            pipe_add,
             bgl,
             ubgl,
             sampler,
@@ -223,7 +240,7 @@ impl SliceRenderer {
         }
     }
 
-    /// Clears `target` to black and draws every slice of `screen`, each sampling the texture
+    /// Clears `target` to black (transparent with `additive_overlap`) and draws every slice of `screen`, each sampling the texture
     /// `src` returns for it (with its size). With `screen.pixel_perfect`, unscaled slices
     /// sample nearest.
     pub fn render<'a>(
@@ -303,6 +320,9 @@ impl SliceRenderer {
                 })
             })
             .collect();
+        // Additive screens start transparent (alpha 0 outside the slices); a disabled one
+        // stays an opaque black frame.
+        let additive = screen.additive_overlap && screen.enabled;
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -312,7 +332,11 @@ impl SliceRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(if additive {
+                            wgpu::Color::TRANSPARENT
+                        } else {
+                            wgpu::Color::BLACK
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -321,7 +345,7 @@ impl SliceRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipe);
+            pass.set_pipeline(if additive { &self.pipe_add } else { &self.pipe });
             for (b, n, ubind, (bind, bind_nearest), near) in &bufs {
                 pass.set_bind_group(0, if *near { bind_nearest } else { bind }, &[]);
                 pass.set_bind_group(1, ubind, &[]);
@@ -821,6 +845,37 @@ mod tests {
         screen.slices[0].color = Default::default();
         let id = render_rgba(&screen, [200, 200, 200, 255]).unwrap();
         assert_eq!(px(&id, 1, 0, 0), [200, 200, 200, 255]);
+    }
+
+    /// Additive screens add overlapping slices and leave alpha 0 outside them; the default
+    /// covers earlier slices over opaque black (negative control: the flag off).
+    #[test]
+    fn gpu_additive_overlap_adds_slices_and_clears_to_alpha_zero() {
+        let src = [100, 50, 20, 255];
+        let mut screen = mapping::new_screen("t", 4, 1);
+        screen.slices = vec![mapping::new_slice(4, 1), mapping::new_slice(4, 1)];
+        let Some(off) = render_rgba(&screen, src) else {
+            return;
+        };
+        assert_eq!(px(&off, 4, 1, 0), src, "second slice covers the first");
+        screen.additive_overlap = true;
+        let on = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&on, 4, 1, 0), [200, 100, 40, 255], "overlap adds up");
+        // One slice over the left half: the right half is black (off) or alpha 0 (on).
+        screen.slices.truncate(1);
+        screen.slices[0].output_mesh = vec![(0.0, 0.0), (2.0, 0.0), (0.0, 1.0), (2.0, 1.0)];
+        screen.slices[0].mesh_cols = 2;
+        let on = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&on, 4, 0, 0), src);
+        assert_eq!(px(&on, 4, 3, 0), [0, 0, 0, 0], "outside is transparent");
+        screen.additive_overlap = false;
+        let off = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&off, 4, 3, 0), [0, 0, 0, 255], "outside is black");
+        // A disabled additive screen is still an opaque black frame.
+        screen.additive_overlap = true;
+        screen.enabled = false;
+        let dis = render_rgba(&screen, src).unwrap();
+        assert_eq!(px(&dis, 4, 0, 0), [0, 0, 0, 255]);
     }
 
     fn one_slice_screen() -> Screen {
