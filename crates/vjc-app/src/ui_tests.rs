@@ -2608,13 +2608,13 @@ fn slice_source_dropdown_routes_a_layer_and_undoes() {
         .find(|l| l.name == "Layer 1")
         .unwrap()
         .id;
-    click(&mut h, "Source");
+    click(&mut h, "Source list");
     click(&mut h, "Layer: Layer 1");
     assert_eq!(first_slice(&h).source, SliceSource::Layer(layer));
     click(&mut h, "Undo edit");
     assert_eq!(first_slice(&h).source, SliceSource::Composition);
     // The menu also offers the preview.
-    click(&mut h, "Source");
+    click(&mut h, "Source list");
     assert!(exists(&h, "Preview"));
 }
 

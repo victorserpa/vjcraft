@@ -246,7 +246,7 @@ impl State {
             _ => self.device_label(c),
         };
         widgets::prop_row(ui, Some("Device"), |ui| {
-            egui::ComboBox::from_id_salt(("screen-device", c.id))
+            let combo = egui::ComboBox::from_id_salt(("screen-device", c.id))
             .selected_text(label)
             .show_ui(ui, |ui| {
                 if ui
@@ -291,6 +291,7 @@ impl State {
                     }
                 }
             });
+            crate::icons::name(combo.response, "Device list", None);
         });
     }
 
@@ -408,7 +409,7 @@ impl State {
                 .map(|g| (format!("Group: {}", g.name), SliceSource::Group(g.id))),
         );
         widgets::prop_row(ui, Some("Source"), |ui| {
-            egui::ComboBox::from_id_salt(("slice-source", sl.id))
+            let combo = egui::ComboBox::from_id_salt(("slice-source", sl.id))
                 .selected_text(current)
                 .show_ui(ui, |ui| {
                     for (label, source) in choices {
@@ -430,6 +431,7 @@ impl State {
                         }
                     }
                 });
+            crate::icons::name(combo.response, "Source list", None);
         });
     }
 
