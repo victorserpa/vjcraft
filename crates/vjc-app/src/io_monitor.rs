@@ -39,10 +39,6 @@ impl Log {
         self.lines.push_back(line);
     }
 
-    pub fn lines(&self) -> impl Iterator<Item = &String> {
-        self.lines.iter()
-    }
-
     pub fn len(&self) -> usize {
         self.lines.len()
     }
@@ -203,8 +199,8 @@ mod tests {
             l.push(i.to_string());
         }
         assert_eq!(l.len(), MAX_LINES);
-        assert_eq!(l.lines().next().unwrap(), "5");
-        assert_eq!(l.lines().last().unwrap(), &(MAX_LINES + 4).to_string());
+        assert_eq!(l.numbered().next().unwrap().1, "5");
+        assert_eq!(l.numbered().last().unwrap().1, &(MAX_LINES + 4).to_string());
     }
 
     #[test]
