@@ -200,6 +200,9 @@ impl State {
                     ui.vertical(|ui| {
                         ui.set_width(OUTPUT_LIST_W);
                         self.screen_list(ui, &screens, sel_screen.as_ref(), (cw, ch), &mut cmds);
+                        if let Some(scr) = &sel_screen {
+                            self.slice_overview(ui, scr);
+                        }
                     });
                     ui.separator();
                     if let Some(scr) = &sel_screen {
@@ -930,7 +933,7 @@ impl State {
             slice: sl.id,
             mask: m,
         };
-        widgets::section(ui, "Mask", |ui| {
+        widgets::fold_section(ui, "slice", "Mask", |ui| {
             ui.horizontal(|ui| {
                 if sl.mask.is_none() {
                     self.edit_mask = false;
@@ -1015,7 +1018,7 @@ impl State {
                 }
             });
         });
-        widgets::section(ui, "Soft edge", |ui| {
+        widgets::fold_section(ui, "slice", "Soft edge", |ui| {
             ui.horizontal_wrapped(|ui| {
                 let mut on = sl.soft_edge.is_some();
                 if toggle(ui, &mut on, "Enabled").changed() {
@@ -1059,7 +1062,7 @@ impl State {
         sl: &vjc_model::Slice,
         cmds: &mut Vec<Command>,
     ) {
-        widgets::section(ui, "Alpha", |ui| {
+        widgets::fold_section(ui, "slice", "Alpha", |ui| {
             ui.horizontal(|ui| {
                 let (mut key, mut bg) = (sl.is_key, sl.black_bg);
                 let a = toggle(ui, &mut key, "Is Key").changed();
@@ -1084,7 +1087,7 @@ impl State {
         sl: &vjc_model::Slice,
         cmds: &mut Vec<Command>,
     ) {
-        widgets::section(ui, "Colour", |ui| {
+        widgets::fold_section(ui, "slice", "Colour", |ui| {
             ui.horizontal_wrapped(|ui| {
                 let mut n = sl.color;
                 let r = 0.0..=mapping::MAX_GAIN;

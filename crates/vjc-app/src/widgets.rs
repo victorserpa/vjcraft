@@ -144,6 +144,61 @@ pub fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui))
     ui.add_space(SP_4);
 }
 
+/// Like `section`, but the header folds the body. The fold state lives in egui memory under
+/// `group` + title; Shift+click on a header folds or unfolds every section of the group.
+pub fn fold_section(ui: &mut egui::Ui, group: &str, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let key = |t: &str| egui::Id::new(("fold", group, t.to_owned()));
+    let list = egui::Id::new(("fold-all", group));
+    let open = ui.data(|d| d.get_temp::<bool>(key(title))).unwrap_or(true);
+    ui.data_mut(|d| {
+        let seen = d.get_temp_mut_or_default::<Vec<String>>(list);
+        if !seen.iter().any(|t| t == title) {
+            seen.push(title.to_owned());
+        }
+    });
+    let caret = if open {
+        crate::icons::i::CARET_DOWN
+    } else {
+        crate::icons::i::CARET_RIGHT
+    };
+    let r = ui
+        .horizontal(|ui| {
+            let c = ui.add(
+                egui::Label::new(crate::icons::glyph(caret).color(TEXT_MUTED))
+                    .sense(egui::Sense::click()),
+            );
+            let t = ui.add(
+                egui::Label::new(
+                    RichText::new(title)
+                        .font(bold_font(ui.ctx(), FS_SM))
+                        .color(TEXT),
+                )
+                .sense(egui::Sense::click()),
+            );
+            c.union(t)
+        })
+        .inner;
+    if r.clicked() {
+        let all = ui.input(|i| i.modifiers.shift);
+        let titles = if all {
+            ui.data(|d| d.get_temp::<Vec<String>>(list))
+                .unwrap_or_default()
+        } else {
+            vec![title.to_owned()]
+        };
+        ui.data_mut(|d| {
+            titles.iter().for_each(|t| {
+                d.insert_temp(key(t), !open);
+            })
+        });
+    }
+    ui.separator();
+    if open {
+        body(ui);
+    }
+    ui.add_space(SP_4);
+}
+
 /// Small muted help line.
 pub fn help(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.label(RichText::new(text).size(FS_XS).color(TEXT_MUTED))

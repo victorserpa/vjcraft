@@ -43,6 +43,7 @@ mod preload;
 mod qr;
 mod shortcut_editor;
 mod slice_inspector;
+mod slice_overview;
 mod slice_render;
 mod source_info;
 mod stats_bar;
