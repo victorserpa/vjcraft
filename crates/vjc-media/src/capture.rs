@@ -198,7 +198,7 @@ pub(crate) fn run_capture(device: &str, shared: &Shared) -> Result<(), String> {
 }
 
 fn publish(shared: &Shared, f: Frame) {
-    *shared.latest.lock().unwrap() = Some(f);
+    *crate::lock(&shared.latest) = Some(f);
 }
 
 #[cfg(test)]

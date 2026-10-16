@@ -114,6 +114,28 @@ impl Shared {
     }
 }
 
+/// Locks ignoring poison: a panicked decoder thread must not turn the UI thread's next
+/// read of the slot into a second panic.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Text of a panic payload.
+pub fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
+/// Runs a player thread body; a panic marks the player failed (`error()`) instead of
+/// leaving a silent dead thread, and never reaches the rest of the app.
+fn guarded(shared: &Shared, what: &str, body: impl FnOnce()) {
+    if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        *lock(&shared.error) = Some(format!("{what} crashed: {}", panic_text(&*p)));
+    }
+}
+
 pub struct Player {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -131,20 +153,22 @@ impl Player {
         let thread = std::thread::Builder::new()
             .name("vjc-decode".into())
             .spawn(move || {
-                if let Some((pattern, fps)) = sequence::parse_label(&p) {
-                    run_sequence(&pattern, fps, &s);
-                    return;
-                }
-                if is_image(&p) {
-                    match load_image(&p) {
-                        Ok(f) => *s.latest.lock().unwrap() = Some(f),
-                        Err(e) => *s.error.lock().unwrap() = Some(e),
+                guarded(&s.clone(), "decoder", move || {
+                    if let Some((pattern, fps)) = sequence::parse_label(&p) {
+                        run_sequence(&pattern, fps, &s);
+                        return;
                     }
-                    return;
-                }
-                if let Err(e) = run_scrub(&p, &s) {
-                    *s.error.lock().unwrap() = Some(e.to_string());
-                }
+                    if is_image(&p) {
+                        match load_image(&p) {
+                            Ok(f) => *lock(&s.latest) = Some(f),
+                            Err(e) => *lock(&s.error) = Some(e),
+                        }
+                        return;
+                    }
+                    if let Err(e) = run_scrub(&p, &s) {
+                        *lock(&s.error) = Some(e.to_string());
+                    }
+                })
             })
             .ok();
         Player {
@@ -163,9 +187,11 @@ impl Player {
         let thread = std::thread::Builder::new()
             .name("vjc-capture".into())
             .spawn(move || {
-                if let Err(e) = capture::run_capture(&d, &s) {
-                    *s.error.lock().unwrap() = Some(e);
-                }
+                guarded(&s.clone(), "capture", || {
+                    if let Err(e) = capture::run_capture(&d, &s) {
+                        *lock(&s.error) = Some(e);
+                    }
+                })
             })
             .ok();
         Player {
@@ -189,27 +215,29 @@ impl Player {
         let thread = std::thread::Builder::new()
             .name("vjc-external".into())
             .spawn(move || {
-                let mut seq = 0u64;
-                let mut sink = |width: u32, height: u32, data: Vec<u8>| {
-                    if s.stop.load(Ordering::Relaxed) {
-                        return false;
+                guarded(&s.clone(), "source", || {
+                    let mut seq = 0u64;
+                    let mut sink = |width: u32, height: u32, data: Vec<u8>| {
+                        if s.stop.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        // An empty frame is an idle probe: only reports whether to go on.
+                        if width == 0 || height == 0 || data.is_empty() {
+                            return true;
+                        }
+                        seq += 1;
+                        *lock(&s.latest) = Some(Frame {
+                            width,
+                            height,
+                            data: Arc::new(data),
+                            seq,
+                        });
+                        true
+                    };
+                    if let Err(e) = run(&mut sink) {
+                        *lock(&s.error) = Some(e);
                     }
-                    // An empty frame is an idle probe: only reports whether to go on.
-                    if width == 0 || height == 0 || data.is_empty() {
-                        return true;
-                    }
-                    seq += 1;
-                    *s.latest.lock().unwrap() = Some(Frame {
-                        width,
-                        height,
-                        data: Arc::new(data),
-                        seq,
-                    });
-                    true
-                };
-                if let Err(e) = run(&mut sink) {
-                    *s.error.lock().unwrap() = Some(e);
-                }
+                })
             })
             .ok();
         Player {
@@ -263,11 +291,11 @@ impl Player {
     }
 
     pub fn latest_frame(&self) -> Option<Frame> {
-        self.shared.latest.lock().unwrap().clone()
+        lock(&self.shared.latest).clone()
     }
 
     pub fn error(&self) -> Option<String> {
-        self.shared.error.lock().unwrap().clone()
+        lock(&self.shared.error).clone()
     }
 
     /// Duration of the file in seconds, once known (None for images/unknown).
@@ -304,7 +332,7 @@ fn is_live_label(path: &Path) -> bool {
 fn run_sequence(pattern: &Path, fps: f32, shared: &Shared) {
     let files = sequence::resolve_pattern(pattern);
     if files.is_empty() {
-        *shared.error.lock().unwrap() = Some("no frames match the sequence".into());
+        *lock(&shared.error) = Some("no frames match the sequence".into());
         return;
     }
     let n = files.len();
@@ -327,14 +355,14 @@ fn run_sequence(pattern: &Path, fps: f32, shared: &Shared) {
                         Some(f)
                     }
                     Err(e) => {
-                        *shared.error.lock().unwrap() = Some(e);
+                        *lock(&shared.error) = Some(e);
                         None
                     }
                 },
             };
             if let Some(f) = f {
                 seq += 1;
-                *shared.latest.lock().unwrap() = Some(Frame { seq, ..f });
+                *lock(&shared.latest) = Some(Frame { seq, ..f });
                 shown = i;
                 if !announced {
                     announced = true;
@@ -715,7 +743,7 @@ fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
     let mut seq = 0u64;
     let publish = |f: &Frame, seq: &mut u64| {
         *seq += 1;
-        *shared.latest.lock().unwrap() = Some(Frame {
+        *lock(&shared.latest) = Some(Frame {
             seq: *seq,
             ..f.clone()
         });
@@ -876,6 +904,12 @@ fn load_all(sc: &mut Scrubber, start: f64, shared: &Shared) -> Option<Vec<(f64, 
 /// First frame of a video or the image itself, shrunk so the longest side is at most
 /// `max_side` (box-free nearest sampling; enough for browser thumbnails).
 pub fn thumbnail(path: &Path, max_side: u32) -> Result<Frame, String> {
+    // Corrupt media can trip a panic in a decoder: report it as a failed thumbnail.
+    std::panic::catch_unwind(|| thumbnail_inner(path, max_side))
+        .unwrap_or_else(|p| Err(format!("thumbnail crashed: {}", panic_text(&*p))))
+}
+
+fn thumbnail_inner(path: &Path, max_side: u32) -> Result<Frame, String> {
     let frame = if is_image(path) {
         load_image(path)?
     } else {
@@ -928,6 +962,27 @@ pub fn decode_n(path: &Path, n: usize) -> Result<Vec<Frame>, ff::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_source_marks_that_player_failed_and_others_keep_running() {
+        let bad = Player::open_external("bad", |_sink| panic!("boom in decoder"));
+        let good = Player::open_external("good", |sink| {
+            sink(2, 2, vec![255; 16]);
+            Ok(())
+        });
+        let t = Instant::now();
+        while (bad.error().is_none() || good.latest_frame().is_none())
+            && t.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let e = bad.error().expect("panic must surface as an error");
+        assert!(e.contains("boom in decoder"), "{e}");
+        assert!(good.error().is_none());
+        assert!(good.latest_frame().is_some());
+        // The slots stay usable after the panic (no poison).
+        assert!(bad.latest_frame().is_none());
+    }
 
     #[test]
     fn live_labels_are_not_files() {

@@ -1069,7 +1069,12 @@ impl AudioPart {
         );
         let thread = std::thread::Builder::new()
             .name("vjc-audio-dec".into())
-            .spawn(move || run_audio(&p, &rate, &v, &shared, &s))
+            .spawn(move || {
+                // A decoder panic silences this clip's audio, nothing else.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_audio(&p, &rate, &v, &shared, &s)
+                }));
+            })
             .ok();
         if thread.is_none() {
             engine.remove_voice(&voice);
