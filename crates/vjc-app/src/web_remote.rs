@@ -25,6 +25,77 @@ pub fn pin_ok(pin: Option<&str>, given: Option<&str>) -> bool {
     }
 }
 
+/// Wrong PINs allowed per client IP inside [`LIMIT_WINDOW`] before it is locked out.
+pub const LIMIT_MAX: usize = 5;
+pub const LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Pause applied to each wrong PIN (on the request thread, never the UI thread).
+pub const FAIL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const LIMIT_MAP_MAX: usize = 1024;
+
+/// Per-IP brute-force guard for the PIN. The clock is passed in so tests control it.
+#[derive(Default)]
+pub struct PinLimiter {
+    map: std::sync::Mutex<std::collections::HashMap<IpAddr, Entry>>,
+}
+
+#[derive(Default)]
+struct Entry {
+    fails: Vec<std::time::Instant>,
+    locked_until: Option<std::time::Instant>,
+}
+
+impl PinLimiter {
+    /// False while `ip` is locked out (answer 429).
+    pub fn allowed(&self, ip: IpAddr, now: std::time::Instant) -> bool {
+        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        g.get(&ip)
+            .and_then(|e| e.locked_until)
+            .is_none_or(|t| now >= t)
+    }
+
+    /// Records a wrong PIN; the 5th inside the window starts the lockout.
+    pub fn fail(&self, ip: IpAddr, now: std::time::Instant) {
+        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= LIMIT_MAP_MAX && !g.contains_key(&ip) {
+            g.retain(|_, e| {
+                e.locked_until.is_some_and(|t| now < t)
+                    || e.fails
+                        .iter()
+                        .any(|&f| now.duration_since(f) < LIMIT_WINDOW)
+            });
+            if g.len() >= LIMIT_MAP_MAX {
+                let oldest = g
+                    .iter()
+                    .min_by_key(|(_, e)| e.fails.last().copied())
+                    .map(|(k, _)| *k);
+                if let Some(k) = oldest {
+                    g.remove(&k);
+                }
+            }
+        }
+        let e = g.entry(ip).or_default();
+        e.fails.retain(|&f| now.duration_since(f) < LIMIT_WINDOW);
+        e.fails.push(now);
+        if e.fails.len() >= LIMIT_MAX {
+            e.locked_until = Some(now + LIMIT_WINDOW);
+            e.fails.clear();
+        }
+    }
+
+    /// A correct PIN clears the history of `ip`.
+    pub fn success(&self, ip: IpAddr) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ip);
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+}
+
 /// Machine name, once (empty when unknown).
 pub fn hostname() -> &'static str {
     static NAME: OnceLock<String> = OnceLock::new();
@@ -159,6 +230,44 @@ pub fn png_rgb(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn limiter_locks_after_five_and_resets() {
+        use std::time::{Duration, Instant};
+        let l = PinLimiter::default();
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            l.fail(a, t0);
+        }
+        assert!(l.allowed(a, t0));
+        l.fail(a, t0);
+        assert!(!l.allowed(a, t0 + Duration::from_secs(59)));
+        assert!(l.allowed(b, t0));
+        assert!(l.allowed(a, t0 + Duration::from_secs(60)));
+        let t1 = t0 + Duration::from_secs(100);
+        for _ in 0..4 {
+            l.fail(b, t1);
+        }
+        l.success(b);
+        l.fail(b, t1);
+        assert!(l.allowed(b, t1));
+        for i in 0..10 {
+            l.fail(b, t1 + Duration::from_secs(61 * (i + 1)));
+        }
+        assert!(l.allowed(b, t1 + Duration::from_secs(61 * 10)));
+    }
+
+    #[test]
+    fn limiter_map_is_bounded() {
+        let l = PinLimiter::default();
+        let t = std::time::Instant::now();
+        for i in 0..3000u32 {
+            l.fail(IpAddr::from(i.to_be_bytes()), t);
+        }
+        assert!(l.len() <= 1024);
+    }
     use super::*;
 
     #[test]

@@ -355,7 +355,7 @@ fn snapshot(p: &Project, ctx: &Ctx, active: Active) -> Value {
                     let li = c.layers.iter().position(|l| l.id == cc.layer)?;
                     Some(json!({
                         "layer": nl - li, "column": cc.column + 1,
-                        "name": cc.clip.name, "kind": kind_of(&cc.clip.source),
+                        "id": cc.clip.id.to_string(), "name": cc.clip.name, "kind": kind_of(&cc.clip.source),
                     }))
                 })
                 .collect();
@@ -453,6 +453,7 @@ pub struct Link {
     pub tx: Sender<Msg>,
     pub wake: Wake,
     pub pin: Option<Arc<str>>,
+    pub limiter: Arc<web::PinLimiter>,
 }
 
 /// What the Remote API is doing, for the preferences.
@@ -536,6 +537,7 @@ impl Server {
             tx,
             wake,
             pin: pin.map(Arc::from),
+            limiter: Arc::default(),
         };
         let server = tiny_http::Server::http(http).map_err(std::io::Error::other)?;
         let http_addr = server
@@ -614,6 +616,31 @@ fn header_value(rq: &tiny_http::Request, name: &'static str) -> Option<String> {
         .map(|h| h.value.as_str().to_owned())
 }
 
+/// PIN gate with per-IP brute-force protection: 429 while locked out, 401 otherwise.
+/// A wrong PIN pauses the calling (request) thread, never the UI thread.
+fn pin_gate(
+    link: &Link,
+    ip: Option<IpAddr>,
+    given: Option<&str>,
+) -> Result<(), (u16, &'static str)> {
+    if link.pin.is_none() {
+        return Ok(());
+    }
+    let ip = ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    if !link.limiter.allowed(ip, Instant::now()) {
+        return Err((429, "too many wrong PINs, try again later"));
+    }
+    if web::pin_ok(link.pin.as_deref(), given) {
+        link.limiter.success(ip);
+        return Ok(());
+    }
+    if given.is_some() {
+        link.limiter.fail(ip, Instant::now());
+        std::thread::sleep(web::FAIL_DELAY);
+    }
+    Err((401, "PIN required or wrong"))
+}
+
 /// PIN of a request: `X-Pin`, `Authorization: Bearer`, or `?pin=`.
 fn request_pin(rq: &tiny_http::Request, query: &str) -> Option<String> {
     header_value(rq, "X-Pin")
@@ -660,6 +687,16 @@ fn http_loop(
     }
 }
 
+/// Thumbnails are revalidated every time (the clip behind a cell can change).
+const THUMB_CACHE: &str = "no-cache";
+
+fn etag_of(b: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    b.hash(&mut h);
+    format!("\"{:016x}\"", h.finish())
+}
+
 fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
     let method = rq.method().as_str().to_owned();
     let url = rq.url().to_owned();
@@ -677,8 +714,10 @@ fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
         }
         let mut body = Vec::new();
         if method == "POST" {
-            if !web::pin_ok(link.pin.as_deref(), request_pin(&rq, query).as_deref()) {
-                return Err(err(401, "PIN required or wrong"));
+            let given = request_pin(&rq, query);
+            let ip = rq.remote_addr().map(|a| a.ip());
+            if let Err((code, m)) = pin_gate(link, ip, given.as_deref()) {
+                return Err(err(code, m));
             }
             // Requiring JSON makes a browser page send a preflight we never answer.
             let json_ct = rq.headers().iter().any(|h| {
@@ -724,14 +763,18 @@ fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
                 ("X-Frame-Options", "DENY"),
             ],
         ),
-        Ok(Out::Png(b)) => with_headers(
-            tiny_http::Response::from_data(b),
-            &[
-                ("Content-Type", "image/png"),
-                ("Cache-Control", "private, max-age=30"),
-                ("X-Content-Type-Options", "nosniff"),
-            ],
-        ),
+        Ok(Out::Png(b)) => {
+            let thumb_etag = etag_of(&b);
+            with_headers(
+                tiny_http::Response::from_data(b),
+                &[
+                    ("Content-Type", "image/png"),
+                    ("Cache-Control", THUMB_CACHE),
+                    ("ETag", &thumb_etag),
+                    ("X-Content-Type-Options", "nosniff"),
+                ],
+            )
+        }
         Err(e) => json_response(e.status, &json!({"error": e.msg})),
     };
     let _ = rq.respond(resp);
@@ -778,6 +821,7 @@ fn ws_conn(stream: TcpStream, tx: &Link, stop: &AtomicBool, any: bool, port: u16
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let peer = stream.peer_addr().ok().map(|a| a.ip());
     let check = |rq: &Request, resp: Response| -> Result<Response, ErrorResponse> {
         let reject = |code: u16, m: &str| {
             let mut r = ErrorResponse::new(Some(m.to_owned()));
@@ -812,8 +856,8 @@ fn ws_conn(stream: TcpStream, tx: &Link, stop: &AtomicBool, any: bool, port: u16
                     .and_then(|h| h.to_str().ok())
                     .map(str::to_owned)
             });
-        if !web::pin_ok(tx.pin.as_deref(), given.as_deref()) {
-            return Err(reject(401, "PIN required or wrong"));
+        if let Err((code, m)) = pin_gate(tx, peer, given.as_deref()) {
+            return Err(reject(code, m));
         }
         Ok(resp)
     };
@@ -1362,6 +1406,7 @@ mod tests {
                 n2.fetch_add(1, Ordering::Relaxed);
             }),
             pin: None,
+            limiter: Arc::default(),
         };
         let _ = ask(&link, Req::Composition);
         assert_eq!(n.load(Ordering::Relaxed), 1);
@@ -1666,6 +1711,57 @@ mod tests {
             .unwrap();
             assert_eq!(tungstenite::client(rq, s).is_ok(), ok, "{q}");
         }
+    }
+
+    #[test]
+    fn pin_brute_force_gets_429_per_ip() {
+        let r = rig_pin(Some("4321"));
+        let a = r.server.http_addr;
+        let body = r#"{"path":"/comp/layer/1/opacity","value":0.3}"#;
+        for _ in 0..5 {
+            let (st, _) = http(a, "POST", "/api/v1/address?pin=0000", JSON, body);
+            assert_eq!(st, 401);
+        }
+        // Locked: even the right PIN is refused, over HTTP and WebSocket.
+        let (st, _) = http(a, "POST", "/api/v1/address?pin=4321", JSON, body);
+        assert_eq!(st, 429);
+        let s = TcpStream::connect(r.server.ws_addr).unwrap();
+        let rq = tungstenite::client::IntoClientRequest::into_client_request(format!(
+            "ws://{}/api/v1/ws?pin=4321",
+            r.server.ws_addr
+        ))
+        .unwrap();
+        assert!(tungstenite::client(rq, s).is_err());
+    }
+
+    #[test]
+    fn pin_gate_window_other_ips_and_reset() {
+        let (tx, _rx) = channel::<Msg>();
+        let link = Link {
+            tx,
+            wake: Arc::new(|| {}),
+            pin: Some(Arc::from("1")),
+            limiter: Arc::default(),
+        };
+        let (a, b): (IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        for _ in 0..4 {
+            assert_eq!(pin_gate(&link, Some(a), Some("x")).unwrap_err().0, 401);
+        }
+        assert!(pin_gate(&link, Some(a), Some("1")).is_ok()); // success resets
+        for _ in 0..5 {
+            let _ = pin_gate(&link, Some(a), Some("x"));
+        }
+        assert_eq!(pin_gate(&link, Some(a), Some("1")).unwrap_err().0, 429);
+        assert!(pin_gate(&link, Some(b), Some("1")).is_ok());
+    }
+
+    #[test]
+    fn page_retries_thumbs_and_thumb_route_revalidates() {
+        assert!(web::PAGE.contains("THUMB_RETRY"));
+        assert!(web::PAGE.contains("api/v1/web"));
+        assert_eq!(THUMB_CACHE, "no-cache");
+        assert!(etag_of(b"a").starts_with('"'));
+        assert_ne!(etag_of(b"a"), etag_of(b"b"));
     }
 
     #[test]

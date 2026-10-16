@@ -192,8 +192,14 @@ function render() {
       if (k) {
         if (k.kind === "file") {
           const im = mk("img"); im.loading = "lazy"; im.alt = "";
-          im.src = "api/v1/clip/" + l.number + "/" + c.number + "/thumb";
-          im.onerror = () => im.remove();
+          const base = "api/v1/clip/" + l.number + "/" + c.number + "/thumb?v=" + encodeURIComponent(k.id || "");
+          let tries = 0;
+          im.src = base;
+          // THUMB_RETRY: the first request can 404 while the thumbnail is still decoding.
+          im.onerror = () => {
+            if (++tries > 10) { im.remove(); return; }
+            setTimeout(() => { if (im.isConnected) { im.src = base + "&r=" + tries; } }, 1500);
+          };
           b.append(im);
         }
         b.append(mk("span", "", k.name));
@@ -222,9 +228,21 @@ function connect() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const q = pin ? "?pin=" + encodeURIComponent(pin) : "";
   ws = new WebSocket(scheme + "://" + location.hostname + ":" + port + "/api/v1/ws" + q);
-  ws.onopen = () => ws.send(JSON.stringify({ subscribe: ["/comp/tempo/bpm", "/comp/master/opacity", "/comp/crossfader"] }));
+  let opened = false;
+  ws.onopen = () => opened = true;
+  ws.addEventListener("open", () => ws.send(JSON.stringify({ subscribe: ["/comp/tempo/bpm", "/comp/master/opacity", "/comp/crossfader"] }));
   ws.onmessage = () => refreshSoon();
-  ws.onclose = () => { $("live").className = "dot"; clearTimeout(timer); timer = setTimeout(connect, 2000); };
+  ws.onclose = async () => {
+    $("live").className = "dot"; clearTimeout(timer);
+    // A refused handshake (401) never opens; ask for the PIN instead of retrying forever.
+    if (!opened) {
+      try {
+        const w = await fetch("api/v1/web").then(r => r.json());
+        if (w.pin_required) { askPin(); return; }
+      } catch (e) { /* offline: retry below */ }
+    }
+    timer = setTimeout(connect, 2000);
+  };
 }
 
 (async () => {

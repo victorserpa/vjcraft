@@ -481,6 +481,10 @@ fn web_remote_links(ui: &mut egui::Ui, a: &vjc_io::prefs::Api) {
     for u in &urls {
         ui.add(egui::Label::new(egui::RichText::new(u).monospace()).selectable(true));
     }
+    // Loopback: only the local URL as text. No QR (nothing to scan from a phone), no PIN.
+    if !a.expose_network {
+        return;
+    }
     let mut target = urls[0].clone();
     if !a.web_pin.is_empty() {
         let pin: String = a
