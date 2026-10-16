@@ -292,6 +292,8 @@ pub struct Api {
     pub port: u16,
     /// Bind 0.0.0.0 instead of 127.0.0.1 (anyone on the network can then control VJCraft).
     pub expose_network: bool,
+    /// "Web remote PIN": when not empty, mutating calls and the WebSocket must carry it.
+    pub web_pin: String,
 }
 
 impl Default for Api {
@@ -300,6 +302,7 @@ impl Default for Api {
             enabled: false,
             port: 8090,
             expose_network: false,
+            web_pin: String::new(),
         }
     }
 }

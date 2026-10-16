@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#181a1e">
+<title>VJCraft Remote</title>
+<style>
+:root{--bg:#181a1e;--surface:#262930;--raised:#2f333b;--border:#3d424c;--text:#d6dae2;--muted:#96a0b2;--accent:#a98bff;--play:#46be78;--danger:#ff8080;--warn:#f0c83c;--on:#101216}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.3 system-ui,-apple-system,sans-serif;touch-action:manipulation}
+header{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--border);padding:8px 10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+h1{font-size:15px;margin:0;color:var(--accent);flex:1 1 auto}
+button{font:inherit;color:var(--text);background:var(--raised);border:1px solid var(--border);border-radius:6px;padding:8px 12px;min-height:40px}
+button:active{filter:brightness(1.4)}
+button.on{background:var(--accent);color:var(--on);border-color:var(--accent)}
+button.danger.on{background:var(--danger);border-color:var(--danger)}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--muted);display:inline-block}
+.dot.live{background:var(--play)}
+.beat{width:14px;height:14px;border-radius:50%;background:var(--accent);animation:beat 0.5s infinite}
+@keyframes beat{0%{opacity:1;transform:scale(1.25)}60%,100%{opacity:.25;transform:scale(.8)}}
+.bpm{font-variant-numeric:tabular-nums;font-size:20px;min-width:70px;text-align:center}
+.row{display:flex;gap:10px;align-items:center;padding:6px 10px;flex-wrap:wrap}
+.row label{color:var(--muted);font-size:12px;min-width:64px}
+input[type=range]{flex:1 1 140px;min-width:120px;height:32px;accent-color:var(--accent)}
+.decks{display:flex;gap:6px;padding:4px 10px;overflow-x:auto}
+.dials{display:none;padding:4px 10px;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px}
+.dials.open{display:grid}
+.dial small{display:block;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dial input{width:100%}
+.scroll{overflow:auto;padding-bottom:40px}
+.grid{display:grid;gap:4px;padding:6px 10px;width:max-content;min-width:100%}
+.colh{min-height:34px;padding:4px;font-size:12px}
+.layer{position:sticky;left:0;background:var(--bg);z-index:2;padding:2px 6px 2px 0;display:flex;flex-direction:column;gap:3px}
+.layer b{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.layer .btns{display:flex;gap:3px}
+.layer .btns button{padding:2px 0;min-height:30px;flex:1;font-size:12px}
+.layer input{width:100%;height:24px}
+.cell{position:relative;aspect-ratio:16/9;border:2px solid var(--border);border-radius:6px;background:var(--surface);overflow:hidden;padding:0;min-height:0}
+.cell img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.cell span{position:absolute;left:0;right:0;bottom:0;padding:1px 4px;font-size:11px;background:rgba(16,18,22,.75);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}
+.cell.empty{background:#181a1e;border-style:dashed;opacity:.5}
+.cell.air{border-color:var(--play);box-shadow:0 0 0 1px var(--play)}
+#pin{position:fixed;inset:0;background:rgba(16,18,22,.95);z-index:20;display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+#pin input{font-size:24px;text-align:center;width:180px;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px}
+#msg{color:var(--warn);font-size:12px;padding:0 10px}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="name">VJCraft</h1>
+  <span class="beat" id="beat"></span>
+  <button id="bpm-" aria-label="BPM minus">-</button>
+  <span class="bpm" id="bpm">--</span>
+  <button id="bpm+" aria-label="BPM plus">+</button>
+  <button id="tap">Tap</button>
+  <button id="resync">Resync</button>
+  <button id="black" class="danger">Black-out</button>
+  <span class="dot" id="live" title="live updates"></span>
+</header>
+<div id="msg"></div>
+<div class="row"><label>Master</label><input type="range" id="master" min="0" max="1" step="0.001">
+<label>Crossfader</label><input type="range" id="xfade" min="0" max="1" step="0.001"></div>
+<div class="row"><button id="dialsbtn">Dashboard</button><button id="clear">Clear all</button></div>
+<div class="dials" id="dials"></div>
+<div class="decks" id="decks"></div>
+<div class="scroll"><div class="grid" id="grid"></div></div>
+<div id="pin"><div>PIN required</div><input id="pinin" type="password" inputmode="numeric" autocomplete="off"><button id="pinok" class="on">Connect</button></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let pin = sessionStorage.getItem("vjc-pin") || (new URLSearchParams(location.search).get("pin") || "");
+if (pin) { sessionStorage.setItem("vjc-pin", pin); }
+let state = null, dragging = 0, ws = null, timer = 0;
+const msg = t => { $("msg").textContent = t || ""; };
+
+async function api(path, body) {
+  const o = body === undefined ? {} : {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Pin": pin },
+    body: JSON.stringify(body)
+  };
+  const r = await fetch(path, o);
+  if (r.status === 401) { askPin(); throw new Error("PIN"); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { msg(j.error || ("error " + r.status)); throw new Error(j.error || r.status); }
+  msg("");
+  return j;
+}
+const setv = (path, value) => api("api/v1/address", { path, value }).then(refreshSoon, () => {});
+const trig = (layer, column) => api("api/v1/trigger", layer ? { layer, column } : { column }).then(refreshSoon, () => {});
+const throttle = (fn, ms) => { let t = 0, last; return v => { last = v; if (!t) { t = setTimeout(() => { t = 0; fn(last); }, ms); } }; };
+
+function askPin() { $("pin").style.display = "flex"; $("pinin").focus(); }
+$("pinok").onclick = () => {
+  pin = $("pinin").value; sessionStorage.setItem("vjc-pin", pin);
+  $("pin").style.display = "none"; connect(); refresh();
+};
+
+let rt = 0;
+function refreshSoon() { clearTimeout(rt); rt = setTimeout(refresh, 60); }
+async function refresh() {
+  try { state = await api("api/v1/composition"); render(); } catch (e) { $("live").className = "dot"; }
+}
+
+function bind(el, path, val, send) {
+  if (dragging !== el) { el.value = val; }
+  if (!el.dataset.b) {
+    el.dataset.b = 1;
+    el.addEventListener("pointerdown", () => { dragging = el; });
+    const up = () => { dragging = 0; };
+    el.addEventListener("pointerup", up); el.addEventListener("pointercancel", up); el.addEventListener("change", up);
+    el.addEventListener("input", () => send(Number(el.value)));
+  }
+}
+const sliderSend = {};
+function slider(el, path, val) {
+  sliderSend[path] = sliderSend[path] || throttle(v => setv(path, v), 50);
+  bind(el, path, val, sliderSend[path]);
+}
+
+function mk(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) { e.className = cls; }
+  if (text !== undefined) { e.textContent = text; }
+  return e;
+}
+
+function render() {
+  const s = state;
+  $("name").textContent = s.name || "VJCraft";
+  if (dragging !== $("bpm")) { $("bpm").textContent = s.bpm.toFixed(1); }
+  $("beat").style.animationDuration = (60 / Math.max(20, s.bpm)) + "s";
+  slider($("master"), "/comp/master/opacity", s.master.opacity);
+  slider($("xfade"), "/comp/crossfader", s.crossfader);
+  $("black").classList.toggle("on", !!s.master.bypass);
+  $("black").textContent = s.master.bypass ? "Black-out ON" : "Black-out";
+  $("live").className = "dot live";
+  // decks
+  const dk = $("decks"); dk.replaceChildren();
+  s.decks.forEach((d, i) => {
+    const b = mk("button", d.current ? "on" : "", d.name || ("Deck " + (i + 1)));
+    b.onclick = () => setv("/comp/deck/" + (i + 1) + "/select", 1);
+    dk.append(b);
+  });
+  // dashboard
+  const dl = $("dials");
+  (s.dashboard || []).forEach((d, i) => {
+    let w = dl.children[i];
+    if (!w) { w = mk("div", "dial"); w.append(mk("small"), Object.assign(mk("input"), { type: "range", min: 0, max: 1, step: 0.001 })); dl.append(w); }
+    w.firstChild.textContent = d.name;
+    slider(w.lastChild, "/comp/dashboard/" + (i + 1), d.value);
+  });
+  // grid
+  const g = $("grid");
+  const sig = JSON.stringify([s.layers, s.columns, s.decks]);
+  if (sig === g.dataset.sig || (dragging && g.contains(dragging))) { return; }
+  g.dataset.sig = sig;
+  const cols = s.columns.length;
+  g.style.gridTemplateColumns = "112px repeat(" + cols + ", 108px)";
+  g.replaceChildren();
+  g.append(mk("div"));
+  s.columns.forEach(c => {
+    const b = mk("button", "colh", c.name || String(c.number));
+    b.onclick = () => trig(0, c.number);
+    g.append(b);
+  });
+  const deck = s.decks.find(d => d.current) || { clips: [] };
+  const at = {};
+  deck.clips.forEach(k => { at[k.layer + ":" + k.column] = k; });
+  s.layers.forEach(l => {
+    const lc = mk("div", "layer");
+    lc.append(mk("b", "", l.name || ("Layer " + l.number)));
+    const o = Object.assign(mk("input"), { type: "range", min: 0, max: 1, step: 0.001 });
+    slider(o, "/comp/layer/" + l.number + "/opacity", l.opacity);
+    const bt = mk("div", "btns");
+    [["B", "bypass", l.bypass], ["S", "solo", l.solo]].forEach(([t, k, on]) => {
+      const b = mk("button", on ? "on" : "", t);
+      b.title = k;
+      b.onclick = () => setv("/comp/layer/" + l.number + "/" + k, on ? 0 : 1);
+      bt.append(b);
+    });
+    const x = mk("button", "", "X"); x.title = "clear";
+    x.onclick = () => setv("/comp/layer/" + l.number + "/clear", 1);
+    bt.append(x);
+    lc.append(o, bt);
+    g.append(lc);
+    s.columns.forEach(c => {
+      const k = at[l.number + ":" + c.number];
+      const air = l.active_columns.includes(c.number);
+      const b = mk("button", "cell" + (k ? "" : " empty") + (air ? " air" : ""));
+      if (k) {
+        if (k.kind === "file") {
+          const im = mk("img"); im.loading = "lazy"; im.alt = "";
+          im.src = "api/v1/clip/" + l.number + "/" + c.number + "/thumb";
+          im.onerror = () => im.remove();
+          b.append(im);
+        }
+        b.append(mk("span", "", k.name));
+        b.onclick = () => trig(l.number, c.number);
+      }
+      g.append(b);
+    });
+  });
+}
+
+$("tap").onclick = () => setv("/comp/tempo/tap", 1);
+$("resync").onclick = () => setv("/comp/tempo/resync", 1);
+$("bpm-").onclick = () => state && setv("/comp/tempo/bpm", Math.max(20, Math.round(state.bpm) - 1));
+$("bpm+").onclick = () => state && setv("/comp/tempo/bpm", Math.round(state.bpm) + 1);
+$("clear").onclick = () => { if (confirm("Clear every layer?")) { setv("/comp/clear", 1); } };
+$("black").onclick = () => {
+  if (!state) { return; }
+  if (state.master.bypass) { setv("/comp/master/bypass", 0); }
+  else if (confirm("Black-out the output?")) { setv("/comp/master/bypass", 1); }
+};
+$("dialsbtn").onclick = () => $("dials").classList.toggle("open");
+
+function connect() {
+  if (ws) { ws.onclose = null; ws.close(); }
+  const port = Number(location.port || (location.protocol === "https:" ? 443 : 80)) + 1;
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const q = pin ? "?pin=" + encodeURIComponent(pin) : "";
+  ws = new WebSocket(scheme + "://" + location.hostname + ":" + port + "/api/v1/ws" + q);
+  ws.onopen = () => ws.send(JSON.stringify({ subscribe: ["/comp/tempo/bpm", "/comp/master/opacity", "/comp/crossfader"] }));
+  ws.onmessage = () => refreshSoon();
+  ws.onclose = () => { $("live").className = "dot"; clearTimeout(timer); timer = setTimeout(connect, 2000); };
+}
+
+(async () => {
+  try {
+    const w = await fetch("api/v1/web").then(r => r.json());
+    if (w.pin_required && !pin) { askPin(); }
+  } catch (e) { /* offline: retry below */ }
+  connect();
+  refresh();
+  setInterval(refresh, 1500);
+})();
+</script>
+</body>
+</html>

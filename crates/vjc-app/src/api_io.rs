@@ -2,7 +2,8 @@
 //! Everything runs on its own threads; the state lives on the UI thread, so a request
 //! becomes a `Msg` on a channel and the UI answers it once per frame (`answer`). The
 //! server threads wait for the reply with a timeout, the render loop never waits.
-//! No authentication: loopback by default, 0.0.0.0 only when the user asks for it.
+//! Loopback by default, 0.0.0.0 only when the user asks for it. An optional PIN guards
+//! every mutating call and the WebSocket. The HTTP port also serves the web remote page.
 
 use eframe::egui;
 use serde_json::{Map, Value, json};
@@ -20,6 +21,8 @@ use vjc_core::osc::{self, Active};
 use vjc_core::shortcuts::{self, Ctx};
 use vjc_io::prefs;
 use vjc_model::{Project, Source};
+
+use crate::web_remote as web;
 
 /// Requests the UI answers per frame at most.
 pub const MAX_PER_FRAME: usize = 64;
@@ -57,6 +60,9 @@ pub enum Req {
     Set(String, f64),
     /// Values of the paths plus the output state (clips, bpm) for events.
     Poll(Vec<String>),
+    /// PNG thumbnail of the clip at (layer, column), 1-based. Answered by the app (it owns
+    /// the thumbnail cache): `{"png": <bytes as chars 0..=255>}`.
+    Thumb(u32, u32),
 }
 
 pub struct Msg {
@@ -176,6 +182,22 @@ pub fn parse_route(method: &str, url: &str, body: &[u8]) -> Result<Req, ApiErr> 
             set_of(o, o.get("path").unwrap_or(&Value::Null))
         }
         ("POST", "/api/v1/trigger") => trigger_set(&json_body(body)?),
+        ("GET", p) if p.starts_with("/api/v1/clip/") => {
+            let parts: Vec<&str> = p.split('/').collect();
+            match parts.as_slice() {
+                ["", "api", "v1", "clip", l, c, "thumb"] => Ok(Req::Thumb(
+                    l.parse()
+                        .ok()
+                        .filter(|n| (1..=100_000).contains(n))
+                        .ok_or_else(|| err(400, "bad layer"))?,
+                    c.parse()
+                        .ok()
+                        .filter(|n| (1..=100_000).contains(n))
+                        .ok_or_else(|| err(400, "bad column"))?,
+                )),
+                _ => Err(err(404, "not found")),
+            }
+        }
         (_, "/api/v1/composition" | "/api/v1/address" | "/api/v1/trigger") => {
             Err(err(405, "method not allowed"))
         }
@@ -238,10 +260,13 @@ pub fn origin_ok(origin: Option<&str>, any: bool) -> bool {
 /// browser, but still sends its own Host. On loopback accept only our own names and port;
 /// when exposed to the network any Host is fine. No Host (HTTP/1.0) means no browser.
 pub fn host_ok(host: Option<&str>, any: bool, port: u16) -> bool {
+    host_ok_named(host, any, port, web::hostname())
+}
+
+/// `host_ok` with the machine name given (testable). When exposed to the network the Host
+/// must be an IP literal, localhost or this machine's name: a rebinding page uses its own.
+pub fn host_ok_named(host: Option<&str>, any: bool, port: u16, own: &str) -> bool {
     let Some(h) = host else { return true };
-    if any {
-        return true;
-    }
     let (name, p) = if let Some(r) = h.strip_prefix('[') {
         match r.split_once(']') {
             Some((n, rest)) => (n, rest.strip_prefix(':')),
@@ -253,8 +278,12 @@ pub fn host_ok(host: Option<&str>, any: bool, port: u16) -> bool {
             None => (h, None),
         }
     };
-    let name_ok = name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1";
-    name_ok && p.is_none_or(|p| p.parse::<u16>() == Ok(port))
+    let name_ok = if any {
+        web::network_host_ok(name, own)
+    } else {
+        name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
+    };
+    name_ok && (any || p.is_none_or(|p| p.parse::<u16>() == Ok(port)))
 }
 
 // ---------- state side ----------
@@ -333,12 +362,19 @@ fn snapshot(p: &Project, ctx: &Ctx, active: Active) -> Value {
             json!({"name": d.name, "current": d.id == c.current_deck, "clips": clips})
         })
         .collect();
+    let dashboard: Vec<Value> = c
+        .dashboard
+        .iter()
+        .enumerate()
+        .map(|(i, d)| json!({"name": d.name, "value": cur(&format!("/comp/dashboard/{}", i + 1))}))
+        .collect();
     json!({
         "name": c.name, "width": c.width, "height": c.height, "fps": c.fps,
         "bpm": c.tempo.bpm,
         "master": {"opacity": cur("/comp/master/opacity"), "bypass": ctx.master_bypass},
         "crossfader": cur("/comp/crossfader"),
         "layers": layers, "groups": groups, "columns": columns, "decks": decks,
+        "dashboard": dashboard,
     })
 }
 
@@ -361,6 +397,7 @@ pub fn answer(p: &Project, ctx: &Ctx, active: Active, req: Req) -> (Option<Comma
                 )),
             ),
         },
+        Req::Thumb(..) => (None, Err(err(404, "thumbnail not available"))),
         Req::Poll(paths) => {
             let values: Map<String, Value> = paths
                 .into_iter()
@@ -381,6 +418,8 @@ pub fn answer(p: &Project, ctx: &Ctx, active: Active, req: Req) -> (Option<Comma
 pub struct Cfg {
     pub http: Option<SocketAddr>,
     pub ws: Option<SocketAddr>,
+    /// Required by mutating calls and the WebSocket when set.
+    pub pin: Option<String>,
 }
 
 impl Cfg {
@@ -394,10 +433,12 @@ impl Cfg {
             Some(ws) if p.enabled => Cfg {
                 http: Some(SocketAddr::new(ip, p.port)),
                 ws: Some(SocketAddr::new(ip, ws)),
+                pin: (!p.web_pin.is_empty()).then(|| p.web_pin.clone()),
             },
             _ => Cfg {
                 http: None,
                 ws: None,
+                pin: None,
             },
         }
     }
@@ -411,6 +452,7 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 pub struct Link {
     pub tx: Sender<Msg>,
     pub wake: Wake,
+    pub pin: Option<Arc<str>>,
 }
 
 /// What the Remote API is doing, for the preferences.
@@ -468,14 +510,15 @@ fn spawn_named(name: &str, f: Box<dyn FnOnce() + Send>) -> std::io::Result<JoinH
 }
 
 impl Server {
-    pub fn start(
+    pub fn start_pin(
         http: SocketAddr,
         ws: SocketAddr,
         tx: Sender<Msg>,
         wake: Wake,
         status: SharedStatus,
+        pin: Option<String>,
     ) -> std::io::Result<Server> {
-        Self::start_with(http, ws, tx, wake, status, &spawn_named)
+        Self::start_with(http, ws, tx, wake, status, pin, &spawn_named)
     }
 
     /// `start` with the thread spawner injected, so a spawn failure is testable.
@@ -486,9 +529,14 @@ impl Server {
         tx: Sender<Msg>,
         wake: Wake,
         status: SharedStatus,
+        pin: Option<String>,
         spawn: &Spawner,
     ) -> std::io::Result<Server> {
-        let link = Link { tx, wake };
+        let link = Link {
+            tx,
+            wake,
+            pin: pin.map(Arc::from),
+        };
         let server = tiny_http::Server::http(http).map_err(std::io::Error::other)?;
         let http_addr = server
             .server_addr()
@@ -527,12 +575,53 @@ impl Server {
     }
 }
 
-fn json_response(status: u16, body: &Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    let mut r = tiny_http::Response::from_string(body.to_string()).with_status_code(status);
-    if let Ok(h) = tiny_http::Header::from_bytes("Content-Type", "application/json") {
-        r = r.with_header(h);
+type Resp = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
+
+fn with_headers(mut r: Resp, hs: &[(&str, &str)]) -> Resp {
+    for (k, v) in hs {
+        if let Ok(h) = tiny_http::Header::from_bytes(*k, *v) {
+            r = r.with_header(h);
+        }
     }
     r
+}
+
+fn json_response(status: u16, body: &Value) -> Resp {
+    with_headers(
+        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+        &[
+            ("Content-Type", "application/json"),
+            ("Cache-Control", "no-store"),
+        ],
+    )
+}
+
+/// What a request resolved to.
+enum Out {
+    Json(Value),
+    Page,
+    Png(Vec<u8>),
+}
+
+/// The page may only load itself and talk to its own host (the socket is on the next port).
+const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+    img-src 'self'; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+fn header_value(rq: &tiny_http::Request, name: &'static str) -> Option<String> {
+    rq.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_owned())
+}
+
+/// PIN of a request: `X-Pin`, `Authorization: Bearer`, or `?pin=`.
+fn request_pin(rq: &tiny_http::Request, query: &str) -> Option<String> {
+    header_value(rq, "X-Pin")
+        .or_else(|| {
+            header_value(rq, "Authorization")
+                .and_then(|a| a.strip_prefix("Bearer ").map(str::to_owned))
+        })
+        .or_else(|| query_param(query, "pin"))
 }
 
 fn http_loop(
@@ -574,17 +663,23 @@ fn http_loop(
 fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
     let method = rq.method().as_str().to_owned();
     let url = rq.url().to_owned();
-    let host = rq
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Host"))
-        .map(|h| h.value.as_str().to_owned());
+    let host = header_value(&rq, "Host");
     let result = (|| {
         if !host_ok(host.as_deref(), any, port) {
             return Err(err(403, "host not allowed"));
         }
+        let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+        if method == "GET" && matches!(path, "/" | "/index.html") {
+            return Ok(Out::Page);
+        }
+        if method == "GET" && path == "/api/v1/web" {
+            return Ok(Out::Json(json!({"pin_required": link.pin.is_some()})));
+        }
         let mut body = Vec::new();
         if method == "POST" {
+            if !web::pin_ok(link.pin.as_deref(), request_pin(&rq, query).as_deref()) {
+                return Err(err(401, "PIN required or wrong"));
+            }
             // Requiring JSON makes a browser page send a preflight we never answer.
             let json_ct = rq.headers().iter().any(|h| {
                 h.field.equiv("Content-Type")
@@ -604,13 +699,42 @@ fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
                 .read_to_end(&mut body)
                 .map_err(|_| err(400, "cannot read body"))?;
         }
-        ask(link, parse_route(&method, &url, &body)?)
+        let req = parse_route(&method, &url, &body)?;
+        let thumb = matches!(req, Req::Thumb(..));
+        let v = ask(link, req)?;
+        if !thumb {
+            return Ok(Out::Json(v));
+        }
+        let png = v["png"]
+            .as_str()
+            .map(|s| s.chars().map(|c| c as u32 as u8).collect::<Vec<u8>>())
+            .ok_or_else(|| err(404, "thumbnail not available"))?;
+        Ok(Out::Png(png))
     })();
-    let (status, v) = match result {
-        Ok(v) => (200, v),
-        Err(e) => (e.status, json!({"error": e.msg})),
+    let resp = match result {
+        Ok(Out::Json(v)) => json_response(200, &v),
+        Ok(Out::Page) => with_headers(
+            tiny_http::Response::from_string(web::PAGE),
+            &[
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Cache-Control", "no-cache"),
+                ("Content-Security-Policy", CSP),
+                ("X-Content-Type-Options", "nosniff"),
+                ("Referrer-Policy", "no-referrer"),
+                ("X-Frame-Options", "DENY"),
+            ],
+        ),
+        Ok(Out::Png(b)) => with_headers(
+            tiny_http::Response::from_data(b),
+            &[
+                ("Content-Type", "image/png"),
+                ("Cache-Control", "private, max-age=30"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        ),
+        Err(e) => json_response(e.status, &json!({"error": e.msg})),
     };
-    let _ = rq.respond(json_response(status, &v));
+    let _ = rq.respond(resp);
 }
 
 fn ws_accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, link: Link, any: bool, port: u16) {
@@ -670,6 +794,26 @@ fn ws_conn(stream: TcpStream, tx: &Link, stop: &AtomicBool, any: bool, port: u16
         let origin = rq.headers().get("origin").and_then(|h| h.to_str().ok());
         if !origin_ok(origin, any) {
             return Err(reject(403, "origin not allowed"));
+        }
+        // Exposed to the network: a page may only open the socket of the host it came from.
+        if any
+            && let (Some(o), Some(h)) = (origin, host)
+            && !web::origin_matches_host(o, h)
+        {
+            return Err(reject(403, "origin not allowed"));
+        }
+        let given = rq
+            .uri()
+            .query()
+            .and_then(|q| query_param(q, "pin"))
+            .or_else(|| {
+                rq.headers()
+                    .get("x-pin")
+                    .and_then(|h| h.to_str().ok())
+                    .map(str::to_owned)
+            });
+        if !web::pin_ok(tx.pin.as_deref(), given.as_deref()) {
+            return Err(reject(401, "PIN required or wrong"));
         }
         Ok(resp)
     };
@@ -799,7 +943,14 @@ impl Api {
                     drop(server.take());
                     set_status(&st2, Status::Off);
                     if let (Some(h), Some(w)) = (c.http, c.ws) {
-                        match Server::start(h, w, tx.clone(), wake.clone(), st2.clone()) {
+                        match Server::start_pin(
+                            h,
+                            w,
+                            tx.clone(),
+                            wake.clone(),
+                            st2.clone(),
+                            c.pin.clone(),
+                        ) {
                             Ok(s) => {
                                 set_status(&st2, Status::Listening(s.http_addr));
                                 server = Some(s);
@@ -1047,6 +1198,10 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with(None)
+    }
+
+    fn rig_with(pin: Option<String>) -> Rig {
         let mut p = Project::new("demo");
         p.composition.layers.push(layer());
         let project = Arc::new(Mutex::new(p));
@@ -1069,7 +1224,8 @@ mod tests {
             }
         });
         let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = Server::start(lo, lo, tx, Arc::new(|| {}), Default::default()).unwrap();
+        let server =
+            Server::start_pin(lo, lo, tx, Arc::new(|| {}), Default::default(), pin).unwrap();
         Rig {
             server,
             project,
@@ -1143,7 +1299,25 @@ mod tests {
         ] {
             assert!(!host_ok(Some(h), false, 80), "{h}");
         }
-        assert!(host_ok(Some("evil.example"), true, 80));
+        // Exposed to the network: IP literals, localhost and our own name only.
+        for h in [
+            "192.168.1.5:80",
+            "10.0.0.2",
+            "[fe80::1]:80",
+            "localhost",
+            "mac.local:80",
+            "mac:9",
+        ] {
+            assert!(host_ok_named(Some(h), true, 80, "mac"), "{h}");
+        }
+        for h in [
+            "evil.example",
+            "evil.example:80",
+            "mac.evil.example",
+            "192.168.1.5.evil.example",
+        ] {
+            assert!(!host_ok_named(Some(h), true, 80, "mac"), "{h}");
+        }
     }
 
     #[test]
@@ -1187,6 +1361,7 @@ mod tests {
             wake: Arc::new(move || {
                 n2.fetch_add(1, Ordering::Relaxed);
             }),
+            pin: None,
         };
         let _ = ask(&link, Req::Composition);
         assert_eq!(n.load(Ordering::Relaxed), 1);
@@ -1202,6 +1377,7 @@ mod tests {
         a.configure(Cfg {
             http: Some(SocketAddr::new(ip, port)),
             ws: Some(SocketAddr::new(ip, port.wrapping_add(1))),
+            pin: None,
         });
         for _ in 0..100 {
             if matches!(a.status(), Status::Failed(_)) {
@@ -1362,10 +1538,189 @@ mod tests {
         });
         let (tx, _rx) = std::sync::mpsc::channel();
         let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let r = Server::start_with(lo, lo, tx, Arc::new(|| {}), Default::default(), &*spawn);
+        let r = Server::start_with(
+            lo,
+            lo,
+            tx,
+            Arc::new(|| {}),
+            Default::default(),
+            None,
+            &*spawn,
+        );
         assert!(r.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         // Negative control: without stop+join in the error path this stays false.
         assert!(finished.load(Ordering::SeqCst), "http thread leaked");
+    }
+
+    // ----- web remote -----
+
+    fn rig_pin(pin: Option<&str>) -> Rig {
+        rig_with(pin.map(str::to_owned))
+    }
+
+    /// Raw GET: (status, headers+body text).
+    fn raw_get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+        let status = raw
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (status, raw)
+    }
+
+    #[test]
+    fn serves_the_page_with_safe_headers() {
+        let r = rig();
+        let (st, raw) = raw_get(r.server.http_addr, "/");
+        assert_eq!(st, 200);
+        assert!(raw.contains("text/html"));
+        assert!(raw.contains("<title>VJCraft Remote</title>"));
+        assert!(raw.to_lowercase().contains("content-security-policy"));
+        assert!(!raw.to_lowercase().contains("access-control-allow"));
+        let (st, _) = raw_get(r.server.http_addr, "/nope");
+        assert_eq!(st, 404);
+    }
+
+    #[test]
+    fn page_uses_only_relative_urls() {
+        let page = web::PAGE;
+        for bad in [
+            "http://", "https://", "src=\"//", "href=", "@import", "url(", "<link", "<iframe",
+            "<form",
+        ] {
+            assert!(!page.contains(bad), "{bad}");
+        }
+        for (i, _) in page.match_indices("fetch(\"") {
+            assert!(!page[i + 7..].starts_with("/"), "absolute fetch");
+        }
+        assert!(page.contains("api/v1/composition") && page.contains("api/v1/clip/"));
+    }
+
+    #[test]
+    fn thumb_route_and_missing_thumb_is_404() {
+        assert_eq!(
+            parse_route("GET", "/api/v1/clip/2/3/thumb", b""),
+            Ok(Req::Thumb(2, 3))
+        );
+        assert_eq!(
+            parse_route("GET", "/api/v1/clip/0/3/thumb", b"")
+                .unwrap_err()
+                .status,
+            400
+        );
+        assert_eq!(
+            parse_route("GET", "/api/v1/clip/x/3/thumb", b"")
+                .unwrap_err()
+                .status,
+            400
+        );
+        assert_eq!(
+            parse_route("GET", "/api/v1/clip/1/2", b"")
+                .unwrap_err()
+                .status,
+            404
+        );
+        let r = rig();
+        let (st, _) = raw_get(r.server.http_addr, "/api/v1/clip/1/1/thumb");
+        assert_eq!(st, 404);
+    }
+
+    #[test]
+    fn pin_guards_post_and_websocket() {
+        let r = rig_pin(Some("4321"));
+        let a = r.server.http_addr;
+        let body = r#"{"path":"/comp/layer/1/opacity","value":0.3}"#;
+        let (st, _) = http(a, "POST", "/api/v1/address", JSON, body);
+        assert_eq!(st, 401);
+        let (st, _) = http(a, "POST", "/api/v1/address?pin=0000", JSON, body);
+        assert_eq!(st, 401);
+        let cur = |r: &Rig| {
+            let p = r.project.lock().unwrap();
+            shortcuts::current(&p, &Ctx::new(None, false), "/comp/layer/1/opacity")
+        };
+        assert_eq!(cur(&r), Some(1.0));
+        let (st, _) = http(a, "POST", "/api/v1/address?pin=4321", JSON, body);
+        assert_eq!(st, 200);
+        assert_eq!(cur(&r), Some(0.3));
+        // Reads stay open and tell the page a PIN is needed.
+        let (st, v) = http(a, "GET", "/api/v1/web", None, "");
+        assert_eq!((st, &v["pin_required"]), (200, &json!(true)));
+        // WebSocket: no PIN and wrong PIN are refused, the right one works.
+        for (q, ok) in [("", false), ("?pin=1", false), ("?pin=4321", true)] {
+            let s = TcpStream::connect(r.server.ws_addr).unwrap();
+            let rq = tungstenite::client::IntoClientRequest::into_client_request(format!(
+                "ws://{}/api/v1/ws{q}",
+                r.server.ws_addr
+            ))
+            .unwrap();
+            assert_eq!(tungstenite::client(rq, s).is_ok(), ok, "{q}");
+        }
+    }
+
+    #[test]
+    fn no_pin_means_open() {
+        let r = rig_pin(None);
+        let a = r.server.http_addr;
+        let body = r#"{"path":"/comp/layer/1/opacity","value":0.5}"#;
+        assert_eq!(http(a, "POST", "/api/v1/address", JSON, body).0, 200);
+        let (_, v) = http(a, "GET", "/api/v1/web", None, "");
+        assert_eq!(v["pin_required"], json!(false));
+    }
+
+    #[test]
+    fn cfg_carries_the_pin() {
+        let mut a = prefs::Api {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(Cfg::from_prefs(&a).pin, None);
+        a.web_pin = "99".into();
+        assert_eq!(Cfg::from_prefs(&a).pin.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn remote_triggers_never_black_out_or_change_air() {
+        // Layer bypass/solo and resync exist as addresses; black-out is the master bypass.
+        let mut p = Project::new("x");
+        p.composition.layers.push(layer());
+        let ctx = Ctx::new(None, false);
+        for path in [
+            "/comp/layer/1/bypass",
+            "/comp/layer/1/solo",
+            "/comp/master/bypass",
+        ] {
+            assert!(
+                matches!(
+                    answer(&p, &ctx, &|_| Vec::new(), Req::Set(path.into(), 1.0)),
+                    (Some(_), Ok(_))
+                ),
+                "{path}"
+            );
+        }
+        let (c, _) = answer(
+            &p,
+            &ctx,
+            &|_| Vec::new(),
+            Req::Set("/comp/tempo/resync".into(), 1.0),
+        );
+        assert!(matches!(c, Some(Command::Resync { .. })));
+        let (c, _) = answer(
+            &p,
+            &ctx,
+            &|_| Vec::new(),
+            Req::Set("/comp/tempo/resync".into(), 0.0),
+        );
+        assert!(c.is_none());
     }
 }

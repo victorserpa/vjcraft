@@ -411,11 +411,24 @@ impl State {
                             });
                             toggle(ui, &mut a.expose_network, "Expose to the network (default: this computer only)");
                         });
-                        if a.enabled && a.expose_network {
+                        ui.horizontal(|ui| {
+                            ui.label("Web remote PIN");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut a.web_pin)
+                                    .password(true)
+                                    .desired_width(100.0)
+                                    .char_limit(32),
+                            );
+                            help(ui, "Empty = no PIN. Needed for changes and live updates.");
+                        });
+                        if a.enabled && a.expose_network && a.web_pin.is_empty() {
                             ui.colored_label(
                                 ui.visuals().warn_fg_color,
-                                "Warning: no authentication. Anyone on your network can control VJCraft.",
+                                "Warning: no PIN. Anyone on your network can control VJCraft.",
                             );
+                        }
+                        if a.enabled {
+                            web_remote_links(ui, a);
                         }
                         if a.enabled {
                             match self.api.status() {
@@ -458,4 +471,50 @@ const DEFAULT_BLENDS: [vjc_model::BlendMode; 6] = {
 
 fn blend_name(b: &vjc_model::BlendMode) -> String {
     format!("{b:?}")
+}
+
+/// URLs of the web remote and a QR code of the first one (with the PIN when set, so a
+/// phone camera opens it logged in: keep the screen to yourself).
+fn web_remote_links(ui: &mut egui::Ui, a: &vjc_io::prefs::Api) {
+    let urls = crate::web_remote::urls(a.port, a.expose_network);
+    help(ui, "Web remote, open in a browser:");
+    for u in &urls {
+        ui.add(egui::Label::new(egui::RichText::new(u).monospace()).selectable(true));
+    }
+    let mut target = urls[0].clone();
+    if !a.web_pin.is_empty() {
+        let pin: String = a
+            .web_pin
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        target = format!("{target}?pin={pin}");
+    }
+    let Some(qr) = crate::qr::encode(target.as_bytes()) else {
+        return;
+    };
+    let px = 4.0;
+    let quiet = 2usize;
+    let side = (qr.size + 2 * quiet) as f32 * px;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, egui::Color32::WHITE);
+    for y in 0..qr.size {
+        for x in 0..qr.size {
+            if qr.get(x, y) {
+                let min = rect.min + egui::vec2((x + quiet) as f32, (y + quiet) as f32) * px;
+                p.rect_filled(
+                    egui::Rect::from_min_size(min, egui::vec2(px, px)),
+                    0.0,
+                    egui::Color32::BLACK,
+                );
+            }
+        }
+    }
 }
