@@ -319,6 +319,25 @@ pub fn offset_start(
     }
 }
 
+/// Where a freshly started clip must seek. `start` is the trigger mode's own position
+/// (Continue, Relative): it is used as it is and the start offset is not added. Only a
+/// plain restart (`None`) begins `offset_secs` into the clip, measured on the clip's own
+/// `file_secs`. `None` = no seek needed.
+pub fn first_seek(
+    start: Option<f64>,
+    offset_secs: f64,
+    file_secs: Option<f64>,
+    region: (f64, f64),
+) -> Option<f64> {
+    match start {
+        Some(s) => Some(s),
+        None => {
+            let to = offset_start(region.0, offset_secs, file_secs, region);
+            (to != region.0).then_some(to)
+        }
+    }
+}
+
 /// Position inside the file for a playhead position local to the region (0..=1).
 pub fn to_actual(local: f64, region: (f64, f64)) -> f64 {
     region.0 + local.clamp(0.0, 1.0) * (region.1 - region.0)
@@ -916,5 +935,22 @@ mod global_transport_tests {
         assert!(super::picture_refresh(false, 10.0, 0.1));
         assert!(super::picture_refresh(false, 0.0, 0.0));
         assert!(super::picture_refresh(false, f64::NAN, 0.0));
+    }
+
+    #[test]
+    fn first_seek_offsets_only_a_plain_restart_by_the_clips_own_length() {
+        let reg = (0.0, 1.0);
+        // Restart: 5 s into a 100 s clip.
+        assert_eq!(super::first_seek(None, 5.0, Some(100.0), reg), Some(0.05));
+        // The clip's own length decides (the same 5 s is a tenth of a 50 s clip).
+        assert_eq!(super::first_seek(None, 5.0, Some(50.0), reg), Some(0.1));
+        // Continue / Relative bring their own position: no offset on top.
+        assert_eq!(
+            super::first_seek(Some(0.4), 5.0, Some(100.0), reg),
+            Some(0.4)
+        );
+        // Unknown length or no offset: nothing to do.
+        assert_eq!(super::first_seek(None, 5.0, None, reg), None);
+        assert_eq!(super::first_seek(None, 0.0, Some(100.0), reg), None);
     }
 }

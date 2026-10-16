@@ -133,6 +133,8 @@ struct State {
     frame_ms: frame_stats::FrameStats,
     /// View > Show FPS & Stats: readout in the status bar (runtime only).
     show_stats: bool,
+    /// Last `ui_scale` pref pushed to egui (so the pref is not forced back every frame).
+    applied_ui_scale: Option<f32>,
     /// Cmd/Ctrl+K quick search.
     palette: palette::Palette,
     /// Animation presets already handed to the param popups (false: publish them).
@@ -509,6 +511,16 @@ fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -
 
 /// Rewrites the column of a queued command after columns moved; false when its column was
 /// removed (the command is dropped).
+/// The zoom to set when the `ui_scale` pref differs from the last one applied; None while
+/// it is unchanged, so a Cmd +/- zoom made meanwhile stays.
+fn scale_to_apply(applied: &mut Option<f32>, pref: f32) -> Option<f32> {
+    if applied.is_some_and(|a| (a - pref).abs() < 1e-3) {
+        return None;
+    }
+    *applied = Some(pref);
+    Some(pref)
+}
+
 fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
     match cmd {
         Command::ImportMedia { column, .. }
@@ -1896,6 +1908,7 @@ impl State {
             vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
             show_stats: false,
+            applied_ui_scale: None,
             palette: Default::default(),
             presets_published: false,
             stats: Default::default(),
@@ -3680,16 +3693,18 @@ impl State {
                             prev_local,
                         );
                         let offset = f64::from(self.prefs.general.clip_start_offset_ms) / 1000.0;
-                        if offset > 0.0 {
-                            let reg = self.region_of(layer);
-                            let dur = self.players.get(&layer).and_then(|(_, _, p)| p.duration());
-                            let from = start.unwrap_or(reg.0);
-                            let to = vjc_core::playback::offset_start(from, offset, dur, reg);
-                            if start.is_some() || to != from {
-                                self.seek(layer, to);
-                            }
-                        } else if let Some(start) = start {
-                            self.seek(layer, start);
+                        let reg = self.region_of(layer);
+                        // The new clip's own length (the player may not know it yet).
+                        let dur = self
+                            .players
+                            .get(&layer)
+                            .and_then(|(_, _, p)| p.duration())
+                            .or_else(|| {
+                                self.transport(deck, src, column)
+                                    .and_then(|t| t.duration_secs)
+                            });
+                        if let Some(to) = vjc_core::playback::first_seek(start, offset, dur, reg) {
+                            self.seek(layer, to);
                         }
                     } else {
                         self.notify(
@@ -6871,8 +6886,9 @@ impl State {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        let scale = self.prefs.general.ui_scale;
-        if (ui.ctx().zoom_factor() - scale).abs() > 1e-3 {
+        // Only when the pref changes: egui's own Cmd +/- must keep working in between.
+        if let Some(scale) = scale_to_apply(&mut self.applied_ui_scale, self.prefs.general.ui_scale)
+        {
             ui.ctx().set_zoom_factor(scale);
         }
         params::set_hidden(ui.ctx(), &self.prefs.layouts.current.hidden);
@@ -12214,6 +12230,19 @@ fn numbered_image_folder_drops_as_one_sequence_clip() {
 #[cfg(test)]
 mod remap_tests {
     use super::*;
+
+    #[test]
+    fn ui_scale_is_applied_only_when_the_pref_changes() {
+        let mut applied = None;
+        assert_eq!(scale_to_apply(&mut applied, 1.0), Some(1.0), "first frame");
+        assert_eq!(
+            scale_to_apply(&mut applied, 1.0),
+            None,
+            "unchanged: Cmd +/- survives"
+        );
+        assert_eq!(scale_to_apply(&mut applied, 1.25), Some(1.25));
+        assert_eq!(scale_to_apply(&mut applied, 1.25), None);
+    }
 
     #[test]
     fn remap_covers_every_column_bearing_command() {
