@@ -29,6 +29,10 @@ const MAX_THUMBS: usize = 512;
 /// gets a fresh thumbnail.
 pub struct ClipThumbs {
     textures: HashMap<ClipId, (PathBuf, egui::TextureHandle, u64)>,
+    /// PNG of the same thumbnails, made on demand for the web remote and dropped with the texture.
+    pngs: HashMap<ClipId, (PathBuf, Arc<Vec<u8>>)>,
+    /// Pixels of the thumbnails, kept so the PNG can be made without decoding again.
+    frames: HashMap<ClipId, (PathBuf, Frame)>,
     /// Logical clock for LRU: bumped on every insert and hit.
     tick: u64,
     cap: usize,
@@ -66,6 +70,8 @@ impl ClipThumbs {
         });
         ClipThumbs {
             textures: HashMap::new(),
+            pngs: HashMap::new(),
+            frames: HashMap::new(),
             tick: 0,
             cap: MAX_THUMBS,
             frame_floor: None,
@@ -99,6 +105,8 @@ impl ClipThumbs {
             any = true;
             match f {
                 Some(f) => {
+                    self.pngs.remove(&id);
+                    self.frames.insert(id, (path.clone(), f.clone()));
                     let img = egui::ColorImage::from_rgba_unmultiplied(
                         [f.width as usize, f.height as usize],
                         &f.data,
@@ -159,6 +167,24 @@ impl ClipThumbs {
         None
     }
 
+    /// PNG of the clip's thumbnail for the web remote, or None while it is not decoded
+    /// (this also starts the decode, like `texture`).
+    pub fn png(&mut self, id: ClipId, path: &std::path::Path) -> Option<Arc<Vec<u8>>> {
+        self.texture(id, path);
+        if let Some((p, png)) = self.pngs.get(&id)
+            && p == path
+        {
+            return Some(png.clone());
+        }
+        let (p, f) = self.frames.get(&id)?;
+        if p != path || !self.textures.contains_key(&id) {
+            return None;
+        }
+        let png = Arc::new(crate::web_remote::png_rgb(f.width, f.height, &f.data)?);
+        self.pngs.insert(id, (path.to_path_buf(), png.clone()));
+        Some(png)
+    }
+
     /// Drops the least recently used thumbnails until at most `cap` remain, never one
     /// shown in the last frame or two (the cache then grows past `cap` until they scroll
     /// away).
@@ -175,6 +201,8 @@ impl ClipThumbs {
                 break;
             };
             self.textures.remove(&oldest);
+            self.frames.remove(&oldest);
+            self.pngs.remove(&oldest);
         }
     }
 

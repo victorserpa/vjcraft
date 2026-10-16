@@ -540,6 +540,15 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
                 _ => None,
             }
         }
+        ["comp", "layer", n, prop @ ("bypass" | "solo")] => {
+            let id = layer_by_number(p, number_of(n)?)?;
+            let l = p.composition.layers.iter().find(|x| x.id == id)?;
+            Some(f64::from(u8::from(if *prop == "bypass" {
+                l.bypass
+            } else {
+                l.solo
+            })))
+        }
         ["comp", "master", "opacity"] => Some(number(&p.composition.master.opacity.value)),
         ["comp", "master", "bypass"] => Some(f64::from(u8::from(ctx.master_bypass))),
         ["comp", "tempo", "bpm"] => Some(p.composition.tempo.bpm),
@@ -649,6 +658,15 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
                 _ => None,
             }
         }
+        ["comp", "layer", n, "bypass"] => Some(Command::SetLayerBypass {
+            layer: layer_by_number(p, number_of(n)?)?,
+            bypass: value >= 0.5,
+        }),
+        ["comp", "layer", n, "solo"] => Some(Command::SetLayerSolo {
+            layer: layer_by_number(p, number_of(n)?)?,
+            solo: value >= 0.5,
+        }),
+        ["comp", "tempo", "resync"] => fire.then_some(Command::Resync { at: ctx.now }),
         ["comp", "layer", n, "clear"] => fire.then_some(Command::ClearLayer {
             layer: layer_by_number(p, number_of(n)?)?,
         }),

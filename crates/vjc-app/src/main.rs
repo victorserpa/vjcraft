@@ -34,6 +34,7 @@ mod persist;
 mod pool;
 mod prefs_ui;
 mod preload;
+mod qr;
 mod shortcut_editor;
 mod slice_inspector;
 mod slice_render;
@@ -44,6 +45,7 @@ mod ui_stats;
 mod vram;
 mod wake;
 mod wave_ui;
+mod web_remote;
 mod widgets;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
@@ -5515,6 +5517,40 @@ impl State {
         }
     }
 
+    /// PNG of the thumbnail of the clip at (layer, column), 1-based from the bottom layer,
+    /// of the current deck. Starts the decode when it is not cached yet (404 until ready).
+    fn web_thumb(&mut self, layer: u32, column: u32) -> api_io::Reply {
+        let c = &self.project.composition;
+        let li = c.layers.len().checked_sub(layer as usize);
+        let clip = li
+            .and_then(|i| c.layers.get(i))
+            .and_then(|l| {
+                let col = column.checked_sub(1)?;
+                c.decks
+                    .iter()
+                    .find(|d| d.id == c.current_deck)?
+                    .clips
+                    .iter()
+                    .find(|k| k.layer == l.id && k.column == col)
+            })
+            .map(|k| (k.clip.id, k.clip.source.clone()));
+        let miss = |m: &str| {
+            Err(api_io::ApiErr {
+                status: 404,
+                msg: m.into(),
+            })
+        };
+        let Some((id, vjc_model::Source::File { path })) = clip else {
+            return miss("no thumbnail for this cell");
+        };
+        match self.thumbs.png(id, &path) {
+            Some(png) => Ok(
+                serde_json::json!({"png": png.iter().map(|b| char::from(*b)).collect::<String>()}),
+            ),
+            None => miss("thumbnail not ready"),
+        }
+    }
+
     /// Remote API, once per frame: applies the config, then answers the queued requests
     /// (the server threads wait for the reply, the render loop never waits for them).
     fn api_pump(&mut self, ctx: &egui::Context) {
@@ -5530,6 +5566,11 @@ impl State {
             };
             let rt = self.rt_ctx();
             let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
+            if let api_io::Req::Thumb(l, c) = &msg.req {
+                let reply = self.web_thumb(*l, *c);
+                let _ = msg.reply.send(reply);
+                continue;
+            }
             let (cmd, reply) = api_io::answer(&self.project, &rt, &active, msg.req);
             if let Some(c) = cmd {
                 self.exec(c);

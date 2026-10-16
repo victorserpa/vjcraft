@@ -5,20 +5,46 @@ Control VJCraft from scripts, web pages or other apps. Off by default.
 Enable in Preferences > Remote API. REST listens on port **P** (default 8090), the
 WebSocket on **P + 1** (default 8091). Default bind is `127.0.0.1` (this computer only).
 
+## Web remote
+
+`GET /` on the REST port serves a phone-friendly page (clip grid with thumbnails, trigger clip/column,
+layer opacity/bypass/solo/clear, master, crossfader, BPM/tap/resync, black-out with confirm, decks,
+dashboard dials, live updates over the WebSocket). Open `http://<this-computer>:8090/` from a phone,
+tablet or another PC (enable "Expose to the network" first). Preferences > Remote API lists the URLs
+(LAN IPv4, `name.local`) and a QR code (it carries `?pin=` when a PIN is set). The page is one embedded
+HTML file: no CDN, no external request, CSP `default-src 'none'`. It connects to the socket on port + 1.
+
+- `GET /api/v1/web` returns `{"pin_required": bool}` (open).
+- `GET /api/v1/clip/{layer}/{column}/thumb` returns the clip's thumbnail as `image/png` (`Cache-Control:
+  private, max-age=30`); 404 for cells that are empty, not file clips, or not decoded yet (the decode
+  starts on the first request; retry).
+- Added addresses: `/comp/layer/N/bypass`, `/comp/layer/N/solo` (0/1) and `/comp/tempo/resync`.
+- `GET /api/v1/composition` also returns `dashboard` (`[{name, value}]`).
+
+## PIN
+
+Preferences > Remote API > "Web remote PIN" (empty = none, stored in plain text in the preferences file).
+When set, every `POST` needs it as header `X-Pin: <pin>`, `Authorization: Bearer <pin>` or `?pin=`
+(401 otherwise), and the WebSocket upgrade needs `?pin=` or `X-Pin` (401). Compared in constant time.
+Reads (`GET`, the page itself) stay open. A PIN is not encryption: it travels in clear over HTTP, so use
+it on a network you trust.
+
 ## Security warning
 
-There is **no authentication**. Anyone who can reach the port can trigger clips, change
+Without a PIN there is **no authentication**. Anyone who can reach the port can trigger clips, change
 opacity/BPM and clear the composition.
 
 - Keep the default (loopback) unless you need another machine.
-- "Expose to the network" binds `0.0.0.0`: everyone on that network gets full control.
+- "Expose to the network" binds `0.0.0.0`: everyone on that network gets full control unless a PIN is set.
   Use it only on a network you trust, or behind a firewall/VPN.
 - Against web pages in your own browser: POST needs `Content-Type: application/json` (this
-  forces a CORS preflight, which is never answered), and WebSocket upgrades carrying an
-  `Origin` other than localhost/127.0.0.1/[::1] are refused (unless exposed to the network).
+  forces a CORS preflight, which is never answered; no `Access-Control-*` header is ever sent), and
+  WebSocket upgrades carrying an `Origin` other than localhost/127.0.0.1/[::1] are refused. When exposed
+  to the network the `Origin` host must equal the `Host` the socket was reached at (same site only).
 - Against DNS rebinding: on loopback (default) REST and WebSocket accept only `Host`
   127.0.0.1, localhost or [::1] (with the API port, or none); anything else gets 403.
-  When exposed to the network any `Host` is accepted.
+  When exposed to the network the `Host` must be an IP literal, `localhost`, or this computer's name
+  (`name` or `name.local`); other names get 403.
 - Limits: 64 KB per body/message, 16 concurrent HTTP requests, 8 WebSocket clients,
   256 subscribed paths.
 
@@ -38,7 +64,7 @@ range (position and anchor +-16384 px, scale 0..10, rotation +-360 degrees).
 ## REST
 
 Errors: 4xx/5xx with `{"error": "..."}` (400 malformed, 404 unknown route/address, 405 method,
-413 too large, 415 content type, 422 address unknown or value without effect, 503 app busy).
+401 PIN missing/wrong, 413 too large, 415 content type, 422 address unknown or value without effect, 503 app busy).
 
 ```sh
 curl http://127.0.0.1:8090/api/v1/composition
