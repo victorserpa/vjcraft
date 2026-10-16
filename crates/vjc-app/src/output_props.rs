@@ -8,7 +8,7 @@ use crate::icons;
 use crate::output_hints::hint;
 use crate::output_tree::{inset_mask, one_command, slice_label};
 use crate::params::{param_slider_step, text_field, text_field_free};
-use crate::theme::{COMBO_W_SM, FS_SM, PROP_LABEL_W, SP_2, SP_4, TEXT, bold_font};
+use crate::theme::{self, COMBO_W_SM, FS_SM, PROP_LABEL_W, SP_2, SP_4, TEXT, bold_font};
 use crate::widgets::{self, Kind, toggle};
 use eframe::egui::{self, RichText};
 use uuid::Uuid;
@@ -49,7 +49,14 @@ fn num(
     value: f32,
     (default, range, step): (f32, (f32, f32), f32),
 ) -> Option<f32> {
-    widgets::prop_row(ui, None, |ui| {
+    let tint = match label {
+        "R" => Some(theme::palette(Some(1))),
+        "G" => Some(theme::palette(Some(4))),
+        "B" => Some(theme::palette(Some(5))),
+        _ => None,
+    }
+    .flatten();
+    widgets::prop_row_tint(ui, None, tint, |ui| {
         param_slider_step(
             ui,
             id,
@@ -530,14 +537,17 @@ impl State {
             row(ui, "slice-flip", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let mut ops = vec![];
-                    for (label, op) in [
-                        ("Rotate 90", Op::Rotate(1)),
-                        ("Rotate 180", Op::Rotate(2)),
-                        ("Rotate 270", Op::Rotate(3)),
-                        ("Flip H", Op::FlipH),
-                        ("Flip V", Op::FlipV),
+                    for (label, icon, op) in [
+                        ("Rotate 90", icons::i::ARROW_CLOCKWISE, Op::Rotate(1)),
+                        (
+                            "Rotate 270",
+                            icons::i::ARROW_COUNTER_CLOCKWISE,
+                            Op::Rotate(3),
+                        ),
+                        ("Flip H", icons::i::FLIP_HORIZONTAL, Op::FlipH),
+                        ("Flip V", icons::i::FLIP_VERTICAL, Op::FlipV),
                     ] {
-                        if widgets::btn(ui, label, Kind::Secondary).clicked() {
+                        if icons::button(ui, icon, label).clicked() {
                             ops.push(op);
                         }
                     }
@@ -667,47 +677,53 @@ impl State {
         full: bool,
         cmds: &mut Vec<Command>,
     ) {
-        widgets::fold_section(ui, "slice", "Soft edge", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let mut on = sl.soft_edge.is_some();
-                if hint(toggle(ui, &mut on, "Enabled"), "slice-soft").changed() {
-                    let all = ids
-                        .iter()
-                        .map(|slice| Command::SetSliceSoftEdge {
+        let mut on = sl.soft_edge.is_some();
+        let toggled = widgets::fold_section_with(
+            ui,
+            "slice",
+            "Soft edge",
+            Some(("Enabled", &mut on)),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let Some(e) = &sl.soft_edge else { return };
+                    if !full {
+                        return;
+                    }
+                    let mut n = e.clone();
+                    let w = 0.0..=mapping::MAX_SOFT_WIDTH;
+                    ui.add(egui::Slider::new(&mut n.left, w.clone()).text("Edge left"));
+                    ui.add(egui::Slider::new(&mut n.right, w.clone()).text("Edge right"));
+                    ui.add(egui::Slider::new(&mut n.top, w.clone()).text("Edge top"));
+                    widgets::slider(ui, &mut n.bottom, w, "Edge bottom");
+                    let g = mapping::GAMMA_RANGE.0..=mapping::GAMMA_RANGE.1;
+                    widgets::slider(ui, &mut n.gamma, g, "Edge gamma");
+                    if n != *e {
+                        cmds.push(Command::SetSliceSoftEdge {
                             screen: scr.id,
-                            slice: *slice,
-                            soft_edge: on.then_some(SoftEdge {
-                                left: SOFT_EDGE_DEFAULT,
-                                right: SOFT_EDGE_DEFAULT,
-                                top: 0.0,
-                                bottom: 0.0,
-                                gamma: 1.0,
-                            }),
-                        })
-                        .collect();
-                    cmds.extend(one_command(all));
-                }
-                let Some(e) = &sl.soft_edge else { return };
-                if !full {
-                    return;
-                }
-                let mut n = e.clone();
-                let w = 0.0..=mapping::MAX_SOFT_WIDTH;
-                ui.add(egui::Slider::new(&mut n.left, w.clone()).text("Edge left"));
-                ui.add(egui::Slider::new(&mut n.right, w.clone()).text("Edge right"));
-                ui.add(egui::Slider::new(&mut n.top, w.clone()).text("Edge top"));
-                widgets::slider(ui, &mut n.bottom, w, "Edge bottom");
-                let g = mapping::GAMMA_RANGE.0..=mapping::GAMMA_RANGE.1;
-                widgets::slider(ui, &mut n.gamma, g, "Edge gamma");
-                if n != *e {
-                    cmds.push(Command::SetSliceSoftEdge {
-                        screen: scr.id,
-                        slice: sl.id,
-                        soft_edge: Some(n),
-                    });
-                }
-            });
-        });
+                            slice: sl.id,
+                            soft_edge: Some(n),
+                        });
+                    }
+                });
+            },
+        );
+        if toggled {
+            let all = ids
+                .iter()
+                .map(|slice| Command::SetSliceSoftEdge {
+                    screen: scr.id,
+                    slice: *slice,
+                    soft_edge: on.then_some(SoftEdge {
+                        left: SOFT_EDGE_DEFAULT,
+                        right: SOFT_EDGE_DEFAULT,
+                        top: 0.0,
+                        bottom: 0.0,
+                        gamma: 1.0,
+                    }),
+                })
+                .collect();
+            cmds.extend(one_command(all));
+        }
     }
 
     /// Mask: a row of shape buttons, plus create / edit / clear and invert.

@@ -7493,19 +7493,19 @@ fn shift_click_on_a_slice_section_folds_all_of_them() {
         h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
         settle(h);
     };
-    assert!(exists(&h, "Rectangle") && exists(&h, "Enabled"));
+    assert!(exists(&h, "Rectangle") && exists(&h, "Brightness"));
     // Plain click folds only its own section.
     let at = header(&h, "Soft edge");
     click_at(&mut h, at, egui::Modifiers::NONE);
-    assert!(exists(&h, "Rectangle") && !exists(&h, "Enabled"));
+    assert!(exists(&h, "Rectangle") && exists(&h, "Brightness"));
     // Shift+click folds every section.
     let at = header(&h, "Mask");
     click_at(&mut h, at, egui::Modifiers::SHIFT);
-    assert!(!exists(&h, "Rectangle") && !exists(&h, "Enabled"));
+    assert!(!exists(&h, "Rectangle") && !exists(&h, "Brightness"));
     // Shift+click again opens them all.
     let at = header(&h, "Mask");
     click_at(&mut h, at, egui::Modifiers::SHIFT);
-    assert!(exists(&h, "Rectangle") && exists(&h, "Enabled"));
+    assert!(exists(&h, "Rectangle") && exists(&h, "Brightness"));
 }
 
 // ---- Output setup window: tree, tabs, canvas, working copy ---------------------------------
@@ -8170,6 +8170,32 @@ fn output_canvas_lists_the_slices_of_the_selected_screen() {
         .unwrap();
     assert_eq!(scr.name, "Wall 2");
     assert!(sl.is_none() && scr.slices.len() == 2);
+}
+
+#[test]
+fn output_toolbar_modes_sit_right_and_flip_is_four_icons() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Centre");
+    click_tab(&mut h, "Output");
+    let t = h.get_by_label("Transform").rect();
+    let e = h.get_by_label("Edit points").rect();
+    let hand = h.get_by_label("Hand tool").rect();
+    assert!(hand.max.x < t.min.x, "modes are right of the tools");
+    assert!(t.max.x < e.min.x, "Edit points is the rightmost");
+    for l in ["Rotate 90", "Rotate 270", "Flip H", "Flip V"] {
+        assert!(exists(&h, l), "{l}");
+    }
+    assert!(!exists(&h, "Rotate 180"));
+}
+
+#[test]
+fn output_help_title_follows_the_hovered_control() {
+    let (mut h, _tex) = stage_setup();
+    assert!(exists(&h, "Help"));
+    let at = h.get_by_label("Centre").rect().center();
+    h.hover_at(at);
+    settle(&mut h);
+    assert!(exists(&h, "Screens and slices") && !exists(&h, "Help"));
 }
 
 // 30, 31: many screens and the property rows.

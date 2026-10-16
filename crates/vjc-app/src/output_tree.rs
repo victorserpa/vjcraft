@@ -601,7 +601,7 @@ impl State {
                 ui.set_min_size(size - egui::Vec2::splat(2.0 * SP_3));
                 ui.set_max_size(size - egui::Vec2::splat(2.0 * SP_3));
                 ui.label(
-                    RichText::new("Help")
+                    RichText::new(output_hints::title(ui.ctx()))
                         .font(bold_font(ui.ctx(), FS_SM))
                         .color(TEXT),
                 );

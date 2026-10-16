@@ -5,7 +5,7 @@ use crate::theme::{
     RADIUS_SM, SP_1, SP_2, SP_4, STATUS_H, STROKE_W, SURFACE_RAISED, TEXT, TEXT_MUTED, TOAST_TTL_S,
     TOAST_W, WARN, bold_font,
 };
-use crate::theme::{PROP_BAND_H, PROP_DIVIDER, PROP_ZEBRA, SECTION_BG, SP_3};
+use crate::theme::{PROP_BAND_H, PROP_DIVIDER, PROP_TINT_W, PROP_ZEBRA, SECTION_BG, SP_3};
 use eframe::egui::{self, RichText, Stroke};
 
 /// Button emphasis: the main action, a plain one, or a destructive one.
@@ -148,6 +148,19 @@ pub fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui))
 /// Like `section`, but the header folds the body. The fold state lives in egui memory under
 /// `group` + title; Shift+click on a header folds or unfolds every section of the group.
 pub fn fold_section(ui: &mut egui::Ui, group: &str, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    fold_section_with(ui, group, title, None, body);
+}
+
+/// `fold_section` with a checkbox (`label`, state) inside the header band, right-aligned.
+/// Returns true on the frame the checkbox changed.
+pub fn fold_section_with(
+    ui: &mut egui::Ui,
+    group: &str,
+    title: &str,
+    mut check: Option<(&str, &mut bool)>,
+    body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut changed = false;
     let key = |t: &str| egui::Id::new(("fold", group, t.to_owned()));
     let list = egui::Id::new(("fold-all", group));
     let open = ui.data(|d| d.get_temp::<bool>(key(title))).unwrap_or(true);
@@ -180,6 +193,11 @@ pub fn fold_section(ui: &mut egui::Ui, group: &str, title: &str, body: impl FnOn
                     )
                     .sense(egui::Sense::click()),
                 );
+                if let Some((label, on)) = check.as_mut() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        changed = toggle(ui, on, label).changed();
+                    });
+                }
                 c.union(t)
             })
             .inner
@@ -204,6 +222,7 @@ pub fn fold_section(ui: &mut egui::Ui, group: &str, title: &str, body: impl FnOn
         body(ui);
     }
     ui.add_space(SP_4);
+    changed
 }
 
 /// Non-folding header band for a whole panel ("Screen", "Slice").
@@ -240,6 +259,16 @@ pub fn prop_row<R>(
     label: Option<&str>,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    prop_row_tint(ui, label, None, body)
+}
+
+/// `prop_row` with a small coloured bar at the right edge (R, G and B rows).
+pub fn prop_row_tint<R>(
+    ui: &mut egui::Ui,
+    label: Option<&str>,
+    tint: Option<egui::Color32>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     let n: u32 = ui.data(|d| d.get_temp(zebra_key())).unwrap_or(0);
     ui.data_mut(|d| d.insert_temp(zebra_key(), n + 1));
     let fill = if n % 2 == 1 {
@@ -262,6 +291,13 @@ pub fn prop_row<R>(
             .inner
         });
     let r = out.response.rect;
+    if let Some(c) = tint {
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(r.right() - PROP_TINT_W - 1.0, r.top() + SP_2),
+            egui::pos2(r.right() - 1.0, r.bottom() - SP_2),
+        );
+        ui.painter().rect_filled(bar, 1.0, c);
+    }
     ui.painter()
         .hline(r.x_range(), r.bottom(), Stroke::new(STROKE_W, PROP_DIVIDER));
     out.inner

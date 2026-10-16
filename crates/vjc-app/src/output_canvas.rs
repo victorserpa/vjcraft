@@ -373,32 +373,34 @@ impl State {
                 egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Grid lines")
             });
             hint(r.response, "grid");
-            ui.separator();
-            if hint(
-                widgets::choice(ui, mode == OutMode::Transform, "Transform"),
-                "mode-transform",
-            )
-            .clicked()
-            {
-                new_mode = OutMode::Transform;
-            }
-            if hint(
-                widgets::choice(ui, mode == OutMode::Points, "Edit points"),
-                "mode-points",
-            )
-            .clicked()
-            {
-                new_mode = OutMode::Points;
-            }
-            if let Some(id) = self.sel_screen
-                && Self::guide_texture(ui.ctx(), id).is_some()
-                && let Some(w) = self.out_win.as_mut()
-            {
-                let mut on = w.guide_on;
-                if hint(widgets::toggle(ui, &mut on, "Guide"), "guide").changed() {
-                    w.guide_on = on;
+            // Right side: the editing mode (the active one filled), then the guide switch.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if hint(
+                    widgets::choice(ui, mode == OutMode::Points, "Edit points"),
+                    "mode-points",
+                )
+                .clicked()
+                {
+                    new_mode = OutMode::Points;
                 }
-            }
+                if hint(
+                    widgets::choice(ui, mode == OutMode::Transform, "Transform"),
+                    "mode-transform",
+                )
+                .clicked()
+                {
+                    new_mode = OutMode::Transform;
+                }
+                if let Some(id) = self.sel_screen
+                    && Self::guide_texture(ui.ctx(), id).is_some()
+                    && let Some(w) = self.out_win.as_mut()
+                {
+                    let mut on = w.guide_on;
+                    if hint(widgets::toggle(ui, &mut on, "Guide"), "guide").changed() {
+                        w.guide_on = on;
+                    }
+                }
+            });
         });
         if let Some(w) = self.out_win.as_mut() {
             if new_tab != w.tab {

@@ -85,7 +85,7 @@ pub const OUTPUT_WIN_Y: f32 = 80.0;
 pub const OUTPUT_MIN_W: f32 = 860.0;
 pub const OUTPUT_MIN_H: f32 = 500.0;
 pub const OUTPUT_LIST_W: f32 = 250.0;
-pub const OUTPUT_PROPS_W: f32 = 330.0;
+pub const OUTPUT_PROPS_W: f32 = 400.0;
 pub const OUTPUT_HELP_H: f32 = 92.0;
 pub const OUTPUT_FOOTER_H: f32 = 32.0;
 /// Output canvas: dash and gap of the outline of an unselected slice, how far past the
@@ -299,6 +299,8 @@ pub const PARAM_LABEL_MAX: f32 = 180.0;
 /// alternate row fill and the 1px divider under each row.
 pub const PROP_BAND_H: f32 = 22.0;
 pub const PROP_LABEL_W: f32 = 84.0;
+/// Width of the coloured bar on the R, G and B rows.
+pub const PROP_TINT_W: f32 = 4.0;
 pub const PROP_ZEBRA: Color32 = Color32::from_rgb(0x2b, 0x2f, 0x36);
 pub const PROP_DIVIDER: Color32 = Color32::from_rgb(0x33, 0x37, 0x40);
 /// Tree row: screen header height, and the slice-count / sub-line colour.
