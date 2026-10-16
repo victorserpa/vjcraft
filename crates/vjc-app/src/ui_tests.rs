@@ -6768,3 +6768,42 @@ fn layer_and_clip_panels_show_the_wave_m_fields() {
     }
     assert!(exists(&h, "Refresh thumbnail") && exists(&h, "Freeze"));
 }
+
+#[test]
+fn view_menu_toggles_the_stats_bar() {
+    let mut h = app();
+    settle(&mut h);
+    assert!(!h.state().show_stats);
+    click(&mut h, "View");
+    click(&mut h, "Show FPS & Stats");
+    assert!(h.state().show_stats);
+    h.run_steps(2);
+    assert!(h.query_all_by_label_contains("fps").next().is_some());
+}
+
+#[test]
+fn midi_monitor_pause_holds_the_list_and_resume_takes_new_messages() {
+    let mut h = app();
+    h.state_mut().midi_monitor_open = true;
+    h.state_mut().midi_log.push("first".into());
+    settle(&mut h);
+    click(&mut h, "Pause");
+    assert!(h.state().midi_log.paused());
+    h.state_mut().midi_log.push("second".into());
+    assert_eq!(h.state().midi_log.len(), 1);
+    click(&mut h, "Resume");
+    h.state_mut().midi_log.push("third".into());
+    assert_eq!(h.state().midi_log.copy_text(), "first\nthird");
+}
+
+#[test]
+fn midi_monitor_click_selects_a_line_for_copy() {
+    let mut h = app();
+    h.state_mut().midi_monitor_open = true;
+    h.state_mut().midi_log.push("alpha".into());
+    h.state_mut().midi_log.push("beta".into());
+    settle(&mut h);
+    click(&mut h, "alpha");
+    assert_eq!(h.state().midi_log.copy_text(), "alpha");
+    click(&mut h, "Copy");
+}

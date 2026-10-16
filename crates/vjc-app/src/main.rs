@@ -40,6 +40,7 @@ mod shortcut_editor;
 mod slice_inspector;
 mod slice_render;
 mod source_info;
+mod stats_bar;
 mod theme;
 mod timecode_io;
 mod ui_stats;
@@ -118,6 +119,12 @@ struct State {
     /// Texture-memory limit in bytes (`VJC_VRAM_LIMIT_MB`).
     vram_limit: u64,
     frame_ms: frame_stats::FrameStats,
+    /// View > Show FPS & Stats: readout in the status bar (runtime only).
+    show_stats: bool,
+    stats: stats_bar::Sampler,
+    /// Estimated texture bytes (refreshed with the VRAM watchdog) and GPU adapter name.
+    vram_bytes: u64,
+    gpu_name: String,
     ui_stats: ui_stats::UiStats,
     last_ui: Option<std::time::Instant>,
     render_gate: FrameGate,
@@ -1781,6 +1788,10 @@ impl State {
             vram_dog: vram::Watchdog::default(),
             vram_limit: vram::limit_from(std::env::var("VJC_VRAM_LIMIT_MB").ok().as_deref()),
             frame_ms: frame_stats::FrameStats::new(),
+            show_stats: false,
+            stats: Default::default(),
+            vram_bytes: 0,
+            gpu_name: String::new(),
             ui_stats: ui_stats::UiStats::new(),
             last_ui: None,
             render_gate: FrameGate::default(),
@@ -2143,6 +2154,8 @@ impl State {
                 }
             }
         });
+        ui.separator();
+        crate::widgets::toggle(ui, &mut self.show_stats, "Show FPS & Stats");
         ui.separator();
         let l = self.prefs.layouts.current.clone();
         let mut new = l.clone();
@@ -6415,6 +6428,22 @@ impl State {
                                 .monospace()
                                 .color(theme::CLOCK_TEXT),
                         );
+                        if self.show_stats {
+                            ui.separator();
+                            let txt = self.stats.text(
+                                std::time::Instant::now(),
+                                stats_bar::Inputs {
+                                    p99_ms: self.frame_ms.p99(),
+                                    vram_bytes: self.vram_bytes,
+                                    gpu: &self.gpu_name,
+                                    preload: self.preload.len(),
+                                },
+                            );
+                            ui.weak(egui::RichText::new(txt).monospace())
+                                .on_hover_text(
+                                    "UI frames per second, frame time p99, UI frames later than 2 periods while playing, process CPU, estimated texture memory, GPU, decoders preloaded",
+                                );
+                        }
                         if self.frame_ms.len() > 0 {
                             ui.separator();
                             let stale = self.frame_label.0.is_none_or(|t| {
@@ -6431,8 +6460,13 @@ impl State {
                 });
             });
         if self.persist {
-            // Live app only: keeps the clock ticking while idle.
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            // Live app only: keeps the clock ticking while idle (2 Hz with the stats bar).
+            let every = if self.show_stats {
+                stats_bar::EVERY
+            } else {
+                std::time::Duration::from_secs(1)
+            };
+            ctx.request_repaint_after(every);
         }
         let help_shown = self.help_shown.and_then(help::text).unwrap_or(help::IDLE);
         let help_on = self.prefs.layouts.help;
@@ -10068,6 +10102,11 @@ impl State {
         };
         let thumbs = std::cell::RefCell::new(&mut self.browser.fx_thumbs);
         let comp = std::cell::RefCell::new(comp);
+        self.vram_bytes = {
+            let mut u = comp.borrow().vram();
+            u.thumbs = thumbs.borrow().bytes();
+            u.total()
+        };
         self.vram_warn = self.vram_dog.step(
             self.vram_limit,
             || {
@@ -10525,6 +10564,9 @@ impl eframe::App for State {
             self.vram_watch();
         }
         if let Some(rs) = frame.wgpu_render_state() {
+            if self.gpu_name.is_empty() {
+                self.gpu_name = rs.adapter.get_info().name;
+            }
             self.browser
                 .fx_thumbs
                 .attach(rs.device.clone(), rs.queue.clone(), ui.ctx().clone());
@@ -10532,6 +10574,10 @@ impl eframe::App for State {
         State::ui(self, ui);
         let ctx = ui.ctx().clone();
         self.ui_stats.frame(&ctx);
+        if self.show_stats {
+            let fps = effective_fps(self.project.composition.fps, self.prefs.video.max_fps);
+            self.stats.frame(t0, self.is_live(), fps);
+        }
         self.output_window(&ctx);
         self.frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
         // VJC_FRAME_LOG=1 prints the counter every 120 frames (measuring N layers).
