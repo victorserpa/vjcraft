@@ -5338,6 +5338,54 @@ mod tests {
         );
     }
 
+    /// An ML effect renders without wgpu validation errors on a 16-bit compositor,
+    /// both before the first mask (skipped) and after it (applied). Skipped without adapter.
+    #[test]
+    fn gpu_ml_effect_16bit_has_no_validation_errors() {
+        let Some((device, queue)) = gpu() else { return };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("remove_bg").unwrap()).unwrap();
+        let mut comp = Compositor::with_format(&device, 2, 1, wgpu::TextureFormat::Rgba16Float);
+        comp.add_effect(&device, "remove_bg", &wgsl).unwrap();
+        let ml = MlDraw {
+            key: 7,
+            tag: 0,
+            size: (2, 1),
+        };
+        let red = [255u8, 0, 0, 255].repeat(2);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        for round in 0..2 {
+            let layer = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![EffectDraw {
+                    lut: None,
+                    blend: Default::default(),
+                    kind: "remove_bg".into(),
+                    uniforms: isf.pack(&isf.default_params(), 0.0, (2, 1)),
+                    dry_wet: 1.0,
+                    ml: Some(ml.clone()),
+                    persistent: None,
+                    ticking: false,
+                }],
+                frame: Some((2, 1, &red, 1)),
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            if round == 0 {
+                comp.ml_set_mask(&device, &queue, 7, (2, 1), &[0, 255]);
+            }
+        }
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "validation error: {err:?}");
+    }
+
     /// Red channel of each row of a 1-pixel-wide target, top row first.
     fn read_col(device: &wgpu::Device, queue: &wgpu::Queue, comp: &Compositor, h: u32) -> Vec<u8> {
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
