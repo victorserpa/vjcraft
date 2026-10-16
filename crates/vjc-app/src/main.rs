@@ -1276,29 +1276,10 @@ fn transform_ui_range(field: TransformField, (w, h): (f64, f64)) -> ((f64, f64),
 
 /// Transition types offered in the layer and clip panels: (stored name, label).
 fn transition_kinds() -> Vec<(String, String)> {
-    [
-        "Cut",
-        "Dissolve",
-        "ToBlack",
-        "PushLeft",
-        "PushRight",
-        "PushUp",
-        "PushDown",
-        "ZoomIn",
-        "ZoomOut",
-        "WipeEllipse",
-        "WipeLeft",
-        "WipeRight",
-        "WipeUp",
-        "WipeDown",
-        "Cube",
-        "Pixelate",
-        "LumaWipe",
-        "Random",
-    ]
-    .iter()
-    .map(|k| (k.to_string(), k.to_string()))
-    .collect()
+    vjc_core::transition::Kind::ALL
+        .iter()
+        .map(|k| (k.name(), k.name()))
+        .collect()
 }
 
 fn labeled<T: Copy>(v: &[(T, &str)]) -> Vec<(T, String)> {
@@ -4125,6 +4106,13 @@ impl State {
                 .map_or(1, |d| d.as_nanos() as u64);
             let running = !self.clock.is_paused();
             let comp = &self.project.composition;
+            // Longest layer transition: the next column fires that much early when asked.
+            let bpm = self.project.composition.tempo.bpm;
+            let lead_secs = comp
+                .layers
+                .iter()
+                .map(|l| vjc_core::transition::duration_secs(&l.transition, bpm))
+                .fold(0.0, f64::max);
             if let Some(next) = self.comp_ap.tick(
                 &comp.autopilot,
                 &comp.columns,
@@ -4134,6 +4122,8 @@ impl State {
                     dt,
                     running,
                     rand,
+                    lead_secs,
+                    bpm,
                 },
             ) {
                 let deck = comp.current_deck;

@@ -166,9 +166,16 @@ pub fn comp_section(ui: &mut egui::Ui, a: &CompAutopilot, cmds: &mut Vec<Command
     }
     ui.horizontal(|ui| {
         params::row_label(ui, "Loop");
-        edited |= crate::widgets::toggle(ui, &mut n.looping, "").changed();
+        edited |= crate::widgets::toggle(ui, &mut n.looping, "")
+            .on_hover_text("Loop off stops at the first or last column.")
+            .changed();
+        ui.label("Compensate transition");
+        edited |= crate::widgets::toggle(ui, &mut n.compensate_transition, "")
+            .on_hover_text(
+                "Compensate transition: starts the next column early by the longest layer transition, so the crossing ends when the time is up.",
+            )
+            .changed();
     });
-    widgets::help(ui, "Loop off stops at the first or last column.");
     if edited {
         cmds.push(Command::SetCompAutopilot { autopilot: n });
     }

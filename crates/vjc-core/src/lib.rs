@@ -23,6 +23,7 @@ pub mod slice_geom;
 pub mod timecode;
 pub mod transform;
 pub mod transition;
+pub mod transition_fx;
 #[cfg(test)]
 mod wave_j_tests;
 

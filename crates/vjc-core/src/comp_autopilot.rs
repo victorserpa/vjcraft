@@ -122,7 +122,7 @@ pub fn pick(
 }
 
 /// What one frame tells the autopilot.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Frame {
     /// Beat phase of the app clock.
     pub phase: f64,
@@ -132,6 +132,19 @@ pub struct Frame {
     pub running: bool,
     /// Random number for a random pick.
     pub rand: u64,
+    /// Longest layer transition in seconds and the tempo, for transition compensation.
+    pub lead_secs: f64,
+    pub bpm: f64,
+}
+
+/// How much earlier than `hold` the next column fires: the transition time when
+/// `compensate` is on, never more than half the hold (so a long crossing cannot make the
+/// autopilot fire every frame).
+fn lead_of(compensate: bool, lead_secs: f64, hold_secs: f64) -> f64 {
+    if !compensate || !lead_secs.is_finite() || !hold_secs.is_finite() {
+        return 0.0;
+    }
+    lead_secs.clamp(0.0, hold_secs * 0.5)
 }
 
 /// Run-time state of the composition autopilot (never saved).
@@ -184,6 +197,8 @@ impl State {
             dt,
             running,
             rand,
+            lead_secs,
+            bpm,
         } = f;
         let cur = self.current?;
         let col = columns.get(cur as usize)?;
@@ -198,9 +213,17 @@ impl State {
         if phase < self.start_phase {
             self.start_phase = phase;
         }
+        let comp_on = comp.compensate_transition;
         let due = match hold(&r, clip_secs) {
-            Hold::Beats(b) => b > 0.0 && b.is_finite() && phase - self.start_phase >= b,
-            Hold::Secs(s) => s > 0.0 && s.is_finite() && self.secs >= s,
+            Hold::Beats(b) => {
+                let bps = if bpm > 0.0 { bpm / 60.0 } else { 1.0 };
+                let lead = lead_of(comp_on, lead_secs, b / bps) * bps;
+                b > 0.0 && b.is_finite() && phase - self.start_phase >= b - lead
+            }
+            Hold::Secs(s) => {
+                let lead = lead_of(comp_on, lead_secs, s);
+                s > 0.0 && s.is_finite() && self.secs >= s - lead
+            }
         };
         if !due {
             return None;
@@ -251,6 +274,7 @@ mod tests {
         t0: Instant,
         now: Instant,
         clock: crate::clock::Clock,
+        lead: f64,
     }
 
     impl Fake {
@@ -260,6 +284,7 @@ mod tests {
                 t0,
                 now: t0,
                 clock: crate::clock::Clock::new(bpm, t0),
+                lead: 0.0,
             }
         }
         /// Advances 100 ms until `secs` have passed; true at the first fire.
@@ -285,6 +310,8 @@ mod tests {
                         dt: 0.1,
                         running: true,
                         rand: 7,
+                        lead_secs: self.lead,
+                        bpm: 120.0,
                     },
                 ) {
                     out.push((at, n));
@@ -390,6 +417,47 @@ mod tests {
     }
 
     #[test]
+    fn transition_compensation_fires_early_by_the_crossing() {
+        let mk = |on: bool| CompAutopilot {
+            duration: ColumnDuration::Seconds,
+            seconds: 4.0,
+            compensate_transition: on,
+            ..cfg(ColumnTarget::Next)
+        };
+        let cs = cols(3);
+        let first = |on: bool, lead: f64| {
+            let mut f = Fake::new(120.0);
+            f.lead = lead;
+            let mut st = State::default();
+            st.on_air(0, 0.0);
+            f.run(&mut st, &mk(on), &cs, 4.2).first().map(|x| x.0)
+        };
+        // 1 s crossing: fires at ~3 s so the overlap ends at 4 s.
+        assert!((first(true, 1.0).unwrap() - 3.0).abs() < 0.11);
+        // Negative controls: off, or no transition, keeps the full hold.
+        assert!((first(false, 1.0).unwrap() - 4.0).abs() < 0.11);
+        assert!((first(true, 0.0).unwrap() - 4.0).abs() < 0.11);
+        // A crossing longer than the hold is capped at half of it.
+        assert!((first(true, 99.0).unwrap() - 2.0).abs() < 0.11);
+    }
+
+    #[test]
+    fn transition_compensation_works_in_beats_too() {
+        let c = CompAutopilot {
+            beats: 8.0,
+            compensate_transition: true,
+            ..cfg(ColumnTarget::Next)
+        };
+        let cs = cols(3);
+        let mut f = Fake::new(120.0); // 8 beats = 4 s
+        f.lead = 1.0;
+        let mut st = State::default();
+        st.on_air(0, 0.0);
+        let fires = f.run(&mut st, &c, &cs, 3.5);
+        assert!((fires[0].0 - 3.0).abs() < 0.11, "{fires:?}");
+    }
+
+    #[test]
     fn seconds_fire_on_time_and_not_early() {
         let c = CompAutopilot {
             duration: ColumnDuration::Seconds,
@@ -426,7 +494,8 @@ mod tests {
                         phase: 0.0,
                         dt: 0.1,
                         running: false,
-                        rand: 0
+                        rand: 0,
+                        ..Default::default()
                     }
                 ),
                 None
@@ -478,7 +547,8 @@ mod tests {
                     phase: 0.0,
                     dt: 1.9,
                     running: true,
-                    rand: 0
+                    rand: 0,
+                    ..Default::default()
                 }
             ),
             None
@@ -492,7 +562,8 @@ mod tests {
                     phase: 0.0,
                     dt: 0.2,
                     running: true,
-                    rand: 0
+                    rand: 0,
+                    ..Default::default()
                 }
             ),
             Some(1)
@@ -536,7 +607,8 @@ mod tests {
                     phase: 0.0,
                     dt: 1.0,
                     running: true,
-                    rand: 0
+                    rand: 0,
+                    ..Default::default()
                 }
             ),
             Some(3)
@@ -553,7 +625,8 @@ mod tests {
                     phase: 100.0,
                     dt: 100.0,
                     running: true,
-                    rand: 0
+                    rand: 0,
+                    ..Default::default()
                 }
             ),
             None
@@ -569,9 +642,17 @@ mod tests {
             seconds: 2.5,
             random: RandomKind::Bag,
             looping: false,
+            compensate_transition: true,
         };
         let s = serde_json::to_string(&cp).unwrap();
         assert_eq!(serde_json::from_str::<CompAutopilot>(&s).unwrap(), cp);
+        // Old files lack the flag: off.
+        let old = r#"{"target":"Next","beats":4.0}"#;
+        assert!(
+            !serde_json::from_str::<CompAutopilot>(old)
+                .unwrap()
+                .compensate_transition
+        );
         let mut col = cols(1).remove(0);
         col.autopilot.target = Some(ColumnTarget::Next);
         col.autopilot.duration = Some(ColumnDuration::TopClip);

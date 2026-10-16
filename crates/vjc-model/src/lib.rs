@@ -127,6 +127,9 @@ pub struct CompAutopilot {
     /// Next/Previous wrap around at the ends when on; off stops there.
     #[serde(rename = "loop")]
     pub looping: bool,
+    /// Fire the next column early by the longest layer transition, so the crossing ends
+    /// when the hold time does. Old files lack it (off).
+    pub compensate_transition: bool,
 }
 
 impl Default for CompAutopilot {
@@ -138,6 +141,7 @@ impl Default for CompAutopilot {
             seconds: default_ap_secs(),
             random: RandomKind::Any,
             looping: true,
+            compensate_transition: false,
         }
     }
 }

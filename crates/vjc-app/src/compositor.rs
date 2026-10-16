@@ -149,6 +149,26 @@ fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
     return (c - vec3(n)) * s / (x - n);
 }
 
+// Transition helpers (CPU twin: vjc_core::transition_fx).
+fn redge(d: f32, p: f32) -> f32 {
+    return 1.0 - smoothstep(p * 1.05 - 0.05, p * 1.05, d);
+}
+
+fn thash(a: u32, b: u32) -> f32 {
+    var h = (a * 73856093u) ^ (b * 19349663u);
+    h = h ^ (h >> 13u);
+    h = h * 0x5bd1e995u;
+    h = h ^ (h >> 15u);
+    return f32(h & 0xffffu) / 65536.0;
+}
+
+fn tspin(q: vec2<f32>, s: f32, ang: f32) -> vec2<f32> {
+    let c = cos(ang);
+    let sn = sin(ang);
+    let r = (q - vec2(0.5)) / s;
+    return vec2(c * r.x + sn * r.y, -sn * r.x + c * r.y) + vec2(0.5);
+}
+
 fn per_channel(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
     return vec3(channel(id, b.r, s.r), channel(id, b.g, s.g), channel(id, b.b, s.b));
 }
@@ -198,10 +218,12 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     }
     var tmix = 1.0;
     var tblack = 0.0;
+    var tcol = vec3(0.0);
     let p = u.prog;
     if (u.tkind == 1u) {
         if (u.out == 0u) { tmix = p; }
-    } else if (u.tkind == 2u) {
+    } else if (u.tkind == 2u || u.tkind == 41u) {
+        if (u.tkind == 41u) { tcol = vec3(1.0); }
         if (u.out == 1u) {
             if (p >= 0.5) { discard; }
             tblack = min(2.0 * p, 1.0);
@@ -281,6 +303,71 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
             let l = 0.6 * in.uv.x + 0.4 * n;
             tmix = smoothstep(0.0, 0.2, p * 1.2 - l);
         }
+    } else if (u.tkind >= 17u && u.tkind <= 30u) {
+        // Reveal masks: the new picture appears where the front d has passed.
+        if (u.out == 0u) {
+            let x = in.uv.x;
+            let y = in.uv.y;
+            var d = 0.0;
+            switch u.tkind {
+                case 17u: { d = ((1.0 - x) + (1.0 - y)) * 0.5; }
+                case 18u: { d = (x + (1.0 - y)) * 0.5; }
+                case 19u: { d = ((1.0 - x) + y) * 0.5; }
+                case 20u: { d = (x + y) * 0.5; }
+                case 21u: { d = 1.0 - length((in.uv - vec2(0.5)) * 2.0) / 1.41421356; }
+                case 22u: { d = fract(atan2(x - 0.5, 0.5 - y) / 6.28318531); }
+                case 23u: { d = 1.0 - fract(atan2(x - 0.5, 0.5 - y) / 6.28318531); }
+                case 24u: { d = fract(y * 8.0); }
+                case 25u: { d = fract(x * 8.0); }
+                case 26u: {
+                    let lx = abs(fract(x * 8.0) - 0.5) * 2.0;
+                    let ly = abs(fract(y * 8.0) - 0.5) * 2.0;
+                    let cell = u32(floor(x * 8.0)) + u32(floor(y * 8.0));
+                    d = 0.5 * max(lx, ly) + 0.5 * f32(cell & 1u);
+                }
+                case 27u: { d = abs(x - 0.5) * 2.0; }
+                case 28u: { d = abs(y - 0.5) * 2.0; }
+                case 29u: { d = abs(x - 0.5) + abs(y - 0.5); }
+                default: { d = thash(u32(floor(x * 32.0)), u32(floor(y * 32.0))); }
+            }
+            tmix = redge(d, p);
+        }
+    } else if (u.tkind >= 31u && u.tkind <= 34u) {
+        // Slide: the new picture slides over the old one, which stays put.
+        if (u.out == 0u) {
+            switch u.tkind {
+                case 31u: { q.x = q.x + p - 1.0; }
+                case 32u: { q.x = q.x + 1.0 - p; }
+                case 33u: { q.y = q.y + p - 1.0; }
+                default: { q.y = q.y + 1.0 - p; }
+            }
+        }
+    } else if (u.tkind == 35u) {
+        if (u.out == 0u) { q = tspin(q, max(p, 0.001), (1.0 - p) * 6.28318531); }
+    } else if (u.tkind == 36u) {
+        if (u.out == 1u) {
+            q = tspin(q, max(1.0 - p, 0.001), p * 6.28318531);
+            tmix = 1.0 - p;
+        } else {
+            tmix = p;
+        }
+    } else if (u.tkind == 37u || u.tkind == 38u) {
+        // Card flip: the old picture squeezes to a line, then the new one opens.
+        if ((u.out == 1u) == (p >= 0.5)) { discard; }
+        let k = max(select(2.0 * p - 1.0, 1.0 - 2.0 * p, u.out == 1u), 0.001);
+        if (u.tkind == 37u) { q.x = (q.x - 0.5) / k + 0.5; } else { q.y = (q.y - 0.5) / k + 0.5; }
+    } else if (u.tkind == 39u) {
+        // Glitch: horizontal bands jump sideways and switch to the new picture at random.
+        let band = u32(floor(in.uv.y * 16.0));
+        let st = u32(floor(p * 12.0));
+        q.x = q.x + (thash(band, st + 100u) - 0.5) * 0.3 * sin(p * 3.14159265);
+        if ((u.out == 1u) == (thash(band, 7u) < p)) { discard; }
+    } else if (u.tkind == 40u) {
+        // Ripple: rings push both pictures radially while they cross-fade.
+        let c = in.uv - vec2(0.5);
+        let r = length(c);
+        q = q + c / max(r, 1e-5) * (0.03 * sin(p * 3.14159265) * sin(r * 30.0 - p * 20.0));
+        tmix = select(p, 1.0 - p, u.out == 1u);
     }
     if (q.x < 0.0 || q.x > 1.0 || q.y < 0.0 || q.y > 1.0) {
         discard;
@@ -307,7 +394,7 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     if ((u.pad & 2u) != 0u) { s.g = 0.0; }
     if ((u.pad & 4u) != 0u) { s.b = 0.0; }
     if ((u.pad & 8u) != 0u) { s.a = 1.0; }
-    s = vec4(mix(s.rgb, vec3(0.0), tblack), s.a * tmix);
+    s = vec4(mix(s.rgb, tcol, tblack), s.a * tmix);
     let md = textureDimensions(mask_tex);
     if (md.x > 1u) {
         s.a = s.a * luma(textureLoad(mask_tex, vec2<i32>(in.pos.xy), 0).rgb);
@@ -3141,7 +3228,10 @@ mod tests {
     /// New transition kinds: at progress 0 every pixel is the old clip, at 1 the new one,
     /// and halfway the frame is neither. Old is black and new is white.
     fn check_new_kind(kind: vjc_core::transition::Kind) {
-        let size = (16, 4);
+        check_new_kind_sized(kind, (16, 4));
+    }
+
+    fn check_new_kind_sized(kind: vjc_core::transition::Kind, size: (u32, u32)) {
         let Some(start) = render_transition(kind, 0.0, size, PX_BLACK, PX_WHITE) else {
             return;
         };
@@ -3210,6 +3300,78 @@ mod tests {
         let r = render_transition(WipeRight, 0.5, (8, 1), PX_BLACK, PX_WHITE).unwrap();
         assert!(px_near(l[7], 255) && px_near(l[0], 0), "{l:?}");
         assert!(px_near(r[0], 255) && px_near(r[7], 0), "{r:?}");
+    }
+
+    /// Every kind added after LumaWipe: GPU pixels vs the CPU twin, for the incoming half
+    /// (black old, white new) and the outgoing half (white old, black new). Skipped
+    /// without an adapter.
+    #[test]
+    fn gpu_new_transition_kinds_match_cpu_twin() {
+        use vjc_core::transition::Kind;
+        use vjc_core::transition_fx::coverage;
+        let size = (32u32, 32u32);
+        let mut checked = 0;
+        for kind in Kind::ALL
+            .into_iter()
+            .filter(|k| k.shader_id() >= 17 && !matches!(k, Kind::Random | Kind::ToWhite))
+        {
+            for p in [0.0f32, 0.3, 0.5, 0.7, 1.0] {
+                let Some(new_half) = render_transition(kind, p, size, PX_BLACK, PX_WHITE) else {
+                    return;
+                };
+                let old_half = render_transition(kind, p, size, PX_WHITE, PX_BLACK).unwrap();
+                for (i, (a, b)) in new_half.iter().zip(&old_half).enumerate() {
+                    let uv = (
+                        ((i as u32 % size.0) as f32 + 0.5) / size.0 as f32,
+                        ((i as u32 / size.0) as f32 + 0.5) / size.1 as f32,
+                    );
+                    let (o, n) = (coverage(kind, p, true, uv), coverage(kind, p, false, uv));
+                    let (want_new, want_old) = (255.0 * n, 255.0 * o * (1.0 - n));
+                    assert!(
+                        (f32::from(a[0]) - want_new).abs() <= 6.0,
+                        "{kind:?} p={p} new half px {i}: gpu {} cpu {want_new}",
+                        a[0]
+                    );
+                    assert!(
+                        (f32::from(b[0]) - want_old).abs() <= 6.0,
+                        "{kind:?} p={p} old half px {i}: gpu {} cpu {want_old}",
+                        b[0]
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 24 * 5);
+    }
+
+    /// Every new kind is a real transition on the GPU: old at 0, new at 1, neither at .5.
+    #[test]
+    fn gpu_new_kinds_start_old_end_new() {
+        use vjc_core::transition::Kind;
+        for kind in Kind::ALL.into_iter().filter(|k| {
+            // Flips squeeze the old picture to nothing: black-on-black looks the same
+            // as the start there; the CPU-twin test covers them with both colours.
+            k.shader_id() >= 17
+                && !matches!(k, Kind::Random | Kind::ToWhite | Kind::FlipH | Kind::FlipV)
+        }) {
+            check_new_kind_sized(kind, (32, 32));
+        }
+    }
+
+    /// ToWhite dips through white: a black picture reaches full white mid-way.
+    #[test]
+    fn gpu_to_white_dips_through_white() {
+        use vjc_core::transition::Kind::ToWhite;
+        let Some(mid) = render_transition(ToWhite, 0.5, (1, 1), PX_BLACK, PX_BLACK) else {
+            return;
+        };
+        assert!(px_near(mid[0], 255), "{mid:?}");
+        let q = render_transition(ToWhite, 0.25, (1, 1), PX_BLACK, PX_BLACK).unwrap();
+        assert!(q[0][0].abs_diff(128) <= 3, "{q:?}");
+        let e = render_transition(ToWhite, 0.75, (1, 1), PX_BLACK, PX_BLACK).unwrap();
+        assert!(e[0][0].abs_diff(128) <= 3, "{e:?}");
+        let done = render_transition(ToWhite, 1.0, (1, 1), PX_BLACK, PX_BLACK).unwrap();
+        assert!(px_near(done[0], 0), "{done:?}");
     }
 
     /// Invert on one pixel through the full chain (translate, pipeline, ping-pong), for a
