@@ -23,8 +23,11 @@ pub mod slice_geom;
 pub mod timecode;
 pub mod transform;
 pub mod transition;
+pub mod transition_fx;
 #[cfg(test)]
 mod wave_j_tests;
+#[cfg(test)]
+mod wave_m_tests;
 
 pub use effects::EffectTarget;
 use std::path::PathBuf;
@@ -211,6 +214,25 @@ pub enum Command {
         column: ColumnIdx,
         beat_sync: Option<f64>,
         timecode_start: Option<Timecode>,
+    },
+    /// Plays the in..out region in `secs` seconds (speed derived from it); None = free
+    /// speed. Beat sync wins when both are set. Undoable.
+    SetClipDuration {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        secs: Option<f64>,
+    },
+    /// Layer master level and sizing (auto-size, width, height). Undoable.
+    SetLayerExtras {
+        layer: LayerId,
+        extras: vjc_model::LayerExtras,
+    },
+    /// Decodes the clip's thumbnail again. Runtime only.
+    RefreshClipThumb {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
     },
     /// Seeks the playing clip to cue `index`. Runtime only.
     JumpToCue {
@@ -1105,6 +1127,12 @@ pub enum Event {
     },
     LayerCleared {
         layer: LayerId,
+    },
+    /// The clip's thumbnail must be decoded again.
+    ThumbRefresh {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
     },
     /// The layer's fader went from 0 up and it has fader start: restart its playing clip.
     FaderStart {
@@ -3732,6 +3760,60 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetClipDuration {
+            deck,
+            layer,
+            column,
+            secs,
+        } => {
+            if secs.is_some_and(|s| !s.is_finite() || !(0.001..=86_400.0).contains(&s)) {
+                return Err(Error::InvalidValue);
+            }
+            let t = transport_mut(p, deck, layer, column)?;
+            let prev = std::mem::replace(&mut t.duration_secs, secs);
+            undoable(
+                Command::SetClipDuration {
+                    deck,
+                    layer,
+                    column,
+                    secs: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetLayerExtras { layer, extras } => {
+            if !extras.master.is_finite()
+                || !(0.0..=1.0).contains(&extras.master)
+                || extras.width > vjc_model::MAX_LAYER_SIDE
+                || extras.height > vjc_model::MAX_LAYER_SIDE
+            {
+                return Err(Error::InvalidValue);
+            }
+            let i = layer_idx(p, layer)?;
+            let prev = std::mem::replace(&mut p.composition.layers[i].extras, extras);
+            undoable(
+                Command::SetLayerExtras {
+                    layer,
+                    extras: prev,
+                },
+                vec![],
+            )
+        }
+        Command::RefreshClipThumb {
+            deck,
+            layer,
+            column,
+        } => {
+            clip_mut(p, deck, layer, column)?;
+            Ok(Applied {
+                inverse: None,
+                events: vec![Event::ThumbRefresh {
+                    deck,
+                    layer,
+                    column,
+                }],
+            })
+        }
         Command::SetTimecodeStart {
             deck,
             layer,
@@ -4484,6 +4566,7 @@ mod tests {
             ignore_column_trigger: false,
             lock_content: false,
             fader_start: false,
+            extras: Default::default(),
             mask_mode: Default::default(),
             group: None,
         }

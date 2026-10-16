@@ -3,11 +3,12 @@
 
 use vjc_model::Transition;
 
-/// Transition styles the compositor implements. Other `BlendMode` names fall back to
-/// `Dissolve` (TODO(#23): ToWhite, PushUp/Down, ZoomOut and the rest).
+/// Transition styles the compositor implements. Unknown names fall back to `Dissolve`.
+/// Variants are declared in shader-id order (`shader_id` is the discriminant); the CPU
+/// twin of the newer ones is in `transition_fx`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    Cut,
+    Cut = 0,
     Dissolve,
     ToBlack,
     PushLeft,
@@ -24,30 +25,93 @@ pub enum Kind {
     Cube,
     Pixelate,
     LumaWipe,
+    WipeUpLeft,
+    WipeUpRight,
+    WipeDownLeft,
+    WipeDownRight,
+    IrisOut,
+    Clock,
+    ClockReverse,
+    BlindsH,
+    BlindsV,
+    Checker,
+    BarnDoorH,
+    BarnDoorV,
+    Diamond,
+    NoiseDissolve,
+    SlideLeft,
+    SlideRight,
+    SlideUp,
+    SlideDown,
+    SpinIn,
+    SpinOut,
+    FlipH,
+    FlipV,
+    Glitch,
+    Ripple,
+    ToWhite,
     /// Resolved to one of `Kind::RANDOM_POOL` at each trigger; never reaches the shader.
     Random,
 }
 
 impl Kind {
-    /// What `Random` draws from: every visible transition except itself and Cut.
-    pub const RANDOM_POOL: [Kind; 16] = [
+    /// Every kind in shader-id order (`Random` last): the picker list and the parser.
+    pub const ALL: [Kind; 43] = [
+        Kind::Cut,
         Kind::Dissolve,
         Kind::ToBlack,
         Kind::PushLeft,
         Kind::PushRight,
-        Kind::PushUp,
-        Kind::PushDown,
         Kind::ZoomIn,
-        Kind::ZoomOut,
         Kind::WipeEllipse,
         Kind::WipeLeft,
         Kind::WipeRight,
         Kind::WipeUp,
         Kind::WipeDown,
+        Kind::PushUp,
+        Kind::PushDown,
+        Kind::ZoomOut,
         Kind::Cube,
         Kind::Pixelate,
         Kind::LumaWipe,
+        Kind::WipeUpLeft,
+        Kind::WipeUpRight,
+        Kind::WipeDownLeft,
+        Kind::WipeDownRight,
+        Kind::IrisOut,
+        Kind::Clock,
+        Kind::ClockReverse,
+        Kind::BlindsH,
+        Kind::BlindsV,
+        Kind::Checker,
+        Kind::BarnDoorH,
+        Kind::BarnDoorV,
+        Kind::Diamond,
+        Kind::NoiseDissolve,
+        Kind::SlideLeft,
+        Kind::SlideRight,
+        Kind::SlideUp,
+        Kind::SlideDown,
+        Kind::SpinIn,
+        Kind::SpinOut,
+        Kind::FlipH,
+        Kind::FlipV,
+        Kind::Glitch,
+        Kind::Ripple,
+        Kind::ToWhite,
+        Kind::Random,
     ];
+
+    /// What `Random` draws from: every visible transition except itself and Cut.
+    pub const RANDOM_POOL: [Kind; 41] = {
+        let mut out = [Kind::Cut; 41];
+        let mut i = 0;
+        while i < 41 {
+            out[i] = Kind::ALL[i + 1];
+            i += 1;
+        }
+        out
+    };
 
     /// Concrete kind for a `Random` pick: deterministic in `seed`, never `Random`/`Cut`.
     /// Other kinds come back unchanged.
@@ -63,52 +127,30 @@ impl Kind {
         Kind::RANDOM_POOL[(z % Kind::RANDOM_POOL.len() as u64) as usize]
     }
 
+    /// Stored name (the variant name, as in the project file and the pickers).
+    pub fn name(self) -> String {
+        format!("{self:?}")
+    }
+
     pub fn parse(name: &str) -> Kind {
         match name {
             // "Alpha" is the default kind written by the .avc importer: no transition.
             "Cut" | "Alpha" | "" => Kind::Cut,
-            "ToBlack" => Kind::ToBlack,
-            "PushLeft" => Kind::PushLeft,
-            "PushRight" => Kind::PushRight,
-            "ZoomIn" => Kind::ZoomIn,
-            "WipeEllipse" => Kind::WipeEllipse,
-            "WipeLeft" => Kind::WipeLeft,
-            "WipeRight" => Kind::WipeRight,
-            "WipeUp" => Kind::WipeUp,
-            "WipeDown" => Kind::WipeDown,
-            "PushUp" => Kind::PushUp,
-            "PushDown" => Kind::PushDown,
-            "ZoomOut" => Kind::ZoomOut,
-            "Cube" => Kind::Cube,
-            "Pixelate" => Kind::Pixelate,
-            "LumaWipe" => Kind::LumaWipe,
-            "Random" => Kind::Random,
-            _ => Kind::Dissolve,
+            n => Kind::ALL
+                .iter()
+                .copied()
+                .find(|k| k.name() == n)
+                .unwrap_or(Kind::Dissolve),
         }
     }
 
-    /// Index used by the compositor shader (0 is "no transition").
+    /// Index used by the compositor shader (0 is "no transition"); kinds are declared in
+    /// shader-id order.
     pub fn shader_id(self) -> u32 {
         match self {
-            Kind::Cut => 0,
-            Kind::Dissolve => 1,
-            Kind::ToBlack => 2,
-            Kind::PushLeft => 3,
-            Kind::PushRight => 4,
-            Kind::ZoomIn => 5,
-            Kind::WipeEllipse => 6,
-            Kind::WipeLeft => 7,
-            Kind::WipeRight => 8,
-            Kind::WipeUp => 9,
-            Kind::WipeDown => 10,
-            Kind::PushUp => 11,
-            Kind::PushDown => 12,
-            Kind::ZoomOut => 13,
-            Kind::Cube => 14,
-            Kind::Pixelate => 15,
-            Kind::LumaWipe => 16,
             // Unresolved Random: a plain dissolve is the safe picture.
             Kind::Random => 1,
+            k => k as u32,
         }
     }
 }
@@ -144,12 +186,12 @@ pub fn weights(kind: Kind, progress: f32) -> Option<(f32, f32)> {
     match kind {
         Kind::Cut => Some((0.0, 1.0)),
         Kind::Dissolve => Some((1.0, p)),
-        Kind::ToBlack => Some(if p < 0.5 {
+        Kind::ToBlack | Kind::ToWhite => Some(if p < 0.5 {
             (1.0 - 2.0 * p, 0.0)
         } else {
             (0.0, 2.0 * p - 1.0)
         }),
-        Kind::ZoomIn | Kind::ZoomOut => Some((1.0 - p, p)),
+        Kind::ZoomIn | Kind::ZoomOut | Kind::SpinOut | Kind::Ripple => Some((1.0 - p, p)),
         Kind::Pixelate | Kind::Random => Some((1.0, p)),
         Kind::PushLeft
         | Kind::PushRight
@@ -161,7 +203,29 @@ pub fn weights(kind: Kind, progress: f32) -> Option<(f32, f32)> {
         | Kind::WipeUp
         | Kind::WipeDown
         | Kind::Cube
-        | Kind::LumaWipe => None,
+        | Kind::LumaWipe
+        | Kind::WipeUpLeft
+        | Kind::WipeUpRight
+        | Kind::WipeDownLeft
+        | Kind::WipeDownRight
+        | Kind::IrisOut
+        | Kind::Clock
+        | Kind::ClockReverse
+        | Kind::BlindsH
+        | Kind::BlindsV
+        | Kind::Checker
+        | Kind::BarnDoorH
+        | Kind::BarnDoorV
+        | Kind::Diamond
+        | Kind::NoiseDissolve
+        | Kind::SlideLeft
+        | Kind::SlideRight
+        | Kind::SlideUp
+        | Kind::SlideDown
+        | Kind::SpinIn
+        | Kind::FlipH
+        | Kind::FlipV
+        | Kind::Glitch => None,
     }
 }
 
@@ -338,6 +402,19 @@ mod tests {
     }
 
     #[test]
+    fn every_kind_round_trips_with_a_unique_id() {
+        assert!(Kind::ALL.len() >= 40);
+        for (i, k) in Kind::ALL.iter().enumerate() {
+            assert_eq!(Kind::parse(&k.name()), *k, "{k:?}");
+            if *k != Kind::Random {
+                assert_eq!(k.shader_id(), i as u32, "{k:?} id follows ALL order");
+            }
+        }
+        // Negative control: the id of a kind is not another kind's.
+        assert_ne!(Kind::Clock.shader_id(), Kind::Checker.shader_id());
+    }
+
+    #[test]
     fn shader_ids_are_unique() {
         let mut ids: Vec<u32> = Kind::RANDOM_POOL.iter().map(|k| k.shader_id()).collect();
         ids.sort();
@@ -349,7 +426,8 @@ mod tests {
     fn cut_and_zero_are_instant_unknown_dissolves() {
         assert_eq!(State::start(&tr("Cut", None, 1.0), 120.0), State::Idle);
         assert_eq!(State::start(&tr("Dissolve", None, 0.0), 120.0), State::Idle);
-        assert_eq!(Kind::parse("ToWhite"), Kind::Dissolve);
+        assert_eq!(Kind::parse("ToWhite"), Kind::ToWhite);
+        assert_eq!(Kind::parse("NoSuchKind"), Kind::Dissolve);
         assert_eq!(Kind::parse("WipeEllipse"), Kind::WipeEllipse);
     }
 }

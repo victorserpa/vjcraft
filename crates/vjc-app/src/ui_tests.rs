@@ -6732,3 +6732,39 @@ fn a_clip_on_air_in_another_deck_counts_for_the_remove_guard() {
     assert_ne!(b, cur);
     assert_eq!(cols_on_air(&st.players, &st.gens), vec![1]);
 }
+
+#[test]
+fn transition_picker_offers_every_kind_and_each_runs() {
+    let kinds = transition_kinds();
+    assert!(kinds.len() >= 40, "{} kinds", kinds.len());
+    for (name, label) in &kinds {
+        assert_eq!(name, label);
+        let t = vjc_model::Transition {
+            kind: name.clone(),
+            duration_beats: None,
+            duration_secs: 1.0,
+        };
+        let kind = vjc_core::transition::Kind::parse(name);
+        // Cut is instant; every other entry starts a real crossing of its own kind.
+        match vjc_core::transition::State::start_seeded(&t, 120.0, 3).current() {
+            None => assert_eq!(kind, vjc_core::transition::Kind::Cut),
+            Some((k, _)) => assert_eq!(k, kind.resolve(3), "{name}"),
+        }
+    }
+    // Negative control: an unknown name is not offered.
+    assert!(!kinds.iter().any(|(n, _)| n == "NoSuchKind"));
+}
+
+#[test]
+fn layer_and_clip_panels_show_the_wave_m_fields() {
+    let mut h = app();
+    playing_generator(&mut h);
+    click(&mut h, "Layer");
+    for label in ["Master", "Auto-size", "Size"] {
+        assert!(has_text(&h, label), "layer panel: {label}");
+    }
+    for label in ["Alpha type", "Duration (s)", "Autopilot", "Stop-motion fps"] {
+        assert!(has_text(&h, label), "clip panel: {label}");
+    }
+    assert!(exists(&h, "Refresh thumbnail") && exists(&h, "Freeze"));
+}

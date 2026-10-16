@@ -634,6 +634,123 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
                 value: value.clamp(0.0, 1.0),
             })
         }
+        ["comp", "layer", n, "master"] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            let mut extras = p
+                .composition
+                .layers
+                .iter()
+                .find(|l| l.id == layer)?
+                .extras
+                .clone();
+            extras.master = value.clamp(0.0, 1.0);
+            Some(Command::SetLayerExtras { layer, extras })
+        }
+        [
+            "comp",
+            "layer",
+            n,
+            prop @ ("auto_size" | "width" | "height"),
+        ] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            let mut extras = p
+                .composition
+                .layers
+                .iter()
+                .find(|l| l.id == layer)?
+                .extras
+                .clone();
+            let unit = value.clamp(0.0, 1.0);
+            match *prop {
+                "auto_size" => {
+                    let all = vjc_model::AutoSize::ALL;
+                    extras.auto_size = all[(unit * (all.len() - 1) as f64).round() as usize];
+                }
+                "width" => {
+                    extras.width = (unit * f64::from(vjc_model::MAX_LAYER_SIDE)).round() as u32
+                }
+                _ => extras.height = (unit * f64::from(vjc_model::MAX_LAYER_SIDE)).round() as u32,
+            }
+            Some(Command::SetLayerExtras { layer, extras })
+        }
+        [
+            "comp",
+            "layer",
+            n,
+            "clip",
+            prop @ ("duration" | "alpha" | "freeze" | "stop_motion" | "autopilot"
+            | "autopilot_loops" | "refresh_thumb"),
+        ] => {
+            let layer = layer_by_number(p, number_of(n)?)?;
+            let (deck, src, column) = ctx.cell(layer)?;
+            let k = super::clip_in(p, deck, src, column)?;
+            let mut extras = k.extras.clone();
+            let unit = value.clamp(0.0, 1.0);
+            match *prop {
+                "duration" => {
+                    // 0 = free speed; otherwise up to 600 s.
+                    return Some(Command::SetClipDuration {
+                        deck,
+                        layer: src,
+                        column,
+                        secs: (unit > 0.0).then(|| (unit * 600.0).max(0.001)),
+                    });
+                }
+                "alpha" => {
+                    return Some(Command::SetClipChannels {
+                        deck,
+                        layer: src,
+                        column,
+                        channels: vjc_model::Channels {
+                            premultiplied: value >= 0.5,
+                            ..k.channels
+                        },
+                    });
+                }
+                "refresh_thumb" => {
+                    return fire.then_some(Command::RefreshClipThumb {
+                        deck,
+                        layer: src,
+                        column,
+                    });
+                }
+                "freeze" => extras.freeze = value >= 0.5,
+                "stop_motion" => extras.stop_motion_fps = unit * 60.0,
+                _ => {
+                    use vjc_model::AutopilotMode as M;
+                    let base = match extras.autopilot.clone() {
+                        Some(a) => a,
+                        None => p
+                            .composition
+                            .layers
+                            .iter()
+                            .find(|l| l.id == src)?
+                            .autopilot
+                            .clone(),
+                    };
+                    if *prop == "autopilot" {
+                        // 0 = the layer's own; then Off, Next, Random, Previous, FirstLast.
+                        let modes = [M::Off, M::Next, M::Random, M::Previous, M::FirstLast];
+                        let i = (unit * modes.len() as f64).round() as usize;
+                        extras.autopilot = i.checked_sub(1).map(|i| vjc_model::Autopilot {
+                            mode: modes[i.min(modes.len() - 1)],
+                            ..base
+                        });
+                    } else {
+                        extras.autopilot = Some(vjc_model::Autopilot {
+                            every_loops: ((unit * 64.0).round() as u32).max(1),
+                            ..base
+                        });
+                    }
+                }
+            }
+            Some(Command::SetClipExtras {
+                deck,
+                layer: src,
+                column,
+                extras,
+            })
+        }
         ["comp", "layer", n, "opacity"] => Some(Command::SetOpacity {
             layer: layer_by_number(p, number_of(n)?)?,
             value: value.clamp(0.0, 1.0),
@@ -1132,6 +1249,7 @@ mod effect_id_tests {
             ignore_column_trigger: false,
             lock_content: false,
             fader_start: false,
+            extras: Default::default(),
             mask_mode: Default::default(),
             group: None,
         });

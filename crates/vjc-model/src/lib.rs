@@ -127,6 +127,9 @@ pub struct CompAutopilot {
     /// Next/Previous wrap around at the ends when on; off stops there.
     #[serde(rename = "loop")]
     pub looping: bool,
+    /// Fire the next column early by the longest layer transition, so the crossing ends
+    /// when the hold time does. Old files lack it (off).
+    pub compensate_transition: bool,
 }
 
 impl Default for CompAutopilot {
@@ -138,6 +141,7 @@ impl Default for CompAutopilot {
             seconds: default_ap_secs(),
             random: RandomKind::Any,
             looping: true,
+            compensate_transition: false,
         }
     }
 }
@@ -222,6 +226,68 @@ pub struct Layer {
     /// Collapsed in the grid UI.
     #[serde(default)]
     pub folded: bool,
+    /// Layer master and sizing; old files open with master 1 and the clip's own fit.
+    #[serde(default)]
+    pub extras: LayerExtras,
+}
+
+/// Largest layer width or height, composition px.
+pub const MAX_LAYER_SIDE: u32 = 16_384;
+
+/// What the layer adds on top of its clips: a master level separate from the video
+/// opacity, and its own picture size.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayerExtras {
+    /// Layer master (M) 0..=1: scales picture and audio together; the video opacity (V) in
+    /// `Track::opacity` only fades the picture.
+    pub master: f64,
+    /// Fit applied to every clip of the layer; `Off` keeps each clip's own fit.
+    pub auto_size: AutoSize,
+    /// Size of the layer's picture area in composition px; 0 = the composition's.
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for LayerExtras {
+    fn default() -> Self {
+        LayerExtras {
+            master: 1.0,
+            auto_size: AutoSize::Off,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+/// Layer auto-size: how the layer fits its clips into its picture area.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutoSize {
+    /// Each clip keeps its own fit mode.
+    #[default]
+    Off,
+    Fill,
+    Fit,
+    Stretch,
+}
+
+impl AutoSize {
+    pub const ALL: [AutoSize; 4] = [
+        AutoSize::Off,
+        AutoSize::Fill,
+        AutoSize::Fit,
+        AutoSize::Stretch,
+    ];
+
+    /// The fit this forces, or `None` for Off.
+    pub fn fit(self) -> Option<FitMode> {
+        match self {
+            AutoSize::Off => None,
+            AutoSize::Fill => Some(FitMode::Fill),
+            AutoSize::Fit => Some(FitMode::Fit),
+            AutoSize::Stretch => Some(FitMode::Stretch),
+        }
+    }
 }
 
 /// What a layer masks: its luminance multiplies the layer(s) below it.
@@ -364,6 +430,12 @@ pub struct ClipExtras {
     pub strip_audio: bool,
     /// Video track removed from playback (picture not drawn).
     pub strip_video: bool,
+    /// Clip's own autopilot (target and loops); None = the layer's.
+    pub autopilot: Option<Autopilot>,
+    /// The picture holds its current frame while the transport keeps running.
+    pub freeze: bool,
+    /// Stop-motion: the picture refreshes at this many fps (0 = off).
+    pub stop_motion_fps: f64,
 }
 
 /// How a trigger behaves over time (not where the clip starts: see `TriggerMode`).
@@ -461,6 +533,10 @@ pub struct Channels {
     pub g: bool,
     pub b: bool,
     pub a: bool,
+    /// Alpha type of the source: its colour is already multiplied by alpha (premultiplied)
+    /// instead of straight. Old files lack it: straight.
+    #[serde(default)]
+    pub premultiplied: bool,
 }
 
 impl Default for Channels {
@@ -470,17 +546,19 @@ impl Default for Channels {
             g: true,
             b: true,
             a: true,
+            premultiplied: false,
         }
     }
 }
 
 impl Channels {
-    /// Shader mask: bit 0..3 set = that channel (R, G, B, A) is OFF.
+    /// Shader mask: bit 0..3 set = that channel (R, G, B, A) is OFF; bit 4 = premultiplied.
     pub fn off_mask(self) -> u32 {
         u32::from(!self.r)
             | u32::from(!self.g) << 1
             | u32::from(!self.b) << 2
             | u32::from(!self.a) << 3
+            | u32::from(self.premultiplied) << 4
     }
 }
 
@@ -571,6 +649,10 @@ pub struct Transport {
     /// When set, the clip follows the external timecode: position = timecode - this start.
     #[serde(default)]
     pub timecode_start: Option<Timecode>,
+    /// When set (and no beat sync), the in..out region plays in this many seconds, i.e. the
+    /// speed is derived from it. Old files lack it: free speed.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 /// Timecode frame rates.
@@ -639,6 +721,8 @@ pub enum PlayMode {
     Bounce,
     Once,
     OnceHold,
+    /// Plays forward like Loop; each time it reaches the end it jumps to a random position.
+    Random,
     #[serde(other)]
     Unknown,
 }
@@ -1736,6 +1820,7 @@ impl Default for Transport {
             in_point: 0.0,
             out_point: 1.0,
             timecode_start: None,
+            duration_secs: None,
         }
     }
 }
@@ -2176,6 +2261,7 @@ mod tests {
             ignore_column_trigger: false,
             lock_content: false,
             fader_start: false,
+            extras: Default::default(),
             mask_mode: Default::default(),
             transition: Transition {
                 kind: "cut".into(),
@@ -2235,6 +2321,7 @@ mod tests {
             ignore_column_trigger: false,
             lock_content: false,
             fader_start: false,
+            extras: Default::default(),
             mask_mode: Default::default(),
             group: None,
         });
@@ -2404,6 +2491,7 @@ mod tests {
             ignore_column_trigger: false,
             lock_content: false,
             fader_start: false,
+            extras: Default::default(),
             mask_mode: Default::default(),
             transition: Transition {
                 kind: "cut".into(),

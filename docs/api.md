@@ -61,6 +61,17 @@ Transform: `/comp/transform/F` (composition), `/comp/layer/N/transform/F` and
 `scale_w`, `scale_h`, `rotation`, `anchor_x`, `anchor_y`. Values are normalized over the field's
 range (position and anchor +-16384 px, scale 0..10, rotation +-360 degrees).
 
+Layer fields: `/comp/layer/N/master` (0..1, scales picture and sound; `opacity` only fades the
+picture), `/comp/layer/N/auto_size` (0 Off, 1/3 Fill, 2/3 Fit, 1 Stretch), `/comp/layer/N/width` and
+`/comp/layer/N/height` (0..1 of 16384 px, 0 = composition size).
+
+Clip fields (clip playing on the layer): `/comp/layer/N/clip/duration` (0 = free speed, else
+value x 600 s), `/comp/layer/N/clip/alpha` (>= 0.5 premultiplied), `/comp/layer/N/clip/freeze` (>= 0.5),
+`/comp/layer/N/clip/stop_motion` (value x 60 fps, 0 = off), `/comp/layer/N/clip/autopilot`
+(round(value x 5): 0 = the layer's, then Off, Next, Random, Previous, First/last),
+`/comp/layer/N/clip/autopilot_loops` (value x 64, at least 1) and
+`/comp/layer/N/clip/refresh_thumb` (trigger: decode the thumbnail again).
+
 ## REST
 
 Errors: 4xx/5xx with `{"error": "..."}` (400 malformed, 404 unknown route/address, 405 method,
