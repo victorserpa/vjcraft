@@ -302,6 +302,23 @@ pub fn start_position(
     }
 }
 
+/// `start` moved `offset_secs` into the file, kept inside the region (stopping a hair before
+/// the out-point so the clip does not end at once). Unknown length or no offset: unchanged.
+pub fn offset_start(
+    start: f64,
+    offset_secs: f64,
+    file_secs: Option<f64>,
+    region: (f64, f64),
+) -> f64 {
+    match file_secs {
+        Some(d) if d > 0.0 && offset_secs > 0.0 => {
+            let top = (region.1 - 2.0 * END_EPS).max(region.0);
+            (start + offset_secs / d).min(top)
+        }
+        _ => start,
+    }
+}
+
 /// Position inside the file for a playhead position local to the region (0..=1).
 pub fn to_actual(local: f64, region: (f64, f64)) -> f64 {
     region.0 + local.clamp(0.0, 1.0) * (region.1 - region.0)
@@ -459,6 +476,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn offset_start_moves_into_the_file_and_stays_in_the_region() {
+        let r = (0.0, 1.0);
+        assert!((offset_start(0.0, 2.0, Some(10.0), r) - 0.2).abs() < 1e-9);
+        assert_eq!(offset_start(0.0, 0.0, Some(10.0), r), 0.0);
+        assert_eq!(offset_start(0.3, 5.0, None, r), 0.3);
+        assert!(offset_start(0.0, 50.0, Some(10.0), r) < 1.0);
+    }
 
     #[test]
     fn scrub_press_grabs_the_nearest_marker_or_seeks() {

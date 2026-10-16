@@ -5907,7 +5907,7 @@ fn osc_hold_without_argument_is_a_plain_trigger() {
 fn prefs_tab_moves_focus_forward_in_visual_order() {
     use PrefsTab::*;
     for tab in [
-        General, Audio, Video, Control, Osc, Dmx, Api, Timecode, Midi,
+        General, Recording, Defaults, Audio, Video, Control, Osc, Dmx, Api, Timecode, Midi,
     ] {
         let mut h = app();
         h.state_mut().prefs_open = true;
@@ -5955,6 +5955,8 @@ fn prefs_and_output_setup_kit_windows_render() {
         assert!(exists(&h, l), "output: {l}");
     }
     for tab in [
+        "Recording",
+        "Defaults",
         "Audio",
         "Video",
         "Control",
@@ -8253,4 +8255,59 @@ fn output_setup_snapshots() {
     settle(&mut h);
     snap(&mut h, "23-output-screen-props");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prefs_recording_tab_holds_folders_and_codec() {
+    let mut h = app();
+    h.state_mut().prefs_open = true;
+    h.state_mut().prefs_tab = PrefsTab::Recording;
+    settle(&mut h);
+    for l in ["Recording folder", "Snapshot folder", "Quality"] {
+        assert!(exists(&h, l), "recording tab: {l}");
+    }
+    snap(&mut h, "40-prefs-recording");
+    h.state_mut().prefs_tab = PrefsTab::General;
+    settle(&mut h);
+    assert!(!exists(&h, "Recording folder"), "moved out of General");
+    assert!(exists(&h, "Clip start offset"));
+}
+
+#[test]
+fn prefs_defaults_apply_to_a_new_clip() {
+    let mut h = app();
+    h.state_mut().prefs.defaults.play_mode = vjc_model::PlayMode::Bounce;
+    h.state_mut().prefs.defaults.direction = vjc_model::Direction::Backward;
+    h.state_mut().prefs.defaults.trigger_mode = vjc_model::TriggerMode::Continue;
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().load_file(layer, 0, "/x/new.mp4".into());
+    let deck = h.state().project.composition.current_deck;
+    let k = vjc_core::clip_in(&h.state().project, deck, layer, 0).expect("clip");
+    assert_eq!(k.transport.play_mode, vjc_model::PlayMode::Bounce);
+    assert_eq!(k.transport.direction, vjc_model::Direction::Backward);
+    assert_eq!(k.transport.trigger_mode, vjc_model::TriggerMode::Continue);
+    // Control: stock prefs leave the stock transport.
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().load_file(layer, 0, "/x/new.mp4".into());
+    let deck = h.state().project.composition.current_deck;
+    let k = vjc_core::clip_in(&h.state().project, deck, layer, 0).expect("clip");
+    assert_eq!(k.transport.play_mode, vjc_model::PlayMode::Loop);
+}
+
+#[test]
+fn prefs_defaults_and_web_tabs_render() {
+    let mut h = app();
+    h.state_mut().prefs_open = true;
+    h.state_mut().prefs_tab = PrefsTab::Defaults;
+    settle(&mut h);
+    for l in ["Play mode", "Direction", "Clip start", "Bounce"] {
+        assert!(exists(&h, l), "defaults tab: {l}");
+    }
+    snap(&mut h, "41-prefs-defaults");
+    h.state_mut().prefs.api.enabled = true;
+    h.state_mut().prefs_tab = PrefsTab::Api;
+    settle(&mut h);
+    assert!(exists(&h, "Web remote PIN"));
+    snap(&mut h, "42-prefs-web");
 }

@@ -33,6 +33,10 @@ pub struct General {
     pub confirm_quit: bool,
     /// Blend mode of layers added from the toolbar.
     pub default_blend: vjc_model::BlendMode,
+    /// Milliseconds into a clip that a trigger starts at (0 = at the in-point).
+    pub clip_start_offset_ms: u32,
+    /// Scale of the whole interface (1.0 = normal).
+    pub ui_scale: f32,
 }
 
 /// Longest recent-projects list kept.
@@ -62,6 +66,12 @@ impl General {
     }
 
     fn sanitize(&mut self) {
+        self.clip_start_offset_ms = self.clip_start_offset_ms.min(600_000);
+        self.ui_scale = if self.ui_scale.is_finite() {
+            self.ui_scale.clamp(0.75, 2.0)
+        } else {
+            1.0
+        };
         let mut seen = std::collections::HashSet::new();
         self.recent_projects.retain(|p| seen.insert(p.clone()));
         self.recent_projects.truncate(MAX_RECENT);
@@ -95,6 +105,8 @@ impl Default for General {
             snapshot_folder: None,
             confirm_quit: false,
             default_blend: vjc_model::BlendMode::Normal,
+            clip_start_offset_ms: 0,
+            ui_scale: 1.0,
         }
     }
 }
@@ -296,6 +308,41 @@ impl Default for Record {
             codec: "h264".into(),
             quality: 70,
         }
+    }
+}
+
+/// What a new clip starts with (applied when a file is loaded into a cell).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Defaults {
+    pub play_mode: vjc_model::PlayMode,
+    pub direction: vjc_model::Direction,
+    /// Where a trigger starts the clip (`Layer` = the layer's setting).
+    pub trigger_mode: vjc_model::TriggerMode,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        let t = vjc_model::Transport::default();
+        Defaults {
+            play_mode: t.play_mode,
+            direction: t.direction,
+            trigger_mode: t.trigger_mode,
+        }
+    }
+}
+
+impl Defaults {
+    /// Sets the transport of a freshly created clip.
+    pub fn apply(&self, clip: &mut vjc_model::Clip) {
+        let t = &mut clip.transport;
+        t.play_mode = self.play_mode;
+        t.direction = self.direction;
+        t.resume_direction = match self.direction {
+            vjc_model::Direction::Pause => vjc_model::Direction::Forward,
+            d => d,
+        };
+        t.trigger_mode = self.trigger_mode;
     }
 }
 
@@ -552,6 +599,7 @@ pub struct Prefs {
     pub control: Control,
     pub audio: Audio,
     pub record: Record,
+    pub defaults: Defaults,
     pub midi: Midi,
     pub osc: Osc,
     pub dmx: Dmx,
@@ -571,6 +619,7 @@ impl Default for Prefs {
             control: Control::default(),
             audio: Audio::default(),
             record: Record::default(),
+            defaults: Defaults::default(),
             midi: Midi::default(),
             osc: Osc::default(),
             dmx: Dmx::default(),
@@ -696,6 +745,29 @@ fn merge_unknown(new: &mut serde_json::Value, old: &serde_json::Value, known: &s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_prefs_fields_roundtrip_and_default_when_missing() {
+        let mut p = super::Prefs::default();
+        p.general.clip_start_offset_ms = 1500;
+        p.general.ui_scale = 1.25;
+        p.defaults.play_mode = vjc_model::PlayMode::Bounce;
+        p.defaults.direction = vjc_model::Direction::Backward;
+        p.defaults.trigger_mode = vjc_model::TriggerMode::Continue;
+        let (back, warn) = super::Prefs::from_json(&serde_json::to_string(&p).unwrap());
+        assert!(warn.is_none());
+        assert_eq!(back.general.clip_start_offset_ms, 1500);
+        assert_eq!(back.general.ui_scale, 1.25);
+        assert_eq!(back.defaults, p.defaults);
+        // An old file without the fields loads with the defaults.
+        let (old, warn) = super::Prefs::from_json(r#"{"general":{"autosave":false}}"#);
+        assert!(warn.is_none());
+        assert_eq!(old.defaults, super::Defaults::default());
+        assert_eq!(old.general.ui_scale, 1.0);
+        // Nonsense is clamped.
+        let (bad, _) = super::Prefs::from_json(r#"{"general":{"ui_scale":99.0}}"#);
+        assert_eq!(bad.general.ui_scale, 2.0);
+    }
+
     #[derive(Default, serde::Serialize, serde::Deserialize)]
     #[serde(default)]
     struct Inner {

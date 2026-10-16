@@ -585,6 +585,8 @@ const OUT_MASK: u128 = 0x6f75_745f_736c_6f74;
 #[derive(Clone, Copy, PartialEq)]
 enum PrefsTab {
     General,
+    Recording,
+    Defaults,
     Audio,
     Video,
     Control,
@@ -3578,14 +3580,24 @@ impl State {
                         self.flow.regions.remove(&layer);
                         let own_last =
                             resume_pos(&self.project, &self.flow.resume, (deck, src, column));
-                        if let Some(start) = vjc_core::trigger_start(
+                        let start = vjc_core::trigger_start(
                             &self.project,
                             deck,
                             src,
                             column,
                             own_last,
                             prev_local,
-                        ) {
+                        );
+                        let offset = f64::from(self.prefs.general.clip_start_offset_ms) / 1000.0;
+                        if offset > 0.0 {
+                            let reg = self.region_of(layer);
+                            let dur = self.players.get(&layer).and_then(|(_, _, p)| p.duration());
+                            let from = start.unwrap_or(reg.0);
+                            let to = vjc_core::playback::offset_start(from, offset, dur, reg);
+                            if start.is_some() || to != from {
+                                self.seek(layer, to);
+                            }
+                        } else if let Some(start) = start {
                             self.seek(layer, start);
                         }
                     } else {
@@ -4747,6 +4759,7 @@ impl State {
                 None => vjc_core::clip_from_path(path.clone()),
             };
             clip.fit = self.prefs.video.fit;
+            self.prefs.defaults.apply(&mut clip);
             commands.push(Command::SetClip {
                 deck,
                 layer,
@@ -4781,6 +4794,7 @@ impl State {
         // One undo step: the default fit is set on the clip before it is placed.
         let mut clip = vjc_core::clip_from_path(path);
         clip.fit = self.prefs.video.fit;
+        self.prefs.defaults.apply(&mut clip);
         self.exec(Command::SetClip {
             deck,
             layer,
@@ -6756,6 +6770,10 @@ impl State {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        let scale = self.prefs.general.ui_scale;
+        if (ui.ctx().zoom_factor() - scale).abs() > 1e-3 {
+            ui.ctx().set_zoom_factor(scale);
+        }
         self.prune_screen_state();
         self.prune_sel_slices();
         self.ui_body(ui);
