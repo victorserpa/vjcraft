@@ -4682,11 +4682,7 @@ impl State {
             let comp = &self.project.composition;
             // Longest layer transition: the next column fires that much early when asked.
             let bpm = self.project.composition.tempo.bpm;
-            let lead_secs = comp
-                .layers
-                .iter()
-                .map(|l| vjc_core::transition::duration_secs(&l.transition, bpm))
-                .fold(0.0, f64::max);
+            let lead_secs = vjc_core::comp_autopilot::lead_secs(&self.project, cur, bpm);
             if let Some(next) = self.comp_ap.tick(
                 &comp.autopilot,
                 &comp.columns,

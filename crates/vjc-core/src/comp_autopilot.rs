@@ -147,6 +147,27 @@ fn lead_of(compensate: bool, lead_secs: f64, hold_secs: f64) -> f64 {
     lead_secs.clamp(0.0, hold_secs * 0.5)
 }
 
+/// Longest crossing the next column can start, in seconds: for every candidate column
+/// (anything but `from`) and layer with a clip there, the clip's own transition when set,
+/// else the layer's. A Cut and a layer left empty by the column cross nothing.
+pub fn lead_secs(p: &vjc_model::Project, from: u32, bpm: f64) -> f64 {
+    use crate::transition::{Kind, duration_secs, effective};
+    let comp = &p.composition;
+    let mut best = 0.0_f64;
+    for col in (0..comp.columns.len() as u32).filter(|c| *c != from) {
+        for l in &comp.layers {
+            let Some(clip) = crate::clip_in(p, comp.current_deck, l.id, col) else {
+                continue;
+            };
+            let t = effective(&l.transition, clip.transition.as_ref());
+            if Kind::parse(&t.kind) != Kind::Cut {
+                best = best.max(duration_secs(t, bpm));
+            }
+        }
+    }
+    best
+}
+
 /// Run-time state of the composition autopilot (never saved).
 #[derive(Debug, Clone, Default)]
 pub struct State {
@@ -667,5 +688,61 @@ mod tests {
             serde_json::from_str::<CompAutopilot>("{}").unwrap().target,
             ColumnTarget::Off
         );
+    }
+}
+
+#[cfg(test)]
+mod lead_tests {
+    use super::*;
+    use crate::{Command, History, apply};
+    use std::time::Instant;
+    use vjc_model::Transition;
+
+    fn tr(kind: &str, secs: f64) -> Transition {
+        Transition {
+            kind: kind.into(),
+            duration_beats: None,
+            duration_secs: secs,
+        }
+    }
+
+    #[test]
+    fn lead_uses_the_effective_transition() {
+        let (mut p, l) = crate::tests::setup();
+        let deck = p.composition.current_deck;
+        p.composition.columns.push(p.composition.columns[0].clone());
+        p.composition.columns[1].id = uuid::Uuid::new_v4();
+        p.composition.layers[0].transition = tr("Cube", 2.0);
+        assert_eq!(lead_secs(&p, 0, 120.0), 0.0, "empty layer crosses nothing");
+        History::default()
+            .exec(
+                &mut p,
+                Command::ImportMedia {
+                    deck,
+                    layer: l,
+                    column: 1,
+                    path: "/x/a.mov".into(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(lead_secs(&p, 0, 120.0), 2.0, "layer transition");
+        let set = |p: &mut vjc_model::Project, t| {
+            apply(
+                p,
+                Command::SetClipTransition {
+                    deck,
+                    layer: l,
+                    column: 1,
+                    transition: t,
+                },
+            )
+            .unwrap();
+        };
+        set(&mut p, Some(tr("Cut", 2.0)));
+        assert_eq!(lead_secs(&p, 0, 120.0), 0.0, "clip override Cut");
+        p.composition.layers[0].transition = tr("Cut", 0.0);
+        set(&mut p, Some(tr("Cube", 0.5)));
+        assert_eq!(lead_secs(&p, 0, 120.0), 0.5, "clip override wins");
     }
 }
