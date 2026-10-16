@@ -133,22 +133,6 @@ pub fn text(key: &str) -> Option<&'static str> {
             "Recordings made by the app, newest first. Double-click one to load it into the selected cell."
         }
         "browser-network" => "Video sources found on the network.",
-        // Output setup
-        "out-screens" => {
-            "Output screens. Each one is a monitor, a network sender or a DMX fixture fed by slices of the composition."
-        }
-        "out-add-screen" => {
-            "Adds a new output screen with one slice covering the whole composition."
-        }
-        "out-device" => "Where the selected screen is sent: a monitor, Syphon or Art-Net.",
-        "out-pixel-perfect" => {
-            "Unscaled slices sample the composition with nearest (no filtering), and the output window shows the canvas 1:1 in physical pixels, never stretched."
-        }
-        "out-slices" => "Slices pick a part of the composition and place it on the screen.",
-        "out-add-slice" => "Adds a slice to the selected screen.",
-        "out-remove-slice" => "Removes the selected slice.",
-        "out-create-mask" => "Starts a polygon mask for the slice; only the inside stays visible.",
-        "out-clear-mask" => "Removes the slice mask.",
         // Preferences
         "prefs-general" => "Startup behavior, autosave and the default browser folder.",
         "prefs-audio" => "Audio output device for clips with sound.",

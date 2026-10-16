@@ -22,6 +22,17 @@ pub fn parse_value(text: &str, range: Option<(f64, f64)>) -> Option<f64> {
     })
 }
 
+/// A typed value: a plain number, or with `math` an expression that may be relative to the
+/// current value (`/3`, `+10`, `1920/4`), as the numeric fields of the Output setup take.
+fn typed(text: &str, current: f64, range: (f64, f64), math: bool) -> Option<f64> {
+    if math {
+        let v = f64::from(vjc_core::slice_geom::eval_field(text, current as f32)?);
+        Some(v.clamp(range.0, range.1))
+    } else {
+        parse_value(text, Some(range))
+    }
+}
+
 /// The value a reset button applies: the default, or None when already there.
 pub fn reset_to(current: &Value, default: &Value) -> Option<Value> {
     (current != default).then(|| default.clone())
@@ -125,7 +136,29 @@ pub fn param_slider(
     default: f64,
     range: (f64, f64),
 ) -> Option<f64> {
-    slider_inner(ui, id, label, value, default, range, None, None).0
+    slider_inner(ui, id, label, value, default, range, None, (None, false)).0
+}
+
+/// Like `param_slider`, with the -/+ buttons stepping by `step` instead of 1% of the range.
+pub fn param_slider_step(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    value: f64,
+    default: f64,
+    (range, step): ((f64, f64), f64),
+) -> Option<f64> {
+    slider_inner(
+        ui,
+        id,
+        label,
+        value,
+        default,
+        range,
+        None,
+        (Some(step), true),
+    )
+    .0
 }
 
 /// Like `param_slider` plus the "~" animation button. `value` is the effective (animated)
@@ -139,7 +172,16 @@ pub fn param_slider_anim(
     range: (f64, f64),
     anim: &Option<Animation>,
 ) -> (Option<f64>, Option<Option<Animation>>) {
-    slider_inner(ui, id, label, value, default, range, Some(anim), None)
+    slider_inner(
+        ui,
+        id,
+        label,
+        value,
+        default,
+        range,
+        Some(anim),
+        (None, false),
+    )
 }
 
 /// Like `param_slider_anim`, with the -/+ buttons stepping by `step` instead of 1% of the range.
@@ -154,7 +196,16 @@ pub fn param_slider_anim_step(
     step: f64,
     anim: &Option<Animation>,
 ) -> (Option<f64>, Option<Option<Animation>>) {
-    slider_inner(ui, id, label, value, default, range, Some(anim), Some(step))
+    slider_inner(
+        ui,
+        id,
+        label,
+        value,
+        default,
+        range,
+        Some(anim),
+        (Some(step), false),
+    )
 }
 
 /// Loop mode and direction combos; true when either changed.
@@ -768,7 +819,7 @@ fn slider_inner(
     default: f64,
     range: (f64, f64),
     anim: Option<&Option<Animation>>,
-    step: Option<f64>,
+    (step, math): (Option<f64>, bool),
 ) -> (Option<f64>, Option<Option<Animation>>) {
     let id = ui.id().with(id);
     let mut out = None;
@@ -791,7 +842,7 @@ fn slider_inner(
             }
             if e.lost_focus() {
                 if ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && let Some(v) = parse_value(&buf, Some(range))
+                    && let Some(v) = typed(&buf, value, range, math)
                 {
                     out = Some(v);
                 }

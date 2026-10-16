@@ -31,8 +31,13 @@ mod monitor;
 mod monitors;
 mod netout;
 mod osc_io;
+mod output_artnet;
+mod output_canvas;
+mod output_hints;
 mod output_overlay;
 mod output_presets_ui;
+mod output_props;
+mod output_tree;
 mod output_ui;
 mod palette;
 mod params;
@@ -43,7 +48,6 @@ mod preload;
 mod qr;
 mod shortcut_editor;
 mod slice_inspector;
-mod slice_overview;
 mod slice_render;
 mod source_info;
 mod stats_bar;
@@ -311,6 +315,8 @@ struct State {
     sel_slice: Option<Uuid>,
     /// Slices selected together (shift / cmd click); empty means only `sel_slice`.
     sel_slices: Vec<Uuid>,
+    /// Working copy of the Output setup while its window is open.
+    out_win: Option<output_ui::OutWin>,
     sel_pt_in: Option<usize>,
     sel_pt_out: Option<usize>,
     snap: bool,
@@ -327,7 +333,6 @@ struct State {
     /// Why the last loaded preset differs from what was saved.
     preset_warnings: Vec<String>,
     /// Side of the slice the inspector's numeric fields and buttons edit.
-    geom_side: vjc_core::slice_geom::Side,
     /// Output canvas edits the slice mask polygon instead of the warp mesh.
     edit_mask: bool,
     sel_mask_pt: Option<usize>,
@@ -1952,6 +1957,7 @@ impl State {
             sel_screen: None,
             sel_slice: None,
             sel_slices: vec![],
+            out_win: None,
             sel_pt_in: None,
             sel_pt_out: None,
             snap: false,
@@ -1966,7 +1972,6 @@ impl State {
             preset_text: String::new(),
             preset_confirm_delete: false,
             preset_warnings: vec![],
-            geom_side: vjc_core::slice_geom::Side::Output,
             edit_mask: false,
             sel_mask_pt: None,
             closed_screens: Default::default(),
@@ -5483,6 +5488,13 @@ impl State {
         let mut ids: Vec<Uuid> = self.open_screens().into_iter().map(|(id, _)| id).collect();
         ids.extend(self.net_wants().iter().map(|w| w.id));
         ids.extend(self.artnet_wants().iter().map(|w| w.id));
+        // The Output tab of the setup window shows the live render of the selected screen,
+        // even when that screen goes to no display.
+        if let Some(id) = self.out_preview_screen()
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
         ids
     }
 
@@ -7305,6 +7317,8 @@ impl State {
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
+        // Files dropped on the Output setup window are a guide image, not clips.
+        let dropped = self.out_take_drops(&ctx, dropped);
         if !dropped.is_empty() {
             match resolve_drop(&self.cells, self.last_pointer, self.selected) {
                 Some((l, c, w)) => {
