@@ -7246,6 +7246,19 @@ fn rest_save_refuses_symlinks_and_directories() {
     assert_eq!(r.unwrap_err().status, 422);
 }
 
+#[test]
+fn audio_prefs_are_sanitized_before_they_reach_the_engine() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.prefs.audio.sample_rate = Some(5);
+    st.prefs.audio.buffer_size = Some(1);
+    st.prefs.audio.channels = Some(500);
+    st.save_prefs();
+    assert_eq!(st.audio_cfg.sample_rate, None);
+    assert_eq!(st.audio_cfg.buffer_frames, None);
+    assert_eq!(st.audio_cfg.channels, None);
+}
+
 fn top_layer_no(h: &Harness<'_, State>) -> usize {
     h.state().project.composition.layers.len()
 }

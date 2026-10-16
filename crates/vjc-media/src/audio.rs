@@ -422,6 +422,8 @@ pub struct AudioEngine {
     /// What the stream is (re)opened with; `reconfigure` changes it and raises `failed`.
     cfg: Arc<Mutex<OutConfig>>,
     failed: Arc<AtomicBool>,
+    /// Why the last reconfigure could not open (the old settings were reopened instead).
+    reopen_error: Arc<Mutex<Option<String>>>,
     _guard: Arc<Guard>,
 }
 
@@ -495,6 +497,9 @@ impl AudioEngine {
     pub fn start_with(cfg: OutConfig) -> Result<AudioEngine, String> {
         let cfg = Arc::new(Mutex::new(cfg));
         let cfg_thread = cfg.clone();
+        let good = Arc::new(Mutex::new(cfg.lock().unwrap().clone()));
+        let reopen_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let error_thread = reopen_error.clone();
         let failed = Arc::new(AtomicBool::new(false));
         let failed_thread = failed.clone();
         let voices: VoiceList = Arc::new(Mutex::new(Vec::new()));
@@ -513,8 +518,9 @@ impl AudioEngine {
                 // The cpal stream is not Send: it lives and dies on this thread.
                 let failed = failed_thread;
                 let open = || {
-                    let want = cfg_thread.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    open_stream(v.clone(), t.clone(), bs.clone(), failed.clone(), &want)
+                    open_or_fall_back(&cfg_thread, &good, &error_thread, |want| {
+                        open_stream(v.clone(), t.clone(), bs.clone(), failed.clone(), want)
+                    })
                 };
                 match open() {
                     Ok((stream, rate)) => {
@@ -539,6 +545,7 @@ impl AudioEngine {
             rate: shared_rate,
             cfg,
             failed,
+            reopen_error,
             _guard: Arc::new(Guard {
                 stop: Some(stop_tx),
                 thread: Some(thread),
@@ -550,6 +557,14 @@ impl AudioEngine {
     /// recording tap stay, decoders follow the new rate. False when nothing changed.
     pub fn reconfigure(&self, cfg: OutConfig) -> bool {
         swap_cfg(&self.cfg, &self.failed, cfg)
+    }
+
+    /// The reason the last reconfigure failed and the previous settings were reopened.
+    pub fn take_reopen_error(&self) -> Option<String> {
+        self.reopen_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// The recording tap of the master output.
@@ -657,6 +672,33 @@ fn swap_cfg(slot: &Mutex<OutConfig>, failed: &AtomicBool, cfg: OutConfig) -> boo
     *g = cfg;
     failed.store(true, Ordering::Relaxed);
     true
+}
+
+/// Opens with the wishes in `slot`. When that fails and a different configuration worked
+/// before, the slot goes back to it, the reason is kept in `error` and it is opened instead,
+/// so a bad reconfigure never leaves the app without sound.
+fn open_or_fall_back<T>(
+    slot: &Mutex<OutConfig>,
+    good: &Mutex<OutConfig>,
+    error: &Mutex<Option<String>>,
+    mut try_open: impl FnMut(&OutConfig) -> Result<T, String>,
+) -> Result<T, String> {
+    let want = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match try_open(&want) {
+        Ok(t) => {
+            *good.lock().unwrap_or_else(|e| e.into_inner()) = want;
+            Ok(t)
+        }
+        Err(e) => {
+            let prev = good.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if prev == want {
+                return Err(e);
+            }
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = prev.clone();
+            *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+            try_open(&prev)
+        }
+    }
 }
 
 /// Pause between attempts to reopen a lost output device.
@@ -1405,6 +1447,32 @@ mod tests {
             None,
             "unknown range: host default"
         );
+    }
+
+    #[test]
+    fn failed_reconfigure_falls_back_to_the_old_settings() {
+        let old = OutConfig::default();
+        let bad = OutConfig {
+            sample_rate: Some(12_345),
+            ..Default::default()
+        };
+        let slot = Mutex::new(old.clone());
+        let good = Mutex::new(old.clone());
+        let err = Mutex::new(None);
+        let ok = |c: &OutConfig| {
+            if c.sample_rate.is_some() {
+                Err("no such rate".to_string())
+            } else {
+                Ok(c.clone())
+            }
+        };
+        assert!(open_or_fall_back(&slot, &good, &err, ok).is_ok());
+        assert!(err.lock().unwrap().is_none());
+        *slot.lock().unwrap() = bad;
+        let got = open_or_fall_back(&slot, &good, &err, ok).unwrap();
+        assert_eq!(got, old, "reopened the previous settings");
+        assert_eq!(*slot.lock().unwrap(), old);
+        assert_eq!(err.lock().unwrap().as_deref(), Some("no such rate"));
     }
 
     #[test]

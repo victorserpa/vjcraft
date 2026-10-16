@@ -2788,6 +2788,8 @@ impl State {
     }
 
     fn save_prefs(&mut self) {
+        // Out-of-range wishes (rate, buffer, channels) never reach the engine.
+        self.prefs.sanitize();
         // Output device, rate, buffer and channels reopen the running output in place;
         // the analysis input restarts with its new device, channel and FFT size.
         let new_out = audio_prefs::out_config(&self.prefs.audio);
@@ -2806,7 +2808,6 @@ impl State {
             self.prefs_dirty = false;
             return;
         };
-        self.prefs.sanitize();
         if let Err(e) = self.prefs.save(&p) {
             self.status = format!("Saving preferences failed: {e}");
         }
@@ -6271,6 +6272,9 @@ impl State {
         if self.api_cfg.as_ref() != Some(&cfg) {
             self.api.configure(cfg.clone());
             self.api_cfg = Some(cfg);
+        }
+        if let Some(e) = self.audio.as_ref().and_then(|a| a.take_reopen_error()) {
+            self.status = format!("Audio: could not use the new settings ({e}); kept the old ones");
         }
         api_ext::snap_expire(&mut self.snap_jobs);
         for _ in 0..api_io::MAX_PER_FRAME {
