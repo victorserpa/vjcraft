@@ -3,7 +3,7 @@
   "CATEGORIES": ["Stylize"],
   "INPUTS": [
     { "NAME": "inputImage", "TYPE": "image" },
-    { "NAME": "length", "TYPE": "float", "MIN": 0.0, "MAX": 0.15, "DEFAULT": 0.04 },
+    { "NAME": "stroke_length", "TYPE": "float", "MIN": 0.0, "MAX": 0.15, "DEFAULT": 0.04 },
     { "NAME": "contrast", "TYPE": "float", "MIN": 0.0, "MAX": 2.0, "DEFAULT": 1.0 },
     { "NAME": "jitter", "TYPE": "float", "MIN": 0.0, "MAX": 1.0, "DEFAULT": 0.4 },
     { "NAME": "mix_original", "TYPE": "float", "MIN": 0.0, "MAX": 1.0, "DEFAULT": 0.0 }
@@ -28,7 +28,7 @@ void main() {
     vec2 dir = length(grad) > 1e-4 ? normalize(vec2(-grad.y, grad.x)) : vec2(cos(rnd), sin(rnd));
     vec2 rd = vec2(cos(rnd), sin(rnd));
     dir = normalize(mix(rd, dir, strength) + vec2(1e-5));
-    vec2 step_uv = dir * length / 6.0 * vec2(1.0 / aspect, 1.0);
+    vec2 step_uv = dir * stroke_length / 6.0 * vec2(1.0 / aspect, 1.0);
     float j = (hash(uv * RENDERSIZE) - 0.5) * jitter;
     vec4 sum = vec4(0.0);
     for (int i = -6; i <= 6; i++) {

@@ -3959,6 +3959,72 @@ mod tests {
         assert!(bad.is_empty(), "failed:\n{}", bad.join("\n"));
     }
 
+    /// Default text generators draw centred and fully on screen (padding spaces must not
+    /// count towards line length). Skipped without an adapter.
+    #[test]
+    fn gpu_default_text_is_centred_and_on_screen() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let (w, h) = (64u32, 36u32);
+        let mut comp = Compositor::new(&device, w, h);
+        for id in ["text_block", "text_animator"] {
+            let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(id).unwrap()).unwrap();
+            comp.add_effect_passes(&device, id, &wgsl, &isf.passes)
+                .unwrap();
+            let draw = EffectDraw {
+                lut: None,
+                blend: Default::default(),
+                kind: id.to_string(),
+                uniforms: isf.pack(&isf.default_params(), 0.0, (w, h)),
+                dry_wet: 1.0,
+                ml: None,
+                persistent: isf.needs_instance().then(|| uuid::Uuid::from_u128(78)),
+                ticking: false,
+            };
+            let layer = [LayerDraw {
+                id: uuid::Uuid::from_u128(3),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![],
+                frame: None,
+                generator: Some(draw),
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            let data = read_target(&device, &queue, &comp);
+            let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
+            for (i, p) in data.chunks(4).enumerate() {
+                if p[..3].iter().any(|v| *v > 40) {
+                    let (x, y) = (i as u32 % w, i as u32 / w);
+                    (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+                }
+            }
+            assert!(x0 != u32::MAX, "{id}: nothing drawn");
+            assert!(
+                x0 > 0 && x1 < w - 1 && y0 > 0 && y1 < h - 1,
+                "{id}: touches edge {x0}..{x1} {y0}..{y1}"
+            );
+            let (cx, cy) = ((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0);
+            assert!(
+                (cx - w as f32 / 2.0).abs() < 3.0 && (cy - h as f32 / 2.0).abs() < 4.0,
+                "{id}: centre ({cx}, {cy}) off {x0}..{x1} {y0}..{y1}"
+            );
+        }
+    }
+
     #[test]
     fn mix_plan_cases() {
         assert_eq!(mix_plan(0.0, 0), MixPlan::Skip);

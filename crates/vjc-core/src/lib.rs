@@ -5287,6 +5287,20 @@ mod tests {
                 read(&mut p, target, TransformField::Scale),
                 vjc_model::TRANSFORM_SCALE_MAX
             );
+            apply(
+                &mut p,
+                Command::SetTransformMulti {
+                    target,
+                    values: vec![(TransformField::Scale, 99.0), (TransformField::X, 5.0)],
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                read(&mut p, target, TransformField::Scale),
+                vjc_model::TRANSFORM_SCALE_MAX,
+                "multi clamps like SetTransform"
+            );
+            assert_eq!(read(&mut p, target, TransformField::X), 5.0);
             let anim = |a| Command::SetAnimation {
                 target: AnimTarget::Transform {
                     target,

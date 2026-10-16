@@ -2045,6 +2045,20 @@ void main() {
     }
 
     #[test]
+    fn strokes_compiles_with_its_length_input() {
+        let (isf, wgsl) = compile(builtin_source("strokes").unwrap()).unwrap();
+        assert!(isf.inputs.iter().any(|i| i.name == "stroke_length"));
+        assert!(!isf.inputs.iter().any(|i| i.name == "length"));
+        let m = naga::front::wgsl::parse_str(&wgsl).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&m)
+        .unwrap();
+    }
+
+    #[test]
     fn input_names_cannot_shadow_builtins() {
         for n in ["TIME", "main", "vec4", "isf_u", "gl_Position"] {
             let src = format!(

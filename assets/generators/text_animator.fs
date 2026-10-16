@@ -35,11 +35,22 @@ bool glyph_on(int c, int cx, int cy) {
     return ((bits >> shift) & 1) == 1;
 }
 
+// Message length without the trailing space padding (the host pads to 24 slots).
+int text_end() {
+    int n = 0;
+    for (int i = 0; i < 24; i++) {
+        if (raw_at(i) != 32) { n = i + 1; }
+    }
+    return n;
+}
+
 // Characters on the line that starts at message index `start` (a '|' ends a line).
 int line_len(int start) {
     int n = 0;
+    int end = text_end();
     for (int i = 0; i < 24; i++) {
         if (i < start) { continue; }
+        if (i >= end) { break; }
         int c = raw_at(i);
         if (c == 124) { break; }
         n += 1;
@@ -50,7 +61,9 @@ int line_len(int start) {
 int widest() {
     int best = 0;
     int cur = 0;
+    int end = text_end();
     for (int i = 0; i < 24; i++) {
+        if (i >= end) { break; }
         if (raw_at(i) == 124) { cur = 0; } else { cur += 1; best = max(best, cur); }
     }
     return best;
@@ -58,7 +71,9 @@ int widest() {
 
 int line_count() {
     int n = 1;
+    int end = text_end();
     for (int i = 0; i < 24; i++) {
+        if (i >= end) { break; }
         if (raw_at(i) == 124) { n += 1; }
     }
     return n;
@@ -80,7 +95,8 @@ void main() {
     int line = 0;
     int col = 0;
     float lw = 0.0;
-    for (int i = 0; i < 24; i++) {
+    int end = text_end();
+    for (int i = 0; i < end; i++) {
         int c = raw_at(i);
         if (c == 124) { line += 1; col = 0; continue; }
         if (col == 0) { lw = float(line_len(i)) * 6.0 * cell; }
