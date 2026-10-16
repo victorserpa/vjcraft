@@ -6603,3 +6603,47 @@ fn column_edits_keep_the_playing_clip_on_air_and_refuse_removing_it() {
     assert!(h.state().status.contains("on air"), "{}", h.state().status);
     assert!(h.state().gens.contains_key(&lid));
 }
+
+#[test]
+fn global_stop_ejects_pause_and_play_follow_and_reverse_and_metronome_are_commands() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let dir = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, lid, 1)
+            .unwrap()
+            .transport
+            .direction
+    };
+    click(&mut h, "Pause tempo clock");
+    assert_eq!(dir(&h), vjc_model::Direction::Pause, "clips pause");
+    assert!(h.state().gens.contains_key(&lid), "still on air");
+    click(&mut h, "Play tempo clock");
+    assert_eq!(dir(&h), vjc_model::Direction::Forward, "clips resume");
+    // Metronome and reverse go through the command bus (saved, undoable).
+    click(&mut h, "Metronome");
+    assert!(h.state().project.composition.tempo.metronome);
+    click(&mut h, "Reverse all clips");
+    assert!(h.state().project.composition.master_reverse);
+    h.state_mut().undo();
+    assert!(!h.state().project.composition.master_reverse);
+    // Stop ejects (negative control: pause and play above did not).
+    click(&mut h, "Stop tempo clock");
+    assert!(h.state().gens.is_empty() && h.state().players.is_empty());
+    assert_eq!(
+        h.state().project.composition.tempo.play_state,
+        vjc_model::PlayState::Stop
+    );
+}
+
+#[test]
+fn speed_sliders_can_be_hidden_from_the_view_option() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    h.state_mut().selected = Some((lid, 1));
+    settle(&mut h);
+    assert!(exists(&h, "Speed"), "clip speed slider shows by default");
+    h.state_mut().prefs.layouts.current.speed_sliders = false;
+    settle(&mut h);
+    assert!(!exists(&h, "Speed"), "hidden by the View option");
+}

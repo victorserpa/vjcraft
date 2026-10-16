@@ -49,6 +49,9 @@ pub struct Composition {
     /// Multiplies the speed of every clip, 0..=4.
     #[serde(default = "one")]
     pub master_speed: f64,
+    /// Plays every clip against its own direction (Forward <-> Backward). Old files: off.
+    #[serde(default)]
+    pub master_reverse: bool,
     pub crossfader: Option<Crossfader>,
     pub dashboard: Vec<Param>,
     /// Timecode cues, fired when the external timecode crosses them.
@@ -1867,6 +1870,7 @@ impl Project {
                 master: Track::new(BlendMode::Normal),
                 groups: vec![],
                 master_speed: 1.0,
+                master_reverse: false,
                 crossfader: None,
                 dashboard: vec![],
                 timecode_cues: vec![],

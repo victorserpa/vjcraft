@@ -318,6 +318,20 @@ pub enum Command {
     SetCrossfaderBlend {
         blend: Option<BlendMode>,
     },
+    /// Global transport of the tempo clock. Stop also ejects every clip (`LayerCleared` for
+    /// each layer that is not locked) and parks the clock on beat 0, which rewinds the
+    /// animations that follow it. Not undoable: it is a performance action.
+    SetTransport {
+        state: vjc_model::PlayState,
+    },
+    /// Global reverse: every clip runs against its own direction. Undoable.
+    SetMasterReverse {
+        reverse: bool,
+    },
+    /// Metronome click on/off (saved with the project). Undoable.
+    SetMetronome {
+        on: bool,
+    },
     /// Layer audio / video enable toggles. Undoable.
     SetLayerAudio {
         layer: LayerId,
@@ -2418,6 +2432,31 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = number(&op.value);
             op.set_number(value);
             undoable(Command::SetMasterOpacity { value: prev }, vec![])
+        }
+        Command::SetTransport { state } => {
+            p.composition.tempo.play_state = state;
+            let events = if state == vjc_model::PlayState::Stop {
+                p.composition
+                    .layers
+                    .iter()
+                    .filter(|l| !l.lock_content)
+                    .map(|l| Event::LayerCleared { layer: l.id })
+                    .collect()
+            } else {
+                vec![]
+            };
+            Ok(Applied {
+                inverse: None,
+                events,
+            })
+        }
+        Command::SetMasterReverse { reverse } => {
+            let prev = std::mem::replace(&mut p.composition.master_reverse, reverse);
+            undoable(Command::SetMasterReverse { reverse: prev }, vec![])
+        }
+        Command::SetMetronome { on } => {
+            let prev = std::mem::replace(&mut p.composition.tempo.metronome, on);
+            undoable(Command::SetMetronome { on: prev }, vec![])
         }
         Command::SetMasterSpeed { value } => {
             if !value.is_finite() || !(0.0..=4.0).contains(&value) {

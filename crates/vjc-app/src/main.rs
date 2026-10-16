@@ -353,8 +353,6 @@ struct State {
     /// Composition autopilot: which column is on air and since when (runtime only).
     comp_ap: vjc_core::comp_autopilot::State,
     nudge_dir: i8,
-    /// Visual only for now. TODO(#9): click sound (see build-log).
-    metronome: bool,
     link: link_io::Link,
     link_sync: LinkSync,
     /// Set when a layout is applied or panels are toggled: the next frame forces the saved
@@ -1928,7 +1926,6 @@ impl State {
             hold_token: 0,
             comp_ap: Default::default(),
             nudge_dir: 0,
-            metronome: false,
             link: link_io::Link::new(120.0),
             link_sync: LinkSync::default(),
             force_panels: false,
@@ -2139,6 +2136,7 @@ impl State {
             (&mut new.monitors, "Monitors", "Cmd+2"),
             (&mut new.params, "Parameters", "Cmd+3"),
             (&mut new.grid, "Clip grid", "Cmd+4"),
+            (&mut new.speed_sliders, "Speed sliders", ""),
         ] {
             if ui
                 .add(egui::Button::selectable(*on, label).shortcut_text(key))
@@ -2855,9 +2853,27 @@ impl State {
         #[cfg(not(test))]
         let now = std::time::Instant::now();
         let col_ids = self.column_ids();
+        let transport = match &cmd {
+            Command::SetTransport { state } => Some(*state),
+            _ => None,
+        };
         match self.history.exec(&mut self.project, cmd, now) {
             Ok(events) => {
                 self.follow_columns(&col_ids);
+                if let Some(st) = transport
+                    && st != vjc_model::PlayState::Stop
+                {
+                    // The clips follow the global transport (a no-op when none is playing).
+                    let ctx = self.rt_ctx();
+                    if let Some(c) = vjc_core::shortcuts::set_all_paused(
+                        &ctx.active,
+                        &ctx.origin,
+                        st == vjc_model::PlayState::Pause,
+                    ) {
+                        // Clips already in that state make this fail: nothing to do then.
+                        let _ = self.history.exec(&mut self.project, c, now);
+                    }
+                }
                 if is_set_bpm {
                     self.link_sync.note_bpm_edit();
                 }
@@ -3749,7 +3765,9 @@ impl State {
         if let Some(b) = t.beat {
             self.beat = b;
         }
-        if let Some(accent) = vjc_media::audio::beat_click(self.metronome, t.beat) {
+        if let Some(accent) =
+            vjc_media::audio::beat_click(self.project.composition.tempo.metronome, t.beat)
+        {
             if self.metro.is_none()
                 && let Some(engine) = self.audio_engine()
             {
@@ -3764,6 +3782,7 @@ impl State {
             .as_secs_f64();
         self.last_head_tick = now;
         let master_speed = self.project.composition.master_speed;
+        let reverse = self.project.composition.master_reverse;
         // A group's speed multiplies the clips of its layers, on top of the master speed.
         let comp = &self.project.composition;
         let speed_of = |layer: &LayerId| {
@@ -3817,6 +3836,7 @@ impl State {
                 _ => 1.0,
             };
             let rate = vjc_core::playback_rate(tr.speed, sync, speed_of(layer));
+            let gdir = vjc_core::playback::global_direction(tr.direction, reverse);
             // Play modes: the playhead picks the position, the player serves the frame.
             if let (Some(file_d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
                 // The playhead runs over the in..out region only; `position` below is the
@@ -3837,7 +3857,7 @@ impl State {
                             cur,
                             start,
                             tr.play_mode,
-                            tr.direction,
+                            gdir,
                             rate,
                             d,
                         );
@@ -3845,12 +3865,12 @@ impl State {
                         t
                     }
                     (Some(_), None) if tc_on && !tc_free_run => {
-                        head.tick(0.0, tr.play_mode, tr.direction, rate, d)
+                        head.tick(0.0, tr.play_mode, gdir, rate, d)
                     }
-                    _ => head.tick(dt, tr.play_mode, tr.direction, rate, d),
+                    _ => head.tick(dt, tr.play_mode, gdir, rate, d),
                 };
                 // Forward playback streams; everything else needs random access.
-                player.set_sequential(!by_tc && is_sequential(tr.play_mode, tr.direction, rate));
+                player.set_sequential(!by_tc && is_sequential(tr.play_mode, gdir, rate));
                 let mut position = vjc_core::playback::to_actual(t.position, reg);
                 if let Some((_, w)) = self.flow.beat_loops.get(layer)
                     && !t.finished
@@ -3864,8 +3884,8 @@ impl State {
                 let audible = rate.is_finite()
                     && !by_tc
                     && (rate - 1.0).abs() < 1e-3
-                    && is_sequential(tr.play_mode, tr.direction, rate)
-                    && tr.direction != Direction::Pause
+                    && is_sequential(tr.play_mode, gdir, rate)
+                    && gdir != Direction::Pause
                     && !t.finished;
                 let (vol, pan) = audio_mix(&self.project, *layer, clip);
                 player.set_audio(vol, pan, audible);
@@ -3957,7 +3977,7 @@ impl State {
             if let Some(tr) =
                 clip_for(&self.project, &self.origin, *layer, *deck, *col).map(|k| &k.transport)
             {
-                let dir = match tr.direction {
+                let dir = match vjc_core::playback::global_direction(tr.direction, reverse) {
                     Direction::Backward => -1.0,
                     Direction::Pause => 0.0,
                     _ => 1.0,
@@ -5854,9 +5874,9 @@ impl State {
                     tip,
                 );
                 // Transport, not an edit: no undo step (like TAP), but the project is saved.
+                // Stop ejects every clip; Pause / Play also pause / resume the clips.
                 if b.clicked() && self.project.composition.tempo.play_state != state {
-                    self.project.composition.tempo.play_state = state;
-                    self.dirty = true;
+                    cmds.push(Command::SetTransport { state });
                 }
             }
             let minus = help(
@@ -5916,10 +5936,19 @@ impl State {
                 };
                 ui.painter().circle_filled(rect.center(), 6.0, col);
             }
-            help(
-                icons::toggle(ui, &mut self.metronome, icons::i::METRONOME, "Metronome"),
+            let mut metro = self.project.composition.tempo.metronome;
+            let mr = help(
+                icons::toggle(ui, &mut metro, icons::i::METRONOME, "Metronome"),
                 "metronome",
             );
+            if mr.changed() {
+                cmds.push(Command::SetMetronome { on: metro });
+            }
+            let mut rev = self.project.composition.master_reverse;
+            let rr = icons::toggle(ui, &mut rev, icons::i::ARROWS_LEFT_RIGHT, "Reverse all clips");
+            if rr.changed() {
+                cmds.push(Command::SetMasterReverse { reverse: rev });
+            }
             ui.separator();
             let (can_undo, can_redo) = (self.history.can_undo(), self.history.can_redo());
             undo = help(
@@ -8043,7 +8072,8 @@ impl State {
                 }
             }
         }
-        if params::section(ui, "sec-transport", "Transport")
+        if self.prefs.layouts.current.speed_sliders
+            && params::section(ui, "sec-transport", "Transport")
             && let Some(value) =
                 params::param_slider(ui, "msp", "Speed", c.master_speed, 1.0, (0.0, 4.0))
         {
@@ -8484,8 +8514,9 @@ impl State {
             if let Some(blend) = params::combo(ui, ("gbl", gid), "Blend", &g.track.blend, &modes) {
                 cmds.push(Command::SetGroupBlend { group: gid, blend });
             }
-            if let Some(value) =
-                params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
+            if self.prefs.layouts.current.speed_sliders
+                && let Some(value) =
+                    params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
             {
                 cmds.push(Command::SetGroupSpeed { group: gid, value });
             }
@@ -8775,7 +8806,9 @@ impl State {
                     direction,
                 });
             }
-            if let Some(speed) = params::param_slider(ui, "spd", "Speed", t.speed, 1.0, (0.0, 4.0))
+            if self.prefs.layouts.current.speed_sliders
+                && let Some(speed) =
+                    params::param_slider(ui, "spd", "Speed", t.speed, 1.0, (0.0, 4.0))
             {
                 cmds.push(Command::SetSpeed {
                     deck,

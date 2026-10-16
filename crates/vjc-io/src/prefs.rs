@@ -349,6 +349,8 @@ pub struct Layout {
     pub params: bool,
     pub params_h: f32,
     pub grid: bool,
+    /// Speed sliders of the master, groups and clips (hidden = less clutter, speeds stay).
+    pub speed_sliders: bool,
 }
 
 impl Default for Layout {
@@ -362,6 +364,7 @@ impl Default for Layout {
             params: true,
             params_h: 400.0,
             grid: true,
+            speed_sliders: true,
         }
     }
 }
