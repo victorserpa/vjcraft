@@ -1779,7 +1779,7 @@ fn dragging_shared_bottom_panel_updates_monitor_height_too() {
     );
 }
 
-// ---- replica-test: flows F01-F08 gaps (see replica/test-plan.md) ----
+// ---- replica-test: flows F01-F08 gaps ----
 
 fn project_file_with_missing_media(base: &vjc_model::Project, name: &str) -> PathBuf {
     let mut p = base.clone();

@@ -1,5 +1,4 @@
 target/
 
 *.onnx
-replica/screens/
-replica/diffs/*.png
+replica/

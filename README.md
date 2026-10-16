@@ -33,6 +33,15 @@ cargo test
 - Syphon, NDI, MIDI and Ableton Link are set up in Preferences. The Remote API is off by default (`docs/api.md`).
 - No telemetry. Network is used only by features you turn on: Remote API, NDI, Ableton Link, OSC and Art-Net.
 
+## Platforms
+
+macOS (Apple Silicon) is tested. Windows and Linux builds are in progress; please report what
+works and what breaks.
+
+## Contributing
+
+See `CONTRIBUTING.md`. Bugs and ideas go to GitHub Issues.
+
 ## License
 
 GPL-3.0, see `LICENSE`.

@@ -6,7 +6,7 @@ use eframe::egui::{
     Vec2, vec2,
 };
 
-/// Base palette (tokens `bg`, `surface`, ... in replica/design/tokens.json).
+/// Base palette (tokens `bg`, `surface`, ... in design/tokens.json).
 pub const BG: Color32 = Color32::from_rgb(0x18, 0x1a, 0x1e);
 pub const SURFACE: Color32 = Color32::from_rgb(0x26, 0x29, 0x30);
 pub const SURFACE_RAISED: Color32 = Color32::from_rgb(0x2f, 0x33, 0x3b);
@@ -254,7 +254,7 @@ pub const CELL_SELECTED: Color32 = Color32::from_rgb(110, 170, 240);
 pub const CELL_DROP: Color32 = Color32::from_rgb(240, 200, 60);
 pub const CELL_PENDING: Color32 = Color32::from_rgb(44, 48, 56);
 
-/// Brand accent (violet), token `accent` in replica/design/tokens.json.
+/// Brand accent (violet), token `accent` in design/tokens.json.
 pub const ACCENT: Color32 = Color32::from_rgb(169, 139, 255);
 
 /// Layer header block (left of the cells).
@@ -392,11 +392,11 @@ mod tests {
         assert_eq!(s.visuals.disabled_alpha, DISABLED_ALPHA);
     }
 
-    /// replica/design/tokens.json must say what this file does.
+    /// design/tokens.json must say what this file does.
     #[test]
     fn tokens_json_matches_theme_constants() {
         let j: serde_json::Value =
-            serde_json::from_str(include_str!("../../../replica/design/tokens.json")).unwrap();
+            serde_json::from_str(include_str!("../../../design/tokens.json")).unwrap();
         let hex = |c: Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
         for (name, c) in [
             ("bg", BG),

@@ -1,6 +1,6 @@
 //! Video decoding for VJCraft: one decode thread per `Player`, RGBA frames.
 //! The frame shown follows a position (0..1) set by the caller (play modes and
-//! directions live in the app, see replica/build-log.md, #8). Two serving modes,
+//! directions live in the app, #8). Two serving modes,
 //! switchable at any time from `Player::set_sequential`:
 //! - streaming (forward playback): decodes sequentially, keeping only the last frame;
 //! - random access (backward, bounce, scrub): the whole clip is cached in RAM when the

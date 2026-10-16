@@ -45,3 +45,10 @@
 ## egui-phosphor 0.14 and Phosphor Icons
 
 - Icon font for the UI (crate `egui-phosphor`, depends only on egui, no build script, no network). Crate and icons: MIT. Sources: https://crates.io/crates/egui-phosphor, https://phosphoricons.com.
+
+## epaint 0.36.2 (vendor/epaint)
+
+Copy of the `epaint` crate from crates.io, used through `[patch.crates-io]`, with one change
+in `src/text/fonts.rs` (the galley cache keeps two generations, so an immediate viewport does
+not evict the main UI's text every frame). License: MIT OR Apache-2.0; used under MIT, see
+`vendor/epaint/LICENSE-MIT`. Copyright (c) 2018-2021 Emil Ernerfeldt.

@@ -10,8 +10,8 @@ Read only what the task needs:
 | clean-room and brand rules | docs/dev/clean-room.md |
 | build, test, run and capture the app | docs/dev/build-test.md |
 | crate map and where things live | docs/dev/architecture.md |
-| features, parity and backlog | replica/features.csv, replica/parity.md, `gh issue list` |
-| file formats | docs/02-formato-avc.md, replica/schema.rs |
+| backlog | `gh issue list` |
+| file formats | docs/02-formato-avc.md |
 | API (REST/WS) | docs/api.md |
 | ML effects | docs/ml.md |
 

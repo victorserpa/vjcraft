@@ -1,5 +1,5 @@
 //! VJCraft project data model (format_version 1).
-//! Serialized as JSON (`.vjc`). Clean-room design; see replica/architecture.md.
+//! Serialized as JSON (`.vjc`). Clean-room design.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

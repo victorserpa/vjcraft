@@ -1,6 +1,6 @@
 //! Command bus: every state change is a `Command` applied to a `Project` by the pure
 //! function `apply`. `History` keeps inverses for undo/redo. No UI, no players: the app
-//! reacts to the returned `Event`s. See replica/architecture.md section 3.
+//! reacts to the returned `Event`s.
 
 pub mod anim;
 pub mod blend;
