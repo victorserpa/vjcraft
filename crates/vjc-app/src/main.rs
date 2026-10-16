@@ -8479,18 +8479,16 @@ impl State {
             resp.request_focus();
         }
         let mut busy = false;
-        if let Some(d) = self.xf_drag.take() {
-            if resp.dragged()
-                && d.target == target
-                && let Some(ptr) = ui.input(|i| i.pointer.latest_pos())
-            {
-                let shift = ui.input(|i| i.modifiers.shift);
-                let values =
-                    xform_widget::drag(d.handle, &d.start, comp, d.p0, to_frame(ptr), shift);
-                self.exec(Command::SetTransformMulti { target, values });
-                self.xf_drag = Some(d);
-                busy = true;
-            }
+        if let Some(d) = self.xf_drag.take()
+            && resp.dragged()
+            && d.target == target
+            && let Some(ptr) = ui.input(|i| i.pointer.latest_pos())
+        {
+            let shift = ui.input(|i| i.modifiers.shift);
+            let values = xform_widget::drag(d.handle, &d.start, comp, d.p0, to_frame(ptr), shift);
+            self.exec(Command::SetTransformMulti { target, values });
+            self.xf_drag = Some(d);
+            busy = true;
         }
         if resp.has_focus() {
             ui.memory_mut(|m| {
