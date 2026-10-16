@@ -66,7 +66,9 @@ impl PinLimiter {
             if g.len() >= LIMIT_MAP_MAX {
                 let oldest = g
                     .iter()
-                    .min_by_key(|(_, e)| e.fails.last().copied())
+                    // Evict the entry seen longest ago; a lockout counts as seen at its end,
+                    // so locked IPs are the last to go.
+                    .min_by_key(|(_, e)| e.locked_until.or(e.fails.last().copied()))
                     .map(|(k, _)| *k);
                 if let Some(k) = oldest {
                     g.remove(&k);
