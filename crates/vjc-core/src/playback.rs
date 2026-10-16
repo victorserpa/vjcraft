@@ -144,6 +144,39 @@ pub fn timed_due(ap: &vjc_model::Autopilot, e: &Elapsed) -> bool {
     }
 }
 
+/// Playback rate that makes a region of `region_secs` seconds last `target` seconds.
+/// 1.0 when either is unusable; clamped to 0.01..100 like the beat sync.
+pub fn duration_rate(region_secs: f64, target: Option<f64>) -> f64 {
+    match target {
+        Some(t) if t.is_finite() && t > 0.0 && region_secs.is_finite() && region_secs > 0.0 => {
+            (region_secs / t).clamp(0.01, 100.0)
+        }
+        _ => 1.0,
+    }
+}
+
+/// Freeze / stop-motion: should the picture take a fresh frame now? `since` is the time
+/// since the picture last refreshed. Frozen never refreshes; stop-motion at `fps` refreshes
+/// every `1/fps`; otherwise every frame.
+pub fn picture_refresh(freeze: bool, stop_motion_fps: f64, since: f64) -> bool {
+    if freeze {
+        return false;
+    }
+    if stop_motion_fps.is_finite() && stop_motion_fps > 0.0 {
+        return since >= 1.0 / stop_motion_fps;
+    }
+    true
+}
+
+/// Autopilot that rules a layer playing `clip`: the clip's own when set, else the layer's.
+pub fn autopilot_of<'a>(
+    layer: &'a vjc_model::Layer,
+    clip: Option<&'a vjc_model::Clip>,
+) -> &'a vjc_model::Autopilot {
+    clip.and_then(|k| k.extras.autopilot.as_ref())
+        .unwrap_or(&layer.autopilot)
+}
+
 /// Counts completed loops from successive playhead positions.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoopCounter {
@@ -835,5 +868,27 @@ mod global_transport_tests {
             r("/comp/tempo/metronome", 0.0),
             Some(Command::SetMetronome { on: false })
         );
+    }
+
+    #[test]
+    fn duration_rate_fits_the_region_to_the_seconds() {
+        assert_eq!(super::duration_rate(10.0, Some(5.0)), 2.0);
+        assert_eq!(super::duration_rate(10.0, Some(20.0)), 0.5);
+        // Negative controls: unset or unusable input leaves the speed alone.
+        assert_eq!(super::duration_rate(10.0, None), 1.0);
+        assert_eq!(super::duration_rate(10.0, Some(0.0)), 1.0);
+        assert_eq!(super::duration_rate(0.0, Some(3.0)), 1.0);
+        assert_eq!(super::duration_rate(10.0, Some(f64::NAN)), 1.0);
+        assert_eq!(super::duration_rate(1000.0, Some(1.0)), 100.0);
+    }
+
+    #[test]
+    fn freeze_and_stop_motion_gate_the_refresh() {
+        assert!(!super::picture_refresh(true, 0.0, 99.0));
+        assert!(!super::picture_refresh(true, 12.0, 99.0));
+        assert!(!super::picture_refresh(false, 10.0, 0.05));
+        assert!(super::picture_refresh(false, 10.0, 0.1));
+        assert!(super::picture_refresh(false, 0.0, 0.0));
+        assert!(super::picture_refresh(false, f64::NAN, 0.0));
     }
 }

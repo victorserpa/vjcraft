@@ -31,6 +31,43 @@ pub fn fit_scale(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32) 
     (sw * k / dw, sh * k / dh)
 }
 
+/// Extra picture-space scale for a layer with its own width / height: the picture fitted
+/// into the `area` rect (centred) instead of the whole frame. `None` when the layer uses
+/// the composition's size or the result is the same as the frame fit.
+pub fn area_affine(
+    extras: &vjc_model::LayerExtras,
+    src: (u32, u32),
+    frame: (u32, u32),
+    fit: FitMode,
+) -> Option<vjc_core::transform::Affine> {
+    if extras.width == 0 && extras.height == 0 {
+        return None;
+    }
+    let area = (
+        if extras.width == 0 {
+            frame.0
+        } else {
+            extras.width
+        },
+        if extras.height == 0 {
+            frame.1
+        } else {
+            extras.height
+        },
+    );
+    let (fa, ff) = (fit_scale(src, area, fit), fit_scale(src, frame, fit));
+    let gx = f64::from(fa.0 * area.0 as f32 / frame.0.max(1) as f32 / ff.0.max(1e-6));
+    let gy = f64::from(fa.1 * area.1 as f32 / frame.1.max(1) as f32 / ff.1.max(1e-6));
+    if (gx - 1.0).abs() < 1e-6 && (gy - 1.0).abs() < 1e-6 {
+        return None;
+    }
+    Some(vjc_core::transform::Affine {
+        m: [1.0 / gx.max(1e-6), 0.0, 0.0, 1.0 / gy.max(1e-6)],
+        t: [0.0, 0.0],
+        p: [0.0, 0.0, 1.0],
+    })
+}
+
 /// Centred rect (x, y, w, h) in destination px that `src` occupies under `mode`.
 #[cfg(test)]
 fn fit_rect(src: (u32, u32), dst: (u32, u32), mode: FitMode) -> (f32, f32, f32, f32) {
@@ -389,6 +426,8 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         q = clamp(q + o / td, vec2(0.5) / td, vec2(1.0) - vec2(0.5) / td);
     }
     var s = textureSample(tex, smp, q);
+    // pad bit 4: the source is premultiplied; blending wants straight colour.
+    if ((u.pad & 16u) != 0u && s.a > 0.0) { s = vec4(min(s.rgb / s.a, vec3(1.0)), s.a); }
     // pad = channel mask: bit 0..3 set = R, G, B, A off (off alpha means opaque).
     if ((u.pad & 1u) != 0u) { s.r = 0.0; }
     if ((u.pad & 2u) != 0u) { s.g = 0.0; }
@@ -5761,6 +5800,62 @@ mod tests {
             "opaque alpha keeps colour {no_a:?}"
         );
         assert!(all[0] < 150, "half alpha over black darkens {all:?}");
+    }
+
+    /// Alpha type: the same texel is brighter once declared premultiplied (its colour is
+    /// divided by alpha before blending). Skipped when there is no adapter.
+    #[test]
+    fn gpu_premultiplied_source_is_unpremultiplied_before_blending() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let mut comp = Compositor::new(&device, 1, 1);
+        // Own layer id per texel: the compositor keeps a layer's texture while its seq stays.
+        let mut show = |id: u128, px: [u8; 4], premultiplied: bool| {
+            let mut layers = [solid(id, &px, 1.0)];
+            layers[0].channels = vjc_model::Channels {
+                premultiplied,
+                ..Default::default()
+            };
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            read_px(&device, &queue, &comp)
+        };
+        let straight = show(1, [100, 50, 25, 128], false);
+        let premult = show(1, [100, 50, 25, 128], true);
+        // Straight: 100 * 0.5 over black; premultiplied: (100 / 0.5) * 0.5.
+        assert!(straight[0].abs_diff(50) <= 3, "{straight:?}");
+        assert!(premult[0].abs_diff(100) <= 3, "{premult:?}");
+        // An opaque texel is the same either way.
+        let a = show(2, [100, 50, 25, 255], false);
+        let b = show(2, [100, 50, 25, 255], true);
+        assert!(a[0].abs_diff(b[0]) <= 1, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn layer_area_scales_the_picture_into_its_own_rect() {
+        let ex = |w, h| vjc_model::LayerExtras {
+            width: w,
+            height: h,
+            ..Default::default()
+        };
+        let frame = (1920, 1080);
+        // Composition size: nothing to do.
+        assert!(area_affine(&ex(0, 0), (1920, 1080), frame, FitMode::Fit).is_none());
+        assert!(area_affine(&ex(1920, 1080), (1920, 1080), frame, FitMode::Fit).is_none());
+        // Half-size area, same aspect: the picture covers half the frame on each axis.
+        let a = area_affine(&ex(960, 540), (1920, 1080), frame, FitMode::Fit).unwrap();
+        assert!(
+            (a.m[0] - 2.0).abs() < 1e-4 && (a.m[3] - 2.0).abs() < 1e-4,
+            "{a:?}"
+        );
+        // Stretch into a square area: both axes follow the area.
+        let s = area_affine(&ex(540, 540), (1920, 1080), frame, FitMode::Stretch).unwrap();
+        assert!((s.m[0] - 1920.0 / 540.0).abs() < 1e-3 && (s.m[3] - 1080.0 / 540.0).abs() < 1e-3);
+        // Fit into the same square keeps the aspect: the 16:9 picture fills its width only.
+        let f = area_affine(&ex(540, 540), (1920, 1080), frame, FitMode::Fit).unwrap();
+        assert!((f.m[0] - f.m[3]).abs() < 1e-4 && f.m[0] > 3.0, "{f:?}");
+        // Native size is left alone by the area.
+        assert!(area_affine(&ex(540, 540), (1920, 1080), frame, FitMode::Original).is_none());
     }
 
     /// Measures ms/frame of N 1080p layers with two effects each (CPU submit + GPU wait):

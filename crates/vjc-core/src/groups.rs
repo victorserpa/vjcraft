@@ -243,6 +243,7 @@ mod tests {
             ignore_column_trigger: false,
             lock_content: false,
             fader_start: false,
+            extras: Default::default(),
             mask_mode: Default::default(),
             group: None,
         }

@@ -167,6 +167,16 @@ impl ClipThumbs {
         None
     }
 
+    /// Forgets the clip's thumbnail (and any failure) so the next draw decodes it again.
+    pub fn refresh(&mut self, id: ClipId) {
+        self.textures.remove(&id);
+        self.pending.remove(&id);
+        self.failed.remove(&id);
+        self.failures.remove(&id);
+        self.frames.remove(&id);
+        self.pngs.remove(&id);
+    }
+
     /// PNG of the clip's thumbnail for the web remote, or None while it is not decoded
     /// (this also starts the decode, like `texture`).
     pub fn png(&mut self, id: ClipId, path: &std::path::Path) -> Option<Arc<Vec<u8>>> {
@@ -274,6 +284,30 @@ mod tests {
             put(&mut t, &ctx, c);
         }
         assert!(ids.iter().all(|c| t.ready(*c)));
+    }
+
+    #[test]
+    fn refresh_drops_the_texture_and_a_failure_wait() {
+        let ctx = egui::Context::default();
+        let mut t = ClipThumbs::new();
+        let (shown, bad) = (id(), id());
+        put(&mut t, &ctx, shown);
+        assert!(t.ready(shown));
+        t.refresh(shown);
+        assert!(!t.ready(shown), "texture dropped");
+        // A failed clip waits before retrying; refresh asks again at once.
+        let p = Path::new("/nonexistent/a.mp4");
+        t.texture(bad, p);
+        wait_done(&mut t);
+        t.texture(bad, p);
+        assert!(t.pending.is_empty(), "negative control: still waiting");
+        t.refresh(bad);
+        t.texture(bad, p);
+        assert!(t.pending.contains_key(&bad), "decoded again");
+        // Other clips are left alone.
+        put(&mut t, &ctx, shown);
+        t.refresh(bad);
+        assert!(t.ready(shown));
     }
 
     #[test]

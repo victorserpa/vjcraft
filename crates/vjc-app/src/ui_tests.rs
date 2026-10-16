@@ -6754,3 +6754,17 @@ fn transition_picker_offers_every_kind_and_each_runs() {
     // Negative control: an unknown name is not offered.
     assert!(!kinds.iter().any(|(n, _)| n == "NoSuchKind"));
 }
+
+#[test]
+fn layer_and_clip_panels_show_the_wave_m_fields() {
+    let mut h = app();
+    playing_generator(&mut h);
+    click(&mut h, "Layer");
+    for label in ["Master", "Auto-size", "Size"] {
+        assert!(has_text(&h, label), "layer panel: {label}");
+    }
+    for label in ["Alpha type", "Duration (s)", "Autopilot", "Stop-motion fps"] {
+        assert!(has_text(&h, label), "clip panel: {label}");
+    }
+    assert!(exists(&h, "Refresh thumbnail") && exists(&h, "Freeze"));
+}

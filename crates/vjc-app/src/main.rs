@@ -519,6 +519,8 @@ struct Flow {
     gen_bars: HashMap<LayerId, (i64, u32)>,
     /// Time each layer's clip has run, for the beat/second autopilot units.
     auto_time: HashMap<LayerId, vjc_core::playback::TimedClock>,
+    /// Frozen / stop-motion picture per layer: (clip, frame shown, when it was taken).
+    held: HashMap<LayerId, (vjc_model::ClipId, Frame, std::time::Instant)>,
 }
 
 /// Message from the collect-media worker.
@@ -1713,6 +1715,7 @@ fn new_layer(n: usize) -> Layer {
         ignore_column_trigger: false,
         lock_content: false,
         fader_start: false,
+        extras: Default::default(),
         mask_mode: Default::default(),
         audio: true,
         video: true,
@@ -3226,6 +3229,15 @@ impl State {
                         self.seek(layer, pos);
                     }
                 }
+                Event::ThumbRefresh {
+                    deck,
+                    layer,
+                    column,
+                } => {
+                    if let Some(k) = vjc_core::clip_in(&self.project, deck, layer, column) {
+                        self.thumbs.refresh(k.id);
+                    }
+                }
                 Event::LayerCleared { layer } => {
                     self.remember_pos(layer);
                     self.flow.outgoing.remove(&layer);
@@ -3675,7 +3687,9 @@ impl State {
             .map_or(1, |d| d.as_nanos() as u64);
         let mut bags = self.layer_bags.borrow_mut();
         let bag = bags.entry(layer).or_default();
-        vjc_core::playback::next_clip_ap(&l.autopilot, cur, &playable, rand, bag).map(|c| (deck, c))
+        let clip = vjc_core::clip_in(&self.project, deck, layer, cur);
+        let ap = vjc_core::playback::autopilot_of(l, clip);
+        vjc_core::playback::next_clip_ap(ap, cur, &playable, rand, bag).map(|c| (deck, c))
     }
 
     /// Deck and column of the clip playing on the layer (video or generator).
@@ -3895,6 +3909,10 @@ impl State {
                     let reg = vjc_core::playback::region(tr);
                     beat_sync_rate(d * (reg.1 - reg.0), n, bpm)
                 }
+                (None, Some(d)) => {
+                    let reg = vjc_core::playback::region(tr);
+                    vjc_core::playback::duration_rate(d * (reg.1 - reg.0), tr.duration_secs)
+                }
                 _ => 1.0,
             };
             let rate = vjc_core::playback_rate(tr.speed, sync, speed_of(layer));
@@ -3954,19 +3972,22 @@ impl State {
                 self.flow.pos.insert(*layer, position);
                 if t.finished {
                     finished.push(*layer);
-                } else if tr.play_mode == PlayMode::Loop
+                } else if matches!(tr.play_mode, PlayMode::Loop | PlayMode::Random)
                     && let Some(l) = self
                         .project
                         .composition
                         .layers
                         .iter()
                         .find(|l| l.id == *layer)
-                    && l.autopilot.mode != vjc_model::AutopilotMode::Off
-                    && l.autopilot.unit == vjc_model::AutopilotUnit::Loops
+                    && vjc_core::playback::autopilot_of(l, Some(clip)).mode
+                        != vjc_model::AutopilotMode::Off
+                    && vjc_core::playback::autopilot_of(l, Some(clip)).unit
+                        == vjc_model::AutopilotUnit::Loops
                 {
+                    let every = vjc_core::playback::autopilot_of(l, Some(clip)).every_loops;
                     let c = self.flow.loops.entry(*layer).or_default();
                     if c.observe(t.position, tr.direction)
-                        && vjc_core::playback::loops_reached(c.count, l.autopilot.every_loops)
+                        && vjc_core::playback::loops_reached(c.count, every)
                     {
                         autopilot.push(*layer);
                     }
@@ -3975,21 +3996,26 @@ impl State {
         }
         // Autopilot on generators: they never finish, so a bar of the app clock counts as a loop.
         let bar = (self.clock.phase(std::time::Instant::now()) / 4.0).floor() as i64;
-        for layer in self.gens.keys() {
+        for (layer, (deck, col, _)) in &self.gens {
             let Some(l) = self
                 .project
                 .composition
                 .layers
                 .iter()
                 .find(|l| l.id == *layer)
-                .filter(|l| l.autopilot.mode != vjc_model::AutopilotMode::Off)
-                .filter(|l| l.autopilot.unit == vjc_model::AutopilotUnit::Loops)
             else {
                 continue;
             };
+            let gclip = clip_for(&self.project, &self.origin, *layer, *deck, *col);
+            let ap = vjc_core::playback::autopilot_of(l, gclip);
+            if ap.mode == vjc_model::AutopilotMode::Off
+                || ap.unit != vjc_model::AutopilotUnit::Loops
+            {
+                continue;
+            }
             let st = vjc_core::playback::gen_bars(self.flow.gen_bars.get(layer).copied(), bar);
             self.flow.gen_bars.insert(*layer, st);
-            if vjc_core::playback::loops_reached(st.1, l.autopilot.every_loops) {
+            if vjc_core::playback::loops_reached(st.1, ap.every_loops) {
                 autopilot.push(*layer);
                 self.flow.gen_bars.remove(layer);
             }
@@ -4010,7 +4036,10 @@ impl State {
                 .layers
                 .iter()
                 .find(|l| l.id == layer)
-                .map(|l| l.autopilot.clone())
+                .map(|l| {
+                    let k = clip_for(&self.project, &self.origin, layer, deck, col);
+                    vjc_core::playback::autopilot_of(l, k).clone()
+                })
                 .filter(|a| {
                     a.mode != vjc_model::AutopilotMode::Off
                         && a.unit != vjc_model::AutopilotUnit::Loops
@@ -4534,6 +4563,36 @@ impl State {
                 )
             })
             .collect();
+        // Freeze and stop-motion: the layer keeps showing an older frame of its clip.
+        let mut frames = frames;
+        for (l, f) in frames.iter_mut() {
+            let hold = active_of(&self.players, &self.gens, l.id)
+                .and_then(|(d, col)| clip_for(&self.project, &self.origin, l.id, d, col))
+                .filter(|k| k.extras.freeze || k.extras.stop_motion_fps > 0.0)
+                .map(|k| (k.id, k.extras.freeze, k.extras.stop_motion_fps));
+            let Some((cid, freeze, fps)) = hold else {
+                self.flow.held.remove(&l.id);
+                continue;
+            };
+            let keep = self
+                .flow
+                .held
+                .get(&l.id)
+                .filter(|h| h.0 == cid)
+                .and_then(|h| {
+                    let since = h.2.elapsed().as_secs_f64();
+                    (!vjc_core::playback::picture_refresh(freeze, fps, since)).then(|| h.1.clone())
+                });
+            match (keep, f.clone()) {
+                (Some(held), _) => *f = Some(held),
+                (None, Some(fresh)) => {
+                    self.flow
+                        .held
+                        .insert(l.id, (cid, fresh, std::time::Instant::now()));
+                }
+                (None, None) => {}
+            }
+        }
         let out_frames: HashMap<LayerId, Frame> = self
             .flow
             .outgoing
@@ -4544,7 +4603,8 @@ impl State {
         let (players, gens, origin) = (&self.players, &self.gens, &self.origin);
         let fit_of = |l: &Layer| {
             let (deck, col) = active_of(players, gens, l.id)?;
-            Some(clip_for(&self.project, origin, l.id, deck, col)?.fit)
+            let fit = clip_for(&self.project, origin, l.id, deck, col)?.fit;
+            Some(l.extras.auto_size.fit().unwrap_or(fit))
         };
         // Shaders compile on worker threads; install the ones that finished.
         for done in self.fx.poll() {
@@ -4652,6 +4712,9 @@ impl State {
             let xf = clip.map_or(layer_xf, |k| {
                 layer_xf.through(&xf_inverse(&k.track.transform, &lctx, frame_px))
             });
+            let fit_now = fit_of(l).unwrap_or_default();
+            let xf = compositor::area_affine(&l.extras, size, (w, h), fit_now)
+                .map_or(xf, |a| xf.through(&a));
             let cross = self
                 .flow
                 .outgoing
@@ -4659,6 +4722,7 @@ impl State {
                 .filter(|_| !c.layer_off(l))
                 .and_then(|o| Some((o, o.state.current()?, out_frames.get(&l.id)?)));
             let opacity = (vjc_core::anim::effective_number(&l.track.opacity, &lctx)
+                * l.extras.master
                 * vjc_core::crossfader::layer_gain(
                     c.crossfader.as_ref(),
                     vjc_core::crossfader::effective_bus(l, &c.groups),
@@ -4687,11 +4751,17 @@ impl State {
                     id: Uuid::from_u128(l.id.as_u128() ^ OUT_MASK),
                     opacity,
                     blend: blend.clone(),
-                    fit: o.fit,
+                    fit: l.extras.auto_size.fit().unwrap_or(o.fit),
                     effects: fx,
                     generator: None,
                     transition: Some((kind.shader_id(), prog, true)),
-                    transform: layer_xf,
+                    transform: compositor::area_affine(
+                        &l.extras,
+                        (of.width, of.height),
+                        (w, h),
+                        l.extras.auto_size.fit().unwrap_or(o.fit),
+                    )
+                    .map_or(layer_xf, |a| layer_xf.through(&a)),
                     channels: channels_of(o.clip.as_ref()),
                     mask: l.mask_mode,
                     frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
@@ -4703,7 +4773,7 @@ impl State {
                 transition: cross.map(|(_, (k, p), _)| (k.shader_id(), p, false)),
                 opacity,
                 blend,
-                fit: fit_of(l).unwrap_or_default(),
+                fit: fit_now,
                 effects,
                 generator,
                 transform: xf,
@@ -8364,6 +8434,62 @@ impl State {
                     });
                 }
             }
+            // Master (M) scales picture and sound; Opacity (V) only fades the picture.
+            let ex = l.extras.clone();
+            if let Some(master) =
+                params::param_slider(ui, ("lmaster", lid), "Master", ex.master, 1.0, (0.0, 1.0))
+            {
+                cmds.push(Command::SetLayerExtras {
+                    layer: lid,
+                    extras: vjc_model::LayerExtras {
+                        master,
+                        ..ex.clone()
+                    },
+                });
+            }
+            let sizes: Vec<(vjc_model::AutoSize, String)> = vjc_model::AutoSize::ALL
+                .iter()
+                .map(|a| {
+                    let label = match a {
+                        vjc_model::AutoSize::Off => "Off (clip's fit)",
+                        vjc_model::AutoSize::Fill => "Fill",
+                        vjc_model::AutoSize::Fit => "Fit",
+                        vjc_model::AutoSize::Stretch => "Stretch",
+                    };
+                    (*a, label.to_string())
+                })
+                .collect();
+            if let Some(auto_size) =
+                params::combo(ui, ("las", lid), "Auto-size", &ex.auto_size, &sizes)
+            {
+                cmds.push(Command::SetLayerExtras {
+                    layer: lid,
+                    extras: vjc_model::LayerExtras {
+                        auto_size,
+                        ..ex.clone()
+                    },
+                });
+            }
+            ui.horizontal(|ui| {
+                params::row_label(ui, "Size");
+                let max = vjc_model::MAX_LAYER_SIDE as f32;
+                let (mut w, mut h) = (ex.width as f32, ex.height as f32);
+                let cw = widgets::field_num(ui, &mut w, 0.0..=max, 1.0).changed();
+                ui.label("x");
+                let ch = widgets::field_num(ui, &mut h, 0.0..=max, 1.0).changed();
+                if cw || ch {
+                    cmds.push(Command::SetLayerExtras {
+                        layer: lid,
+                        extras: vjc_model::LayerExtras {
+                            width: w.round() as u32,
+                            height: h.round() as u32,
+                            ..ex.clone()
+                        },
+                    });
+                }
+            })
+            .response
+            .on_hover_text("Picture area in composition px; 0 = the composition's size");
             let modes: Vec<(BlendMode, String)> = vjc_core::blend::COMPOSITION_MODES
                 .iter()
                 .map(|(m, n)| (m.clone(), n.to_string()))
@@ -8795,6 +8921,7 @@ impl State {
                 (PlayMode::Bounce, "Bounce"),
                 (PlayMode::Once, "Once"),
                 (PlayMode::OnceHold, "Once, hold last frame"),
+                (PlayMode::Random, "Random position"),
             ]);
             if let Some(mode) = params::combo(ui, "pm", "Play mode", &t.play_mode, &modes) {
                 cmds.push(Command::SetPlayMode {
@@ -8803,6 +8930,79 @@ impl State {
                     column,
                     mode,
                 });
+            }
+            // Duration in seconds: speed follows so the in..out region lasts this long
+            // (beat sync wins when set).
+            ui.horizontal(|ui| {
+                params::row_label(ui, "Duration (s)");
+                let mut secs = t.duration_secs.unwrap_or(0.0) as f32;
+                if widgets::field_num(ui, &mut secs, 0.0..=86_400.0, 0.1).changed() {
+                    cmds.push(Command::SetClipDuration {
+                        deck,
+                        layer,
+                        column,
+                        secs: (secs > 0.0).then_some(f64::from(secs).max(0.001)),
+                    });
+                }
+            })
+            .response
+            .on_hover_text("0 = free speed. Ignored while beat sync is on.");
+            {
+                use vjc_model::AutopilotMode as M;
+                let modes: Vec<(Option<M>, String)> = vec![
+                    (None, "Layer's".into()),
+                    (Some(M::Off), "Off".into()),
+                    (Some(M::Next), "Next".into()),
+                    (Some(M::Random), "Random".into()),
+                    (Some(M::Previous), "Previous".into()),
+                    (Some(M::FirstLast), "First / last".into()),
+                ];
+                let own = k.extras.autopilot.clone();
+                let layer_ap = self
+                    .project
+                    .composition
+                    .layers
+                    .iter()
+                    .find(|l| l.id == layer)
+                    .map(|l| l.autopilot.clone());
+                let base = own.clone().or(layer_ap);
+                if let Some(mode) = params::combo(
+                    ui,
+                    "capm",
+                    "Autopilot",
+                    &own.as_ref().map(|a| a.mode),
+                    &modes,
+                ) {
+                    let mut extras = k.extras.clone();
+                    extras.autopilot = mode
+                        .and_then(|mode| base.clone().map(|b| vjc_model::Autopilot { mode, ..b }));
+                    cmds.push(Command::SetClipExtras {
+                        deck,
+                        layer,
+                        column,
+                        extras,
+                    });
+                }
+                if let Some(a) = own.as_ref().filter(|a| a.mode != M::Off) {
+                    ui.horizontal(|ui| {
+                        params::row_label(ui, "Every loops");
+                        let mut n = a.every_loops as f32;
+                        if widgets::field_num(ui, &mut n, 1.0..=1024.0, 1.0).changed() {
+                            let mut extras = k.extras.clone();
+                            extras.autopilot = Some(vjc_model::Autopilot {
+                                every_loops: n.round().max(1.0) as u32,
+                                unit: vjc_model::AutopilotUnit::Loops,
+                                ..a.clone()
+                            });
+                            cmds.push(Command::SetClipExtras {
+                                deck,
+                                layer,
+                                column,
+                                extras,
+                            });
+                        }
+                    });
+                }
             }
             let trig: Vec<(TriggerMode, String)> = [TriggerMode::Layer]
                 .into_iter()
@@ -9044,6 +9244,62 @@ impl State {
                     layer,
                     column,
                     fit,
+                });
+            }
+            let alphas = [
+                (false, "Straight".to_string()),
+                (true, "Premultiplied".to_string()),
+            ];
+            if let Some(premultiplied) = params::combo(
+                ui,
+                "alphat",
+                "Alpha type",
+                &k.channels.premultiplied,
+                &alphas,
+            ) {
+                cmds.push(Command::SetClipChannels {
+                    deck,
+                    layer,
+                    column,
+                    channels: vjc_model::Channels {
+                        premultiplied,
+                        ..k.channels
+                    },
+                });
+            }
+            ui.horizontal(|ui| {
+                let mut ex = k.extras.clone();
+                let mut changed = ui
+                    .checkbox(&mut ex.freeze, "Freeze")
+                    .on_hover_text("Holds the current picture while the clip keeps running")
+                    .changed();
+                ui.label("Stop-motion fps");
+                let mut fps = ex.stop_motion_fps as f32;
+                if widgets::field_num(ui, &mut fps, 0.0..=60.0, 0.5)
+                    .on_hover_text("0 = off")
+                    .changed()
+                {
+                    ex.stop_motion_fps = f64::from(fps);
+                    changed = true;
+                }
+                if changed {
+                    cmds.push(Command::SetClipExtras {
+                        deck,
+                        layer,
+                        column,
+                        extras: ex,
+                    });
+                }
+            });
+            if ui
+                .button("Refresh thumbnail")
+                .on_hover_text("Decode this clip's thumbnail again")
+                .clicked()
+            {
+                cmds.push(Command::RefreshClipThumb {
+                    deck,
+                    layer,
+                    column,
                 });
             }
             let mut blends: Vec<(Option<BlendMode>, String)> =
@@ -10708,6 +10964,13 @@ mod audio_mix_tests {
         p.composition.layers[0].audio = true;
         p.composition.layers[0].video = false;
         assert!(audio_mix(&p, id, &clip).0 > 0.0);
+        // Layer master scales the sound; the picture-only opacity does not.
+        p.composition.layers[0].extras.master = 0.5;
+        let half = audio_mix(&p, id, &clip).0;
+        assert!((half - 0.25).abs() < 1e-6, "master {half}");
+        p.composition.layers[0].track.opacity.set_number(0.1);
+        assert!((audio_mix(&p, id, &clip).0 - half).abs() < 1e-6);
+        p.composition.layers[0].extras.master = 1.0;
         // Stripping the clip's audio mutes it; stripping video does not.
         let mut stripped = clip.clone();
         stripped.extras.strip_video = true;
@@ -10781,6 +11044,10 @@ fn audio_mix(p: &Project, layer: LayerId, clip: &vjc_model::Clip) -> (f32, f32) 
     if let Some(t) = lt {
         vol *= vnum(&t.volume);
         pan += num(&t.pan);
+    }
+    // Layer master scales the sound with the picture.
+    if let Some(l) = p.composition.layers.iter().find(|l| l.id == layer) {
+        vol *= l.extras.master;
     }
     (vol.max(0.0) as f32, pan.clamp(-1.0, 1.0) as f32)
 }

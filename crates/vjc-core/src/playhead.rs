@@ -155,6 +155,13 @@ impl Playhead {
                 self.x = self.x.clamp(0.0, 1.0);
                 self.x
             }
+            // Random position: plays on like Loop, but each wrap lands somewhere random.
+            PlayMode::Random => {
+                if self.x >= 1.0 || self.x < 0.0 {
+                    self.x = self.next_unit();
+                }
+                self.x
+            }
             // Loop (and Unknown, treated as Loop).
             _ => {
                 self.x = self.x.rem_euclid(1.0);
@@ -202,6 +209,43 @@ mod tests {
         b.x = 1.5; // back half, local 0.5
         b.retarget((0.0, 1.0), (0.0, 0.5));
         assert!((b.x - 1.0).abs() < 1e-9, "{}", b.x);
+    }
+
+    #[test]
+    fn random_mode_jumps_at_the_end_and_stays_in_range() {
+        let mut h = Playhead::new(Direction::Forward, 9);
+        let mut jumps = 0;
+        let mut prev = 0.0;
+        for _ in 0..400 {
+            let t = h.tick(0.1, PlayMode::Random, Direction::Forward, 1.0, 4.0);
+            assert!((0.0..=1.0).contains(&t.position) && !t.finished);
+            if t.position < prev - 0.001 {
+                jumps += 1;
+            }
+            prev = t.position;
+        }
+        assert!(jumps >= 5, "{jumps} jumps");
+        // Negative control: Loop wraps to the start, never to a random spot.
+        let mut l = Playhead::new(Direction::Forward, 9);
+        for _ in 0..39 {
+            l.tick(0.1, PlayMode::Loop, Direction::Forward, 1.0, 4.0);
+        }
+        let wrap = l
+            .tick(0.2, PlayMode::Loop, Direction::Forward, 1.0, 4.0)
+            .position;
+        assert!(wrap < 0.06, "{wrap}");
+        // Same seed, same sequence.
+        let run = |seed| {
+            let mut h = Playhead::new(Direction::Forward, seed);
+            (0..60)
+                .map(|_| {
+                    h.tick(0.2, PlayMode::Random, Direction::Forward, 1.0, 1.0)
+                        .position
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(3), run(3));
+        assert_ne!(run(3), run(4));
     }
 
     #[test]
