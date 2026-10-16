@@ -4480,6 +4480,75 @@ mod tests {
         }
     }
 
+    /// Mask effects cut the layer: shape (inside / outside / invert), auto (luma) and image
+    /// (luma and alpha of a picture). Skipped without a GPU.
+    #[test]
+    fn gpu_mask_effects_cut_the_layer() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = Compositor::new(&device, 1, 1);
+        let mut run = |kind: &str,
+                       set: &[(&str, vjc_model::Value)],
+                       lut: Option<std::sync::Arc<vjc_fx::lut::Lut>>,
+                       src: [u8; 4]| {
+            let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(kind).unwrap()).unwrap();
+            comp.add_effect(&device, kind, &wgsl).unwrap();
+            let mut params = isf.default_params();
+            for p in &mut params {
+                if let Some((_, v)) = set.iter().find(|(n, _)| *n == p.name) {
+                    p.value = v.clone();
+                }
+            }
+            let fx = EffectDraw {
+                blend: 0,
+                lut,
+                kind: kind.into(),
+                uniforms: isf.pack(&params, 0.0, (1, 1)),
+                dry_wet: 1.0,
+                ml: None,
+                persistent: None,
+                ticking: false,
+            };
+            render_pixel(&mut comp, &device, &queue, vec![fx], src)[0]
+        };
+        use vjc_model::Value::{Bool, Number};
+        let white = [255u8, 255, 255, 255];
+        // Shape: the single pixel sits at the centre.
+        assert!(run("shape_mask", &[], None, white) > 240);
+        assert!(run("shape_mask", &[("invert", Bool(true))], None, white) < 15);
+        let pick = |n: u32| vjc_model::Value::Choice {
+            selected: n,
+            options: vec![],
+        };
+        // Every shape holds the centre pixel, inverted it leaves it out.
+        for shape in 0..3 {
+            let s = [("shape", pick(shape)), ("width", Number(0.5))];
+            assert!(run("shape_mask", &s, None, white) > 240, "shape {shape}");
+            let s = [("shape", pick(shape)), ("rotation", Number(30.0))];
+            assert!(run("shape_mask", &s, None, white) > 240, "rotated {shape}");
+            let s = [("shape", pick(shape)), ("invert", Bool(true))];
+            assert!(run("shape_mask", &s, None, white) < 15, "inverted {shape}");
+        }
+        // Auto: bright passes, dark is cut, invert flips.
+        assert!(run("auto_mask", &[], None, white) > 240);
+        assert!(run("auto_mask", &[], None, [10, 10, 10, 255]) < 15);
+        let inv = [("invert", Bool(true))];
+        assert!(run("auto_mask", &inv, None, white) < 15);
+        // Image: a white or black picture, by luma and by alpha.
+        let pic = |px: [u8; 4]| {
+            Some(std::sync::Arc::new(vjc_fx::lut::Lut::picture(
+                1,
+                1,
+                px.to_vec(),
+            )))
+        };
+        assert!(run("image_mask", &[], pic([255, 255, 255, 255]), white) > 240);
+        assert!(run("image_mask", &[], pic([0, 0, 0, 255]), white) < 15);
+        let alpha = [("channel", pick(1))];
+        assert!(run("image_mask", &alpha, pic([0, 0, 0, 255]), white) > 240);
+        assert!(run("image_mask", &alpha, pic([255, 255, 255, 0]), white) < 15);
+        assert!(run("image_mask", &inv, pic([255, 255, 255, 255]), white) < 15);
+    }
+
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {

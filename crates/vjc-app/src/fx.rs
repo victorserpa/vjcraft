@@ -65,6 +65,36 @@ impl FxLib {
         lut
     }
 
+    /// The picture at `path` as a mask texture source (largest side capped at 1024), read
+    /// once and again when the file changes. None while empty, unreadable or not an image.
+    pub fn picture(&mut self, path: &str) -> Option<std::sync::Arc<vjc_fx::lut::Lut>> {
+        if path.trim().is_empty() {
+            return None;
+        }
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let key = format!("img:{path}");
+        if let Some((t, l)) = self.luts.get(&key)
+            && *t == mtime
+        {
+            return l.clone();
+        }
+        let lut = image::open(path).ok().map(|im| {
+            let im = if im.width().max(im.height()) > 1024 {
+                im.resize(1024, 1024, image::imageops::FilterType::Triangle)
+            } else {
+                im
+            };
+            let rgba = im.to_rgba8();
+            std::sync::Arc::new(vjc_fx::lut::Lut::picture(
+                rgba.width(),
+                rgba.height(),
+                rgba.into_raw(),
+            ))
+        });
+        self.luts.insert(key, (mtime, lut.clone()));
+        lut
+    }
+
     /// Parsed header of an effect (cached).
     pub fn isf(&mut self, kind: &str) -> Option<&Isf> {
         self.isfs
@@ -136,5 +166,26 @@ mod tests {
         }
         assert_eq!(got.len(), 1);
         assert!(got[0].result.is_ok());
+    }
+
+    #[test]
+    fn picture_loads_scales_and_rejects_bad_paths() {
+        let dir = std::env::temp_dir().join(format!("vjc-pic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.png");
+        image::RgbaImage::from_pixel(2048, 512, image::Rgba([9, 8, 7, 6]))
+            .save(&path)
+            .unwrap();
+        let mut lib = FxLib::new();
+        let pic = lib.picture(path.to_str().unwrap()).unwrap();
+        let (w, h, px) = pic.strip_rgba8();
+        assert_eq!((w, h), (1024, 256));
+        assert_eq!(&px[..4], &[9, 8, 7, 6]);
+        assert!(lib.picture("").is_none());
+        assert!(
+            lib.picture(dir.join("nope.png").to_str().unwrap())
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

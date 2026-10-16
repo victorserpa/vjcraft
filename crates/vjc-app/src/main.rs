@@ -635,12 +635,16 @@ fn draw_chain(
             None
         };
         // A LUT effect without a readable LUT is skipped (passthrough).
-        let lut = if e.kind == "lut3d" {
+        let lut = if e.kind == "lut3d" || e.kind == "image_mask" {
             let path = e.params.iter().find_map(|p| match &p.value {
                 vjc_model::Value::Text(t) if p.name == "file" => Some(t.as_str()),
                 _ => None,
             });
-            match path.and_then(|p| lib.lut(p)) {
+            let got = match e.kind.as_str() {
+                "image_mask" => path.and_then(|p| lib.picture(p)),
+                _ => path.and_then(|p| lib.lut(p)),
+            };
+            match got {
                 Some(l) => Some(l),
                 None => continue,
             }
@@ -10768,19 +10772,22 @@ impl State {
                     }
                 });
             });
-            if e.kind == "lut3d"
+            if (e.kind == "lut3d" || e.kind == "image_mask")
                 && let Some(pi) = e.params.iter().position(|p| p.name == "file")
             {
+                let is_lut = e.kind == "lut3d";
                 let cur = match &e.params[pi].value {
                     Value::Text(t) => t.clone(),
                     _ => String::new(),
                 };
                 ui.horizontal(|ui| {
-                    if crate::widgets::btn(ui, "Load .cube...", crate::widgets::Kind::Secondary)
-                        .clicked()
-                        && let Some(f) = rfd::FileDialog::new()
-                            .add_filter("3D LUT", &["cube"])
-                            .pick_file()
+                    let (label, filter, exts): (_, _, &[&str]) = if is_lut {
+                        ("Load .cube...", "3D LUT", &["cube"])
+                    } else {
+                        ("Load image...", "Image", &["png", "jpg", "jpeg"])
+                    };
+                    if crate::widgets::btn(ui, label, crate::widgets::Kind::Secondary).clicked()
+                        && let Some(f) = rfd::FileDialog::new().add_filter(filter, exts).pick_file()
                     {
                         cmds.push(Command::SetEffectParam {
                             target,
@@ -10790,7 +10797,14 @@ impl State {
                         });
                     }
                     let name = std::path::Path::new(&cur).file_name().map_or_else(
-                        || "No LUT loaded".to_string(),
+                        || {
+                            if is_lut {
+                                "No LUT loaded"
+                            } else {
+                                "No image loaded"
+                            }
+                            .to_string()
+                        },
                         |n| n.to_string_lossy().into_owned(),
                     );
                     crate::widgets::help(ui, &name);
@@ -10817,7 +10831,7 @@ impl State {
                     else {
                         continue;
                     };
-                    if e.kind == "lut3d" && p.name == "file" {
+                    if (e.kind == "lut3d" || e.kind == "image_mask") && p.name == "file" {
                         continue;
                     }
                     // Scope ids per effect so equal param names do not share edit state.
