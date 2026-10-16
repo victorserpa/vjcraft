@@ -35,6 +35,7 @@ pub fn full_input() -> Vec<Pt> {
 pub fn new_slice(w: u32, h: u32) -> Slice {
     Slice {
         id: Uuid::new_v4(),
+        name: String::new(),
         input: full_input(),
         output_mesh: identity_mesh(w, h, 2, 2),
         mesh_cols: 2,

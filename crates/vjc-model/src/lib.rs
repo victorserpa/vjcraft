@@ -1656,6 +1656,9 @@ impl Default for Fixture {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Slice {
     pub id: Uuid,
+    /// Label shown in the Output setup tree and on the canvas; empty = "Slice N".
+    #[serde(default)]
+    pub name: String,
     /// Normalized 0..1 rectangle or polygon on the composition.
     pub input: Vec<(f32, f32)>,
     /// Warp mesh in output pixels, row-major grid.

@@ -420,6 +420,17 @@ pub enum Command {
     SetOutputSetup {
         screens: Vec<vjc_model::Screen>,
     },
+    /// Renames a screen. Undoable.
+    SetScreenName {
+        screen: Uuid,
+        name: String,
+    },
+    /// Renames a slice (empty = the default "Slice N" label). Undoable.
+    SetSliceName {
+        screen: Uuid,
+        slice: Uuid,
+        name: String,
+    },
     /// Source of a slice: composition, one layer, one group or the preview. Undoable.
     SetSliceSource {
         screen: Uuid,
@@ -2913,6 +2924,27 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             }
             let prev = std::mem::replace(&mut p.output.screens, screens);
             undoable(Command::SetOutputSetup { screens: prev }, vec![])
+        }
+        Command::SetScreenName { screen, name } => {
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.name, name);
+            undoable(Command::SetScreenName { screen, name: prev }, vec![])
+        }
+        Command::SetSliceName {
+            screen,
+            slice,
+            name,
+        } => {
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.name, name);
+            undoable(
+                Command::SetSliceName {
+                    screen,
+                    slice,
+                    name: prev,
+                },
+                vec![],
+            )
         }
         Command::SetSliceSource {
             screen,
@@ -7903,6 +7935,47 @@ mod tests {
             source: SliceSource::Preview,
         };
         assert!(h.exec(&mut p, bad, now).is_err());
+    }
+
+    #[test]
+    fn screen_and_slice_names_are_undoable_and_validated() {
+        let (mut p, _) = setup();
+        let mut scr = mapping::new_screen("A", 1920, 1080);
+        let sl = mapping::new_slice(1920, 1080);
+        let (sid, lid) = (scr.id, sl.id);
+        assert!(sl.name.is_empty(), "a new slice has the default label");
+        scr.slices = vec![sl];
+        p.output.screens = vec![scr];
+        let before = p.clone();
+        let mut h = History::default();
+        let now = Instant::now();
+        let rename = |name: &str| Command::SetScreenName {
+            screen: sid,
+            name: name.into(),
+        };
+        h.exec(&mut p, rename("Stage"), now).unwrap();
+        let name = Command::SetSliceName {
+            screen: sid,
+            slice: lid,
+            name: "Centre".into(),
+        };
+        h.exec(&mut p, name, now + COALESCE_WINDOW * 2).unwrap();
+        assert_eq!(p.output.screens[0].name, "Stage");
+        assert_eq!(p.output.screens[0].slices[0].name, "Centre");
+        while h.undo(&mut p).is_some() {}
+        assert_eq!(p, before);
+        // Unknown screens and slices are refused.
+        let ghost = Command::SetSliceName {
+            screen: sid,
+            slice: Uuid::new_v4(),
+            name: "x".into(),
+        };
+        assert!(h.exec(&mut p, ghost, now).is_err());
+        let ghost = Command::SetScreenName {
+            screen: Uuid::new_v4(),
+            name: "x".into(),
+        };
+        assert!(h.exec(&mut p, ghost, now).is_err());
     }
 
     #[test]
