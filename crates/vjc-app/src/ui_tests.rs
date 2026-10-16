@@ -6524,3 +6524,82 @@ fn idle_ui_does_not_request_extra_passes() {
     let passes = h.ctx.cumulative_pass_nr() - n0;
     assert!(passes <= 40, "{passes} passes in 20 steps");
 }
+
+fn col_names(h: &Harness<'_, State>) -> Vec<String> {
+    h.state()
+        .project
+        .composition
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+fn column_menu(h: &mut Harness<'_, State>, column: &str, item: &str) {
+    let p = h
+        .get_by_label(&format!("Select column {column}"))
+        .rect()
+        .center();
+    right_click_at(h, p);
+    click(h, item);
+}
+
+#[test]
+fn column_menu_insert_move_duplicate_remove_and_undo() {
+    let mut h = fast_app();
+    let before = col_names(&h);
+    let n = before.len();
+    column_menu(&mut h, &before[1], "Insert blank before column");
+    assert_eq!(col_names(&h).len(), n + 1);
+    assert_eq!(col_names(&h)[2], before[1], "old column 2 slid right");
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(col_names(&h), before);
+
+    column_menu(&mut h, &before[0], "Move right column");
+    assert_eq!(col_names(&h)[..2], [before[1].clone(), before[0].clone()]);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(col_names(&h), before);
+
+    column_menu(&mut h, &before[0], "Duplicate column");
+    assert_eq!(col_names(&h)[1], format!("{} copy", before[0]));
+    h.state_mut().undo();
+    settle(&mut h);
+    h.state_mut().redo();
+    settle(&mut h);
+    assert_eq!(col_names(&h)[1], format!("{} copy", before[0]));
+    h.state_mut().undo();
+    settle(&mut h);
+
+    // The last column is empty here: Remove works and undoes.
+    let last = before[n - 1].clone();
+    column_menu(&mut h, &last, "Remove column");
+    assert_eq!(col_names(&h).len(), n - 1);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(col_names(&h), before);
+}
+
+#[test]
+fn column_edits_keep_the_playing_clip_on_air_and_refuse_removing_it() {
+    let mut h = fast_app();
+    let (lid, pos) = cell_center(&h, 0, 1);
+    let (gen_id, _) = vjc_fx::GENERATORS[0];
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    h.state_mut().gens.clear();
+    settle(&mut h);
+    click(&mut h, "Trigger column 2");
+    assert_eq!(h.state().gens[&lid].1, 1);
+    let names = col_names(&h);
+    // Insert before column 1: the clip on air is now in column index 2, still playing.
+    column_menu(&mut h, &names[0], "Insert blank before column");
+    assert_eq!(h.state().gens[&lid].1, 2, "player follows its column");
+    assert!(h.state().gens.contains_key(&lid), "still on air");
+    // Removing the column that is on air is refused (negative control: nothing removed).
+    let n = col_names(&h).len();
+    column_menu(&mut h, &names[1], "Remove column");
+    assert_eq!(col_names(&h).len(), n);
+    assert!(h.state().status.contains("on air"), "{}", h.state().status);
+    assert!(h.state().gens.contains_key(&lid));
+}

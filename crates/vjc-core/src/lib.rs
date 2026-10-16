@@ -5,6 +5,7 @@
 pub mod anim;
 pub mod blend;
 pub mod clock;
+pub mod columns;
 pub mod comp_autopilot;
 pub mod crossfader;
 pub mod dmx;
@@ -703,6 +704,35 @@ pub enum Command {
     /// Removes the last column, which must be empty.
     RemoveColumn {
         column: Uuid,
+    },
+    /// Moves the columns (kept in their grid order) as a block so that the first lands at
+    /// index `to` among the columns left behind (clamped). Clips follow. Undoable.
+    MoveColumns {
+        columns: Vec<Uuid>,
+        to: usize,
+    },
+    /// Puts the columns in exactly this order (a permutation of all ids). Undoable.
+    ReorderColumns {
+        order: Vec<Uuid>,
+    },
+    /// Inserts a blank column at `index` (clamped); later columns and their clips shift.
+    InsertColumn {
+        index: usize,
+        column: vjc_model::Column,
+    },
+    /// Copies the columns with their clips (new ids) as a block after the last of them.
+    DuplicateColumns {
+        columns: Vec<Uuid>,
+    },
+    /// Removes the columns wherever they are, with their clips; fails (`InUse`) while a
+    /// timecode cue targets one of them. Undoable.
+    RemoveColumns {
+        columns: Vec<Uuid>,
+    },
+    /// Puts removed columns and their clips back at their old positions (the undo of
+    /// `RemoveColumns`).
+    RestoreColumns {
+        items: Vec<columns::ColumnItem>,
     },
     SetBpm {
         bpm: f64,
@@ -2090,8 +2120,38 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             if n == 0 {
                 return Err(Error::NoColumn);
             }
-            let to = from.map_or(0, |c| i64::from(c) + i64::from(delta));
-            trigger_column(p, deck, to.clamp(0, n - 1) as ColumnIdx)
+            // Empty columns (no clip in any layer of the deck) are passed over. With nothing
+            // filled in that direction the step stays where it is (clamped, no wrap).
+            let filled = |c: i64| {
+                deck_idx(p, deck).is_ok_and(|d| {
+                    p.composition.decks[d]
+                        .clips
+                        .iter()
+                        .any(|k| i64::from(k.column) == c)
+                })
+            };
+            let to = match from {
+                None => (0..n).find(|c| filled(*c)).unwrap_or(0),
+                Some(f) => {
+                    let f = i64::from(f).clamp(0, n - 1);
+                    let sign = if delta < 0 { -1 } else { 1 };
+                    let mut c = f;
+                    let mut left = delta.unsigned_abs().max(1);
+                    let mut at = f;
+                    while left > 0 {
+                        c += sign;
+                        if !(0..n).contains(&c) {
+                            break;
+                        }
+                        if filled(c) {
+                            at = c;
+                            left -= 1;
+                        }
+                    }
+                    at
+                }
+            };
+            trigger_column(p, deck, to as ColumnIdx)
         }
         Command::StepClip {
             deck,
@@ -3600,6 +3660,12 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let removed = p.composition.columns.remove(i);
             undoable(Command::AddColumn { column: removed }, vec![])
         }
+        Command::MoveColumns { .. }
+        | Command::ReorderColumns { .. }
+        | Command::InsertColumn { .. }
+        | Command::DuplicateColumns { .. }
+        | Command::RemoveColumns { .. }
+        | Command::RestoreColumns { .. } => columns::apply(p, cmd),
         Command::SetBeatSync {
             deck,
             layer,
@@ -4424,7 +4490,7 @@ mod tests {
     }
 
     /// Runs `cmd`, then checks undo restores the exact project and redo reapplies.
-    fn roundtrip(p: &mut Project, cmd: Command) {
+    pub(crate) fn roundtrip(p: &mut Project, cmd: Command) {
         let before = p.clone();
         let mut h = History::new();
         h.exec(p, cmd, Instant::now()).unwrap();
@@ -6533,7 +6599,9 @@ mod tests {
 
     /// Two layers, three columns: layer 1 has clips in columns 0 and 2 (2 is a placeholder
     /// in layer 2), layer 2 has a clip in column 0 and a placeholder in column 2.
-    fn grid() -> (Project, LayerId, LayerId) {
+    pub(crate) const A_DECK: DeckId = A;
+
+    pub(crate) fn grid() -> (Project, LayerId, LayerId) {
         let (mut p, l1) = setup();
         let l2 = layer(2);
         let l2id = l2.id;

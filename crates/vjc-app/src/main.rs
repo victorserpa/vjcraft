@@ -8,6 +8,7 @@ mod autopilot_ui;
 mod browser;
 mod capture;
 mod clip_thumbs;
+mod col_ops;
 mod compositor;
 mod dmx_io;
 mod frame_stats;
@@ -155,6 +156,8 @@ struct State {
     history_now: Option<std::time::Instant>,
     /// Column header being renamed: (column id, text so far).
     col_renaming: Option<(Uuid, String)>,
+    /// Columns marked in the grid header (ctrl/cmd-click, shift-click) for the header menu.
+    col_marks: Vec<Uuid>,
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
     heads: HashMap<LayerId, Playhead>,
     /// Codec / size / fps of file clips, probed on demand.
@@ -1940,6 +1943,7 @@ impl State {
             #[cfg(test)]
             history_now: None,
             col_renaming: None,
+            col_marks: vec![],
         }
     }
 
@@ -2850,8 +2854,10 @@ impl State {
         let now = self.history_now.unwrap_or_else(std::time::Instant::now);
         #[cfg(not(test))]
         let now = std::time::Instant::now();
+        let col_ids = self.column_ids();
         match self.history.exec(&mut self.project, cmd, now) {
             Ok(events) => {
+                self.follow_columns(&col_ids);
                 if is_set_bpm {
                     self.link_sync.note_bpm_edit();
                 }
@@ -2872,6 +2878,9 @@ impl State {
                         _ => None,
                     });
                     self.col_sel = landed.or(self.col_sel);
+                    if let Some(c) = landed {
+                        self.comp_ap.on_air(c, self.phase);
+                    }
                 }
                 if deck_switch {
                     self.col_sel = None;
@@ -2898,8 +2907,10 @@ impl State {
 
     fn undo(&mut self) {
         let before = self.project.composition.tempo.bpm;
+        let col_ids = self.column_ids();
         match self.history.undo(&mut self.project) {
             Some(Ok(ev)) => {
+                self.follow_columns(&col_ids);
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -2914,8 +2925,10 @@ impl State {
 
     fn redo(&mut self) {
         let before = self.project.composition.tempo.bpm;
+        let col_ids = self.column_ids();
         match self.history.redo(&mut self.project) {
             Some(Ok(ev)) => {
+                self.follow_columns(&col_ids);
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -2926,6 +2939,41 @@ impl State {
             Some(Err(e)) => self.status = format!("Redo failed: {e}"),
             None => {}
         }
+    }
+
+    fn column_ids(&self) -> Vec<Uuid> {
+        self.project
+            .composition
+            .columns
+            .iter()
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// After columns moved, were inserted or removed, what is playing and selected keeps
+    /// following its column: the column index it was started from is rewritten to where the
+    /// column is now (nothing on air changes). Entries of a removed column stay as they are.
+    fn follow_columns(&mut self, old: &[Uuid]) {
+        let new = self.column_ids();
+        if *old == new[..] {
+            return;
+        }
+        let map = |c: u32| {
+            old.get(c as usize)
+                .and_then(|id| new.iter().position(|n| n == id))
+                .map_or(c, |n| n as u32)
+        };
+        for (_, c, _) in self.players.values_mut() {
+            *c = map(*c);
+        }
+        for (_, c, _) in self.gens.values_mut() {
+            *c = map(*c);
+        }
+        for (_, _, c) in self.origin.values_mut() {
+            *c = map(*c);
+        }
+        self.col_sel = self.col_sel.map(map);
+        self.col_marks.retain(|m| new.contains(m));
     }
 
     /// The selected column index must point at a column that still exists.
@@ -6630,6 +6678,15 @@ impl State {
                                 &mut self.targets,
                             );
                         });
+                        let all_col_ids: Vec<Uuid> = comp.columns.iter().map(|c| c.id).collect();
+                        let cols_on_air: Vec<u32> = self
+                            .players
+                            .values()
+                            .map(|(d, c, _)| (*d, *c))
+                            .chain(self.gens.values().map(|(d, c, _)| (*d, *c)))
+                            .filter(|(d, _)| *d == cur)
+                            .map(|(_, c)| c)
+                            .collect();
                         for (ci, (cid, n)) in names.iter().enumerate() {
                             if let Some((rid, buf)) =
                                 self.col_renaming.as_mut().filter(|(r, _)| r == cid)
@@ -6722,7 +6779,8 @@ impl State {
                                         ui,
                                         rect,
                                         n,
-                                        self.col_sel == Some(ci as u32),
+                                        self.col_sel == Some(ci as u32)
+                                            || self.col_marks.contains(cid),
                                         &hover,
                                     );
                                     if let Some(c) = theme::palette(comp.columns[ci].color) {
@@ -6786,6 +6844,16 @@ impl State {
                             if nr.double_clicked() {
                                 self.col_renaming = Some((*cid, n.clone()));
                             } else if nr.clicked() {
+                                let (toggle, extend) =
+                                    ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                                col_ops::click_marks(
+                                    &mut self.col_marks,
+                                    &all_col_ids,
+                                    ci,
+                                    self.col_sel,
+                                    toggle,
+                                    extend,
+                                );
                                 self.col_sel = Some(ci as u32);
                             }
                             let col_ap = comp.columns[ci].autopilot.clone();
@@ -6808,6 +6876,34 @@ impl State {
                                         color,
                                     });
                                 }
+                                ui.separator();
+                                let aim = col_ops::targets(&self.col_marks, *cid);
+                                for op in col_ops::ColOp::ALL {
+                                    let label = if aim.len() > 1 {
+                                        format!("{} {} columns", op.label(), aim.len())
+                                    } else {
+                                        format!("{} column", op.label())
+                                    };
+                                    if crate::widgets::btn(
+                                        ui,
+                                        &label,
+                                        crate::widgets::Kind::Secondary,
+                                    )
+                                    .clicked()
+                                    {
+                                        match col_ops::commands(
+                                            &self.project,
+                                            &aim,
+                                            op,
+                                            &cols_on_air,
+                                        ) {
+                                            Ok(c) => cmds.extend(c),
+                                            Err(e) => self.status = e.to_string(),
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
                                 autopilot_ui::column_menu(ui, *cid, &col_ap, &mut cmds);
                                 autopilot_ui::column_snap_menu(ui, *cid, col_snap, &mut cmds);
                             });
