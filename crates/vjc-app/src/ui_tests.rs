@@ -7126,3 +7126,109 @@ fn preview_widget_arrow_keys_nudge_when_focused() {
     settle(&mut h);
     assert_eq!(xf_val(&h, t, F::Y), 10.0);
 }
+
+// ---- REST open-clips: the on-air invariants (issue #13) ----
+
+/// POST /api/v1/clips/open as a client would, answered by the app on its UI thread.
+fn rest_open(
+    st: &mut State,
+    layer_no: usize,
+    column_no: usize,
+    paths: &[PathBuf],
+) -> api_io::Reply {
+    let body = serde_json::json!({
+        "layer": layer_no,
+        "column": column_no,
+        "paths": paths.iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>(),
+    });
+    let req =
+        api_io::parse_route("POST", "/api/v1/clips/open", body.to_string().as_bytes()).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    st.api_handle(req, tx);
+    rx.try_recv().expect("answered in the same call")
+}
+
+fn top_layer_no(h: &Harness<'_, State>) -> usize {
+    h.state().project.composition.layers.len()
+}
+
+#[test]
+fn rest_open_clips_into_another_cell_keeps_on_air() {
+    let d = multi_dir("rest-air");
+    let ps = [touch(&d, "a.mp4"), touch(&d, "b.mp4")];
+    let mut h = app();
+    let lid = playing_generator(&mut h); // on air: top layer, column 2
+    let on_air = h.state().active(lid);
+    let no = top_layer_no(&h);
+    let r = rest_open(h.state_mut(), no, 4, &ps).unwrap();
+    assert_eq!(r["placed"], 2);
+    settle(&mut h);
+    assert_eq!(
+        h.state().active(lid),
+        on_air,
+        "loading elsewhere never changes what plays"
+    );
+    assert!(h.state().gens.contains_key(&lid) && h.state().players.is_empty());
+    assert_eq!(clip_name(h.state(), lid, 3).as_deref(), Some("a"));
+    assert_eq!(clip_name(h.state(), lid, 4).as_deref(), Some("b"));
+}
+
+#[test]
+fn rest_open_clips_over_the_on_air_cell_reloads_it() {
+    let d = multi_dir("rest-live");
+    let ps = [touch(&d, "live.mp4")];
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let on_air = h.state().active(lid);
+    let no = top_layer_no(&h);
+    rest_open(h.state_mut(), no, 2, &ps).unwrap();
+    settle(&mut h);
+    assert_eq!(h.state().active(lid), on_air, "same cell stays on air");
+    assert!(
+        h.state().players.contains_key(&lid),
+        "now playing the new file"
+    );
+}
+
+#[test]
+fn rest_open_clips_during_blackout_stays_black_and_silent() {
+    let d = multi_dir("rest-black");
+    let ps = [touch(&d, "a.mp4")];
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    h.state_mut()
+        .exec(Command::SetMasterBypass { bypass: true });
+    settle(&mut h);
+    assert!(h.state().master_bypass);
+    let on_air = h.state().active(lid);
+    let no = top_layer_no(&h);
+    rest_open(h.state_mut(), no, 4, &ps).unwrap();
+    settle(&mut h);
+    assert!(h.state().master_bypass, "black-out is still on");
+    assert_eq!(h.state().active(lid), on_air);
+    assert!(h.state().players.is_empty());
+}
+
+#[test]
+fn rest_open_clips_rejects_bad_input() {
+    let mut h = app();
+    let no = top_layer_no(&h);
+    assert_eq!(
+        rest_open(h.state_mut(), no + 5, 1, &[PathBuf::from("/x")])
+            .unwrap_err()
+            .status,
+        404
+    );
+    assert_eq!(
+        rest_open(h.state_mut(), no, 1, &[PathBuf::from("/no/such/file.mp4")])
+            .unwrap_err()
+            .status,
+        422
+    );
+    assert_eq!(
+        rest_open(h.state_mut(), no, 1, &[PathBuf::from("rel.mp4")])
+            .unwrap_err()
+            .status,
+        422
+    );
+}

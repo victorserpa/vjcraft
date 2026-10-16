@@ -1,3 +1,4 @@
+mod api_ext;
 mod api_io;
 mod artnet_out;
 mod artnet_reduce;
@@ -20,6 +21,7 @@ mod hold;
 mod icons;
 mod io_monitor;
 mod link_io;
+mod mcp;
 mod midi_io;
 mod ml_fx;
 mod ml_gpu;
@@ -279,6 +281,8 @@ struct State {
     dmx_cfg: Option<dmx_io::Cfg>,
     api: api_io::Api,
     api_cfg: Option<api_io::Cfg>,
+    snap_jobs: Vec<api_ext::SnapJob>,
+    snap_last: Option<std::time::Instant>,
     /// Mappable widgets drawn this frame, for learn clicks and the key overlay.
     targets: Vec<(egui::Rect, String)>,
     /// Master bypass: black output (runtime only, not saved).
@@ -1915,6 +1919,8 @@ impl State {
                 api_io::Api::idle()
             },
             api_cfg: None,
+            snap_jobs: Vec::new(),
+            snap_last: None,
             led_prev: HashMap::new(),
             targets: vec![],
             master_bypass: false,
@@ -5402,6 +5408,14 @@ impl State {
                 cap.capture(&rs.device, &rs.queue, &comp.target);
             }
         }
+        api_ext::snap_service(
+            &mut self.snap_jobs,
+            &rs.device,
+            &rs.queue,
+            &comp.target,
+            comp.size,
+            self.master_bypass,
+        );
         self.render_screens(rs);
     }
 
@@ -6184,18 +6198,142 @@ impl State {
             let Ok(msg) = self.api.rx.try_recv() else {
                 break;
             };
-            let rt = self.rt_ctx();
-            let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
-            if let api_io::Req::Thumb(l, c) = &msg.req {
-                let reply = self.web_thumb(*l, *c);
-                let _ = msg.reply.send(reply);
-                continue;
+            self.api_handle(msg.req, msg.reply);
+        }
+    }
+
+    /// Answers one API request on the UI thread. Snapshots reply later (after the GPU
+    /// readback, see `api_ext::snap_service`); everything else replies right away.
+    fn api_handle(&mut self, req: api_io::Req, reply: std::sync::mpsc::SyncSender<api_io::Reply>) {
+        let rt = self.rt_ctx();
+        let active = |l| cell_active_of(&self.players, &self.gens, &self.origin, l);
+        match req {
+            api_io::Req::Thumb(l, c) => {
+                let r = self.web_thumb(l, c);
+                let _ = reply.send(r);
             }
-            let (cmd, reply) = api_io::answer(&self.project, &rt, &active, msg.req);
-            if let Some(c) = cmd {
-                self.exec(c);
+            api_io::Req::Ext(op, body) if api_ext::APP_OPS.contains(&op) => {
+                // None: the reply comes later (snapshot after the GPU readback).
+                if let Some(r) = self.api_app_op(op, &body, &reply) {
+                    let _ = reply.send(r);
+                }
             }
-            let _ = msg.reply.send(reply);
+            req => {
+                let (cmd, r) = api_io::answer(&self.project, &rt, &active, req);
+                if let Some(c) = cmd {
+                    self.exec(c);
+                }
+                let _ = reply.send(r);
+            }
+        }
+    }
+
+    /// Ops that need files or the GPU. None = the reply is sent later.
+    fn api_app_op(
+        &mut self,
+        op: &str,
+        body: &serde_json::Value,
+        reply: &std::sync::mpsc::SyncSender<api_io::Reply>,
+    ) -> Option<api_io::Reply> {
+        use serde_json::json;
+        let bad = |status, msg: &str| {
+            Some(Err(api_io::ApiErr {
+                status,
+                msg: msg.into(),
+            }))
+        };
+        let path_of = |k: &str| {
+            body[k]
+                .as_str()
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+        };
+        match op {
+            "load" => {
+                let Some(path) = path_of("path").filter(|p| p.is_file()) else {
+                    return bad(422, "path must be an absolute path of an existing file");
+                };
+                if self.dirty && body["force"] != true {
+                    return bad(409, "unsaved changes; pass \"force\": true to discard them");
+                }
+                if self.load(path) {
+                    Some(Ok(json!({"ok": true})))
+                } else {
+                    bad(422, "could not open the project (see the status bar)")
+                }
+            }
+            "save" => {
+                let ok = match path_of("path") {
+                    Some(mut p) => {
+                        if p.extension().is_none() {
+                            p.set_extension("vjc");
+                        }
+                        self.save_to(p)
+                    }
+                    None if body["path"].is_null() && self.file.is_some() => {
+                        self.save_to(self.file.clone().unwrap_or_default())
+                    }
+                    None => return bad(422, "no file yet: pass an absolute \"path\""),
+                };
+                if ok {
+                    Some(Ok(json!({"ok": true, "path": self.file})))
+                } else {
+                    bad(500, "save failed (see the status bar)")
+                }
+            }
+            "open_clips" => {
+                let c = &self.project.composition;
+                let layer = body["layer"]
+                    .as_u64()
+                    .and_then(|n| c.layers.len().checked_sub(n as usize))
+                    .and_then(|i| c.layers.get(i))
+                    .map(|l| l.id);
+                let col = body["column"]
+                    .as_u64()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|n| u32::try_from(n).ok());
+                let (Some(layer), Some(col)) = (layer, col) else {
+                    return bad(404, "no such layer");
+                };
+                // Past the last column is fine: the missing columns are added.
+                let paths: Vec<PathBuf> = body["paths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(PathBuf::from))
+                    .collect();
+                if paths.iter().any(|p| !p.is_absolute() || !p.exists()) {
+                    return bad(422, "every path must be absolute and exist");
+                }
+                if col as usize > c.columns.len() + api_ext::MAX_FILES {
+                    return bad(422, "column too far past the last one");
+                }
+                let (placed, ignored) = self.drop_many(layer, col, paths);
+                Some(Ok(
+                    json!({"ok": placed > 0, "placed": placed, "ignored": ignored}),
+                ))
+            }
+            "monitor" => {
+                let kind = body["kind"].as_str().unwrap_or("");
+                if kind == "preview" {
+                    return bad(501, "preview snapshots are not available; use composition");
+                }
+                let now = std::time::Instant::now();
+                if self.snap_jobs.len() >= api_ext::SNAP_QUEUE
+                    || self
+                        .snap_last
+                        .is_some_and(|t| now.duration_since(t) < api_ext::SNAP_EVERY)
+                {
+                    return bad(429, "snapshots are rate limited (4 per second)");
+                }
+                self.snap_last = Some(now);
+                self.snap_jobs.push(api_ext::SnapJob::new(
+                    body["format"] == "jpg",
+                    reply.clone(),
+                ));
+                None
+            }
+            _ => bad(404, "not found"),
         }
     }
 
@@ -11207,6 +11345,11 @@ fn tex_cap_from(limit: u32) -> u32 {
 }
 
 fn main() -> eframe::Result {
+    // MCP server mode: stdio client of the running app's REST API, no window.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp") {
+        std::process::exit(mcp::run(&args));
+    }
     let (prefs, warn) = match prefs_path() {
         Some(p) => Prefs::load(&p),
         None => (Prefs::default(), None),
