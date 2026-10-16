@@ -1672,8 +1672,8 @@ impl State {
         if self.load(r.clone()) {
             self.file = None;
             self.dirty = true;
-            // Restored state now lives in memory (and is re-autosaved while dirty).
-            clear_recovery(Some(r));
+            // The file stays: a second crash before the next autosave must still find it.
+            // The next autosave overwrites it; a save or clean quit clears it.
             true
         } else {
             quarantine_recovery(&r);
@@ -11392,6 +11392,7 @@ impl State {
     /// project) shows the whole composition; each monitor screen shows its sliced texture,
     /// or the whole composition when it has no slices.
     fn output_window(&mut self, ctx: &egui::Context) {
+        reliability::set_output_live(false);
         let Some(comp_id) = self.comp_tex else { return };
         let comp_size = self.comp.as_ref().map_or((1, 1), |c| c.size);
         type Win = (Uuid, usize, egui::TextureId, Option<Screen>, (u32, u32));
@@ -11421,6 +11422,7 @@ impl State {
                 wins.push((id, mon, tex, info, tex_size));
             }
         }
+        reliability::set_output_live(!wins.is_empty());
         for (sid, mon, tex, info, tex_size) in wins {
             // The list can change between pick and use (hotplug): skip a stale index.
             let Some(mid) = monitors::id_at(&self.monitors, mon) else {
@@ -11673,7 +11675,10 @@ fn main() -> eframe::Result {
     // Normal launch: a tiny supervisor runs the app as a child and relaunches it with
     // --recover after a crash (docs/dev/reliability.md).
     if reliability::should_supervise(&args, std::env::var("VJC_NO_SUPERVISOR").ok().as_deref()) {
-        std::process::exit(reliability::run_supervisor(&args));
+        match reliability::run_supervisor(&args) {
+            Some(code) => std::process::exit(code),
+            None => eprintln!("VJCraft: running unsupervised"),
+        }
     }
     if args.iter().any(|a| a == "--child") {
         reliability::fake_child(&args);

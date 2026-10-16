@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Restarts allowed inside `RESTART_WINDOW` before the supervisor gives up.
@@ -128,12 +128,20 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Newest `*.txt` in `dir` modified at or after `since`.
+/// A crash report: `<stamp>[-n].txt`, not a `stall-*` report or a `*.sample.txt` dump.
+fn is_crash_report(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with(".txt") && !name.starts_with("stall-") && !name.ends_with(".sample.txt")
+}
+
+/// Newest crash report in `dir` modified at or after `since`.
 pub fn newest_report(dir: &Path, since: SystemTime) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "txt"))
+        .filter(|e| is_crash_report(&e.path()))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .filter(|(t, _)| *t >= since)
         .max_by_key(|(t, _)| *t)
@@ -153,9 +161,9 @@ pub enum ChildEnd {
 
 impl ChildEnd {
     /// True for a user quit: exit code 0, or a termination request (SIGHUP/SIGINT/SIGTERM,
-    /// e.g. Ctrl-C under `cargo run`).
+    /// e.g. Ctrl-C under `cargo run`), or SIGKILL (Force Quit / `kill -9` is intentional).
     pub fn is_clean(self) -> bool {
-        matches!(self, ChildEnd::Code(0) | ChildEnd::Signal(1 | 2 | 15))
+        matches!(self, ChildEnd::Code(0) | ChildEnd::Signal(1 | 2 | 9 | 15))
     }
 }
 
@@ -237,8 +245,12 @@ fn end_of(s: std::process::ExitStatus) -> ChildEnd {
 
 /// Whether `main` should run the supervisor instead of the app.
 pub fn should_supervise(args: &[String], no_supervisor: Option<&str>) -> bool {
-    !cfg!(test)
-        && no_supervisor != Some("1")
+    !cfg!(test) && wants_supervisor(args, no_supervisor)
+}
+
+/// The rule itself, without the `cfg!(test)` guard (so tests can exercise it).
+fn wants_supervisor(args: &[String], no_supervisor: Option<&str>) -> bool {
+    no_supervisor != Some("1")
         && !args
             .iter()
             .any(|a| matches!(a.as_str(), "--child" | "--mcp" | "--panic-test"))
@@ -246,10 +258,11 @@ pub fn should_supervise(args: &[String], no_supervisor: Option<&str>) -> bool {
 
 /// The supervisor: spawns this binary as `--child` (plus `--recover` after a crash) and
 /// returns the process exit code.
-pub fn run_supervisor(args: &[String]) -> i32 {
+/// `None` when it cannot supervise (no own executable): the caller runs the app in-process.
+pub fn run_supervisor(args: &[String]) -> Option<i32> {
     let Ok(exe) = std::env::current_exe() else {
         eprintln!("VJCraft: cannot find own executable; running unsupervised");
-        return 1;
+        return None;
     };
     let started = SystemTime::now();
     let fake = args.iter().any(|a| a.starts_with("--fake-child"));
@@ -277,7 +290,7 @@ pub fn run_supervisor(args: &[String]) -> i32 {
         Instant::now,
         || std::thread::sleep(Duration::from_millis(if fake { 50 } else { 500 })),
     );
-    match outcome {
+    Some(match outcome {
         Outcome::Quit => 0,
         Outcome::GaveUp { launches, last } => {
             let report = crash_dir()
@@ -295,7 +308,7 @@ pub fn run_supervisor(args: &[String]) -> i32 {
             }
             1
         }
-    }
+    })
 }
 
 /// A visible message when the supervisor gives up (macOS: dialog; elsewhere stderr only).
@@ -355,8 +368,34 @@ pub fn beat() {
     BEAT_MS.store(mono_ms(), Ordering::Relaxed);
 }
 
-/// Pure stall rule: `Some(stalled_ms)` when a report is due (once per stall).
-pub fn stall_due(last_beat_ms: u64, now_ms: u64, reported: &mut bool) -> Option<u64> {
+static OUTPUT_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Set every frame: whether an output window is live (so the loop must keep ticking).
+pub fn set_output_live(live: bool) {
+    OUTPUT_LIVE.store(live, Ordering::Relaxed);
+}
+
+/// Minimum gap between `sample` thread dumps.
+pub const SAMPLE_GAP: Duration = Duration::from_secs(600);
+
+/// Pure rule: a thread dump is allowed if none ran in the last `SAMPLE_GAP`.
+pub fn sample_allowed(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= SAMPLE_GAP)
+}
+
+/// Pure stall rule: `Some(stalled_ms)` when a report is due (once per stall). An idle UI
+/// (reactive repaint, minimized or occluded window) is not a stall: only `expecting`
+/// frames (an output window is live and must keep rendering) can stall.
+pub fn stall_due(
+    last_beat_ms: u64,
+    now_ms: u64,
+    expecting: bool,
+    reported: &mut bool,
+) -> Option<u64> {
+    if !expecting {
+        *reported = false;
+        return None;
+    }
     if last_beat_ms == 0 {
         return None;
     }
@@ -411,12 +450,22 @@ pub fn start_watchdog() {
         .name("vjc-watchdog".into())
         .spawn(move || {
             let mut reported = false;
+            let mut last_sample = None;
             loop {
                 std::thread::sleep(Duration::from_millis(500));
-                if let Some(ms) =
-                    stall_due(BEAT_MS.load(Ordering::Relaxed), mono_ms(), &mut reported)
-                {
-                    let p = write_stall(&dir, ms, true);
+                let expecting = OUTPUT_LIVE.load(Ordering::Relaxed);
+                if let Some(ms) = stall_due(
+                    BEAT_MS.load(Ordering::Relaxed),
+                    mono_ms(),
+                    expecting,
+                    &mut reported,
+                ) {
+                    let now = Instant::now();
+                    let dump = sample_allowed(last_sample, now);
+                    if dump {
+                        last_sample = Some(now);
+                    }
+                    let p = write_stall(&dir, ms, dump);
                     eprintln!("VJCraft: main loop stalled {ms} ms; report: {p:?}");
                 }
             }
@@ -486,7 +535,12 @@ mod tests {
 
     #[test]
     fn user_quit_and_term_signals_do_not_restart() {
-        for end in [ChildEnd::Code(0), ChildEnd::Signal(2), ChildEnd::Signal(15)] {
+        for end in [
+            ChildEnd::Code(0),
+            ChildEnd::Signal(2),
+            ChildEnd::Signal(9),
+            ChildEnd::Signal(15),
+        ] {
             let mut n = 0;
             let out = supervise(
                 |_| {
@@ -516,18 +570,57 @@ mod tests {
         // `cfg!(test)` is true here, so the rule always says no under unit tests.
         assert!(!should_supervise(&a(&["x"]), None));
         assert!(!should_supervise(&a(&["x", "--child"]), None));
-        assert!(!should_supervise(&a(&["x"]), Some("1")));
+        // The real rule, not masked by `cfg!(test)`.
+        assert!(wants_supervisor(&a(&["x"]), None));
+        assert!(!wants_supervisor(&a(&["x"]), Some("1")));
+        assert!(wants_supervisor(&a(&["x"]), Some("0")));
+        assert!(!wants_supervisor(&a(&["x", "--child"]), None));
+        assert!(!wants_supervisor(&a(&["x", "--mcp"]), None));
     }
 
     #[test]
     fn stall_is_reported_once_and_rearms() {
         let mut rep = false;
-        assert_eq!(stall_due(0, 9_999, &mut rep), None, "no beat yet");
-        assert_eq!(stall_due(1_000, 2_900, &mut rep), None);
-        assert_eq!(stall_due(1_000, 3_100, &mut rep), Some(2_100));
-        assert_eq!(stall_due(1_000, 4_000, &mut rep), None, "once per stall");
-        assert_eq!(stall_due(4_000, 4_100, &mut rep), None);
-        assert_eq!(stall_due(4_000, 6_100, &mut rep), Some(2_100), "re-armed");
+        assert_eq!(stall_due(0, 9_999, true, &mut rep), None, "no beat yet");
+        assert_eq!(stall_due(1_000, 2_900, true, &mut rep), None);
+        assert_eq!(stall_due(1_000, 3_100, true, &mut rep), Some(2_100));
+        assert_eq!(stall_due(1_000, 4_000, true, &mut rep), None, "once");
+        assert_eq!(stall_due(4_000, 4_100, true, &mut rep), None);
+        assert_eq!(
+            stall_due(4_000, 6_100, true, &mut rep),
+            Some(2_100),
+            "re-armed"
+        );
+    }
+
+    #[test]
+    fn idle_ui_is_not_a_stall() {
+        let mut rep = false;
+        assert_eq!(stall_due(1_000, 60_000, false, &mut rep), None);
+        assert_eq!(stall_due(1_000, 60_000, true, &mut rep), Some(59_000));
+    }
+
+    #[test]
+    fn sample_runs_at_most_once_per_ten_minutes() {
+        let t0 = Instant::now();
+        assert!(sample_allowed(None, t0));
+        assert!(!sample_allowed(Some(t0), t0 + Duration::from_secs(599)));
+        assert!(sample_allowed(Some(t0), t0 + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn newest_report_ignores_stall_and_sample_files() {
+        let dir = std::env::temp_dir().join(format!("vjc-newest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let since = SystemTime::now() - Duration::from_secs(5);
+        std::fs::write(dir.join("20260101-000000.txt"), "c").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.join("stall-20260101-000001.txt"), "s").unwrap();
+        std::fs::write(dir.join("stall-20260101-000001.sample.txt"), "d").unwrap();
+        let p = newest_report(&dir, since).unwrap();
+        assert_eq!(p.file_name().unwrap(), "20260101-000000.txt");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
