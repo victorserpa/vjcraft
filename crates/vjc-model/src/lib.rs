@@ -936,6 +936,15 @@ pub enum BlendMode {
     Multiply50,
     Overlay50,
     Subtract50,
+    /// 1 - |base - source|: the inverted Difference.
+    DifferenceInverse,
+    /// Luma Key with the key inverted: bright pixels of the source become transparent.
+    LumaKeyInverse,
+    /// Source read at a per-pixel random offset (a shaky, torn picture).
+    Jitter,
+    /// Transition-style blend: the opacity is the progress of a luma wipe that reveals the
+    /// source from its darkest pixels to its brightest.
+    Bumper,
     #[serde(other)]
     Unknown,
 }

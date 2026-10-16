@@ -155,6 +155,7 @@ fn per_channel(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
 
 // Full-colour modes appended after the original 19 (mirrors blend.rs `color_mode`).
 fn color_mode(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
+    if (id == 36u) { return vec3(1.0) - abs(b - s); }
     if (id == 19u) {
         return select(min(b / s, vec3(1.0)), vec3(1.0), s <= vec3(0.0));
     }
@@ -289,6 +290,17 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         let td = vec2<f32>(textureDimensions(tex));
         q = (floor(q * td / 8.0) * 8.0 + vec2(0.5)) / td;
     }
+    if (u.mode == 38u) {
+        // Jitter: the source is read at a per-pixel hashed offset (mirrors blend.rs).
+        let td = vec2<f32>(textureDimensions(tex));
+        let pxy = vec2<u32>(in.pos.xy);
+        var h = (pxy.x * 73856093u) ^ (pxy.y * 19349663u);
+        h = h ^ (h >> 13u);
+        h = h * 0x5bd1e995u;
+        h = h ^ (h >> 15u);
+        let o = vec2<f32>(f32(i32(h & 7u) - 4), f32(i32((h >> 8u) & 7u) - 4));
+        q = clamp(q + o / td, vec2(0.5) / td, vec2(1.0) - vec2(0.5) / td);
+    }
     var s = textureSample(tex, smp, q);
     // pad = channel mask: bit 0..3 set = R, G, B, A off (off alpha means opaque).
     if ((u.pad & 1u) != 0u) { s.r = 0.0; }
@@ -318,6 +330,14 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         rgb = luma(b.rgb) * s.rgb;
     } else if (id == 18u) {
         rgb = vec3(l);
+    } else if (id == 37u) {
+        a = a * (1.0 - l);
+        rgb = s.rgb;
+    } else if (id == 38u) {
+        rgb = s.rgb;
+    } else if (id == 39u) {
+        a = clamp(s.a * clamp((clamp(u.opacity, 0.0, 1.0) * 1.1 - l) / 0.1, 0.0, 1.0), 0.0, 1.0);
+        rgb = s.rgb;
     } else if (id == 24u) {
         // Displace: the source's red/green push where the base is read from.
         let bs = vec2<i32>(textureDimensions(base_tex)) - vec2<i32>(1);
@@ -4354,7 +4374,11 @@ mod tests {
         let f = |c: [u8; 4]| c.map(|v| v as f32 / 255.0);
         let mut comp = Compositor::new(&device, 16, 16);
         for (mode, name) in &vjc_core::blend::COMPOSITION_MODES[19..] {
-            if matches!(mode, BlendMode::Displace | BlendMode::LoRez) {
+            // Jitter reads other texels: tested apart (a flat colour can't tell it from Normal).
+            if matches!(
+                mode,
+                BlendMode::Displace | BlendMode::LoRez | BlendMode::Jitter
+            ) {
                 continue;
             }
             for (n, (base, src)) in pairs.iter().enumerate() {
@@ -4425,6 +4449,45 @@ mod tests {
         assert_eq!(px_at(&img, 3, 4)[0], 0, "x=3 reads x=0");
         let img = draw(&mut comp, BlendMode::Normal, &ramp, 4);
         assert_eq!(px_at(&img, 11, 4)[0], 176, "control: Normal keeps x=11");
+    }
+
+    /// Jitter against its CPU twin on a ramp source. Control: Normal keeps the pixel's own
+    /// texel, so a shader that fell back to Normal fails.
+    #[test]
+    fn gpu_jitter_matches_reference() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = Compositor::new(&device, 16, 16);
+        let base = [0u8, 0, 0, 255].repeat(256);
+        let ramp: Vec<u8> = (0..256)
+            .flat_map(|i| [(i % 16 * 16) as u8, (i / 16 * 16) as u8, 0, 255])
+            .collect();
+        let mut draw = |mode: BlendMode, s: u64| {
+            let ls = [
+                layer(1, 1.0, BlendMode::Normal, vec![], &base, 1),
+                layer(2, 1.0, mode, vec![], &ramp, s),
+            ];
+            comp.render(&device, &queue, &ls, &[], 1.0);
+            read16(&device, &queue, &comp)
+        };
+        let img = draw(BlendMode::Jitter, 1);
+        let mut moved = 0;
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let o = vjc_core::blend::jitter_offset(x, y);
+                let sx = (x as i32 + o[0]).clamp(0, 15) as u8;
+                let sy = (y as i32 + o[1]).clamp(0, 15) as u8;
+                let got = px_at(&img, x as usize, y as usize);
+                assert_eq!(got[..2], [sx * 16, sy * 16], "pixel {x},{y}");
+                moved += usize::from(o != [0, 0]);
+            }
+        }
+        assert!(moved > 100);
+        let img = draw(BlendMode::Normal, 2);
+        assert_eq!(
+            px_at(&img, 5, 5)[..2],
+            [80, 80],
+            "control: Normal is unshifted"
+        );
     }
 
     /// Crop clears everything outside the box. Control: zero crop leaves the picture.
