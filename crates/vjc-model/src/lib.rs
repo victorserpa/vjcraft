@@ -346,6 +346,16 @@ pub struct LayerGroup {
     /// Crossfader bus of the group; layers without a bus of their own follow it.
     #[serde(default)]
     pub crossfader_bus: Option<Bus>,
+    /// Group-level mask: the composed group is not drawn, its luminance masks the
+    /// ungrouped layers below it.
+    #[serde(default)]
+    pub mask_mode: MaskMode,
+    /// A column trigger skips every layer of the group.
+    #[serde(default)]
+    pub ignore_column_trigger: bool,
+    /// Content lock for every layer of the group.
+    #[serde(default)]
+    pub lock_content: bool,
 }
 
 impl LayerGroup {
@@ -359,6 +369,9 @@ impl LayerGroup {
             speed: 1.0,
             folded: false,
             crossfader_bus: None,
+            mask_mode: MaskMode::Off,
+            ignore_column_trigger: false,
+            lock_content: false,
         }
     }
 }
@@ -2043,6 +2056,20 @@ impl Composition {
         self.groups.iter().find(|g| g.id == id)
     }
 
+    fn layer_group(&self, l: &Layer) -> Option<&LayerGroup> {
+        l.group.and_then(|g| self.group(g))
+    }
+
+    /// Content of the layer is locked, by itself or by its group.
+    pub fn locked(&self, l: &Layer) -> bool {
+        l.lock_content || self.layer_group(l).is_some_and(|g| g.lock_content)
+    }
+
+    /// A column trigger leaves the layer alone (its own flag or its group's).
+    pub fn ignores_column(&self, l: &Layer) -> bool {
+        l.ignore_column_trigger || self.layer_group(l).is_some_and(|g| g.ignore_column_trigger)
+    }
+
     fn any_solo(&self) -> bool {
         self.layers.iter().any(|o| o.solo) || self.groups.iter().any(|g| g.solo)
     }
@@ -2820,5 +2847,21 @@ mod tests {
                 .unwrap()
                 .ignore_column_trigger
         );
+    }
+
+    #[test]
+    fn old_group_without_mask_ignore_lock_loads_with_defaults() {
+        let mut g = LayerGroup::new("G");
+        g.mask_mode = MaskMode::OneBelow;
+        g.ignore_column_trigger = true;
+        g.lock_content = true;
+        let mut v = serde_json::to_value(&g).unwrap();
+        assert_eq!(serde_json::from_value::<LayerGroup>(v.clone()).unwrap(), g);
+        for k in ["mask_mode", "ignore_column_trigger", "lock_content"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: LayerGroup = serde_json::from_value(v).unwrap();
+        assert_eq!(old.mask_mode, MaskMode::Off);
+        assert!(!old.ignore_column_trigger && !old.lock_content);
     }
 }

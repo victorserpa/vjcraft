@@ -5329,6 +5329,7 @@ impl State {
                 .count();
             if let Some(g) = c.group(gid).filter(|g| !c.group_off(g)) {
                 group_draws.push(compositor::GroupDraw {
+                    mask: g.mask_mode,
                     id: Some(gid),
                     start: i,
                     len,
@@ -9488,6 +9489,27 @@ impl State {
                     params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
             {
                 cmds.push(Command::SetGroupSpeed { group: gid, value });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Mask");
+                for mode in vjc_model::MaskMode::ALL {
+                    if crate::widgets::choice(ui, g.mask_mode == mode, mode.label())
+                        .on_hover_text("The composed group masks the ungrouped layers below it")
+                        .clicked()
+                    {
+                        cmds.push(Command::SetGroupMaskMode { group: gid, mode });
+                    }
+                }
+            });
+            let (mut ignore, mut lock) = (g.ignore_column_trigger, g.lock_content);
+            if crate::widgets::toggle(ui, &mut ignore, "Ignore column trigger").changed() {
+                cmds.push(Command::SetGroupIgnoreColumn { group: gid, ignore });
+            }
+            if crate::widgets::toggle(ui, &mut lock, "Lock content").changed() {
+                cmds.push(Command::SetGroupLock {
+                    group: gid,
+                    locked: lock,
+                });
             }
             let (mut solo, mut bypass) = (g.solo, g.bypass);
             ui.horizontal(|ui| {

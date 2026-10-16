@@ -1438,9 +1438,65 @@ fn mask_plan(layers: &[LayerDraw]) -> (Vec<Option<usize>>, Vec<bool>) {
     (plan, is_src)
 }
 
+/// A group run that has something to draw.
+fn group_has_picture(layers: &[LayerDraw], g: &GroupDraw) -> bool {
+    g.len > 0
+        && layers
+            .get(g.start..g.start + g.len)
+            .is_some_and(|r| r.iter().any(|l| l.frame.is_some() || l.generator.is_some()))
+}
+
+/// Adds the group-level masks to `plan`: a group with a mask mode multiplies the ungrouped
+/// layers below it (all of them, or only the one right below) by its composed luminance.
+/// Plan entries `layers.len() + i` name `groups[i]`. The nearest mask above a layer wins.
+/// Returns which groups are mask sources (not drawn into the composition).
+fn group_mask_plan(
+    layers: &[LayerDraw],
+    groups: &[GroupDraw],
+    plan: &mut [Option<usize>],
+    is_src: &[bool],
+) -> Vec<bool> {
+    use vjc_model::MaskMode;
+    let n = layers.len();
+    let mut in_group = vec![false; n];
+    for g in groups {
+        for f in in_group.iter_mut().skip(g.start).take(g.len) {
+            *f = true;
+        }
+    }
+    let outgoing = |j: usize| layers[j].transition.is_some_and(|t| t.2);
+    let src: Vec<bool> = groups
+        .iter()
+        .map(|g| g.mask != MaskMode::Off && group_has_picture(layers, g))
+        .collect();
+    for (gi, g) in groups.iter().enumerate().filter(|(i, _)| src[*i]) {
+        let top = g.start + g.len - 1;
+        let hit = |j: usize, plan: &mut [Option<usize>]| {
+            if !in_group[j] && !is_src[j] && plan[j].is_none_or(|m| m < top) {
+                plan[j] = Some(n + gi);
+            }
+        };
+        match g.mask {
+            MaskMode::AllBelow => (0..g.start).for_each(|j| hit(j, plan)),
+            _ => {
+                let mut j = g.start;
+                while j > 0 {
+                    j -= 1;
+                    hit(j, plan);
+                    if !outgoing(j) || j == 0 || !outgoing(j - 1) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    src
+}
+
 /// Mask data of one frame, for `draw_layer` calls that may need a mask picture.
 struct MaskCtx<'a> {
     layers: &'a [LayerDraw<'a>],
+    groups: &'a [GroupDraw],
     plan: &'a [Option<usize>],
     is_src: &'a [bool],
     /// Index of the first layer of the run being drawn.
@@ -1458,6 +1514,9 @@ pub struct GroupDraw {
     pub opacity: f32,
     pub blend: BlendMode,
     pub effects: Vec<EffectDraw>,
+    /// Group-level mask: the composed group is not drawn, its luminance multiplies the
+    /// ungrouped layer(s) below it instead.
+    pub mask: vjc_model::MaskMode,
 }
 
 /// Intermediate buffer the layers of a group are composed into, one at a time.
@@ -2258,7 +2317,7 @@ impl Compositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         enc: &mut wgpu::CommandEncoder,
-        layers: &[LayerDraw],
+        (layers, groups): (&[LayerDraw], &[GroupDraw]),
         m: usize,
         extent: wgpu::Extent3d,
     ) {
@@ -2281,7 +2340,15 @@ impl Compositor {
             occlusion_query_set: None,
             multiview_mask: None,
         }));
-        self.draw_layer(device, queue, enc, &layers[m], (Dest::Mask, false), extent);
+        if let Some(gi) = m.checked_sub(layers.len()) {
+            // A group mask: composed in the group buffer, blended onto the black mask buffer.
+            let g = &groups[gi];
+            let run = &layers[g.start..g.start + g.len];
+            let n = groups.len() + gi;
+            self.compose_group(device, queue, enc, (run, None), (g, n, true), extent);
+        } else {
+            self.draw_layer(device, queue, enc, &layers[m], (Dest::Mask, false), extent);
+        }
         self.mask_cur = Some(m);
     }
 
@@ -2301,7 +2368,7 @@ impl Compositor {
         }
         let masked = mc.plan[i];
         if let Some(m) = masked {
-            self.render_mask(device, queue, enc, mc.layers, m, extent);
+            self.render_mask(device, queue, enc, (mc.layers, mc.groups), m, extent);
         }
         self.draw_layer(
             device,
@@ -2322,8 +2389,7 @@ impl Compositor {
         queue: &wgpu::Queue,
         enc: &mut wgpu::CommandEncoder,
         (run, mc): (&[LayerDraw], Option<&MaskCtx>),
-        g: &GroupDraw,
-        n: usize,
+        (g, n, to_mask): (&GroupDraw, usize, bool),
         extent: wgpu::Extent3d,
     ) -> bool {
         if !run.iter().any(|l| self.slots.contains_key(&l.id)) {
@@ -2431,15 +2497,16 @@ impl Compositor {
                 },
             ],
         });
-        enc.copy_texture_to_texture(
-            self.target.as_image_copy(),
-            self.base.as_image_copy(),
-            extent,
-        );
+        let (dst_tex, dst_view) = if to_mask {
+            (&self.mask.0, &self.mask.1)
+        } else {
+            (&self.target, &self.target_view)
+        };
+        enc.copy_texture_to_texture(dst_tex.as_image_copy(), self.base.as_image_copy(), extent);
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("group_blend"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.target_view,
+                view: dst_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -2686,7 +2753,8 @@ impl Compositor {
             height: self.size.1.max(1),
             depth_or_array_layers: 1,
         };
-        let (plan, is_src) = mask_plan(layers_bottom_to_top);
+        let (mut plan, is_src) = mask_plan(layers_bottom_to_top);
+        let group_src = group_mask_plan(layers_bottom_to_top, groups, &mut plan, &is_src);
         self.mask_cur = None;
         if !self.white_ready {
             drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2717,25 +2785,32 @@ impl Compositor {
                 let run = &layers_bottom_to_top[i..i + g.len];
                 let mc = MaskCtx {
                     layers: layers_bottom_to_top,
+                    groups,
                     plan: &plan,
                     is_src: &is_src,
                     base: i,
                 };
-                if self.compose_group(
-                    device,
-                    queue,
-                    &mut enc,
-                    (run, Some(&mc)),
-                    g,
-                    group_no,
-                    extent,
-                ) {
+                let is_mask = groups
+                    .iter()
+                    .position(|x| std::ptr::eq(x, g))
+                    .is_some_and(|k| group_src[k]);
+                if !is_mask
+                    && self.compose_group(
+                        device,
+                        queue,
+                        &mut enc,
+                        (run, Some(&mc)),
+                        (g, group_no, false),
+                        extent,
+                    )
+                {
                     group_no += 1;
                 }
                 i += g.len;
             } else {
                 let mc = MaskCtx {
                     layers: layers_bottom_to_top,
+                    groups,
                     plan: &plan,
                     is_src: &is_src,
                     base: i,
@@ -3012,7 +3087,14 @@ impl Compositor {
                     .find(|g| g.id == Some(id) && g.len > 0 && g.start + g.len <= layers.len());
                 if let Some(g) = found {
                     let run = &layers[g.start..g.start + g.len];
-                    if self.compose_group(device, queue, enc, (run, None), g, *group_no, extent) {
+                    if self.compose_group(
+                        device,
+                        queue,
+                        enc,
+                        (run, None),
+                        (g, *group_no, false),
+                        extent,
+                    ) {
                         *group_no += 1;
                     }
                 }
@@ -5828,6 +5910,7 @@ mod tests {
             opacity,
             blend: BlendMode::Normal,
             effects,
+            mask: Default::default(),
         }
     }
 
@@ -5999,6 +6082,95 @@ mod tests {
             all(4),
         ]);
         assert_eq!(plan, vec![Some(1), None, Some(3), None]);
+    }
+
+    /// A group with a mask mode is not drawn; its composed luminance multiplies the
+    /// ungrouped layers below it (one below, all below), never layers above or inside it.
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_group_mask_multiplies_layers_below() {
+        use vjc_model::MaskMode;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (red, green) = ([255u8, 0, 0, 255], [0u8, 255, 0, 255]);
+        let (white, grey, black) = ([255u8; 4], [128u8, 128, 128, 255], [0u8, 0, 0, 255]);
+        let run = |layers: Vec<LayerDraw>, start: usize, len: usize, mode: MaskMode| {
+            let mut comp = Compositor::new(&device, 1, 1);
+            let g = GroupDraw {
+                mask: mode,
+                ..group(start, len, 1.0, vec![])
+            };
+            comp.render_groups(&device, &queue, &layers, &[g], &[], 1.0);
+            read_px(&device, &queue, &comp)
+        };
+        // Control: Off draws the group over the red layer.
+        let got = run(
+            vec![solid(1, &red, 1.0), solid(2, &white, 1.0)],
+            1,
+            1,
+            MaskMode::Off,
+        );
+        assert_eq!(&got[..3], &[255, 255, 255], "{got:?}");
+        // White group: red shows in full and the group itself is not drawn.
+        let got = run(
+            vec![solid(1, &red, 1.0), solid(2, &white, 1.0)],
+            1,
+            1,
+            MaskMode::OneBelow,
+        );
+        assert_eq!(&got[..3], &[255, 0, 0], "{got:?}");
+        // Black group hides the layer below; grey halves it.
+        let got = run(
+            vec![solid(1, &red, 1.0), solid(2, &black, 1.0)],
+            1,
+            1,
+            MaskMode::OneBelow,
+        );
+        assert_eq!(&got[..3], &[0, 0, 0], "{got:?}");
+        let got = run(
+            vec![solid(1, &red, 1.0), solid(2, &grey, 1.0)],
+            1,
+            1,
+            MaskMode::AllBelow,
+        );
+        assert!(got[0].abs_diff(128) <= 3 && got[1] == 0, "{got:?}");
+        // The group is its composed picture: a black layer under a white one in it is white.
+        let got = run(
+            vec![
+                solid(1, &red, 1.0),
+                solid(2, &black, 1.0),
+                solid(3, &white, 1.0),
+            ],
+            1,
+            2,
+            MaskMode::OneBelow,
+        );
+        assert_eq!(&got[..3], &[255, 0, 0], "{got:?}");
+        // One below hits only the layer right below; all below hits both.
+        let stack = || {
+            vec![
+                solid(1, &red, 1.0),
+                solid(2, &green, 1.0),
+                solid(3, &black, 1.0),
+            ]
+        };
+        let got = run(stack(), 2, 1, MaskMode::OneBelow);
+        assert_eq!(&got[..3], &[255, 0, 0], "{got:?}");
+        let got = run(stack(), 2, 1, MaskMode::AllBelow);
+        assert_eq!(&got[..3], &[0, 0, 0], "{got:?}");
+        // A layer above the group is not masked.
+        let got = run(
+            vec![
+                solid(1, &red, 1.0),
+                solid(2, &black, 1.0),
+                solid(3, &green, 1.0),
+            ],
+            1,
+            1,
+            MaskMode::AllBelow,
+        );
+        assert_eq!(&got[..3], &[0, 255, 0], "{got:?}");
     }
 
     /// The group chain runs over the composed group, not over the layers below it.
