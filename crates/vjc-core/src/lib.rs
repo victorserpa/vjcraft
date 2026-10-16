@@ -28,6 +28,8 @@ pub mod transition_fx;
 mod wave_j_tests;
 #[cfg(test)]
 mod wave_m_tests;
+#[cfg(test)]
+mod wave_o_tests;
 
 pub use effects::EffectTarget;
 use std::path::PathBuf;
@@ -275,6 +277,12 @@ pub enum Command {
         target: EffectTarget,
         field: TransformField,
         value: f64,
+    },
+    /// Sets several transform fields at once (the preview widget's drag). A drag over the
+    /// same field set coalesces into one undo step; all-or-nothing on invalid values.
+    SetTransformMulti {
+        target: EffectTarget,
+        values: Vec<(TransformField, f64)>,
     },
     /// Dashboard dial `dial` (0..8), value 0..=1 (coalesces).
     SetDashboardDial {
@@ -993,6 +1001,8 @@ enum Target {
     LayerDial(LayerId, u32),
     ClipDial(DeckId, LayerId, ColumnIdx, u32),
     Transform(EffectTarget, TransformField),
+    /// Target and bitmask of the fields set by `SetTransformMulti`.
+    TransformMulti(EffectTarget, u16),
     Anim(AnimTarget),
     SliceMesh(Uuid),
     /// Slice, point count (0 = cleared) and dragged point (first point that differs from the
@@ -1065,6 +1075,12 @@ impl Command {
                 ..
             } => Some(Target::ClipDial(*deck, *layer, *column, *dial)),
             Command::SetTransform { target, field, .. } => Some(Target::Transform(*target, *field)),
+            Command::SetTransformMulti { target, values } => Some(Target::TransformMulti(
+                *target,
+                values.iter().fold(0u16, |m, (f, _)| {
+                    m | 1 << TransformField::ALL.iter().position(|a| a == f).unwrap_or(0)
+                }),
+            )),
             // Dragging an animation field emits one command per frame.
             Command::SetAnimation { target, .. } => Some(Target::Anim(*target)),
             Command::SetMasterOpacity { .. } => Some(Target::MasterOpacity),
@@ -4102,6 +4118,26 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetTransformMulti { target, values } => {
+            if values.is_empty() || values.iter().any(|(_, v)| !v.is_finite()) {
+                return Err(Error::InvalidValue);
+            }
+            let tr = &mut effects::track_mut(p, target)?.transform;
+            let mut prev = Vec::with_capacity(values.len());
+            for (field, value) in values {
+                let slot = tr.field_mut(field);
+                prev.push((field, number(&slot.value)));
+                slot.set_number(value);
+            }
+            prev.reverse();
+            undoable(
+                Command::SetTransformMulti {
+                    target,
+                    values: prev,
+                },
+                vec![],
+            )
+        }
         Command::SetDialInfo {
             owner,
             dial,
@@ -5251,6 +5287,20 @@ mod tests {
                 read(&mut p, target, TransformField::Scale),
                 vjc_model::TRANSFORM_SCALE_MAX
             );
+            apply(
+                &mut p,
+                Command::SetTransformMulti {
+                    target,
+                    values: vec![(TransformField::Scale, 99.0), (TransformField::X, 5.0)],
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                read(&mut p, target, TransformField::Scale),
+                vjc_model::TRANSFORM_SCALE_MAX,
+                "multi clamps like SetTransform"
+            );
+            assert_eq!(read(&mut p, target, TransformField::X), 5.0);
             let anim = |a| Command::SetAnimation {
                 target: AnimTarget::Transform {
                     target,

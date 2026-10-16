@@ -50,6 +50,7 @@ mod wake;
 mod wave_ui;
 mod web_remote;
 mod widgets;
+mod xform_widget;
 
 use compositor::{Compositor, EffectDraw, LayerDraw};
 use eframe::egui;
@@ -189,6 +190,12 @@ struct State {
     prev_tex: Option<egui::TextureId>,
     /// Fit / pan of the Composition and Preview monitors (runtime only).
     mon_views: [monitor::MonitorView; 2],
+    /// View > Transform widget: handles on the Preview monitor (runtime only).
+    xf_show: bool,
+    /// Widget drag in progress: handle, values and pointer (frame px) at the press.
+    xf_drag: Option<XfDrag>,
+    /// Preview monitor area of the last frame (for hit tests).
+    xf_area: egui::Rect,
     /// Set by `monitor_column` when drawn; `compose` renders the preview only then.
     monitor_seen: bool,
     /// Output recording in progress (runtime only).
@@ -571,6 +578,13 @@ enum PrefsTab {
     Api,
     Timecode,
     Midi,
+}
+
+struct XfDrag {
+    handle: xform_widget::Handle,
+    start: xform_widget::Xf,
+    p0: egui::Vec2,
+    target: EffectTarget,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1823,6 +1837,9 @@ impl State {
             comp_tex: None,
             prev_tex: None,
             mon_views: Default::default(),
+            xf_show: true,
+            xf_drag: None,
+            xf_area: egui::Rect::NOTHING,
             monitor_seen: false,
             capture: None,
             netout: Default::default(),
@@ -2169,6 +2186,7 @@ impl State {
             self.palette_open();
         }
         crate::widgets::toggle(ui, &mut self.show_stats, "Show FPS & Stats");
+        crate::widgets::toggle(ui, &mut self.xf_show, "Transform widget");
         ui.separator();
         let l = self.prefs.layouts.current.clone();
         let mut new = l.clone();
@@ -8400,6 +8418,154 @@ impl State {
         }
     }
 
+    /// Track whose transform the Preview widget edits: the previewed clip or layer, else the
+    /// group shown in the Group tab.
+    fn xf_target(&self) -> Option<EffectTarget> {
+        if !self.xf_show {
+            return None;
+        }
+        let t = match self.preview_target {
+            PreviewTarget::Clip(deck, layer, column) => EffectTarget::Clip {
+                deck,
+                layer,
+                column,
+            },
+            PreviewTarget::Layer(l) => EffectTarget::Layer(l),
+            PreviewTarget::Composition => EffectTarget::Group(
+                self.sel_group
+                    .filter(|_| self.panel_tab == PanelTab::Group)?,
+            ),
+        };
+        vjc_core::effects::track(&self.project, t).map(|_| t)
+    }
+
+    fn xf_values(&self) -> Option<(EffectTarget, xform_widget::Xf)> {
+        let t = self.xf_target()?;
+        let tr = vjc_core::effects::track(&self.project, t)?;
+        Some((t, xform_widget::Xf::of(&tr.transform)))
+    }
+
+    /// Pointer handling of the Preview transform widget; true while it owns the drag.
+    fn xf_interact(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        rect: egui::Rect,
+        comp: (u32, u32),
+    ) -> bool {
+        let Some((target, xf)) = self.xf_values() else {
+            self.xf_drag = None;
+            return false;
+        };
+        let pic = monitor::picture_rect(rect, comp, self.mon_views[1]);
+        let k = pic.width() / comp.0.max(1) as f32;
+        let to_frame = |p: egui::Pos2| (p - pic.center()) / k;
+        let alt = ui.input(|i| i.modifiers.alt);
+        if resp.drag_started_by(egui::PointerButton::Primary) && !alt {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            if let Some(o) = origin {
+                let p0 = to_frame(o);
+                if let Some(handle) = xform_widget::hit(&xf, comp, p0, 8.0 / k) {
+                    self.xf_drag = Some(XfDrag {
+                        handle,
+                        start: xf,
+                        p0,
+                        target,
+                    });
+                }
+            }
+        }
+        if resp.clicked() || resp.drag_started() {
+            resp.request_focus();
+        }
+        let mut busy = false;
+        if let Some(d) = self.xf_drag.take()
+            && resp.dragged()
+            && d.target == target
+            && let Some(ptr) = ui.input(|i| i.pointer.latest_pos())
+        {
+            let shift = ui.input(|i| i.modifiers.shift);
+            let values = xform_widget::drag(d.handle, &d.start, comp, d.p0, to_frame(ptr), shift);
+            self.exec(Command::SetTransformMulti { target, values });
+            self.xf_drag = Some(d);
+            busy = true;
+        }
+        if resp.has_focus() {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    resp.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            let (mut dx, mut dy, mut shift) = (0, 0, false);
+            ui.input_mut(|i| {
+                for (key, ax, ay) in [
+                    (egui::Key::ArrowLeft, -1, 0),
+                    (egui::Key::ArrowRight, 1, 0),
+                    (egui::Key::ArrowUp, 0, -1),
+                    (egui::Key::ArrowDown, 0, 1),
+                ] {
+                    for sh in [true, false] {
+                        let m = if sh {
+                            egui::Modifiers::SHIFT
+                        } else {
+                            egui::Modifiers::NONE
+                        };
+                        while i.consume_key(m, key) {
+                            dx += ax;
+                            dy += ay;
+                            shift = sh;
+                        }
+                    }
+                }
+            });
+            if dx != 0 || dy != 0 {
+                let values = xform_widget::nudge(&xf, dx, dy, shift);
+                self.exec(Command::SetTransformMulti { target, values });
+            }
+        }
+        busy
+    }
+
+    /// Bounding box and handles of the transform widget over the Preview picture.
+    fn xf_paint(&self, painter: &egui::Painter, rect: egui::Rect, comp: (u32, u32)) {
+        let Some((_, xf)) = self.xf_values() else {
+            return;
+        };
+        let pic = monitor::picture_rect(rect, comp, self.mon_views[1]);
+        let k = pic.width() / comp.0.max(1) as f32;
+        let s = |v: egui::Vec2| pic.center() + v * k;
+        let stroke = egui::Stroke::new(1.5, theme::ACCENT);
+        let c = xform_widget::corners(&xf, comp).map(s);
+        painter.add(egui::Shape::closed_line(c.to_vec(), stroke));
+        for p in c {
+            painter.rect_filled(
+                egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0)),
+                1.0,
+                theme::ACCENT,
+            );
+        }
+        let top =
+            s((xform_widget::corners(&xf, comp)[0] + xform_widget::corners(&xf, comp)[1]) / 2.0);
+        let rot = s(xform_widget::rotate_handle(&xf, comp, f64::from(24.0 / k)));
+        painter.line_segment([top, rot], stroke);
+        painter.circle_filled(rot, 4.5, theme::ACCENT);
+        let a = s(xform_widget::anchor_point(&xf));
+        painter.circle_stroke(a, 5.0, egui::Stroke::new(1.5, theme::WARN));
+        painter.line_segment(
+            [a - egui::vec2(8.0, 0.0), a + egui::vec2(8.0, 0.0)],
+            egui::Stroke::new(1.0, theme::WARN),
+        );
+        painter.line_segment(
+            [a - egui::vec2(0.0, 8.0), a + egui::vec2(0.0, 8.0)],
+            egui::Stroke::new(1.0, theme::WARN),
+        );
+    }
+
     /// Left column of the bottom area: Composition monitor over Preview monitor. Each has a
     /// Fit / Fill / 1:1 dropdown, drag to pan (double click resets) and the composition size.
     /// The Preview shows the selected layer alone (the composition when none is selected).
@@ -8435,7 +8601,11 @@ impl State {
             );
             let (rect, resp) =
                 ui.allocate_exact_size(egui::vec2(w, each), egui::Sense::click_and_drag());
-            if resp.dragged() {
+            if i == 1 {
+                self.xf_area = rect;
+            }
+            let xf_busy = i == 1 && self.xf_interact(ui, &resp, rect, (cw, ch));
+            if resp.dragged() && !xf_busy {
                 self.mon_views[i].pan += resp.drag_delta();
             }
             if resp.double_clicked() {
@@ -8471,6 +8641,7 @@ impl State {
                 }
             }
             if i == 1 {
+                self.xf_paint(&painter, rect, (cw, ch));
                 let note = self.preview_caption();
                 painter.text(
                     rect.left_top() + egui::vec2(4.0, 2.0),
