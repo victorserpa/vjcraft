@@ -173,6 +173,8 @@ pub struct Overlay<'a> {
     pub grid: Option<(u32, u32)>,
     /// Big number (1-based screen number) while identifying.
     pub identify: Option<usize>,
+    /// Slice numbers drawn at the slice centres (Output setup: Identify slices).
+    pub slice_ids: bool,
     pub fps: Option<f32>,
 }
 
@@ -265,6 +267,19 @@ pub fn draw(painter: &egui::Painter, rect: Rect, o: &Overlay) {
             theme::TESTCARD_TEXT,
         );
     }
+    if o.slice_ids {
+        for (i, sl) in s.slices.iter().enumerate() {
+            if let Some((cx, cy)) = slice_center(sl) {
+                label(
+                    at(cx, cy),
+                    egui::Align2::CENTER_CENTER,
+                    (i + 1).to_string(),
+                    unit * 3.0,
+                    theme::IDENTIFY_TEXT,
+                );
+            }
+        }
+    }
     if let Some(n) = o.identify {
         let size = (rect.height() * 0.5).max(24.0);
         painter.rect_filled(rect, 0.0, theme::IDENTIFY_BG);
@@ -348,6 +363,7 @@ mod tests {
             blackout: true,
             grid: Some((128, 128)),
             identify: Some(1),
+            slice_ids: false,
             fps: Some(60.0),
         };
         assert_eq!(shapes(&o), 1, "only the black fill");

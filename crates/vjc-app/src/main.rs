@@ -33,6 +33,7 @@ mod netout;
 mod osc_io;
 mod output_artnet;
 mod output_canvas;
+mod output_extras;
 mod output_hints;
 mod output_overlay;
 mod output_presets_ui;
@@ -348,6 +349,8 @@ struct State {
     blackouts: std::collections::HashSet<Uuid>,
     /// Pixel-map grid tile size per screen (runtime only).
     pixel_grids: HashMap<Uuid, (u32, u32)>,
+    /// Slices copied in the Output setup (internal clipboard).
+    slice_clip: Vec<vjc_model::Slice>,
     /// FPS overlay on every output.
     show_fps: bool,
     /// When "Identify displays" was pressed (shows for `output_overlay::IDENTIFY_FOR`).
@@ -585,6 +588,8 @@ const OUT_MASK: u128 = 0x6f75_745f_736c_6f74;
 #[derive(Clone, Copy, PartialEq)]
 enum PrefsTab {
     General,
+    Recording,
+    Defaults,
     Audio,
     Video,
     Control,
@@ -1980,6 +1985,7 @@ impl State {
             test_cards: Default::default(),
             blackouts: Default::default(),
             pixel_grids: Default::default(),
+            slice_clip: vec![],
             show_fps: false,
             identify_at: None,
             display_info_open: false,
@@ -2229,6 +2235,13 @@ impl State {
                 .clicked()
             {
                 *on = !*on;
+            }
+        }
+        ui.separator();
+        for (key, label) in vjc_io::prefs::VIEW_TOGGLES {
+            let shown = !new.is_hidden(key);
+            if ui.add(egui::Button::selectable(shown, label)).clicked() {
+                new.set_hidden(key, shown);
             }
         }
         ui.separator();
@@ -3578,14 +3591,24 @@ impl State {
                         self.flow.regions.remove(&layer);
                         let own_last =
                             resume_pos(&self.project, &self.flow.resume, (deck, src, column));
-                        if let Some(start) = vjc_core::trigger_start(
+                        let start = vjc_core::trigger_start(
                             &self.project,
                             deck,
                             src,
                             column,
                             own_last,
                             prev_local,
-                        ) {
+                        );
+                        let offset = f64::from(self.prefs.general.clip_start_offset_ms) / 1000.0;
+                        if offset > 0.0 {
+                            let reg = self.region_of(layer);
+                            let dur = self.players.get(&layer).and_then(|(_, _, p)| p.duration());
+                            let from = start.unwrap_or(reg.0);
+                            let to = vjc_core::playback::offset_start(from, offset, dur, reg);
+                            if start.is_some() || to != from {
+                                self.seek(layer, to);
+                            }
+                        } else if let Some(start) = start {
                             self.seek(layer, start);
                         }
                     } else {
@@ -4747,6 +4770,7 @@ impl State {
                 None => vjc_core::clip_from_path(path.clone()),
             };
             clip.fit = self.prefs.video.fit;
+            self.prefs.defaults.apply(&mut clip);
             commands.push(Command::SetClip {
                 deck,
                 layer,
@@ -4781,6 +4805,7 @@ impl State {
         // One undo step: the default fit is set on the clip before it is placed.
         let mut clip = vjc_core::clip_from_path(path);
         clip.fit = self.prefs.video.fit;
+        self.prefs.defaults.apply(&mut clip);
         self.exec(Command::SetClip {
             deck,
             layer,
@@ -6531,6 +6556,7 @@ impl State {
                     .show(ui, |ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = theme::SP_2;
+            if !self.prefs.layouts.current.is_hidden("layer-transport") {
             let play = icons::name(
                 ui.add(
                     egui::Button::new(icons::glyph(icons::i::PLAY).color(theme::ON_ACCENT))
@@ -6574,6 +6600,7 @@ impl State {
             );
             if help(stop, "transport-stop").clicked() {
                 cmds.push(Command::ClearAll);
+            }
             }
             ui.separator();
             ui.add_space(theme::SP_3);
@@ -6700,6 +6727,7 @@ impl State {
                 cmds.push(Command::SetMasterReverse { reverse: rev });
             }
             ui.separator();
+            if !self.prefs.layouts.current.is_hidden("undo") {
             let (can_undo, can_redo) = (self.history.can_undo(), self.history.can_redo());
             undo = help(
                 icons::button_enabled(ui, can_undo, icons::i::ARROW_COUNTER_CLOCKWISE, "Undo"),
@@ -6711,6 +6739,7 @@ impl State {
                 "transport-redo",
             )
             .clicked();
+            }
             if self.prefs.timecode.source != vjc_io::prefs::TcSource::Off {
                 ui.separator();
                 let cur = self.tc.current(now);
@@ -6756,6 +6785,11 @@ impl State {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        let scale = self.prefs.general.ui_scale;
+        if (ui.ctx().zoom_factor() - scale).abs() > 1e-3 {
+            ui.ctx().set_zoom_factor(scale);
+        }
+        params::set_hidden(ui.ctx(), &self.prefs.layouts.current.hidden);
         self.prune_screen_state();
         self.prune_sel_slices();
         self.ui_body(ui);
@@ -6880,6 +6914,44 @@ impl State {
             // The panel tab is also called "Layer".
             .widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Layer menu")
+            });
+            ui.menu_button("Clip", |ui| {
+                let deck = self.project.composition.current_deck;
+                let sel = self.selected.and_then(|(l, c)| {
+                    let k = vjc_core::clip_in(&self.project, deck, l, c)?;
+                    let flags = self
+                        .project
+                        .composition
+                        .layers
+                        .iter()
+                        .find(|x| x.id == l)
+                        .map_or((false, false), |x| (x.ignore_column_trigger, x.fader_start));
+                    Some((l, c, k.clone(), flags))
+                });
+                match sel {
+                    Some((l, c, clip, flags)) => {
+                        let seed = self.tc.last.unwrap_or(vjc_model::Timecode::new(
+                            0,
+                            0,
+                            0,
+                            0,
+                            vjc_model::TcFps::F25,
+                        ));
+                        let mut cmds = vec![];
+                        wave_ui::clip_bar_menu(ui, (deck, l, c), &clip, flags, seed, &mut cmds);
+                        for cmd in cmds {
+                            self.exec(cmd);
+                        }
+                    }
+                    None => {
+                        ui.weak("No clip selected");
+                    }
+                }
+            })
+            .response
+            // The panel tab is also called "Clip".
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Clip menu")
             });
             ui.menu_button("View", |ui| self.view_menu(ui));
             ui.menu_button("Shortcuts", |ui| {
@@ -7548,10 +7620,16 @@ impl State {
                                         egui::pos2(rect.left(), top.bottom()),
                                         rect.max,
                                     );
+                                    let triggers =
+                                        !self.prefs.layouts.current.is_hidden("column-triggers");
                                     let r = ui.interact(
                                         top,
                                         egui::Id::new(("colhead-trigger", cid)),
-                                        egui::Sense::click(),
+                                        if triggers {
+                                            egui::Sense::click()
+                                        } else {
+                                            egui::Sense::hover()
+                                        },
                                     );
                                     let nr = ui.interact(
                                         bot,
@@ -7579,6 +7657,7 @@ impl State {
                                         self.col_sel == Some(ci as u32)
                                             || self.col_marks.contains(cid),
                                         &hover,
+                                        triggers,
                                     );
                                     if let Some(c) = theme::palette(comp.columns[ci].color) {
                                         ui.painter().rect_filled(
@@ -7596,33 +7675,35 @@ impl State {
                                         rect.right_top() + egui::vec2(-22.0, 2.0),
                                         egui::vec2(20.0, theme::COLUMN_HEAD_H - 4.0),
                                     );
-                                    let stop = ui
-                                        .scope_builder(
-                                            egui::UiBuilder::new().max_rect(stop_rect),
-                                            |ui| {
-                                                ui.scope(|ui| {
-                                                    if playing_here.is_empty() {
-                                                        ui.set_opacity(0.4);
-                                                    }
-                                                    grid_ui::tool(
-                                                        ui,
-                                                        stop_rect,
-                                                        icons::glyph(icons::i::STOP),
-                                                        &format!("Stop column {n}"),
-                                                        None,
-                                                        None,
-                                                    )
-                                                })
-                                                .inner
-                                            },
-                                        )
-                                        .inner;
-                                    if help(stop, "column-stop").clicked() {
-                                        cmds.extend(
-                                            playing_here
-                                                .into_iter()
-                                                .map(|layer| Command::ClearLayer { layer }),
-                                        );
+                                    if triggers {
+                                        let stop = ui
+                                            .scope_builder(
+                                                egui::UiBuilder::new().max_rect(stop_rect),
+                                                |ui| {
+                                                    ui.scope(|ui| {
+                                                        if playing_here.is_empty() {
+                                                            ui.set_opacity(0.4);
+                                                        }
+                                                        grid_ui::tool(
+                                                            ui,
+                                                            stop_rect,
+                                                            icons::glyph(icons::i::STOP),
+                                                            &format!("Stop column {n}"),
+                                                            None,
+                                                            None,
+                                                        )
+                                                    })
+                                                    .inner
+                                                },
+                                            )
+                                            .inner;
+                                        if help(stop, "column-stop").clicked() {
+                                            cmds.extend(
+                                                playing_here
+                                                    .into_iter()
+                                                    .map(|layer| Command::ClearLayer { layer }),
+                                            );
+                                        }
                                     }
                                     (r, nr)
                                 })
@@ -9987,46 +10068,48 @@ impl State {
                     reg.1 * 100.0
                 ));
             }
-            ui.horizontal(|ui| {
-                ui.label("Cues");
-                if crate::widgets::btn_if(ui, playing, "Set", crate::widgets::Kind::Secondary)
-                    .clicked()
-                {
-                    cmds.push(Command::AddCue {
-                        deck,
-                        layer,
-                        column,
-                        pos,
-                    });
-                }
-                for (i, c) in t.cue_points.iter().enumerate() {
-                    let jump = crate::widgets::btn_if(
-                        ui,
-                        playing,
-                        &format!("Jump {}", i + 1),
-                        crate::widgets::Kind::Secondary,
-                    );
-                    if let Some(a) = vjc_core::shortcuts::cue_address(&self.project, layer, i) {
-                        self.targets.push((jump.rect, a));
-                    }
-                    if jump.clicked() {
-                        cmds.push(Command::JumpToCue {
+            if !self.prefs.layouts.current.is_hidden("cue-points") {
+                ui.horizontal(|ui| {
+                    ui.label("Cues");
+                    if crate::widgets::btn_if(ui, playing, "Set", crate::widgets::Kind::Secondary)
+                        .clicked()
+                    {
+                        cmds.push(Command::AddCue {
                             deck,
                             layer,
                             column,
-                            index: i,
+                            pos,
                         });
                     }
-                    if icons::button(ui, icons::i::X, "Remove cue").clicked() {
-                        cmds.push(Command::RemoveCue {
-                            deck,
-                            layer,
-                            column,
-                            pos: *c,
-                        });
+                    for (i, c) in t.cue_points.iter().enumerate() {
+                        let jump = crate::widgets::btn_if(
+                            ui,
+                            playing,
+                            &format!("Jump {}", i + 1),
+                            crate::widgets::Kind::Secondary,
+                        );
+                        if let Some(a) = vjc_core::shortcuts::cue_address(&self.project, layer, i) {
+                            self.targets.push((jump.rect, a));
+                        }
+                        if jump.clicked() {
+                            cmds.push(Command::JumpToCue {
+                                deck,
+                                layer,
+                                column,
+                                index: i,
+                            });
+                        }
+                        if icons::button(ui, icons::i::X, "Remove cue").clicked() {
+                            cmds.push(Command::RemoveCue {
+                                deck,
+                                layer,
+                                column,
+                                pos: *c,
+                            });
+                        }
                     }
-                }
-            });
+                });
+            }
             let active_loop = self.flow.beat_loops.get(&layer).map(|l| l.0);
             let mut loop_pick = None;
             ui.horizontal(|ui| {
@@ -11235,7 +11318,16 @@ impl State {
             let learning = self.learn;
             let card = self.test_cards.contains(&sid);
             let black = self.blackouts.contains(&sid);
-            let grid = self.pixel_grids.get(&sid).copied();
+            let mirror = self.out_win.as_ref().filter(|w| w.show_in_output);
+            let slice_ids = mirror.is_some_and(|w| w.identify);
+            let grid = self.pixel_grids.get(&sid).copied().or_else(|| {
+                mirror.filter(|w| w.led_grid).map(|w| {
+                    (
+                        w.led_cell.max(output_overlay::MIN_TILE),
+                        w.led_cell.max(output_overlay::MIN_TILE),
+                    )
+                })
+            });
             let mut toggle_black = false;
             let identify = output_overlay::identifying(self.identify_at, std::time::Instant::now());
             let number = self
@@ -11286,6 +11378,7 @@ impl State {
                                 blackout: black,
                                 grid,
                                 identify: identify.then_some(number),
+                                slice_ids,
                                 fps: show_fps.then_some(meter.fps),
                             },
                         );

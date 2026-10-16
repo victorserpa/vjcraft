@@ -5907,7 +5907,7 @@ fn osc_hold_without_argument_is_a_plain_trigger() {
 fn prefs_tab_moves_focus_forward_in_visual_order() {
     use PrefsTab::*;
     for tab in [
-        General, Audio, Video, Control, Osc, Dmx, Api, Timecode, Midi,
+        General, Recording, Defaults, Audio, Video, Control, Osc, Dmx, Api, Timecode, Midi,
     ] {
         let mut h = app();
         h.state_mut().prefs_open = true;
@@ -5955,6 +5955,8 @@ fn prefs_and_output_setup_kit_windows_render() {
         assert!(exists(&h, l), "output: {l}");
     }
     for tab in [
+        "Recording",
+        "Defaults",
         "Audio",
         "Video",
         "Control",
@@ -8253,4 +8255,237 @@ fn output_setup_snapshots() {
     settle(&mut h);
     snap(&mut h, "23-output-screen-props");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prefs_recording_tab_holds_folders_and_codec() {
+    let mut h = app();
+    h.state_mut().prefs_open = true;
+    h.state_mut().prefs_tab = PrefsTab::Recording;
+    settle(&mut h);
+    for l in ["Recording folder", "Snapshot folder", "Quality"] {
+        assert!(exists(&h, l), "recording tab: {l}");
+    }
+    snap(&mut h, "40-prefs-recording");
+    h.state_mut().prefs_tab = PrefsTab::General;
+    settle(&mut h);
+    assert!(!exists(&h, "Recording folder"), "moved out of General");
+    assert!(exists(&h, "Clip start offset"));
+}
+
+#[test]
+fn prefs_defaults_apply_to_a_new_clip() {
+    let mut h = app();
+    h.state_mut().prefs.defaults.play_mode = vjc_model::PlayMode::Bounce;
+    h.state_mut().prefs.defaults.direction = vjc_model::Direction::Backward;
+    h.state_mut().prefs.defaults.trigger_mode = vjc_model::TriggerMode::Continue;
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().load_file(layer, 0, "/x/new.mp4".into());
+    let deck = h.state().project.composition.current_deck;
+    let k = vjc_core::clip_in(&h.state().project, deck, layer, 0).expect("clip");
+    assert_eq!(k.transport.play_mode, vjc_model::PlayMode::Bounce);
+    assert_eq!(k.transport.direction, vjc_model::Direction::Backward);
+    assert_eq!(k.transport.trigger_mode, vjc_model::TriggerMode::Continue);
+    // Control: stock prefs leave the stock transport.
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().load_file(layer, 0, "/x/new.mp4".into());
+    let deck = h.state().project.composition.current_deck;
+    let k = vjc_core::clip_in(&h.state().project, deck, layer, 0).expect("clip");
+    assert_eq!(k.transport.play_mode, vjc_model::PlayMode::Loop);
+}
+
+#[test]
+fn prefs_defaults_and_web_tabs_render() {
+    let mut h = app();
+    h.state_mut().prefs_open = true;
+    h.state_mut().prefs_tab = PrefsTab::Defaults;
+    settle(&mut h);
+    for l in ["Play mode", "Direction", "Clip start", "Bounce"] {
+        assert!(exists(&h, l), "defaults tab: {l}");
+    }
+    snap(&mut h, "41-prefs-defaults");
+    h.state_mut().prefs.api.enabled = true;
+    h.state_mut().prefs_tab = PrefsTab::Api;
+    settle(&mut h);
+    assert!(exists(&h, "Web remote PIN"));
+    snap(&mut h, "42-prefs-web");
+}
+
+#[test]
+fn view_menu_toggle_hides_its_panel_and_persists_in_the_layout() {
+    let mut h = app();
+    settle(&mut h);
+    assert!(exists(&h, "Crossfader (expanded)"));
+    assert!(exists(&h, "Undo"));
+    click(&mut h, "View");
+    snap(&mut h, "43-view-menu");
+    click(&mut h, "Crossfader");
+    settle(&mut h);
+    assert!(h.state().prefs.layouts.current.is_hidden("crossfader"));
+    assert!(!exists(&h, "Crossfader (expanded)"), "section is gone");
+    assert!(exists(&h, "Undo"), "others stay");
+    // The toolbar toggle hides undo/redo.
+    click(&mut h, "View");
+    click(&mut h, "Undo toolbar");
+    settle(&mut h);
+    assert!(!exists(&h, "Undo"));
+    assert!(!exists(&h, "Redo"));
+    // Showing it again brings the section back.
+    click(&mut h, "View");
+    click(&mut h, "Crossfader");
+    settle(&mut h);
+    assert!(exists(&h, "Crossfader (expanded)"));
+}
+
+/// Opens a submenu of an open menu by hovering its button.
+fn open_sub(h: &mut Harness<'_, State>, label: &str) {
+    h.get_by_label(&format!("{label} \u{23f5}")).click();
+    h.run_steps(8);
+}
+
+#[test]
+fn clip_menu_entries_run_the_clip_commands() {
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    h.state_mut().load_file(layer, 0, "/x/menu.mp4".into());
+    h.state_mut().selected = Some((layer, 0));
+    let deck = h.state().project.composition.current_deck;
+    let clip = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, layer, 0)
+            .expect("clip")
+            .clone()
+    };
+    settle(&mut h);
+    click(&mut h, "Clip menu");
+    snap(&mut h, "44-clip-menu");
+    open_sub(&mut h, "Target");
+    click(&mut h, "Free layer");
+    assert_eq!(clip(&h).target, vjc_model::ClipTarget::Free);
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Trigger style");
+    click(&mut h, "Toggle");
+    assert_eq!(clip(&h).trigger_style, vjc_model::TriggerStyle::Toggle);
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Transport");
+    click(&mut h, "BPM sync");
+    assert!(clip(&h).transport.beat_sync.is_some());
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Fader start: layer (off)");
+    click(&mut h, "On");
+    assert_eq!(clip(&h).extras.fader_start, Some(true));
+    click(&mut h, "Clip menu");
+    open_sub(&mut h, "Ignore column: layer (off)");
+    click(&mut h, "Off");
+    assert_eq!(clip(&h).extras.ignore_column_trigger, Some(false));
+}
+
+#[test]
+fn output_led_grid_draws_over_the_canvas_and_shows_in_output() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click_tab(&mut h, "Output");
+    let drawn = |h: &Harness<'_, State>| {
+        h.ctx
+            .data(|d| d.get_temp::<usize>(crate::output_extras::led_drawn_id()))
+            .unwrap_or(0)
+    };
+    assert_eq!(drawn(&h), 0, "off by default");
+    click(&mut h, "Grid lines");
+    click(&mut h, "LED grid");
+    assert!(h.state().out_win.as_ref().unwrap().led_grid);
+    assert_eq!(h.state().out_win.as_ref().unwrap().led_cell, 8);
+    // Cells of 8 px are too small for the zoomed-out canvas: nothing is drawn yet.
+    h.state_mut().out_win.as_mut().unwrap().led_cell = 40;
+    settle(&mut h);
+    assert!(drawn(&h) > 20, "lines drawn: {}", drawn(&h));
+    click(&mut h, "Show in output");
+    assert!(h.state().out_win.as_ref().unwrap().show_in_output);
+    snap(&mut h, "45-output-led-grid");
+    // Control: switching it off clears the lines.
+    click(&mut h, "LED grid");
+    assert_eq!(drawn(&h), 0);
+}
+
+#[test]
+fn output_slice_menu_centres_orders_and_copies_slices() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click_tab(&mut h, "Output");
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    snap(&mut h, "46-output-slice-menu");
+    click(&mut h, "Centre X");
+    let b = slice_named(&h, "Left outer");
+    let x0 = b.output_mesh.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+    let x1 = b.output_mesh.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+    assert!(
+        ((x0 + x1) / 2.0 - 960.0).abs() < 0.5,
+        "centred, got {x0}..{x1}"
+    );
+    // Bring forward: the slice moves one place later in the list.
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Bring forward");
+    let names: Vec<String> = slices_of(&h).into_iter().map(|s| s.name).collect();
+    assert_eq!(names[3], "Left outer");
+    // Mirror Y flips in place: the order of the mesh rows swaps.
+    let before = slice_named(&h, "Left outer").output_mesh;
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Mirror Y");
+    let after = slice_named(&h, "Left outer").output_mesh;
+    assert_eq!(after[0].1, before[2].1);
+    // Copy then paste adds a shifted copy with a fresh id.
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Copy");
+    assert_eq!(h.state().slice_clip.len(), 1);
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Paste");
+    let all = slices_of(&h);
+    assert_eq!(all.len(), 7);
+    let copies: Vec<_> = all.iter().filter(|s| s.name == "Left outer").collect();
+    assert_eq!(copies.len(), 2);
+    assert_ne!(copies[0].id, copies[1].id);
+    // Cut removes the slice and keeps it on the clipboard.
+    h.get_by_label("Centre").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Cut");
+    assert_eq!(slices_of(&h).len(), 6);
+    assert_eq!(h.state().slice_clip[0].name, "Centre");
+}
+
+#[test]
+fn output_plus_menu_adds_an_artnet_screen_and_mesh_subdivisions_resize() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click(&mut h, "Add");
+    click(&mut h, "Add Art-Net output (DMX universe, fixtures)");
+    let screens = &h.state().project.output.screens;
+    assert_eq!(screens.len(), 2);
+    assert!(matches!(
+        screens[1].device,
+        vjc_model::OutputDevice::ArtNet { .. }
+    ));
+    // Subdivisions of the warp mesh: 3 x 3 points instead of 2 x 2.
+    let (scr, sl) = {
+        let s = &h.state().project.output.screens[0];
+        (s.id, s.slices[0].id)
+    };
+    assert_eq!(
+        h.state().project.output.screens[0].slices[0]
+            .output_mesh
+            .len(),
+        4
+    );
+    h.state_mut().exec(Command::SetSliceMeshSize {
+        screen: scr,
+        slice: sl,
+        cols: 3,
+        rows: 3,
+    });
+    let m = &h.state().project.output.screens[0].slices[0];
+    assert_eq!((m.mesh_cols, m.output_mesh.len()), (3, 9));
 }

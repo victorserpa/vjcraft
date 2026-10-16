@@ -24,6 +24,8 @@ impl State {
                 ui.horizontal(|ui| {
                     for (t, l) in [
                         (PrefsTab::General, "General"),
+                        (PrefsTab::Recording, "Recording"),
+                        (PrefsTab::Defaults, "Defaults"),
                         (PrefsTab::Audio, "Audio"),
                         (PrefsTab::Video, "Video"),
                         (PrefsTab::Control, "Control"),
@@ -34,7 +36,7 @@ impl State {
                         (PrefsTab::Timecode, "Timecode"),
                     ] {
                         let r = ui.selectable_value(&mut self.prefs_tab, t, l);
- let key = match t { PrefsTab::General => "prefs-general", PrefsTab::Audio => "prefs-audio", PrefsTab::Video => "prefs-video", PrefsTab::Control => "prefs-control", PrefsTab::Osc => "prefs-osc", PrefsTab::Dmx => "prefs-dmx", PrefsTab::Api => "prefs-api", PrefsTab::Timecode => "prefs-timecode", PrefsTab::Midi => "prefs-midi" };
+ let key = match t { PrefsTab::General => "prefs-general", PrefsTab::Audio => "prefs-audio", PrefsTab::Recording => "prefs-recording", PrefsTab::Defaults => "prefs-defaults", PrefsTab::Video => "prefs-video", PrefsTab::Control => "prefs-control", PrefsTab::Osc => "prefs-osc", PrefsTab::Dmx => "prefs-dmx", PrefsTab::Api => "prefs-api", PrefsTab::Timecode => "prefs-timecode", PrefsTab::Midi => "prefs-midi" };
  crate::help::help(r, key);
                     }
                 });
@@ -48,14 +50,19 @@ impl State {
                         });
                         toggle(ui, &mut p.general.open_last_project, "Open last project at startup");
                         toggle(ui, &mut p.general.confirm_quit, "Confirm before quitting");
-                        egui::ComboBox::from_label("Blend of new layers")
-                            .selected_text(blend_name(&p.general.default_blend))
-                            .show_ui(ui, |ui| {
-                                for b in DEFAULT_BLENDS {
-                                    let name = blend_name(&b);
-                                    ui.selectable_value(&mut p.general.default_blend, b, name);
-                                }
-                            });
+                        ui.horizontal(|ui| {
+                            ui.label("Clip start offset");
+                            field_int(ui, &mut p.general.clip_start_offset_ms, 0..=600_000, "", " ms");
+                        });
+                        help(ui, "A triggered clip starts this far into the file (0 = at its in-point).");
+                        ui.horizontal(|ui| {
+                            ui.label("Interface scale");
+                            ui.add(
+                                egui::Slider::new(&mut p.general.ui_scale, 0.75..=2.0)
+                                    .step_by(0.05)
+                                    .fixed_decimals(2),
+                            );
+                        });
                         ui.horizontal(|ui| {
                             ui.label("Browser start folder");
                             let mut t = p
@@ -98,6 +105,8 @@ impl State {
                             "Where Depth and Remove Background look for their .onnx files \
                              (empty = the app data folder, models/). See docs/ml.md.",
                         );
+                    }
+                    PrefsTab::Recording => {
                         ui.horizontal(|ui| {
                             ui.label("Recording folder");
                             // Edited in a scratch string; committed on Enter or focus loss.
@@ -157,6 +166,55 @@ impl State {
                             "Only codecs this build can encode are listed. Quality 1 (small) to 100 (best); \
                              ignored by the lossless PNG sequence. Applies to the next recording.",
                         );
+                        ui.horizontal(|ui| {
+                            ui.label("Snapshot folder");
+                            let mut t = p
+                                .general
+                                .snapshot_folder
+                                .as_ref()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default();
+                            if field_text(ui, &mut t, Width::Lg, None).changed() {
+                                p.general.snapshot_folder =
+                                    (!t.trim().is_empty()).then(|| t.trim().into());
+                            }
+                            if btn(ui, "Choose...", Kind::Secondary).clicked()
+                                && let Some(d) = rfd::FileDialog::new().pick_folder()
+                            {
+                                p.general.snapshot_folder = Some(d);
+                            }
+                        });
+                        help(ui, "Empty = ask on the first snapshot.");
+                    }
+                    PrefsTab::Defaults => {
+                        help(ui, "Applied to clips and layers created from now on.");
+                        egui::ComboBox::from_label("Blend of new layers")
+                            .selected_text(blend_name(&p.general.default_blend))
+                            .show_ui(ui, |ui| {
+                                for b in DEFAULT_BLENDS {
+                                    let name = blend_name(&b);
+                                    ui.selectable_value(&mut p.general.default_blend, b, name);
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label("Play mode");
+                            for (m, l) in PLAY_MODES {
+                                ui.selectable_value(&mut p.defaults.play_mode, m, l);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Direction");
+                            for (d, l) in DIRECTIONS {
+                                ui.selectable_value(&mut p.defaults.direction, d, l);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Clip start");
+                            for (m, l) in TRIGGER_MODES {
+                                ui.selectable_value(&mut p.defaults.trigger_mode, m, l);
+                            }
+                        });
+                        help(ui, "Clip start: from the in-point, where it stopped, at the same fraction as the previous clip, or the layer's choice.");
                     }
                     PrefsTab::Audio => {
                         let outputs = self
@@ -534,6 +592,36 @@ impl State {
 const DEFAULT_BLENDS: [vjc_model::BlendMode; 6] = {
     use vjc_model::BlendMode::{Add, Multiply, Normal, Overlay, Screen, Subtract};
     [Normal, Add, Multiply, Screen, Overlay, Subtract]
+};
+
+const PLAY_MODES: [(vjc_model::PlayMode, &str); 5] = {
+    use vjc_model::PlayMode::{Bounce, Loop, Once, OnceHold, Random};
+    [
+        (Loop, "Loop"),
+        (Bounce, "Bounce"),
+        (Once, "Once"),
+        (OnceHold, "Once, hold"),
+        (Random, "Random"),
+    ]
+};
+
+const DIRECTIONS: [(vjc_model::Direction, &str); 3] = {
+    use vjc_model::Direction::{Backward, Forward, Random};
+    [
+        (Forward, "Forward"),
+        (Backward, "Backward"),
+        (Random, "Random"),
+    ]
+};
+
+const TRIGGER_MODES: [(vjc_model::TriggerMode, &str); 4] = {
+    use vjc_model::TriggerMode::{Continue, Layer, Relative, Restart};
+    [
+        (Layer, "Layer's"),
+        (Restart, "Restart"),
+        (Continue, "Continue"),
+        (Relative, "Relative"),
+    ]
 };
 
 fn blend_name(b: &vjc_model::BlendMode) -> String {

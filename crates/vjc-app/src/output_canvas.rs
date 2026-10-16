@@ -25,6 +25,10 @@ pub(crate) fn rect_id() -> egui::Id {
     egui::Id::new("out-canvas-rect")
 }
 
+/// Width of the grid dropdown's list, wide enough for its longest toggle.
+const GRID_MENU_W: f32 = 190.0;
+/// Tallest the grid dropdown grows before it scrolls (it holds the grids and the view toggles).
+const GRID_MENU_H: f32 = 360.0;
 /// Zoom steps of the dropdown, in percent.
 const ZOOM_STEPS: [u32; 4] = [25, 50, 100, 200];
 /// Room kept around the content when it is fitted.
@@ -276,6 +280,13 @@ impl State {
         let (tab, mode, zoom, hand, grid) = (w.tab, w.mode, w.zoom, w.hand, w.grid);
         let (can_undo, can_redo) = (w.can_undo(), w.can_redo());
         let custom = w.grid_custom;
+        let mut view = (
+            w.show_slices,
+            w.led_grid,
+            w.led_cell,
+            w.identify,
+            w.show_in_output,
+        );
         let (mut new_tab, mut new_mode) = (tab, mode);
         let (mut new_zoom, mut new_hand, mut new_grid, mut new_custom) = (zoom, hand, grid, custom);
         let mut act = None;
@@ -351,7 +362,9 @@ impl State {
                 GridKind::Custom => format!("Grid: {}x{}", custom.0, custom.1),
             };
             let r = egui::ComboBox::from_id_salt("out-grid")
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .width(100.0)
+                .height(GRID_MENU_H)
                 .selected_text(glabel)
                 .show_ui(ui, |ui| {
                     for (g, name) in [
@@ -368,6 +381,15 @@ impl State {
                         widgets::field_int(ui, &mut new_custom.0, 1..=64, "Cols ", "");
                         widgets::field_int(ui, &mut new_custom.1, 1..=64, "Rows ", "");
                     });
+                    ui.separator();
+                    ui.set_min_width(GRID_MENU_W);
+                    widgets::toggle(ui, &mut view.0, "Show slice grid");
+                    ui.horizontal(|ui| {
+                        widgets::toggle(ui, &mut view.1, "LED grid");
+                        widgets::field_int(ui, &mut view.2, 2..=256, "", " px");
+                    });
+                    widgets::toggle(ui, &mut view.3, "Identify slices");
+                    widgets::toggle(ui, &mut view.4, "Show in output");
                 });
             r.response.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Grid lines")
@@ -416,6 +438,13 @@ impl State {
             w.hand = new_hand;
             w.grid = new_grid;
             w.grid_custom = new_custom;
+            (
+                w.show_slices,
+                w.led_grid,
+                w.led_cell,
+                w.identify,
+                w.show_in_output,
+            ) = view;
         }
         match act {
             Some(false) => self.out_undo(),
@@ -442,6 +471,11 @@ impl State {
         let (tab, mode, hand) = (win.tab, win.mode, win.hand);
         let (zoom, pan, grid) = (win.zoom, win.pan, win.grid_dims());
         let guide_on = win.guide_on;
+        let (show_slices, led, identify) = (
+            win.show_slices,
+            win.led_grid.then_some(win.led_cell),
+            win.identify,
+        );
         let comp = (
             self.project.composition.width,
             self.project.composition.height,
@@ -548,6 +582,18 @@ impl State {
                 p.hline(view.rect.x_range(), y, line);
             }
         }
+        let mut led_lines = 0;
+        if let Some(cell) = led {
+            let lines = crate::output_extras::led_segments(view.rect, space, cell);
+            led_lines = lines.len();
+            let stroke = egui::Stroke::new(STROKE_W, crate::theme::LED_GRID);
+            p.extend(
+                lines
+                    .into_iter()
+                    .map(|l| egui::Shape::line_segment(l, stroke)),
+            );
+        }
+        ui.data_mut(|d| d.insert_temp(crate::output_extras::led_drawn_id(), led_lines));
         // Slice outlines with their names.
         let sel_ids: Vec<Uuid> = scr
             .slices
@@ -559,6 +605,20 @@ impl State {
         for (i, sl) in scr.slices.iter().enumerate() {
             let poly = outline(sl, side, comp);
             if poly.len() < 3 {
+                continue;
+            }
+            if identify && let Some(b) = slice_geom::bbox(&slice_geom::side_points(sl, side, comp))
+            {
+                let c = view.px((b.x + b.w / 2.0, b.y + b.h / 2.0));
+                p.text(
+                    c,
+                    egui::Align2::CENTER_CENTER,
+                    (i + 1).to_string(),
+                    egui::FontId::proportional((view.scale * b.h * 0.5).clamp(FS_SM, 96.0)),
+                    crate::theme::IDENTIFY_TEXT,
+                );
+            }
+            if !show_slices {
                 continue;
             }
             let pts: Vec<egui::Pos2> = poly.iter().map(|q| view.px(*q)).collect();

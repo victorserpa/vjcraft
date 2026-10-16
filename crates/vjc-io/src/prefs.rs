@@ -33,6 +33,10 @@ pub struct General {
     pub confirm_quit: bool,
     /// Blend mode of layers added from the toolbar.
     pub default_blend: vjc_model::BlendMode,
+    /// Milliseconds into a clip that a trigger starts at (0 = at the in-point).
+    pub clip_start_offset_ms: u32,
+    /// Scale of the whole interface (1.0 = normal).
+    pub ui_scale: f32,
 }
 
 /// Longest recent-projects list kept.
@@ -62,6 +66,12 @@ impl General {
     }
 
     fn sanitize(&mut self) {
+        self.clip_start_offset_ms = self.clip_start_offset_ms.min(600_000);
+        self.ui_scale = if self.ui_scale.is_finite() {
+            self.ui_scale.clamp(0.75, 2.0)
+        } else {
+            1.0
+        };
         let mut seen = std::collections::HashSet::new();
         self.recent_projects.retain(|p| seen.insert(p.clone()));
         self.recent_projects.truncate(MAX_RECENT);
@@ -95,6 +105,8 @@ impl Default for General {
             snapshot_folder: None,
             confirm_quit: false,
             default_blend: vjc_model::BlendMode::Normal,
+            clip_start_offset_ms: 0,
+            ui_scale: 1.0,
         }
     }
 }
@@ -299,6 +311,41 @@ impl Default for Record {
     }
 }
 
+/// What a new clip starts with (applied when a file is loaded into a cell).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Defaults {
+    pub play_mode: vjc_model::PlayMode,
+    pub direction: vjc_model::Direction,
+    /// Where a trigger starts the clip (`Layer` = the layer's setting).
+    pub trigger_mode: vjc_model::TriggerMode,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        let t = vjc_model::Transport::default();
+        Defaults {
+            play_mode: t.play_mode,
+            direction: t.direction,
+            trigger_mode: t.trigger_mode,
+        }
+    }
+}
+
+impl Defaults {
+    /// Sets the transport of a freshly created clip.
+    pub fn apply(&self, clip: &mut vjc_model::Clip) {
+        let t = &mut clip.transport;
+        t.play_mode = self.play_mode;
+        t.direction = self.direction;
+        t.resume_direction = match self.direction {
+            vjc_model::Direction::Pause => vjc_model::Direction::Forward,
+            d => d,
+        };
+        t.trigger_mode = self.trigger_mode;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Osc {
@@ -422,7 +469,22 @@ pub struct Layout {
     pub grid: bool,
     /// Speed sliders of the master, groups and clips (hidden = less clutter, speeds stay).
     pub speed_sliders: bool,
+    /// Interface parts hidden by the user (keys of `VIEW_TOGGLES`).
+    pub hidden: Vec<String>,
 }
+
+/// Parts of the interface the View menu can show or hide: (key, menu label).
+pub const VIEW_TOGGLES: [(&str, &str); 9] = [
+    ("crossfader", "Crossfader"),
+    ("dashboard", "Dashboard"),
+    ("autopilot", "Autopilot sections"),
+    ("cue-points", "Cue points"),
+    ("transition", "Transition controls"),
+    ("layer-transport", "Layer transport controls"),
+    ("undo", "Undo toolbar"),
+    ("column-triggers", "Column triggers"),
+    ("audio", "Audio controls"),
+];
 
 impl Default for Layout {
     fn default() -> Self {
@@ -436,11 +498,25 @@ impl Default for Layout {
             params_h: 400.0,
             grid: true,
             speed_sliders: true,
+            hidden: vec![],
         }
     }
 }
 
 impl Layout {
+    /// Whether the interface part `key` (see `VIEW_TOGGLES`) is hidden.
+    pub fn is_hidden(&self, key: &str) -> bool {
+        self.hidden.iter().any(|h| h == key)
+    }
+
+    /// Hides or shows the interface part `key`.
+    pub fn set_hidden(&mut self, key: &str, hide: bool) {
+        self.hidden.retain(|h| h != key);
+        if hide {
+            self.hidden.push(key.to_owned());
+        }
+    }
+
     /// The built-in layouts, in menu order.
     pub fn presets() -> Vec<Layout> {
         let d = Layout::default();
@@ -468,6 +544,10 @@ impl Layout {
     }
 
     fn sanitize(&mut self) {
+        self.hidden
+            .retain(|k| VIEW_TOGGLES.iter().any(|(key, _)| key == k));
+        self.hidden.sort();
+        self.hidden.dedup();
         self.name = self.name.trim().to_owned();
         for v in [
             &mut self.browser_w,
@@ -552,6 +632,7 @@ pub struct Prefs {
     pub control: Control,
     pub audio: Audio,
     pub record: Record,
+    pub defaults: Defaults,
     pub midi: Midi,
     pub osc: Osc,
     pub dmx: Dmx,
@@ -571,6 +652,7 @@ impl Default for Prefs {
             control: Control::default(),
             audio: Audio::default(),
             record: Record::default(),
+            defaults: Defaults::default(),
             midi: Midi::default(),
             osc: Osc::default(),
             dmx: Dmx::default(),
@@ -696,6 +778,43 @@ fn merge_unknown(new: &mut serde_json::Value, old: &serde_json::Value, known: &s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hidden_view_parts_roundtrip_and_unknown_keys_are_dropped() {
+        let mut p = super::Prefs::default();
+        p.layouts.current.set_hidden("crossfader", true);
+        p.layouts.current.set_hidden("undo", true);
+        p.layouts.current.set_hidden("undo", false);
+        let (back, _) = super::Prefs::from_json(&serde_json::to_string(&p).unwrap());
+        assert!(back.layouts.current.is_hidden("crossfader"));
+        assert!(!back.layouts.current.is_hidden("undo"));
+        let (old, _) =
+            super::Prefs::from_json(r#"{"layouts":{"current":{"hidden":["x","audio"]}}}"#);
+        assert_eq!(old.layouts.current.hidden, vec!["audio".to_owned()]);
+    }
+
+    #[test]
+    fn new_prefs_fields_roundtrip_and_default_when_missing() {
+        let mut p = super::Prefs::default();
+        p.general.clip_start_offset_ms = 1500;
+        p.general.ui_scale = 1.25;
+        p.defaults.play_mode = vjc_model::PlayMode::Bounce;
+        p.defaults.direction = vjc_model::Direction::Backward;
+        p.defaults.trigger_mode = vjc_model::TriggerMode::Continue;
+        let (back, warn) = super::Prefs::from_json(&serde_json::to_string(&p).unwrap());
+        assert!(warn.is_none());
+        assert_eq!(back.general.clip_start_offset_ms, 1500);
+        assert_eq!(back.general.ui_scale, 1.25);
+        assert_eq!(back.defaults, p.defaults);
+        // An old file without the fields loads with the defaults.
+        let (old, warn) = super::Prefs::from_json(r#"{"general":{"autosave":false}}"#);
+        assert!(warn.is_none());
+        assert_eq!(old.defaults, super::Defaults::default());
+        assert_eq!(old.general.ui_scale, 1.0);
+        // Nonsense is clamped.
+        let (bad, _) = super::Prefs::from_json(r#"{"general":{"ui_scale":99.0}}"#);
+        assert_eq!(bad.general.ui_scale, 2.0);
+    }
+
     #[derive(Default, serde::Serialize, serde::Deserialize)]
     #[serde(default)]
     struct Inner {

@@ -38,11 +38,49 @@ pub fn reset_to(current: &Value, default: &Value) -> Option<Value> {
     (current != default).then(|| default.clone())
 }
 
+/// View-menu key (see `vjc_io::prefs::VIEW_TOGGLES`) that hides the section `id`.
+fn view_key(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "sec-crossfader" => "crossfader",
+        "sec-dashboard" | "sec-layer-dashboard" | "sec-clip-dashboard" => "dashboard",
+        "sec-comp-autopilot" | "sec-autopilot" => "autopilot",
+        "sec-cues" => "cue-points",
+        "sec-transition" | "sec-clip-transition" => "transition",
+        "sec-comp-audio" | "sec-layer-audio" | "sec-clip-audio" => "audio",
+        _ => return None,
+    })
+}
+
+fn hidden_id() -> egui::Id {
+    egui::Id::new("view-hidden-parts")
+}
+
+/// Hands the hidden interface parts of the current layout to the drawing code.
+pub fn set_hidden(ctx: &egui::Context, hidden: &[String]) {
+    let same = ctx
+        .data(|d| d.get_temp::<Vec<String>>(hidden_id()))
+        .is_some_and(|v| v == hidden);
+    if !same {
+        ctx.data_mut(|d| d.insert_temp(hidden_id(), hidden.to_vec()));
+    }
+}
+
+/// Whether the interface part `key` is hidden in the layout in use.
+pub fn is_hidden(ctx: &egui::Context, key: &str) -> bool {
+    ctx.data(|d| d.get_temp::<Vec<String>>(hidden_id()))
+        .is_some_and(|v| v.iter().any(|k| k == key))
+}
+
 /// Collapsible section header: full-width bar with a fold arrow and the title. The open
 /// state lives in egui memory under `id`, sections start open. Returns whether the body
 /// should be drawn. AccessKit name: "<title> (expanded|collapsed)".
 pub fn section(ui: &mut egui::Ui, id: &'static str, title: &str) -> bool {
     use crate::theme;
+    if let Some(k) = view_key(id)
+        && is_hidden(ui.ctx(), k)
+    {
+        return false;
+    }
     let key = ui.id().with(("section", id));
     let mut open = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(true);
     let (rect, r) = ui.allocate_exact_size(
