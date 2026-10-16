@@ -112,6 +112,9 @@ pub struct Video {
     pub max_fps: u32,
     /// A dropped folder that is a pure numbered image sequence becomes one clip.
     pub folder_sequence: bool,
+    /// Ask for a 10-bit (Rgb10a2) output surface; read at startup, falls back to 8-bit when
+    /// the adapter or surface cannot do it.
+    pub output_10bit: bool,
 }
 
 impl Default for Video {
@@ -124,6 +127,7 @@ impl Default for Video {
             vsync: true,
             max_fps: 0,
             folder_sequence: true,
+            output_10bit: false,
         }
     }
 }

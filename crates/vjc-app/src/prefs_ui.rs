@@ -244,6 +244,7 @@ impl State {
                             });
                         toggle(ui, &mut p.video.folder_sequence, "Dropped folder of numbered images becomes one sequence clip");
                         toggle(ui, &mut p.video.vsync, "VSync (applies on next launch)");
+                        toggle(ui, &mut p.video.output_10bit, "10-bit output when the display allows it (applies on next launch)");
                     }
                     PrefsTab::Control => {
                         toggle(ui, &mut p.control.default_shortcuts, "New projects get the default shortcut preset");

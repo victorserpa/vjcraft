@@ -213,6 +213,10 @@ fn per_channel(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
 // Full-colour modes appended after the original 19 (mirrors blend.rs `color_mode`).
 fn color_mode(id: u32, b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
     if (id == 36u) { return vec3(1.0) - abs(b - s); }
+    if (id == 40u) {
+        let w = clamp(0.5 + luma(s) - luma(b), 0.0, 1.0);
+        return b + (s - b) * w;
+    }
     if (id == 19u) {
         return select(min(b / s, vec3(1.0)), vec3(1.0), s <= vec3(0.0));
     }
@@ -425,7 +429,16 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         let o = vec2<f32>(f32(i32(h & 7u) - 4), f32(i32((h >> 8u) & 7u) - 4));
         q = clamp(q + o / td, vec2(0.5) / td, vec2(1.0) - vec2(0.5) / td);
     }
+    if (u.mode == 41u) {
+        // Multi Task: the source tiled 2 x 2 (mirrors blend.rs `multitask_uv`).
+        q = fract(q * 2.0);
+    }
     var s = textureSample(tex, smp, q);
+    if (u.mode == 42u) {
+        // Cube: three face shades per 16 px cell (mirrors blend.rs `cube_shade`).
+        let cp = vec2<u32>(in.pos.xy) % vec2<u32>(16u);
+        s = vec4(s.rgb * select(select(0.45, 0.7, cp.x < 8u), 1.0, cp.y < 8u), s.a);
+    }
     // pad bit 4: the source is premultiplied; blending wants straight colour.
     if ((u.pad & 16u) != 0u && s.a > 0.0) { s = vec4(min(s.rgb / s.a, vec3(1.0)), s.a); }
     // pad = channel mask: bit 0..3 set = R, G, B, A off (off alpha means opaque).
@@ -470,7 +483,7 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         let off = vec2<i32>(round((s.rg - vec2(0.5)) * 32.0));
         let bp = clamp(vec2<i32>(in.pos.xy) + off, vec2<i32>(0), bs);
         rgb = textureLoad(base_tex, bp, 0).rgb;
-    } else if (id == 25u) {
+    } else if (id == 25u || id == 41u || id == 42u) {
         rgb = s.rgb;
     } else if (id >= 19u) {
         rgb = color_mode(id, b.rgb, s.rgb);
@@ -632,6 +645,8 @@ type Scratch = [(wgpu::Texture, wgpu::TextureView); 3];
 
 /// Effect pipelines and the ping-pong textures the chains render through.
 struct Fx {
+    /// Format of the effect textures (the composition's).
+    fmt: wgpu::TextureFormat,
     vs: wgpu::ShaderModule,
     layout: wgpu::PipelineLayout,
     pipes: HashMap<String, wgpu::RenderPipeline>,
@@ -661,6 +676,94 @@ struct Fx {
     pass_targets: Pool<(u32, u32, usize), (wgpu::Texture, wgpu::TextureView)>,
     /// Where a targeted pass renders before the result is copied to its buffer.
     pass_tmp: Pool<(u32, u32), (wgpu::Texture, wgpu::TextureView)>,
+}
+
+/// Fragment stage that copies a texture, converting it to the 8-bit format of `FORMAT`.
+const RESOLVE_FS: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@fragment
+fn fs(in: VO) -> @location(0) vec4<f32> {
+    return textureSample(src, smp, vec2(in.uv.x, 1.0 - in.uv.y));
+}
+"#;
+
+/// Converts a 16-bit composition to the 8-bit texture that snapshots, recording and
+/// network outputs read (they all expect `FORMAT`).
+struct Resolve {
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    bgl: wgpu::BindGroupLayout,
+    pipe: wgpu::RenderPipeline,
+}
+
+impl Resolve {
+    fn new(device: &wgpu::Device, w: u32, h: u32) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("resolve"),
+            source: wgpu::ShaderSource::Wgsl(format!("{FX_VS}{RESOLVE_FS}").into()),
+        });
+        let tex_entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty,
+            count: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("resolve_bgl"),
+            entries: &[
+                tex_entry(
+                    0,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                tex_entry(
+                    1,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("resolve_pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("resolve"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let (tex, view) = make_target(device, FORMAT, w.max(1), h.max(1));
+        Resolve {
+            tex,
+            view,
+            bgl,
+            pipe,
+        }
+    }
 }
 
 /// A LUT uploaded as a strip texture (see `vjc_fx::lut`).
@@ -746,7 +849,7 @@ fn persist_key(id: uuid::Uuid, scope: u128) -> uuid::Uuid {
     uuid::Uuid::from_u128(half(0) << 64 | half(1))
 }
 
-fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
+fn make_scratch(device: &wgpu::Device, fmt: wgpu::TextureFormat, (w, h): (u32, u32)) -> Scratch {
     let mk = || {
         let t = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("fx_scratch"),
@@ -758,7 +861,7 @@ fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
+            format: fmt,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -771,7 +874,11 @@ fn make_scratch(device: &wgpu::Device, (w, h): (u32, u32)) -> Scratch {
 }
 
 /// Texture holding a persistent effect's previous output (zeroed by wgpu on creation).
-fn make_history(device: &wgpu::Device, (w, h): (u32, u32)) -> (wgpu::Texture, wgpu::TextureView) {
+fn make_history(
+    device: &wgpu::Device,
+    fmt: wgpu::TextureFormat,
+    (w, h): (u32, u32),
+) -> (wgpu::Texture, wgpu::TextureView) {
     let t = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("fx_history"),
         size: wgpu::Extent3d {
@@ -782,7 +889,7 @@ fn make_history(device: &wgpu::Device, (w, h): (u32, u32)) -> (wgpu::Texture, wg
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format: fmt,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1006,7 +1113,9 @@ impl Fx {
                 }
                 (_, m) => m,
             };
-            let scratch = self.scratch.acquire(size, || make_scratch(device, size));
+            let scratch = self
+                .scratch
+                .acquire(size, || make_scratch(device, self.fmt, size));
             if self.bufs.len() <= self.next {
                 self.bufs
                     .push(device.create_buffer(&wgpu::BufferDescriptor {
@@ -1054,18 +1163,19 @@ impl Fx {
                     match key {
                         Some(key) => {
                             self.targets
-                                .acquire(*key, sz, || make_target(device, sz.0, sz.1));
+                                .acquire(*key, sz, || make_target(device, self.fmt, sz.0, sz.1));
                         }
                         None => {
-                            self.pass_targets
-                                .acquire((sz.0, sz.1, k), || make_target(device, sz.0, sz.1));
+                            self.pass_targets.acquire((sz.0, sz.1, k), || {
+                                make_target(device, self.fmt, sz.0, sz.1)
+                            });
                         }
                     }
                 }
                 for p in passes.iter().filter(|p| p.target.is_some()) {
                     let sz = p.size(size);
                     self.pass_tmp
-                        .acquire(sz, || make_target(device, sz.0, sz.1));
+                        .acquire(sz, || make_target(device, self.fmt, sz.0, sz.1));
                 }
                 let tex = |k: usize| -> &(wgpu::Texture, wgpu::TextureView) {
                     match &keys[k] {
@@ -1135,7 +1245,7 @@ impl Fx {
                     let key = persist_key(id, self.persist_scope);
                     let (tex, how) = self
                         .persist
-                        .acquire(key, size, || make_history(device, size));
+                        .acquire(key, size, || make_history(device, self.fmt, size));
                     (key, tex, how)
                 });
                 let mut uniforms = e.uniforms;
@@ -1372,6 +1482,10 @@ struct Slot {
 }
 
 pub struct Compositor {
+    /// Format of the composition and every texture rendered in it (see `color_depth`).
+    pub(crate) fmt: wgpu::TextureFormat,
+    /// 8-bit copy of the composition for readers; only when `fmt` is not `FORMAT`.
+    resolve: Option<Resolve>,
     pipe: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     /// Layout of effect passes (`bgl` plus the ML mask).
@@ -1413,7 +1527,12 @@ pub struct Compositor {
     pub size: (u32, u32),
 }
 
-fn make_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+fn make_target(
+    device: &wgpu::Device,
+    fmt: wgpu::TextureFormat,
+    w: u32,
+    h: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let t = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("composition"),
         size: wgpu::Extent3d {
@@ -1424,7 +1543,7 @@ fn make_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format: fmt,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC
@@ -1438,6 +1557,7 @@ fn make_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
 /// Copy of the composition used as the blend base (a pass cannot read what it writes).
 fn make_base(
     device: &wgpu::Device,
+    fmt: wgpu::TextureFormat,
     layout: &wgpu::BindGroupLayout,
     w: u32,
     h: u32,
@@ -1453,7 +1573,7 @@ fn make_base(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format: fmt,
         usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -1508,7 +1628,14 @@ pub(crate) fn fx_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 }
 
 impl Compositor {
+    #[cfg(test)]
     pub fn new(device: &wgpu::Device, w: u32, h: u32) -> Self {
+        Self::with_format(device, w, h, FORMAT)
+    }
+
+    /// Compositor whose render textures use `fmt` (`Rgba8Unorm`, or `Rgba16Float` for a
+    /// 16-bit composition).
+    pub fn with_format(device: &wgpu::Device, w: u32, h: u32, fmt: wgpu::TextureFormat) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("compositor"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -1580,7 +1707,7 @@ impl Compositor {
                 module: &module,
                 entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
+                    format: fmt,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1711,7 +1838,7 @@ impl Compositor {
                 module: &mix_fs,
                 entry_point: Some("main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
+                    format: fmt,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1727,6 +1854,7 @@ impl Compositor {
         });
         let ml = MlStore::new(device, &fx_vs, &fx_layout);
         let fx = Fx {
+            fmt,
             vs: fx_vs,
             layout: fx_layout,
             ml,
@@ -1747,13 +1875,16 @@ impl Compositor {
             pass_targets: Pool::new(),
             pass_tmp: Pool::new(),
         };
-        let (target, target_view) = make_target(device, w, h);
-        let white = make_target(device, 1, 1);
+        let (target, target_view) = make_target(device, fmt, w, h);
+        let white = make_target(device, fmt, 1, 1);
         // At least 2x2: a 1x1 mask texture means "no mask" to the shader.
-        let mask = make_target(device, w.max(2), h.max(2));
+        let mask = make_target(device, fmt, w.max(2), h.max(2));
         let (base, base_bind, base_bind_masked) =
-            make_base(device, &base_bgl, w, h, (&white.1, &mask.1));
+            make_base(device, fmt, &base_bgl, w, h, (&white.1, &mask.1));
+        let resolve = (fmt != FORMAT).then(|| Resolve::new(device, w, h));
         Compositor {
+            fmt,
+            resolve,
             pipe,
             bgl,
             fx_bgl,
@@ -1835,13 +1966,58 @@ impl Compositor {
         self.fx.scratch.clear()
     }
 
+    /// The 8-bit texture of the finished composition: `target` itself, or its converted copy
+    /// when the composition renders at 16 bits.
+    pub fn readable(&self) -> &wgpu::Texture {
+        self.resolve.as_ref().map_or(&self.target, |r| &r.tex)
+    }
+
+    /// Draws `target` into the 8-bit copy (no-op for an 8-bit composition).
+    fn encode_resolve(&self, device: &wgpu::Device, enc: &mut wgpu::CommandEncoder) {
+        let Some(r) = &self.resolve else { return };
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resolve_bg"),
+            layout: &r.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.target_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("resolve"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &r.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&r.pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     /// Blocking readback of the composition output as tight RGBA8 (a one-off, for snapshots).
     pub fn read_rgba(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Option<(u32, u32, Vec<u8>)> {
-        let (w, h) = (self.target.width(), self.target.height());
+        let tex = self.readable();
+        let (w, h) = (tex.width(), tex.height());
         let row = (w * 4).div_ceil(256) * 256;
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("snapshot"),
@@ -1851,7 +2027,7 @@ impl Compositor {
         });
         let mut enc = device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
-            self.target.as_image_copy(),
+            tex.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -1884,15 +2060,19 @@ impl Compositor {
         if self.size == (w, h) {
             return false;
         }
-        (self.target, self.target_view) = make_target(device, w.max(1), h.max(1));
-        self.mask = make_target(device, w.max(2), h.max(2));
+        (self.target, self.target_view) = make_target(device, self.fmt, w.max(1), h.max(1));
+        self.mask = make_target(device, self.fmt, w.max(2), h.max(2));
         (self.base, self.base_bind, self.base_bind_masked) = make_base(
             device,
+            self.fmt,
             &self.base_bgl,
             w.max(1),
             h.max(1),
             (&self.white.1, &self.mask.1),
         );
+        if self.resolve.is_some() {
+            self.resolve = Some(Resolve::new(device, w, h));
+        }
         self.size = (w, h);
         true
     }
@@ -1938,7 +2118,7 @@ impl Compositor {
                 module: &fs,
                 entry_point: Some("main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
+                    format: self.fmt,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2151,9 +2331,10 @@ impl Compositor {
         }
         let size = (self.size.0.max(1), self.size.1.max(1));
         if self.group.as_ref().is_none_or(|b| b.size != size) {
-            let (tex, view) = make_target(device, size.0, size.1);
+            let (tex, view) = make_target(device, self.fmt, size.0, size.1);
             let (base, base_bind, base_bind_masked) = make_base(
                 device,
+                self.fmt,
                 &self.base_bgl,
                 size.0,
                 size.1,
@@ -2636,6 +2817,7 @@ impl Compositor {
         self.fx.targets.sweep();
         let persist = &self.fx.persist;
         self.fx.ticks.retain(|k, _| persist.contains(k));
+        self.encode_resolve(device, &mut enc);
         queue.submit(Some(enc.finish()));
         self.fx.ml.dispatch(device, queue);
     }
@@ -2660,7 +2842,7 @@ impl Compositor {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: FORMAT,
+                format: self.fmt,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
@@ -2797,7 +2979,7 @@ impl Compositor {
         let size = (self.size.0.max(1), self.size.1.max(1));
         let mut rt = match self.routed.remove(&route) {
             Some(t) if (t.0.width(), t.0.height()) == size => t,
-            _ => make_target(device, size.0, size.1),
+            _ => make_target(device, self.fmt, size.0, size.1),
         };
         std::mem::swap(&mut self.target, &mut rt.0);
         std::mem::swap(&mut self.target_view, &mut rt.1);
@@ -4461,7 +4643,7 @@ mod tests {
         });
         let mut enc = device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
-            comp.target.as_image_copy(),
+            comp.readable().as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -4644,7 +4826,11 @@ mod tests {
             // Jitter reads other texels: tested apart (a flat colour can't tell it from Normal).
             if matches!(
                 mode,
-                BlendMode::Displace | BlendMode::LoRez | BlendMode::Jitter
+                BlendMode::Displace
+                    | BlendMode::LoRez
+                    | BlendMode::Jitter
+                    | BlendMode::MultiTask
+                    | BlendMode::Cube
             ) {
                 continue;
             }
@@ -4755,6 +4941,101 @@ mod tests {
             [80, 80],
             "control: Normal is unshifted"
         );
+    }
+
+    /// A 16-bit composition (Rgba16Float inside, 8-bit copy for readers) gives the same
+    /// picture as the 8-bit one through blends, a single-pass and a multipass effect.
+    /// Control: the 8-bit compositor has no copy, and a wrong bit depth would change the
+    /// target format asserted first.
+    #[test]
+    fn gpu_16bit_composition_matches_8bit() {
+        let Some((device, queue)) = gpu() else { return };
+        let mk = |fmt| {
+            let mut c = Compositor::with_format(&device, 16, 16, fmt);
+            for k in ["invert", "blur_separable"] {
+                let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source(k).unwrap()).unwrap();
+                c.add_effect_passes(&device, k, &wgsl, &isf.passes).unwrap();
+            }
+            c
+        };
+        let mut c8 = mk(FORMAT);
+        let mut c16 = mk(wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(c8.target.format(), FORMAT);
+        assert!(c8.resolve.is_none());
+        assert_eq!(c16.target.format(), wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(c16.readable().format(), FORMAT);
+        let data: Vec<u8> = (0..256)
+            .flat_map(|i| [(i % 16 * 16) as u8, (i / 16 * 16) as u8, 90, 255])
+            .collect();
+        for kind in ["invert", "blur_separable"] {
+            let a = run_fx(&device, &queue, &mut c8, kind, &[], 0.0, None, &data, 1);
+            let b = run_fx(&device, &queue, &mut c16, kind, &[], 0.0, None, &data, 1);
+            let worst = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (*x as i32 - *y as i32).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(worst <= 3, "{kind}: worst {worst:?}");
+        }
+        let base = [200u8, 100, 50, 255].repeat(256);
+        for c in [&mut c8, &mut c16] {
+            let ls = [
+                layer(1, 1.0, BlendMode::Normal, vec![], &base, 7),
+                layer(2, 0.7, BlendMode::Multiply, vec![], &data, 8),
+            ];
+            c.render(&device, &queue, &ls, &[], 1.0);
+        }
+        let (a, b) = (read16(&device, &queue, &c8), read16(&device, &queue, &c16));
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (*x as i32 - *y as i32).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(worst <= 3, "multiply: worst {worst:?}");
+        assert_ne!(
+            px_at(&a, 9, 9)[..3],
+            [200, 100, 50],
+            "blend changed the base"
+        );
+    }
+
+    /// Multi Task tiles the source 2 x 2 and Cube shades it per face. Controls: Normal
+    /// keeps the plain picture.
+    #[test]
+    fn gpu_multitask_and_cube() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut comp = Compositor::new(&device, 16, 16);
+        let base = [0u8, 0, 0, 255].repeat(256);
+        let ramp: Vec<u8> = (0..256)
+            .flat_map(|i| [(i % 16 * 16) as u8, 0, 200, 255])
+            .collect();
+        let mut draw = |mode: BlendMode, s: u64| {
+            let ls = [
+                layer(1, 1.0, BlendMode::Normal, vec![], &base, 1),
+                layer(2, 1.0, mode, vec![], &ramp, s),
+            ];
+            comp.render(&device, &queue, &ls, &[], 1.0);
+            read16(&device, &queue, &comp)
+        };
+        let img = draw(BlendMode::MultiTask, 1);
+        // x = 8 is the start of the second tile: it shows source x = 0 again.
+        assert!(
+            px_at(&img, 9, 4)[0] <= 64,
+            "tile repeats: {:?}",
+            px_at(&img, 9, 4)
+        );
+        assert!(px_at(&img, 7, 4)[0] >= 96);
+        let img = draw(BlendMode::Cube, 2);
+        for (x, y) in [(2usize, 2usize), (2, 12), (12, 12)] {
+            let f = vjc_core::blend::cube_shade(x as u32, y as u32);
+            let want = (200.0 * f) as i32;
+            let got = px_at(&img, x, y)[2] as i32;
+            assert!((got - want).abs() <= 3, "{x},{y}: {got} vs {want}");
+        }
+        let img = draw(BlendMode::Normal, 3);
+        assert_eq!(px_at(&img, 12, 12)[2], 200, "control: Normal is unshaded");
     }
 
     /// Crop clears everything outside the box. Control: zero crop leaves the picture.
@@ -5055,6 +5336,54 @@ mod tests {
             [255, 0, 0, 255],
             "mask 255 keeps the pixel: {got:?}"
         );
+    }
+
+    /// An ML effect renders without wgpu validation errors on a 16-bit compositor,
+    /// both before the first mask (skipped) and after it (applied). Skipped without adapter.
+    #[test]
+    fn gpu_ml_effect_16bit_has_no_validation_errors() {
+        let Some((device, queue)) = gpu() else { return };
+        let (isf, wgsl) = vjc_fx::compile(vjc_fx::builtin_source("remove_bg").unwrap()).unwrap();
+        let mut comp = Compositor::with_format(&device, 2, 1, wgpu::TextureFormat::Rgba16Float);
+        comp.add_effect(&device, "remove_bg", &wgsl).unwrap();
+        let ml = MlDraw {
+            key: 7,
+            tag: 0,
+            size: (2, 1),
+        };
+        let red = [255u8, 0, 0, 255].repeat(2);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        for round in 0..2 {
+            let layer = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![EffectDraw {
+                    lut: None,
+                    blend: Default::default(),
+                    kind: "remove_bg".into(),
+                    uniforms: isf.pack(&isf.default_params(), 0.0, (2, 1)),
+                    dry_wet: 1.0,
+                    ml: Some(ml.clone()),
+                    persistent: None,
+                    ticking: false,
+                }],
+                frame: Some((2, 1, &red, 1)),
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            if round == 0 {
+                comp.ml_set_mask(&device, &queue, 7, (2, 1), &[0, 255]);
+            }
+        }
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "validation error: {err:?}");
     }
 
     /// Red channel of each row of a 1-pixel-wide target, top row first.

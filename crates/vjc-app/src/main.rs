@@ -11,6 +11,7 @@ mod browser;
 mod capture;
 mod clip_thumbs;
 mod col_ops;
+mod color_depth;
 mod compositor;
 mod dmx_io;
 mod frame_stats;
@@ -4956,8 +4957,16 @@ impl State {
         let (w, h) = (c.width.max(1), c.height.max(1));
         let dials = self.dials();
         let actx = self.anim_ctx(&dials);
+        let fmt = color_depth::pool_format(self.project.composition.bit_depth);
+        if self.comp.as_ref().is_some_and(|c| c.fmt != fmt) {
+            // Bit depth changed: every pipeline and texture is built again at the new format.
+            self.comp = None;
+            if let Some(id) = self.comp_tex.take() {
+                rs.renderer.write().free_texture(&id);
+            }
+        }
         if self.comp.is_none() {
-            let comp = Compositor::new(&rs.device, w, h);
+            let comp = Compositor::with_format(&rs.device, w, h, fmt);
             self.comp_tex = Some(rs.renderer.write().register_native_texture(
                 &rs.device,
                 &comp.target_view,
@@ -5431,14 +5440,14 @@ impl State {
                 };
             } else {
                 cap.poll(&rs.device);
-                cap.capture(&rs.device, &rs.queue, &comp.target);
+                cap.capture(&rs.device, &rs.queue, comp.readable());
             }
         }
         api_ext::snap_service(
             &mut self.snap_jobs,
             &rs.device,
             &rs.queue,
-            &comp.target,
+            comp.readable(),
             comp.size,
             self.master_bypass,
         );
@@ -5657,7 +5666,7 @@ impl State {
         for w in &wants {
             let (tex, size) = match self.screen_rt.get(&w.id) {
                 Some(t) => (&t.tex, t.size),
-                None => (&comp.target, comp.size),
+                None => (comp.readable(), comp.size),
             };
             self.netout.feed(
                 &rs.device,
@@ -5675,7 +5684,7 @@ impl State {
         for w in &art {
             let (tex, size) = match self.screen_rt.get(&w.id) {
                 Some(t) => (&t.tex, t.size),
-                None => (&comp.target, comp.size),
+                None => (comp.readable(), comp.size),
             };
             self.artnet.feed(
                 &rs.device,
@@ -8932,6 +8941,14 @@ impl State {
                             .max_decimals(3),
                     )
                     .changed();
+                let depth = c.bit_depth;
+                widgets::combo(ui, "comp-bit-depth", format!("{depth}-bit"), None, |ui| {
+                    for d in vjc_model::BIT_DEPTHS {
+                        if widgets::choice(ui, depth == d, format!("{d}-bit")).clicked() {
+                            cmds.push(Command::SetCompBitDepth { depth: d });
+                        }
+                    }
+                });
             });
             help(size_row.response, "comp-size");
             if size_changed {
@@ -11414,6 +11431,13 @@ fn main() -> eframe::Result {
             let mut s = State::new(prefs);
             if let Some(rs) = &cc.wgpu_render_state {
                 s.tex_cap = tex_cap_from(rs.adapter.limits().max_texture_dimension_2d);
+                if s.prefs.video.output_10bit {
+                    let (_, note) = color_depth::select_output_format(true, &[rs.target_format]);
+                    if let Some(n) = note {
+                        eprintln!("{n}");
+                        s.warnings.push(n);
+                    }
+                }
             }
             if let Some(w) = warn {
                 s.status = w.clone();

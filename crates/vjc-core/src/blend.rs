@@ -47,6 +47,9 @@ pub const COMPOSITION_MODES: &[(BlendMode, &str)] = &[
     (BlendMode::LumaKeyInverse, "Inverse Luma Key"),
     (BlendMode::Jitter, "Jitter"),
     (BlendMode::Bumper, "Luma Reveal"),
+    (BlendMode::MetaMix, "Meta Mix"),
+    (BlendMode::MultiTask, "Multi Task"),
+    (BlendMode::Cube, "Cube"),
 ];
 
 /// Reach in px of the Jitter blend (offset in -JITTER_PX..JITTER_PX on each axis).
@@ -70,11 +73,38 @@ pub fn bumper_gate(l: f32, progress: f32) -> f32 {
     ((progress * 1.1 - l) / 0.1).clamp(0.0, 1.0)
 }
 
-// Not offered as composition blends (they render as Normal):
-// - Cube: a two-picture transition (needs outgoing and incoming faces); it lives in
-//   `transition::Kind::Cube`.
-// - Depth, JitterBug, Meta Mix, Multi Task, Noise...: need depth maps, time or several
-//   inputs that a single source-over-base pass does not have.
+/// Multi Task: the source is tiled `MULTITASK_TILES` x `MULTITASK_TILES` times, each tile
+/// showing the whole picture. Source uv read for frame uv `uv` (the shader mirrors this).
+pub const MULTITASK_TILES: f32 = 2.0;
+pub fn multitask_uv(uv: [f32; 2]) -> [f32; 2] {
+    uv.map(|v| (v * MULTITASK_TILES).fract())
+}
+
+/// Side in px of one Cube cell.
+pub const CUBE_CELL: u32 = 16;
+
+/// Cube: the frame is cut in cells drawn as cube corners; the top face keeps the source
+/// as is, the left face darkens it to 70% and the right face to 45%.
+pub fn cube_shade(x: u32, y: u32) -> f32 {
+    let (lx, ly) = (x % CUBE_CELL, y % CUBE_CELL);
+    if ly < CUBE_CELL / 2 {
+        1.0
+    } else if lx < CUBE_CELL / 2 {
+        0.7
+    } else {
+        0.45
+    }
+}
+
+/// Meta Mix: source weight grows where the source is brighter than the base, so the two
+/// pictures morph into each other by luma (equal luma = half and half).
+pub fn meta_mix(b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
+    let w = (0.5 + luma(s) - luma(b)).clamp(0.0, 1.0);
+    [0, 1, 2].map(|i| b[i] + (s[i] - b[i]) * w)
+}
+
+// Not offered as composition blends (they render as Normal): Depth (needs a depth map
+// that the compositor does not receive), Noise... (need time or several inputs).
 
 /// Reach in px of the Displace blend: red and green of the source push the base sample
 /// (0.5 = no shift).
@@ -293,6 +323,7 @@ fn color_mode(id: u32, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
             [0, 1, 2].map(|i| b[i] + (full[i] - b[i]) * 0.5)
         }
         36 => [0, 1, 2].map(|i| 1.0 - (b[i] - s[i]).abs()),
+        40 => meta_mix(b, s),
         _ => per(id),
     }
 }
@@ -341,6 +372,9 @@ pub fn blend_pixel(mode: &BlendMode, b: [f32; 4], s: [f32; 4], opacity: f32) -> 
             a = (s[3] * bumper_gate(l, opacity.clamp(0.0, 1.0))).clamp(0.0, 1.0);
             rgb = [s[0], s[1], s[2]];
         }
+        // Multi Task and Cube: the caller passes the source read at `multitask_uv` /
+        // already multiplied by `cube_shade`.
+        41 | 42 => rgb = [s[0], s[1], s[2]],
         // Displace and LoRez need neighbouring pixels (see `displace_offset` and
         // `LOREZ_BLOCK`): per pixel the caller passes the displaced base / snapped source.
         24 => rgb = [b[0], b[1], b[2]],
@@ -380,6 +414,32 @@ mod tests {
         let w = [1.0, 1.0, 1.0, 1.0];
         assert_eq!(blend_pixel(&BlendMode::Bumper, b, w, 1.0)[..3], w[..3]);
         assert!(bumper_gate(0.2, 0.4) > bumper_gate(0.8, 0.4));
+    }
+
+    #[test]
+    fn meta_mix_multi_task_cube_reference() {
+        let b = [0.8, 0.5, 0.2, 1.0];
+        // Meta Mix: equal luma = half and half; a white source wins fully over a dim base.
+        let half = blend_pixel(&BlendMode::MetaMix, b, b, 1.0);
+        assert!((half[0] - 0.8).abs() < 1e-6);
+        let g = [0.3, 0.3, 0.3, 1.0];
+        let w = [1.0, 1.0, 1.0, 1.0];
+        let m = blend_pixel(&BlendMode::MetaMix, g, w, 1.0);
+        assert_eq!(m[..3], [1.0; 3]);
+        let d = blend_pixel(&BlendMode::MetaMix, w, g, 1.0);
+        assert_eq!(d[..3], w[..3], "a darker source does not show");
+        // Multi Task: each tile shows the whole picture.
+        let uv = multitask_uv([0.75, 0.25]);
+        assert!((uv[0] - 0.5).abs() < 1e-6 && (uv[1] - 0.5).abs() < 1e-6);
+        // Cube: three shades inside a cell, repeating every cell.
+        assert_eq!(cube_shade(0, 0), 1.0);
+        assert_eq!(cube_shade(0, 9), 0.7);
+        assert_eq!(cube_shade(9, 9), 0.45);
+        assert_eq!(cube_shade(CUBE_CELL + 9, CUBE_CELL + 9), 0.45);
+        // Ids follow list order and stay clear of the original ones.
+        assert_eq!(shader_id(&BlendMode::MetaMix), 40);
+        assert_eq!(shader_id(&BlendMode::MultiTask), 41);
+        assert_eq!(shader_id(&BlendMode::Cube), 42);
     }
 
     #[test]
@@ -515,7 +575,7 @@ mod tests {
             run(BlendMode::Cut, B, S, 1.0),
             run(BlendMode::Normal, B, S, 1.0)
         );
-        assert_eq!(COMPOSITION_MODES.len(), 40);
+        assert_eq!(COMPOSITION_MODES.len(), 43);
     }
 
     /// Old projects keep their blends: the first 19 keep their shader ids and the serialized
