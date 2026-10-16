@@ -49,6 +49,9 @@ pub struct Composition {
     /// Multiplies the speed of every clip, 0..=4.
     #[serde(default = "one")]
     pub master_speed: f64,
+    /// Plays every clip against its own direction (Forward <-> Backward). Old files: off.
+    #[serde(default)]
+    pub master_reverse: bool,
     pub crossfader: Option<Crossfader>,
     pub dashboard: Vec<Param>,
     /// Timecode cues, fired when the external timecode crosses them.
@@ -264,6 +267,9 @@ pub struct LayerGroup {
     /// Collapsed in the grid UI (its layers are hidden).
     #[serde(default)]
     pub folded: bool,
+    /// Crossfader bus of the group; layers without a bus of their own follow it.
+    #[serde(default)]
+    pub crossfader_bus: Option<Bus>,
 }
 
 impl LayerGroup {
@@ -276,6 +282,7 @@ impl LayerGroup {
             bypass: false,
             speed: 1.0,
             folded: false,
+            crossfader_bus: None,
         }
     }
 }
@@ -932,6 +939,15 @@ pub enum BlendMode {
     Multiply50,
     Overlay50,
     Subtract50,
+    /// 1 - |base - source|: the inverted Difference.
+    DifferenceInverse,
+    /// Luma Key with the key inverted: bright pixels of the source become transparent.
+    LumaKeyInverse,
+    /// Source read at a per-pixel random offset (a shaky, torn picture).
+    Jitter,
+    /// Transition-style blend: the opacity is the progress of a luma wipe that reveals the
+    /// source from its darkest pixels to its brightest.
+    Bumper,
     #[serde(other)]
     Unknown,
 }
@@ -1045,6 +1061,23 @@ pub enum CrossfadeBehaviour {
     #[default]
     Fade,
     Cut,
+    /// Hard switch like Cut, and the Go commands hold the far bus only while pressed.
+    CutReturn,
+    /// Hard switch with no overlap: the middle already belongs to B.
+    Jump,
+}
+
+impl CrossfadeBehaviour {
+    pub const ALL: [CrossfadeBehaviour; 4] = [Self::Fade, Self::Cut, Self::CutReturn, Self::Jump];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fade => "Fade",
+            Self::Cut => "Cut",
+            Self::CutReturn => "Cut & return",
+            Self::Jump => "Jump",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1837,6 +1870,7 @@ impl Project {
                 master: Track::new(BlendMode::Normal),
                 groups: vec![],
                 master_speed: 1.0,
+                master_reverse: false,
                 crossfader: None,
                 dashboard: vec![],
                 timecode_cues: vec![],

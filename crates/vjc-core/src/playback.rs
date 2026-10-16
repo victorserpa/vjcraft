@@ -219,6 +219,17 @@ pub const MIN_REGION: f64 = 0.001;
 
 /// The (in, out) region a clip plays, normalised. A damaged pair (not finite, outside 0..=1
 /// or narrower than `MIN_REGION`) plays the whole clip.
+/// Direction a clip really runs in: the global reverse flips Forward and Backward; Pause
+/// and Random stay as they are.
+pub fn global_direction(d: vjc_model::Direction, reverse: bool) -> vjc_model::Direction {
+    use vjc_model::Direction::{Backward, Forward};
+    match (d, reverse) {
+        (Forward, true) => Backward,
+        (Backward, true) => Forward,
+        _ => d,
+    }
+}
+
 pub fn region(t: &vjc_model::Transport) -> (f64, f64) {
     let (a, b) = (t.in_point, t.out_point);
     if a.is_finite() && b.is_finite() && a >= 0.0 && b <= 1.0 && b - a >= MIN_REGION {
@@ -719,5 +730,110 @@ mod ap_tests {
         assert_eq!(next_clip_ap(&a, 0, &pl, 5, &mut bag), Some(1));
         a.random = RandomKind::Any;
         assert_eq!(next_clip_ap(&a, 0, &pl, 4, &mut bag), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod global_transport_tests {
+    use super::global_direction;
+    use crate::{Command, Event, History, apply};
+    use std::time::{Duration, Instant};
+    use vjc_model::{Direction::*, PlayState, Project};
+
+    #[test]
+    fn global_reverse_flips_only_forward_and_backward() {
+        assert_eq!(global_direction(Forward, true), Backward);
+        assert_eq!(global_direction(Backward, true), Forward);
+        assert_eq!(global_direction(Pause, true), Pause);
+        assert_eq!(global_direction(Random, true), Random);
+        assert_eq!(global_direction(Forward, false), Forward);
+    }
+
+    #[test]
+    fn stop_ejects_every_unlocked_layer_and_parks_the_clock_on_beat_zero() {
+        let (mut p, _) = crate::tests::setup();
+        p.composition.layers.push(crate::tests::layer(2));
+        p.composition.layers[1].lock_content = true;
+        let r = apply(
+            &mut p,
+            Command::SetTransport {
+                state: PlayState::Stop,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.composition.tempo.play_state, PlayState::Stop);
+        assert!(r.inverse.is_none(), "a performance action, not an edit");
+        let cleared: Vec<_> = r
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::LayerCleared { layer } => Some(*layer),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cleared,
+            vec![p.composition.layers[0].id],
+            "locked layer stays"
+        );
+        // The app drives the clock from the saved state: the phase goes back to 0.
+        let t0 = Instant::now();
+        let mut clock = crate::clock::Clock::new(120.0, t0);
+        let t1 = t0 + Duration::from_secs(3);
+        assert!(clock.phase(t1) > 5.0);
+        clock.stop(t1);
+        assert_eq!(clock.phase(t1 + Duration::from_secs(1)), 0.0);
+        // Pause and play eject nothing.
+        let r = apply(
+            &mut p,
+            Command::SetTransport {
+                state: PlayState::Pause,
+            },
+        )
+        .unwrap();
+        assert!(r.events.is_empty());
+    }
+
+    #[test]
+    fn reverse_and_metronome_undo_and_old_files_load() {
+        let (mut p, _) = crate::tests::setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        h.exec(&mut p, Command::SetMasterReverse { reverse: true }, t)
+            .unwrap();
+        h.exec(&mut p, Command::SetMetronome { on: true }, t)
+            .unwrap();
+        assert!(p.composition.master_reverse && p.composition.tempo.metronome);
+        h.undo(&mut p).unwrap().unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert!(!p.composition.master_reverse && !p.composition.tempo.metronome);
+        let mut v = serde_json::to_value(Project::new("t")).unwrap();
+        v["composition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("master_reverse");
+        let old: Project = serde_json::from_value(v).unwrap();
+        assert!(!old.composition.master_reverse);
+    }
+
+    #[test]
+    fn transport_addresses_resolve() {
+        let p = Project::new("t");
+        let r = |a: &str, v: f64| crate::shortcuts::resolve(&p, a, v);
+        assert_eq!(
+            r("/comp/transport/stop", 1.0),
+            Some(Command::SetTransport {
+                state: PlayState::Stop
+            })
+        );
+        assert_eq!(r("/comp/transport/stop", 0.0), None, "release does nothing");
+        assert_eq!(
+            r("/comp/transport/reverse", 1.0),
+            Some(Command::SetMasterReverse { reverse: true })
+        );
+        assert_eq!(
+            r("/comp/tempo/metronome", 0.0),
+            Some(Command::SetMetronome { on: false })
+        );
     }
 }

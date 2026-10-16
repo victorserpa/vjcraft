@@ -43,7 +43,32 @@ pub const COMPOSITION_MODES: &[(BlendMode, &str)] = &[
     (BlendMode::Multiply50, "50 Multiply"),
     (BlendMode::Overlay50, "50 Overlay"),
     (BlendMode::Subtract50, "50 Subtract"),
+    (BlendMode::DifferenceInverse, "Inverse Difference"),
+    (BlendMode::LumaKeyInverse, "Inverse Luma Key"),
+    (BlendMode::Jitter, "Jitter"),
+    (BlendMode::Bumper, "Luma Reveal"),
 ];
+
+/// Reach in px of the Jitter blend (offset in -JITTER_PX..JITTER_PX on each axis).
+pub const JITTER_PX: i32 = 4;
+
+/// Per-pixel source offset of the Jitter blend (the shader mirrors this hash).
+pub fn jitter_offset(x: u32, y: u32) -> [i32; 2] {
+    let mut h = x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x5bd1_e995);
+    h ^= h >> 15;
+    [
+        (h & 7) as i32 - JITTER_PX,
+        ((h >> 8) & 7) as i32 - JITTER_PX,
+    ]
+}
+
+/// Share of the source shown by the Bumper blend at `progress` for a pixel of luma `l`:
+/// pixels appear from dark to bright as the progress goes 0 -> 1 (soft edge of 0.1).
+pub fn bumper_gate(l: f32, progress: f32) -> f32 {
+    ((progress * 1.1 - l) / 0.1).clamp(0.0, 1.0)
+}
 
 // Not offered as composition blends (they render as Normal):
 // - Cube: a two-picture transition (needs outgoing and incoming faces); it lives in
@@ -267,6 +292,7 @@ fn color_mode(id: u32, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
             };
             [0, 1, 2].map(|i| b[i] + (full[i] - b[i]) * 0.5)
         }
+        36 => [0, 1, 2].map(|i| 1.0 - (b[i] - s[i]).abs()),
         _ => per(id),
     }
 }
@@ -303,6 +329,18 @@ pub fn blend_pixel(mode: &BlendMode, b: [f32; 4], s: [f32; 4], opacity: f32) -> 
         }
         // Black & White: grayscale source, normal blend.
         18 => rgb = [l; 3],
+        // Inverse Luma Key: bright pixels of the source become transparent.
+        37 => {
+            a *= 1.0 - l;
+            rgb = [s[0], s[1], s[2]];
+        }
+        // Jitter: the caller passes the source already read at `jitter_offset`.
+        38 => rgb = [s[0], s[1], s[2]],
+        // Bumper: the opacity is the wipe progress, not a plain alpha scale.
+        39 => {
+            a = (s[3] * bumper_gate(l, opacity.clamp(0.0, 1.0))).clamp(0.0, 1.0);
+            rgb = [s[0], s[1], s[2]];
+        }
         // Displace and LoRez need neighbouring pixels (see `displace_offset` and
         // `LOREZ_BLOCK`): per pixel the caller passes the displaced base / snapped source.
         24 => rgb = [b[0], b[1], b[2]],
@@ -320,6 +358,42 @@ pub fn blend_pixel(mode: &BlendMode, b: [f32; 4], s: [f32; 4], opacity: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_blends_cpu_reference() {
+        let b = [0.8, 0.5, 0.2, 1.0];
+        let s = [0.4, 0.5, 0.9, 1.0];
+        let d = blend_pixel(&BlendMode::DifferenceInverse, b, s, 1.0);
+        assert!((d[0] - 0.6).abs() < 1e-6 && (d[1] - 1.0).abs() < 1e-6);
+        // Inverse Luma Key: a white source vanishes, a black one stays.
+        let w = blend_pixel(&BlendMode::LumaKeyInverse, b, [1.0, 1.0, 1.0, 1.0], 1.0);
+        assert_eq!(w[..3], b[..3]);
+        let k = blend_pixel(&BlendMode::LumaKeyInverse, b, [0.0, 0.0, 0.0, 1.0], 1.0);
+        assert_eq!(k[..3], [0.0; 3]);
+        // Bumper: nothing at progress 0, all at progress 1, dark pixels first in between.
+        let grey = [0.5, 0.5, 0.5, 1.0];
+        assert_eq!(blend_pixel(&BlendMode::Bumper, b, grey, 0.0)[..3], b[..3]);
+        assert_eq!(
+            blend_pixel(&BlendMode::Bumper, b, grey, 1.0)[..3],
+            grey[..3]
+        );
+        let w = [1.0, 1.0, 1.0, 1.0];
+        assert_eq!(blend_pixel(&BlendMode::Bumper, b, w, 1.0)[..3], w[..3]);
+        assert!(bumper_gate(0.2, 0.4) > bumper_gate(0.8, 0.4));
+    }
+
+    #[test]
+    fn jitter_offsets_are_bounded_and_vary() {
+        let mut seen = std::collections::HashSet::new();
+        for y in 0..16 {
+            for x in 0..16 {
+                let o = jitter_offset(x, y);
+                assert!(o.iter().all(|v| (-JITTER_PX..JITTER_PX).contains(v)));
+                seen.insert(o);
+            }
+        }
+        assert!(seen.len() > 20);
+    }
 
     const B: [f32; 4] = [0.8, 0.5, 0.2, 1.0];
     const S: [f32; 4] = [0.4, 0.5, 0.9, 1.0];
@@ -441,7 +515,7 @@ mod tests {
             run(BlendMode::Cut, B, S, 1.0),
             run(BlendMode::Normal, B, S, 1.0)
         );
-        assert_eq!(COMPOSITION_MODES.len(), 36);
+        assert_eq!(COMPOSITION_MODES.len(), 40);
     }
 
     /// Old projects keep their blends: the first 19 keep their shader ids and the serialized

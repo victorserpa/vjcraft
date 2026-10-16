@@ -799,6 +799,10 @@ fn blend_from_name(name: &str) -> BlendMode {
         "50 Multiply" => BlendMode::Multiply50,
         "50 Overlay" => BlendMode::Overlay50,
         "50 Subtract" => BlendMode::Subtract50,
+        "Difference I" => BlendMode::DifferenceInverse,
+        "Luma Key I" => BlendMode::LumaKeyInverse,
+        "JitterBug" => BlendMode::Jitter,
+        "Video Bumper" => BlendMode::Bumper,
         "RGB" => BlendMode::Rgb,
         "B&W" => BlendMode::BlackWhite,
         // In .avc files "Alpha" is the default alpha-over mixer, i.e. our Normal.
@@ -1115,6 +1119,19 @@ fn collect_unsupported(root: &Node, w: &mut Warns) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_blend_names_map() {
+        for (n, m) in [
+            ("Difference I", BlendMode::DifferenceInverse),
+            ("Luma Key I", BlendMode::LumaKeyInverse),
+            ("JitterBug", BlendMode::Jitter),
+            ("Video Bumper", BlendMode::Bumper),
+        ] {
+            assert_eq!(super::blend_from_name(n), m);
+        }
+        assert_eq!(super::blend_from_name("nope"), BlendMode::Unknown);
+    }
+
     fn anim_of(param: &str) -> (Import, Option<Animation>) {
         let xml = format!(
             r#"<Composition name="x" numColumns="1"><Layer layerIndex="0"/><Deck><Clip layerIndex="0" columnIndex="0"><VideoTrack><Params name="Params"><ParamRange name="Opacity" value="0.5">{param}</ParamRange></Params><PrimarySource><VideoSource type="VideoFormatReaderSource"><VideoFormatReaderSource fileName="/a.mov"/></VideoSource></PrimarySource></VideoTrack></Clip></Deck></Composition>"#

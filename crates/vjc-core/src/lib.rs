@@ -5,6 +5,7 @@
 pub mod anim;
 pub mod blend;
 pub mod clock;
+pub mod columns;
 pub mod comp_autopilot;
 pub mod crossfader;
 pub mod dmx;
@@ -301,9 +302,35 @@ pub enum Command {
     SetCrossfaderBehaviour {
         behaviour: vjc_model::CrossfadeBehaviour,
     },
+    /// Moves the crossfader to bus A (0) or B (1). `pressed = false` is the release of the
+    /// button: with the Cut & return behaviour it goes back to the opposite bus, otherwise
+    /// it does nothing. Undoable.
+    GoCrossfader {
+        bus: vjc_model::Bus,
+        pressed: bool,
+    },
+    /// Assigns a whole group to crossfader bus A or B (None = unaffected). Undoable.
+    SetGroupBus {
+        group: GroupId,
+        bus: Option<vjc_model::Bus>,
+    },
     /// Blend mode of the layers on a crossfader bus (`None` = their own). Undoable.
     SetCrossfaderBlend {
         blend: Option<BlendMode>,
+    },
+    /// Global transport of the tempo clock. Stop also ejects every clip (`LayerCleared` for
+    /// each layer that is not locked) and parks the clock on beat 0, which rewinds the
+    /// animations that follow it. Not undoable: it is a performance action.
+    SetTransport {
+        state: vjc_model::PlayState,
+    },
+    /// Global reverse: every clip runs against its own direction. Undoable.
+    SetMasterReverse {
+        reverse: bool,
+    },
+    /// Metronome click on/off (saved with the project). Undoable.
+    SetMetronome {
+        on: bool,
     },
     /// Layer audio / video enable toggles. Undoable.
     SetLayerAudio {
@@ -691,6 +718,35 @@ pub enum Command {
     /// Removes the last column, which must be empty.
     RemoveColumn {
         column: Uuid,
+    },
+    /// Moves the columns (kept in their grid order) as a block so that the first lands at
+    /// index `to` among the columns left behind (clamped). Clips follow. Undoable.
+    MoveColumns {
+        columns: Vec<Uuid>,
+        to: usize,
+    },
+    /// Puts the columns in exactly this order (a permutation of all ids). Undoable.
+    ReorderColumns {
+        order: Vec<Uuid>,
+    },
+    /// Inserts a blank column at `index` (clamped); later columns and their clips shift.
+    InsertColumn {
+        index: usize,
+        column: vjc_model::Column,
+    },
+    /// Copies the columns with their clips (new ids) as a block after the last of them.
+    DuplicateColumns {
+        columns: Vec<Uuid>,
+    },
+    /// Removes the columns wherever they are, with their clips; fails (`InUse`) while a
+    /// timecode cue targets one of them. Undoable.
+    RemoveColumns {
+        columns: Vec<Uuid>,
+    },
+    /// Puts removed columns and their clips back at their old positions (the undo of
+    /// `RemoveColumns`).
+    RestoreColumns {
+        items: Vec<columns::ColumnItem>,
     },
     SetBpm {
         bpm: f64,
@@ -1202,6 +1258,19 @@ fn anim_param_mut(p: &mut Project, t: AnimTarget) -> Result<&mut Param, Error> {
             Ok(effects::track_mut(p, target)?.transform.field_mut(field))
         }
     }
+}
+
+fn set_crossfader(p: &mut Project, value: f64) -> Result<Applied, Error> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(Error::InvalidValue);
+    }
+    let cf = p
+        .composition
+        .crossfader
+        .get_or_insert_with(crossfader::new_crossfader);
+    let prev = number(&cf.position.value);
+    cf.position.set_number(value);
+    undoable(Command::SetCrossfader { value: prev }, vec![])
 }
 
 fn undoable(inverse: Command, events: Vec<Event>) -> Result<Applied, Error> {
@@ -2065,8 +2134,39 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             if n == 0 {
                 return Err(Error::NoColumn);
             }
-            let to = from.map_or(0, |c| i64::from(c) + i64::from(delta));
-            trigger_column(p, deck, to.clamp(0, n - 1) as ColumnIdx)
+            // Empty columns (no clip in any layer of the deck) are passed over. With nothing
+            // filled in that direction the step stays where it is (clamped, no wrap).
+            let filled = |c: i64| {
+                deck_idx(p, deck).is_ok_and(|d| {
+                    p.composition.decks[d]
+                        .clips
+                        .iter()
+                        .any(|k| i64::from(k.column) == c)
+                })
+            };
+            let to = match from {
+                None => (0..n).find(|c| filled(*c)).unwrap_or(0),
+                Some(f) => {
+                    let f = i64::from(f).clamp(0, n - 1);
+                    let sign = if delta < 0 { -1 } else { 1 };
+                    let mut c = f;
+                    // Delta 0 retriggers the current column.
+                    let mut left = delta.unsigned_abs();
+                    let mut at = f;
+                    while left > 0 {
+                        c += sign;
+                        if !(0..n).contains(&c) {
+                            break;
+                        }
+                        if filled(c) {
+                            at = c;
+                            left -= 1;
+                        }
+                    }
+                    at
+                }
+            };
+            trigger_column(p, deck, to as ColumnIdx)
         }
         Command::StepClip {
             deck,
@@ -2334,6 +2434,31 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             op.set_number(value);
             undoable(Command::SetMasterOpacity { value: prev }, vec![])
         }
+        Command::SetTransport { state } => {
+            p.composition.tempo.play_state = state;
+            let events = if state == vjc_model::PlayState::Stop {
+                p.composition
+                    .layers
+                    .iter()
+                    .filter(|l| !l.lock_content)
+                    .map(|l| Event::LayerCleared { layer: l.id })
+                    .collect()
+            } else {
+                vec![]
+            };
+            Ok(Applied {
+                inverse: None,
+                events,
+            })
+        }
+        Command::SetMasterReverse { reverse } => {
+            let prev = std::mem::replace(&mut p.composition.master_reverse, reverse);
+            undoable(Command::SetMasterReverse { reverse: prev }, vec![])
+        }
+        Command::SetMetronome { on } => {
+            let prev = std::mem::replace(&mut p.composition.tempo.metronome, on);
+            undoable(Command::SetMetronome { on: prev }, vec![])
+        }
         Command::SetMasterSpeed { value } => {
             if !value.is_finite() || !(0.0..=4.0).contains(&value) {
                 return Err(Error::InvalidValue);
@@ -2486,17 +2611,21 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.layers[i].crossfader_bus, bus);
             undoable(Command::SetLayerBus { layer, bus: prev }, vec![])
         }
-        Command::SetCrossfader { value } => {
-            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                return Err(Error::InvalidValue);
+        Command::SetCrossfader { value } => set_crossfader(p, value),
+        Command::GoCrossfader { bus, pressed } => {
+            let to_b = matches!(bus, vjc_model::Bus::B);
+            if pressed {
+                return set_crossfader(p, if to_b { 1.0 } else { 0.0 });
             }
-            let cf = p
-                .composition
-                .crossfader
-                .get_or_insert_with(crossfader::new_crossfader);
-            let prev = number(&cf.position.value);
-            cf.position.set_number(value);
-            undoable(Command::SetCrossfader { value: prev }, vec![])
+            let returns = p.composition.crossfader.as_ref().map(|c| c.behaviour)
+                == Some(vjc_model::CrossfadeBehaviour::CutReturn);
+            if !returns {
+                return Ok(Applied {
+                    inverse: None,
+                    events: vec![],
+                });
+            }
+            set_crossfader(p, if to_b { 0.0 } else { 1.0 })
         }
         Command::SetCrossfaderCurve { curve } => {
             let cf = p
@@ -3571,6 +3700,12 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let removed = p.composition.columns.remove(i);
             undoable(Command::AddColumn { column: removed }, vec![])
         }
+        Command::MoveColumns { .. }
+        | Command::ReorderColumns { .. }
+        | Command::InsertColumn { .. }
+        | Command::DuplicateColumns { .. }
+        | Command::RemoveColumns { .. }
+        | Command::RestoreColumns { .. } => columns::apply(p, cmd),
         Command::SetBeatSync {
             deck,
             layer,
@@ -3960,6 +4095,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::SetGroupBlend { .. }
         | Command::SetGroupBypass { .. }
         | Command::SetGroupSolo { .. }
+        | Command::SetGroupBus { .. }
         | Command::SetGroupSpeed { .. }
         | Command::MoveLayerToGroup { .. }
         | Command::MoveLayerOutOfGroup { .. } => groups::apply(p, cmd),
@@ -4326,7 +4462,7 @@ mod tests {
     const A: DeckId = Uuid::from_u128(1);
     use vjc_model::{ShortcutMode, Transition};
 
-    fn layer(n: usize) -> Layer {
+    pub(crate) fn layer(n: usize) -> Layer {
         Layer {
             color: None,
             folded: false,
@@ -4394,7 +4530,7 @@ mod tests {
     }
 
     /// Runs `cmd`, then checks undo restores the exact project and redo reapplies.
-    fn roundtrip(p: &mut Project, cmd: Command) {
+    pub(crate) fn roundtrip(p: &mut Project, cmd: Command) {
         let before = p.clone();
         let mut h = History::new();
         h.exec(p, cmd, Instant::now()).unwrap();
@@ -6503,7 +6639,9 @@ mod tests {
 
     /// Two layers, three columns: layer 1 has clips in columns 0 and 2 (2 is a placeholder
     /// in layer 2), layer 2 has a clip in column 0 and a placeholder in column 2.
-    fn grid() -> (Project, LayerId, LayerId) {
+    pub(crate) const A_DECK: DeckId = A;
+
+    pub(crate) fn grid() -> (Project, LayerId, LayerId) {
         let (mut p, l1) = setup();
         let l2 = layer(2);
         let l2id = l2.id;
@@ -6590,6 +6728,11 @@ mod tests {
         assert_eq!(col_of(&mut p, None, 1), 0);
         assert_eq!(col_of(&mut p, Some(0), -1), 0);
         assert_eq!(col_of(&mut p, Some(2), 1), 2);
+        assert_eq!(
+            col_of(&mut p, Some(0), 0),
+            0,
+            "delta 0 retriggers the current column"
+        );
         let clip = |p: &mut Project, from, delta| {
             apply(
                 p,

@@ -8,6 +8,7 @@ mod autopilot_ui;
 mod browser;
 mod capture;
 mod clip_thumbs;
+mod col_ops;
 mod compositor;
 mod dmx_io;
 mod frame_stats;
@@ -155,6 +156,8 @@ struct State {
     history_now: Option<std::time::Instant>,
     /// Column header being renamed: (column id, text so far).
     col_renaming: Option<(Uuid, String)>,
+    /// Columns marked in the grid header (ctrl/cmd-click, shift-click) for the header menu.
+    col_marks: Vec<Uuid>,
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
     heads: HashMap<LayerId, Playhead>,
     /// Codec / size / fps of file clips, probed on demand.
@@ -350,8 +353,6 @@ struct State {
     /// Composition autopilot: which column is on air and since when (runtime only).
     comp_ap: vjc_core::comp_autopilot::State,
     nudge_dir: i8,
-    /// Visual only for now. TODO(#9): click sound (see build-log).
-    metronome: bool,
     link: link_io::Link,
     link_sync: LinkSync,
     /// Set when a layout is applied or panels are toggled: the next frame forces the saved
@@ -457,6 +458,37 @@ enum DialOwner {
 enum SnapAct {
     Cmd(Box<Command>),
     BeatLoop(LayerId, f64),
+}
+
+/// Columns with a clip on air in any deck: columns are shared by all decks, so removing one
+/// deletes its clips in every deck.
+fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -> Vec<u32> {
+    players
+        .values()
+        .map(|(_, c, _)| *c)
+        .chain(gens.values().map(|(_, c, _)| *c))
+        .collect()
+}
+
+/// Rewrites the column of a queued command after columns moved; false when its column was
+/// removed (the command is dropped).
+fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
+    match cmd {
+        Command::TriggerClip { column, .. }
+        | Command::TriggerClipOn { column, .. }
+        | Command::TriggerColumn { column, .. } => map(*column).is_some_and(|n| {
+            *column = n;
+            true
+        }),
+        Command::StepColumn { from, .. } | Command::StepClip { from, .. } => match *from {
+            Some(f) => map(f).is_some_and(|n| {
+                *from = Some(n);
+                true
+            }),
+            None => true,
+        },
+        _ => true,
+    }
 }
 
 /// A snapped action and the wall time it was queued (a stalled clock must not hold it forever).
@@ -1925,7 +1957,6 @@ impl State {
             hold_token: 0,
             comp_ap: Default::default(),
             nudge_dir: 0,
-            metronome: false,
             link: link_io::Link::new(120.0),
             link_sync: LinkSync::default(),
             force_panels: false,
@@ -1940,6 +1971,7 @@ impl State {
             #[cfg(test)]
             history_now: None,
             col_renaming: None,
+            col_marks: vec![],
         }
     }
 
@@ -2135,6 +2167,7 @@ impl State {
             (&mut new.monitors, "Monitors", "Cmd+2"),
             (&mut new.params, "Parameters", "Cmd+3"),
             (&mut new.grid, "Clip grid", "Cmd+4"),
+            (&mut new.speed_sliders, "Speed sliders", ""),
         ] {
             if ui
                 .add(egui::Button::selectable(*on, label).shortcut_text(key))
@@ -2850,8 +2883,28 @@ impl State {
         let now = self.history_now.unwrap_or_else(std::time::Instant::now);
         #[cfg(not(test))]
         let now = std::time::Instant::now();
+        let col_ids = self.column_ids();
+        let transport = match &cmd {
+            Command::SetTransport { state } => Some(*state),
+            _ => None,
+        };
         match self.history.exec(&mut self.project, cmd, now) {
             Ok(events) => {
+                self.follow_columns(&col_ids);
+                if let Some(st) = transport
+                    && st != vjc_model::PlayState::Stop
+                {
+                    // The clips follow the global transport (a no-op when none is playing).
+                    let ctx = self.rt_ctx();
+                    if let Some(c) = vjc_core::shortcuts::set_all_paused(
+                        &ctx.active,
+                        &ctx.origin,
+                        st == vjc_model::PlayState::Pause,
+                    ) {
+                        // Clips already in that state make this fail: nothing to do then.
+                        let _ = self.history.exec(&mut self.project, c, now);
+                    }
+                }
                 if is_set_bpm {
                     self.link_sync.note_bpm_edit();
                 }
@@ -2872,6 +2925,9 @@ impl State {
                         _ => None,
                     });
                     self.col_sel = landed.or(self.col_sel);
+                    if let Some(c) = landed {
+                        self.comp_ap.on_air(c, self.phase);
+                    }
                 }
                 if deck_switch {
                     self.col_sel = None;
@@ -2898,8 +2954,10 @@ impl State {
 
     fn undo(&mut self) {
         let before = self.project.composition.tempo.bpm;
+        let col_ids = self.column_ids();
         match self.history.undo(&mut self.project) {
             Some(Ok(ev)) => {
+                self.follow_columns(&col_ids);
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -2914,8 +2972,10 @@ impl State {
 
     fn redo(&mut self) {
         let before = self.project.composition.tempo.bpm;
+        let col_ids = self.column_ids();
         match self.history.redo(&mut self.project) {
             Some(Ok(ev)) => {
+                self.follow_columns(&col_ids);
                 if self.project.composition.tempo.bpm != before {
                     self.link_sync.note_bpm_edit();
                 }
@@ -2925,6 +2985,91 @@ impl State {
             }
             Some(Err(e)) => self.status = format!("Redo failed: {e}"),
             None => {}
+        }
+    }
+
+    fn column_ids(&self) -> Vec<Uuid> {
+        self.project
+            .composition
+            .columns
+            .iter()
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// After columns moved, were inserted or removed, what is playing, selected or queued
+    /// keeps following its column: every column index kept per cell is rewritten to where
+    /// the column is now (nothing on air changes). State of a removed column is dropped.
+    fn follow_columns(&mut self, old: &[Uuid]) {
+        let new = self.column_ids();
+        if *old == new[..] {
+            return;
+        }
+        let map = |c: u32| -> Option<u32> {
+            old.get(c as usize)
+                .and_then(|id| new.iter().position(|n| n == id))
+                .map(|n| n as u32)
+        };
+        self.players.retain(|_, (_, c, _)| match map(*c) {
+            Some(n) => {
+                *c = n;
+                true
+            }
+            None => false,
+        });
+        self.gens.retain(|_, (_, c, _)| match map(*c) {
+            Some(n) => {
+                *c = n;
+                true
+            }
+            None => false,
+        });
+        self.origin.retain(|_, (_, _, c)| match map(*c) {
+            Some(n) => {
+                *c = n;
+                true
+            }
+            None => false,
+        });
+        self.col_sel = self.col_sel.and_then(map);
+        self.col_marks.retain(|m| new.contains(m));
+        self.selected = match self.selected {
+            Some((l, c)) => map(c).map(|n| (l, n)),
+            None => None,
+        };
+        if let PreviewTarget::Clip(d, l, c) = self.preview_target {
+            self.preview_target = match map(c) {
+                Some(n) => PreviewTarget::Clip(d, l, n),
+                None => PreviewTarget::Composition,
+            };
+        }
+        self.comp_ap.remap(map);
+        self.snap_pending.retain_mut(|(_, h)| match &mut h.act {
+            SnapAct::Cmd(cmd) => remap_command(cmd, &map),
+            SnapAct::BeatLoop(..) => true,
+        });
+        self.holds.retain_mut(|r| match map(r.fired.column) {
+            Some(n) => {
+                r.fired.column = n;
+                true
+            }
+            None => false,
+        });
+        self.snap_req = match self.snap_req {
+            Some((d, l, c)) => map(c).map(|n| (d, l, n)),
+            None => None,
+        };
+        self.cell_drag = match self.cell_drag {
+            Some((l, c)) => map(c).map(|n| (l, n)),
+            None => None,
+        };
+        let resume = std::mem::take(&mut self.flow.resume);
+        self.flow.resume = resume
+            .into_iter()
+            .filter_map(|((d, l, c), v)| map(c).map(|n| ((d, l, n), v)))
+            .collect();
+        for bag in self.layer_bags.borrow_mut().values_mut() {
+            *bag = bag.iter().filter_map(|c| map(*c)).collect();
         }
     }
 
@@ -3701,7 +3846,9 @@ impl State {
         if let Some(b) = t.beat {
             self.beat = b;
         }
-        if let Some(accent) = vjc_media::audio::beat_click(self.metronome, t.beat) {
+        if let Some(accent) =
+            vjc_media::audio::beat_click(self.project.composition.tempo.metronome, t.beat)
+        {
             if self.metro.is_none()
                 && let Some(engine) = self.audio_engine()
             {
@@ -3716,6 +3863,7 @@ impl State {
             .as_secs_f64();
         self.last_head_tick = now;
         let master_speed = self.project.composition.master_speed;
+        let reverse = self.project.composition.master_reverse;
         // A group's speed multiplies the clips of its layers, on top of the master speed.
         let comp = &self.project.composition;
         let speed_of = |layer: &LayerId| {
@@ -3769,6 +3917,7 @@ impl State {
                 _ => 1.0,
             };
             let rate = vjc_core::playback_rate(tr.speed, sync, speed_of(layer));
+            let gdir = vjc_core::playback::global_direction(tr.direction, reverse);
             // Play modes: the playhead picks the position, the player serves the frame.
             if let (Some(file_d), Some(head)) = (player.duration(), self.heads.get_mut(layer)) {
                 // The playhead runs over the in..out region only; `position` below is the
@@ -3789,7 +3938,7 @@ impl State {
                             cur,
                             start,
                             tr.play_mode,
-                            tr.direction,
+                            gdir,
                             rate,
                             d,
                         );
@@ -3797,12 +3946,12 @@ impl State {
                         t
                     }
                     (Some(_), None) if tc_on && !tc_free_run => {
-                        head.tick(0.0, tr.play_mode, tr.direction, rate, d)
+                        head.tick(0.0, tr.play_mode, gdir, rate, d)
                     }
-                    _ => head.tick(dt, tr.play_mode, tr.direction, rate, d),
+                    _ => head.tick(dt, tr.play_mode, gdir, rate, d),
                 };
                 // Forward playback streams; everything else needs random access.
-                player.set_sequential(!by_tc && is_sequential(tr.play_mode, tr.direction, rate));
+                player.set_sequential(!by_tc && is_sequential(tr.play_mode, gdir, rate));
                 let mut position = vjc_core::playback::to_actual(t.position, reg);
                 if let Some((_, w)) = self.flow.beat_loops.get(layer)
                     && !t.finished
@@ -3816,8 +3965,8 @@ impl State {
                 let audible = rate.is_finite()
                     && !by_tc
                     && (rate - 1.0).abs() < 1e-3
-                    && is_sequential(tr.play_mode, tr.direction, rate)
-                    && tr.direction != Direction::Pause
+                    && is_sequential(tr.play_mode, gdir, rate)
+                    && gdir != Direction::Pause
                     && !t.finished;
                 let (vol, pan) = audio_mix(&self.project, *layer, clip);
                 player.set_audio(vol, pan, audible);
@@ -3909,7 +4058,7 @@ impl State {
             if let Some(tr) =
                 clip_for(&self.project, &self.origin, *layer, *deck, *col).map(|k| &k.transport)
             {
-                let dir = match tr.direction {
+                let dir = match vjc_core::playback::global_direction(tr.direction, reverse) {
                     Direction::Backward => -1.0,
                     Direction::Pause => 0.0,
                     _ => 1.0,
@@ -4522,13 +4671,13 @@ impl State {
             let opacity = (vjc_core::anim::effective_number(&l.track.opacity, &lctx)
                 * vjc_core::crossfader::layer_gain(
                     c.crossfader.as_ref(),
-                    l.crossfader_bus.as_ref(),
+                    vjc_core::crossfader::effective_bus(l, &c.groups),
                     cf_pos,
                 )) as f32;
             let blend = vjc_core::blend::effective_blend(
                 &vjc_core::crossfader::layer_blend(
                     c.crossfader.as_ref(),
-                    l.crossfader_bus.as_ref(),
+                    vjc_core::crossfader::effective_bus(l, &c.groups),
                     &l.track.blend,
                 ),
                 clip.and_then(|k| k.blend_override.as_ref()),
@@ -5806,9 +5955,9 @@ impl State {
                     tip,
                 );
                 // Transport, not an edit: no undo step (like TAP), but the project is saved.
+                // Stop ejects every clip; Pause / Play also pause / resume the clips.
                 if b.clicked() && self.project.composition.tempo.play_state != state {
-                    self.project.composition.tempo.play_state = state;
-                    self.dirty = true;
+                    cmds.push(Command::SetTransport { state });
                 }
             }
             let minus = help(
@@ -5868,10 +6017,19 @@ impl State {
                 };
                 ui.painter().circle_filled(rect.center(), 6.0, col);
             }
-            help(
-                icons::toggle(ui, &mut self.metronome, icons::i::METRONOME, "Metronome"),
+            let mut metro = self.project.composition.tempo.metronome;
+            let mr = help(
+                icons::toggle(ui, &mut metro, icons::i::METRONOME, "Metronome"),
                 "metronome",
             );
+            if mr.changed() {
+                cmds.push(Command::SetMetronome { on: metro });
+            }
+            let mut rev = self.project.composition.master_reverse;
+            let rr = icons::toggle(ui, &mut rev, icons::i::ARROWS_LEFT_RIGHT, "Reverse all clips");
+            if rr.changed() {
+                cmds.push(Command::SetMasterReverse { reverse: rev });
+            }
             ui.separator();
             let (can_undo, can_redo) = (self.history.can_undo(), self.history.can_redo());
             undo = help(
@@ -6630,6 +6788,8 @@ impl State {
                                 &mut self.targets,
                             );
                         });
+                        let all_col_ids: Vec<Uuid> = comp.columns.iter().map(|c| c.id).collect();
+                        let cols_on_air = cols_on_air(&self.players, &self.gens);
                         for (ci, (cid, n)) in names.iter().enumerate() {
                             if let Some((rid, buf)) =
                                 self.col_renaming.as_mut().filter(|(r, _)| r == cid)
@@ -6722,7 +6882,8 @@ impl State {
                                         ui,
                                         rect,
                                         n,
-                                        self.col_sel == Some(ci as u32),
+                                        self.col_sel == Some(ci as u32)
+                                            || self.col_marks.contains(cid),
                                         &hover,
                                     );
                                     if let Some(c) = theme::palette(comp.columns[ci].color) {
@@ -6786,6 +6947,16 @@ impl State {
                             if nr.double_clicked() {
                                 self.col_renaming = Some((*cid, n.clone()));
                             } else if nr.clicked() {
+                                let (toggle, extend) =
+                                    ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                                col_ops::click_marks(
+                                    &mut self.col_marks,
+                                    &all_col_ids,
+                                    ci,
+                                    self.col_sel,
+                                    toggle,
+                                    extend,
+                                );
                                 self.col_sel = Some(ci as u32);
                             }
                             let col_ap = comp.columns[ci].autopilot.clone();
@@ -6808,6 +6979,34 @@ impl State {
                                         color,
                                     });
                                 }
+                                ui.separator();
+                                let aim = col_ops::targets(&self.col_marks, *cid);
+                                for op in col_ops::ColOp::ALL {
+                                    let label = if aim.len() > 1 {
+                                        format!("{} {} columns", op.label(), aim.len())
+                                    } else {
+                                        format!("{} column", op.label())
+                                    };
+                                    if crate::widgets::btn(
+                                        ui,
+                                        &label,
+                                        crate::widgets::Kind::Secondary,
+                                    )
+                                    .clicked()
+                                    {
+                                        match col_ops::commands(
+                                            &self.project,
+                                            &aim,
+                                            op,
+                                            &cols_on_air,
+                                        ) {
+                                            Ok(c) => cmds.extend(c),
+                                            Err(e) => self.status = e.to_string(),
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
                                 autopilot_ui::column_menu(ui, *cid, &col_ap, &mut cmds);
                                 autopilot_ui::column_snap_menu(ui, *cid, col_snap, &mut cmds);
                             });
@@ -7947,7 +8146,8 @@ impl State {
                 }
             }
         }
-        if params::section(ui, "sec-transport", "Transport")
+        if self.prefs.layouts.current.speed_sliders
+            && params::section(ui, "sec-transport", "Transport")
             && let Some(value) =
                 params::param_slider(ui, "msp", "Speed", c.master_speed, 1.0, (0.0, 4.0))
         {
@@ -8027,10 +8227,7 @@ impl State {
                     }
                 });
             });
-            let behaviours = [
-                (vjc_model::CrossfadeBehaviour::Fade, "Fade".to_string()),
-                (vjc_model::CrossfadeBehaviour::Cut, "Cut".to_string()),
-            ];
+            let behaviours = vjc_model::CrossfadeBehaviour::ALL.map(|b| (b, b.label().to_string()));
             let cur = c
                 .crossfader
                 .as_ref()
@@ -8391,13 +8588,27 @@ impl State {
             if let Some(blend) = params::combo(ui, ("gbl", gid), "Blend", &g.track.blend, &modes) {
                 cmds.push(Command::SetGroupBlend { group: gid, blend });
             }
-            if let Some(value) =
-                params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
+            if self.prefs.layouts.current.speed_sliders
+                && let Some(value) =
+                    params::param_slider(ui, ("gsp", gid), "Speed", g.speed, 1.0, (0.0, 4.0))
             {
                 cmds.push(Command::SetGroupSpeed { group: gid, value });
             }
             let (mut solo, mut bypass) = (g.solo, g.bypass);
             ui.horizontal(|ui| {
+                for (txt, bus) in [("A", vjc_model::Bus::A), ("B", vjc_model::Bus::B)] {
+                    let on = g.crossfader_bus == Some(bus.clone());
+                    if ui
+                        .selectable_label(on, txt)
+                        .on_hover_text(format!("Group on crossfader bus {txt}"))
+                        .clicked()
+                    {
+                        cmds.push(Command::SetGroupBus {
+                            group: gid,
+                            bus: if on { None } else { Some(bus) },
+                        });
+                    }
+                }
                 if icons::toggle(ui, &mut solo, icons::i::HEADPHONES, "Solo").changed() {
                     cmds.push(Command::SetGroupSolo { group: gid, solo });
                 }
@@ -8669,7 +8880,9 @@ impl State {
                     direction,
                 });
             }
-            if let Some(speed) = params::param_slider(ui, "spd", "Speed", t.speed, 1.0, (0.0, 4.0))
+            if self.prefs.layouts.current.speed_sliders
+                && let Some(speed) =
+                    params::param_slider(ui, "spd", "Speed", t.speed, 1.0, (0.0, 4.0))
             {
                 cmds.push(Command::SetSpeed {
                     deck,

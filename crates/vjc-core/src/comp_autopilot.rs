@@ -154,6 +154,13 @@ impl State {
         self.secs = 0.0;
     }
 
+    /// Columns moved, were inserted or removed: `map` gives a column's new index (None =
+    /// removed). The column on air follows its column; a removed one leaves nothing on air.
+    pub fn remap(&mut self, map: impl Fn(u32) -> Option<u32>) {
+        self.current = self.current.and_then(&map);
+        self.bag = self.bag.iter().filter_map(|c| map(*c)).collect();
+    }
+
     /// Nothing is on air any more (project replaced).
     pub fn reset(&mut self) {
         *self = State::default();

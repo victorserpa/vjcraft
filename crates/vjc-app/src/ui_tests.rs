@@ -6524,3 +6524,211 @@ fn idle_ui_does_not_request_extra_passes() {
     let passes = h.ctx.cumulative_pass_nr() - n0;
     assert!(passes <= 40, "{passes} passes in 20 steps");
 }
+
+fn col_names(h: &Harness<'_, State>) -> Vec<String> {
+    h.state()
+        .project
+        .composition
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+fn column_menu(h: &mut Harness<'_, State>, column: &str, item: &str) {
+    let p = h
+        .get_by_label(&format!("Select column {column}"))
+        .rect()
+        .center();
+    right_click_at(h, p);
+    click(h, item);
+}
+
+#[test]
+fn column_menu_insert_move_duplicate_remove_and_undo() {
+    let mut h = fast_app();
+    let before = col_names(&h);
+    let n = before.len();
+    column_menu(&mut h, &before[1], "Insert blank before column");
+    assert_eq!(col_names(&h).len(), n + 1);
+    assert_eq!(col_names(&h)[2], before[1], "old column 2 slid right");
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(col_names(&h), before);
+
+    column_menu(&mut h, &before[0], "Move right column");
+    assert_eq!(col_names(&h)[..2], [before[1].clone(), before[0].clone()]);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(col_names(&h), before);
+
+    column_menu(&mut h, &before[0], "Duplicate column");
+    assert_eq!(col_names(&h)[1], format!("{} copy", before[0]));
+    h.state_mut().undo();
+    settle(&mut h);
+    h.state_mut().redo();
+    settle(&mut h);
+    assert_eq!(col_names(&h)[1], format!("{} copy", before[0]));
+    h.state_mut().undo();
+    settle(&mut h);
+
+    // The last column is empty here: Remove works and undoes.
+    let last = before[n - 1].clone();
+    column_menu(&mut h, &last, "Remove column");
+    assert_eq!(col_names(&h).len(), n - 1);
+    h.state_mut().undo();
+    settle(&mut h);
+    assert_eq!(col_names(&h), before);
+}
+
+#[test]
+fn column_edits_keep_the_playing_clip_on_air_and_refuse_removing_it() {
+    let mut h = fast_app();
+    let (lid, pos) = cell_center(&h, 0, 1);
+    let (gen_id, _) = vjc_fx::GENERATORS[0];
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    h.state_mut().gens.clear();
+    settle(&mut h);
+    click(&mut h, "Trigger column 2");
+    assert_eq!(h.state().gens[&lid].1, 1);
+    let names = col_names(&h);
+    // Insert before column 1: the clip on air is now in column index 2, still playing.
+    column_menu(&mut h, &names[0], "Insert blank before column");
+    assert_eq!(h.state().gens[&lid].1, 2, "player follows its column");
+    assert!(h.state().gens.contains_key(&lid), "still on air");
+    // Removing the column that is on air is refused (negative control: nothing removed).
+    let n = col_names(&h).len();
+    column_menu(&mut h, &names[1], "Remove column");
+    assert_eq!(col_names(&h).len(), n);
+    assert!(h.state().status.contains("on air"), "{}", h.state().status);
+    assert!(h.state().gens.contains_key(&lid));
+}
+
+#[test]
+fn global_stop_ejects_pause_and_play_follow_and_reverse_and_metronome_are_commands() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let dir = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, lid, 1)
+            .unwrap()
+            .transport
+            .direction
+    };
+    click(&mut h, "Pause tempo clock");
+    assert_eq!(dir(&h), vjc_model::Direction::Pause, "clips pause");
+    assert!(h.state().gens.contains_key(&lid), "still on air");
+    click(&mut h, "Play tempo clock");
+    assert_eq!(dir(&h), vjc_model::Direction::Forward, "clips resume");
+    // Metronome and reverse go through the command bus (saved, undoable).
+    click(&mut h, "Metronome");
+    assert!(h.state().project.composition.tempo.metronome);
+    click(&mut h, "Reverse all clips");
+    assert!(h.state().project.composition.master_reverse);
+    h.state_mut().undo();
+    assert!(!h.state().project.composition.master_reverse);
+    // Stop ejects (negative control: pause and play above did not).
+    click(&mut h, "Stop tempo clock");
+    assert!(h.state().gens.is_empty() && h.state().players.is_empty());
+    assert_eq!(
+        h.state().project.composition.tempo.play_state,
+        vjc_model::PlayState::Stop
+    );
+}
+
+#[test]
+fn speed_sliders_can_be_hidden_from_the_view_option() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    h.state_mut().selected = Some((lid, 1));
+    settle(&mut h);
+    assert!(exists(&h, "Speed"), "clip speed slider shows by default");
+    h.state_mut().prefs.layouts.current.speed_sliders = false;
+    settle(&mut h);
+    assert!(!exists(&h, "Speed"), "hidden by the View option");
+}
+
+fn snap_trigger(st: &mut State, deck: DeckId, layer: LayerId, column: u32) {
+    st.snap_pending.push((
+        1.0,
+        Held {
+            act: SnapAct::Cmd(Box::new(Command::TriggerClip {
+                deck,
+                layer,
+                column,
+            })),
+            at: std::time::Instant::now(),
+            token: 0,
+        },
+    ));
+}
+
+fn pending_cols(st: &State) -> Vec<u32> {
+    st.snap_pending
+        .iter()
+        .filter_map(|(_, h)| match &h.act {
+            SnapAct::Cmd(c) => match &**c {
+                Command::TriggerClip { column, .. } => Some(*column),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn column_moves_carry_selection_preview_autopilot_and_pending_triggers() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let deck = st.project.composition.current_deck;
+    let ids = st.column_ids();
+    st.preview_target = PreviewTarget::Clip(deck, lid, 1);
+    st.comp_ap.on_air(1, 0.0);
+    snap_trigger(st, deck, lid, 1);
+    st.exec(Command::MoveColumns {
+        columns: vec![ids[1]],
+        to: 0,
+    });
+    assert_eq!(st.gens[&lid].1, 0, "player");
+    assert_eq!(st.selected, Some((lid, 0)), "selection");
+    assert!(matches!(st.preview_target, PreviewTarget::Clip(_, _, 0)));
+    assert_eq!(st.comp_ap.current(), Some(0), "autopilot");
+    assert_eq!(pending_cols(st), vec![0], "pending snap trigger");
+}
+
+#[test]
+fn removing_a_column_drops_its_pending_trigger_and_state() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let deck = st.project.composition.current_deck;
+    let ids = st.column_ids();
+    assert!(ids.len() > 2);
+    snap_trigger(st, deck, lid, 2);
+    snap_trigger(st, deck, lid, 1);
+    st.selected = Some((lid, 2));
+    st.exec(Command::RemoveColumns {
+        columns: vec![ids[2]],
+    });
+    assert_eq!(
+        pending_cols(st),
+        vec![1],
+        "trigger of the removed column dropped"
+    );
+    assert_eq!(st.selected, None);
+    assert!(st.gens.contains_key(&lid), "on-air column untouched");
+    assert!(st.gens.values().all(|g| g.1 == 1), "no stale player");
+}
+
+#[test]
+fn a_clip_on_air_in_another_deck_counts_for_the_remove_guard() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let b = uuid::Uuid::new_v4();
+    let cur = st.project.composition.current_deck;
+    st.gens.get_mut(&lid).unwrap().0 = b;
+    assert_ne!(b, cur);
+    assert_eq!(cols_on_air(&st.players, &st.gens), vec![1]);
+}

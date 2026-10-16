@@ -552,6 +552,8 @@ pub fn current(p: &Project, ctx: &Ctx, address: &str) -> Option<f64> {
         ["comp", "master", "opacity"] => Some(number(&p.composition.master.opacity.value)),
         ["comp", "master", "bypass"] => Some(f64::from(u8::from(ctx.master_bypass))),
         ["comp", "tempo", "bpm"] => Some(p.composition.tempo.bpm),
+        ["comp", "tempo", "metronome"] => Some(f64::from(u8::from(p.composition.tempo.metronome))),
+        ["comp", "transport", "reverse"] => Some(f64::from(u8::from(p.composition.master_reverse))),
         ["comp", "crossfader"] => Some(
             p.composition
                 .crossfader
@@ -707,6 +709,24 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
         ["comp", "master", "bypass"] => Some(Command::SetMasterBypass {
             bypass: value >= 0.5,
         }),
+        ["comp", "crossfader", "go", side @ ("a" | "b")] => Some(Command::GoCrossfader {
+            bus: if *side == "a" {
+                vjc_model::Bus::A
+            } else {
+                vjc_model::Bus::B
+            },
+            pressed: fire,
+        }),
+        ["comp", "crossfader", "curve"] => value.is_finite().then(|| Command::SetCrossfaderCurve {
+            curve: super::crossfader::CrossfadeCurve::ALL[(value.round().max(0.0) as usize)
+                .min(super::crossfader::CrossfadeCurve::ALL.len() - 1)],
+        }),
+        ["comp", "crossfader", "behaviour"] => {
+            let all = vjc_model::CrossfadeBehaviour::ALL;
+            value.is_finite().then(|| Command::SetCrossfaderBehaviour {
+                behaviour: all[(value.round().max(0.0) as usize).min(all.len() - 1)],
+            })
+        }
         ["comp", "crossfader"] => Some(Command::SetCrossfader {
             value: value.clamp(0.0, 1.0),
         }),
@@ -723,12 +743,41 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
             })
         }
         ["comp", "clear"] => fire.then_some(Command::ClearAll),
+        ["comp", "transport", st @ ("play" | "pause" | "stop")] => {
+            fire.then_some(Command::SetTransport {
+                state: match *st {
+                    "play" => vjc_model::PlayState::Play,
+                    "pause" => vjc_model::PlayState::Pause,
+                    _ => vjc_model::PlayState::Stop,
+                },
+            })
+        }
+        ["comp", "transport", "reverse"] => Some(Command::SetMasterReverse {
+            reverse: value >= 0.5,
+        }),
+        ["comp", "tempo", "metronome"] => Some(Command::SetMetronome { on: value >= 0.5 }),
         _ => None,
     }
 }
 
 /// Pause toggle for the clip playing on `layer` (None = every playing clip): resumes when
 /// they are all paused, pauses otherwise. None when nothing is playing there.
+/// Pause (or resume) of every clip playing: None when nothing is playing.
+pub fn set_all_paused(
+    active: &[(LayerId, DeckId, ColumnIdx)],
+    origin: &[(LayerId, LayerId)],
+    paused: bool,
+) -> Option<Command> {
+    let clips: Vec<_> = active
+        .iter()
+        .map(|&(l, d, c)| {
+            let src = origin.iter().find(|o| o.0 == l).map_or(l, |o| o.1);
+            (d, src, c)
+        })
+        .collect();
+    (!clips.is_empty()).then_some(Command::SetPaused { clips, paused })
+}
+
 pub fn toggle_pause(
     p: &Project,
     active: &[(LayerId, DeckId, ColumnIdx)],
