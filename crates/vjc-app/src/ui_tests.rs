@@ -7005,3 +7005,124 @@ fn quick_search_lists_layers_clips_and_commands() {
         assert!(kinds.contains(&k), "{k:?}");
     }
 }
+
+// #8: transform widget on the Preview monitor.
+fn xf_setup() -> (Harness<'static, State>, LayerId, EffectTarget) {
+    let mut h = app();
+    let (lid, _) = stopped_generator(&mut h);
+    h.state_mut().preview_target = PreviewTarget::Layer(lid);
+    settle(&mut h);
+    (h, lid, EffectTarget::Layer(lid))
+}
+
+fn xf_val(h: &Harness<'_, State>, t: EffectTarget, f: vjc_model::TransformField) -> f64 {
+    let mut p = h.state().project.clone();
+    match vjc_core::effects::track_mut(&mut p, t)
+        .unwrap()
+        .transform
+        .field_mut(f)
+        .value
+    {
+        vjc_model::Value::Number(n) => n,
+        _ => f64::NAN,
+    }
+}
+
+/// Screen point of a frame-space point (frame centre origin) on the Preview picture.
+fn xf_screen(h: &Harness<'_, State>, p: egui::Vec2) -> egui::Pos2 {
+    let st = h.state();
+    let comp = (st.project.composition.width, st.project.composition.height);
+    let pic = monitor::picture_rect(st.xf_area, comp, st.mon_views[1]);
+    pic.center() + p * (pic.width() / comp.0 as f32)
+}
+
+#[test]
+fn preview_widget_drag_moves_position_and_is_one_undo_step() {
+    use vjc_model::TransformField as F;
+    let (mut h, _, t) = xf_setup();
+    let comp = (
+        h.state().project.composition.width as f32,
+        h.state().project.composition.height as f32,
+    );
+    // Inside the box, away from the anchor and the corners.
+    let from = xf_screen(&h, egui::vec2(comp.0 * 0.25, comp.1 * 0.25));
+    let to = from + egui::vec2(30.0, 12.0);
+    drag(&mut h, from, to);
+    let k = comp.0 / h.state().xf_area.width().max(1.0);
+    let pic = monitor::picture_rect(
+        h.state().xf_area,
+        (comp.0 as u32, comp.1 as u32),
+        h.state().mon_views[1],
+    );
+    let scale = comp.0 / pic.width();
+    let _ = k;
+    let (x, y) = (xf_val(&h, t, F::X), xf_val(&h, t, F::Y));
+    assert!((x - 30.0 * f64::from(scale)).abs() < 1.0, "x {x}");
+    assert!((y - 12.0 * f64::from(scale)).abs() < 1.0, "y {y}");
+    assert_eq!(h.state().mon_views[1].pan, egui::Vec2::ZERO, "no pan");
+    h.state_mut().undo();
+    assert_eq!(xf_val(&h, t, F::X), 0.0);
+    assert_eq!(xf_val(&h, t, F::Y), 0.0);
+}
+
+#[test]
+fn preview_widget_corner_scales_and_shift_keeps_aspect() {
+    use vjc_model::TransformField as F;
+    let (mut h, _, t) = xf_setup();
+    let (cw, ch) = (
+        h.state().project.composition.width as f32,
+        h.state().project.composition.height as f32,
+    );
+    let corner = xf_screen(&h, egui::vec2(cw / 2.0, ch / 2.0));
+    let centre = xf_screen(&h, egui::Vec2::ZERO);
+    // Pull the corner out to twice its distance from the anchor.
+    drag(&mut h, corner, centre + (corner - centre) * 2.0);
+    assert!((xf_val(&h, t, F::ScaleW) - 2.0).abs() < 0.05);
+    assert!((xf_val(&h, t, F::ScaleH) - 2.0).abs() < 0.05);
+    h.state_mut().undo();
+    assert_eq!(xf_val(&h, t, F::ScaleW), 1.0);
+    // Shift: only the uniform Scale moves.
+    let to = centre + (corner - centre) * 2.0;
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    drag(&mut h, corner, to);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    settle(&mut h);
+    assert!(xf_val(&h, t, F::Scale) > 1.5);
+    assert_eq!(xf_val(&h, t, F::ScaleW), 1.0);
+}
+
+#[test]
+fn preview_widget_rotation_handle_and_toggle() {
+    use vjc_model::TransformField as F;
+    let (mut h, _, t) = xf_setup();
+    let ch = h.state().project.composition.height as f32;
+    let st = h.state();
+    let comp = (st.project.composition.width, st.project.composition.height);
+    let k = monitor::picture_rect(st.xf_area, comp, st.mon_views[1]).width() / comp.0 as f32;
+    let handle = xf_screen(&h, egui::vec2(0.0, -ch / 2.0 + 24.0 / k));
+    let centre = xf_screen(&h, egui::Vec2::ZERO);
+    drag(&mut h, handle, centre + egui::vec2(100.0, 0.0));
+    assert!((xf_val(&h, t, F::Rotation) - 90.0).abs() < 1.0);
+    // Toggle off in View: dragging pans instead and leaves the transform alone.
+    h.state_mut().undo();
+    h.state_mut().xf_show = false;
+    settle(&mut h);
+    let from = xf_screen(&h, egui::vec2(10.0, 10.0));
+    drag(&mut h, from, from + egui::vec2(20.0, 0.0));
+    assert_eq!(xf_val(&h, t, F::X), 0.0);
+    assert_ne!(h.state().mon_views[1].pan, egui::Vec2::ZERO);
+}
+
+#[test]
+fn preview_widget_arrow_keys_nudge_when_focused() {
+    use vjc_model::TransformField as F;
+    let (mut h, _, t) = xf_setup();
+    let from = xf_screen(&h, egui::vec2(100.0, 100.0));
+    click_at(&mut h, from);
+    h.key_press(egui::Key::ArrowRight);
+    settle(&mut h);
+    assert_eq!(xf_val(&h, t, F::X), 1.0);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+    settle(&mut h);
+    assert_eq!(xf_val(&h, t, F::Y), 10.0);
+}
