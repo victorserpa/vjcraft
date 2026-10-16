@@ -2150,7 +2150,8 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     let f = i64::from(f).clamp(0, n - 1);
                     let sign = if delta < 0 { -1 } else { 1 };
                     let mut c = f;
-                    let mut left = delta.unsigned_abs().max(1);
+                    // Delta 0 retriggers the current column.
+                    let mut left = delta.unsigned_abs();
                     let mut at = f;
                     while left > 0 {
                         c += sign;
@@ -6727,6 +6728,11 @@ mod tests {
         assert_eq!(col_of(&mut p, None, 1), 0);
         assert_eq!(col_of(&mut p, Some(0), -1), 0);
         assert_eq!(col_of(&mut p, Some(2), 1), 2);
+        assert_eq!(
+            col_of(&mut p, Some(0), 0),
+            0,
+            "delta 0 retriggers the current column"
+        );
         let clip = |p: &mut Project, from, delta| {
             apply(
                 p,

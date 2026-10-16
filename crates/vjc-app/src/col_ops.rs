@@ -47,7 +47,7 @@ pub fn targets(marks: &[Uuid], clicked: Uuid) -> Vec<Uuid> {
     }
 }
 
-/// Command for `op` on `targets`. `on_air` = columns (of the current deck) with a clip playing:
+/// Command for `op` on `targets`. `on_air` = columns (of any deck) with a clip playing:
 /// removing one of them is refused so nothing on air changes. None = nothing to do.
 pub fn commands(
     p: &Project,

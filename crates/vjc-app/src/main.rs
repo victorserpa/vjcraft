@@ -460,6 +460,37 @@ enum SnapAct {
     BeatLoop(LayerId, f64),
 }
 
+/// Columns with a clip on air in any deck: columns are shared by all decks, so removing one
+/// deletes its clips in every deck.
+fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -> Vec<u32> {
+    players
+        .values()
+        .map(|(_, c, _)| *c)
+        .chain(gens.values().map(|(_, c, _)| *c))
+        .collect()
+}
+
+/// Rewrites the column of a queued command after columns moved; false when its column was
+/// removed (the command is dropped).
+fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
+    match cmd {
+        Command::TriggerClip { column, .. }
+        | Command::TriggerClipOn { column, .. }
+        | Command::TriggerColumn { column, .. } => map(*column).is_some_and(|n| {
+            *column = n;
+            true
+        }),
+        Command::StepColumn { from, .. } | Command::StepClip { from, .. } => match *from {
+            Some(f) => map(f).is_some_and(|n| {
+                *from = Some(n);
+                true
+            }),
+            None => true,
+        },
+        _ => true,
+    }
+}
+
 /// A snapped action and the wall time it was queued (a stalled clock must not hold it forever).
 struct Held {
     act: SnapAct,
@@ -2966,30 +2997,80 @@ impl State {
             .collect()
     }
 
-    /// After columns moved, were inserted or removed, what is playing and selected keeps
-    /// following its column: the column index it was started from is rewritten to where the
-    /// column is now (nothing on air changes). Entries of a removed column stay as they are.
+    /// After columns moved, were inserted or removed, what is playing, selected or queued
+    /// keeps following its column: every column index kept per cell is rewritten to where
+    /// the column is now (nothing on air changes). State of a removed column is dropped.
     fn follow_columns(&mut self, old: &[Uuid]) {
         let new = self.column_ids();
         if *old == new[..] {
             return;
         }
-        let map = |c: u32| {
+        let map = |c: u32| -> Option<u32> {
             old.get(c as usize)
                 .and_then(|id| new.iter().position(|n| n == id))
-                .map_or(c, |n| n as u32)
+                .map(|n| n as u32)
         };
-        for (_, c, _) in self.players.values_mut() {
-            *c = map(*c);
-        }
-        for (_, c, _) in self.gens.values_mut() {
-            *c = map(*c);
-        }
-        for (_, _, c) in self.origin.values_mut() {
-            *c = map(*c);
-        }
-        self.col_sel = self.col_sel.map(map);
+        self.players.retain(|_, (_, c, _)| match map(*c) {
+            Some(n) => {
+                *c = n;
+                true
+            }
+            None => false,
+        });
+        self.gens.retain(|_, (_, c, _)| match map(*c) {
+            Some(n) => {
+                *c = n;
+                true
+            }
+            None => false,
+        });
+        self.origin.retain(|_, (_, _, c)| match map(*c) {
+            Some(n) => {
+                *c = n;
+                true
+            }
+            None => false,
+        });
+        self.col_sel = self.col_sel.and_then(map);
         self.col_marks.retain(|m| new.contains(m));
+        self.selected = match self.selected {
+            Some((l, c)) => map(c).map(|n| (l, n)),
+            None => None,
+        };
+        if let PreviewTarget::Clip(d, l, c) = self.preview_target {
+            self.preview_target = match map(c) {
+                Some(n) => PreviewTarget::Clip(d, l, n),
+                None => PreviewTarget::Composition,
+            };
+        }
+        self.comp_ap.remap(map);
+        self.snap_pending.retain_mut(|(_, h)| match &mut h.act {
+            SnapAct::Cmd(cmd) => remap_command(cmd, &map),
+            SnapAct::BeatLoop(..) => true,
+        });
+        self.holds.retain_mut(|r| match map(r.fired.column) {
+            Some(n) => {
+                r.fired.column = n;
+                true
+            }
+            None => false,
+        });
+        self.snap_req = match self.snap_req {
+            Some((d, l, c)) => map(c).map(|n| (d, l, n)),
+            None => None,
+        };
+        self.cell_drag = match self.cell_drag {
+            Some((l, c)) => map(c).map(|n| (l, n)),
+            None => None,
+        };
+        let resume = std::mem::take(&mut self.flow.resume);
+        self.flow.resume = resume
+            .into_iter()
+            .filter_map(|((d, l, c), v)| map(c).map(|n| ((d, l, n), v)))
+            .collect();
+        for bag in self.layer_bags.borrow_mut().values_mut() {
+            *bag = bag.iter().filter_map(|c| map(*c)).collect();
+        }
     }
 
     /// The selected column index must point at a column that still exists.
@@ -6708,14 +6789,7 @@ impl State {
                             );
                         });
                         let all_col_ids: Vec<Uuid> = comp.columns.iter().map(|c| c.id).collect();
-                        let cols_on_air: Vec<u32> = self
-                            .players
-                            .values()
-                            .map(|(d, c, _)| (*d, *c))
-                            .chain(self.gens.values().map(|(d, c, _)| (*d, *c)))
-                            .filter(|(d, _)| *d == cur)
-                            .map(|(_, c)| c)
-                            .collect();
+                        let cols_on_air = cols_on_air(&self.players, &self.gens);
                         for (ci, (cid, n)) in names.iter().enumerate() {
                             if let Some((rid, buf)) =
                                 self.col_renaming.as_mut().filter(|(r, _)| r == cid)

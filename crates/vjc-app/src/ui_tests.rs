@@ -6647,3 +6647,88 @@ fn speed_sliders_can_be_hidden_from_the_view_option() {
     settle(&mut h);
     assert!(!exists(&h, "Speed"), "hidden by the View option");
 }
+
+fn snap_trigger(st: &mut State, deck: DeckId, layer: LayerId, column: u32) {
+    st.snap_pending.push((
+        1.0,
+        Held {
+            act: SnapAct::Cmd(Box::new(Command::TriggerClip {
+                deck,
+                layer,
+                column,
+            })),
+            at: std::time::Instant::now(),
+            token: 0,
+        },
+    ));
+}
+
+fn pending_cols(st: &State) -> Vec<u32> {
+    st.snap_pending
+        .iter()
+        .filter_map(|(_, h)| match &h.act {
+            SnapAct::Cmd(c) => match &**c {
+                Command::TriggerClip { column, .. } => Some(*column),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn column_moves_carry_selection_preview_autopilot_and_pending_triggers() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let deck = st.project.composition.current_deck;
+    let ids = st.column_ids();
+    st.preview_target = PreviewTarget::Clip(deck, lid, 1);
+    st.comp_ap.on_air(1, 0.0);
+    snap_trigger(st, deck, lid, 1);
+    st.exec(Command::MoveColumns {
+        columns: vec![ids[1]],
+        to: 0,
+    });
+    assert_eq!(st.gens[&lid].1, 0, "player");
+    assert_eq!(st.selected, Some((lid, 0)), "selection");
+    assert!(matches!(st.preview_target, PreviewTarget::Clip(_, _, 0)));
+    assert_eq!(st.comp_ap.current(), Some(0), "autopilot");
+    assert_eq!(pending_cols(st), vec![0], "pending snap trigger");
+}
+
+#[test]
+fn removing_a_column_drops_its_pending_trigger_and_state() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let deck = st.project.composition.current_deck;
+    let ids = st.column_ids();
+    assert!(ids.len() > 2);
+    snap_trigger(st, deck, lid, 2);
+    snap_trigger(st, deck, lid, 1);
+    st.selected = Some((lid, 2));
+    st.exec(Command::RemoveColumns {
+        columns: vec![ids[2]],
+    });
+    assert_eq!(
+        pending_cols(st),
+        vec![1],
+        "trigger of the removed column dropped"
+    );
+    assert_eq!(st.selected, None);
+    assert!(st.gens.contains_key(&lid), "on-air column untouched");
+    assert!(st.gens.values().all(|g| g.1 == 1), "no stale player");
+}
+
+#[test]
+fn a_clip_on_air_in_another_deck_counts_for_the_remove_guard() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let st = h.state_mut();
+    let b = uuid::Uuid::new_v4();
+    let cur = st.project.composition.current_deck;
+    st.gens.get_mut(&lid).unwrap().0 = b;
+    assert_ne!(b, cur);
+    assert_eq!(cols_on_air(&st.players, &st.gens), vec![1]);
+}
