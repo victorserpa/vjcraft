@@ -3892,6 +3892,7 @@ fn cell_widget_id_does_not_depend_on_the_scroll_offset() {
             let state = grid_ui::CellState {
                 playing: false,
                 selected: false,
+                failed: false,
             };
             let c = grid_ui::cell(ui, id, "a", "a", grid_ui::Tile::Pending, state);
             ids.push((c.pic.id, c.strip.map(|s| s.id)));
@@ -8535,4 +8536,18 @@ fn output_plus_menu_adds_an_artnet_screen_and_mesh_subdivisions_resize() {
     });
     let m = &h.state().project.output.screens[0].slices[0];
     assert_eq!((m.mesh_cols, m.output_mesh.len()), (3, 9));
+}
+
+// Review fix: --recover keeps the recovery file, so a second crash before the next autosave
+// still finds it.
+#[test]
+fn recover_keeps_the_recovery_file() {
+    let file = tmp_vjc("recover-keeps.vjc");
+    let mut src = State::headless(prefs());
+    src.dirty = true;
+    assert!(src.save_to(file.clone()), "write a valid project");
+    let mut st = State::headless(prefs());
+    assert!(st.restore_recovery(file.clone()));
+    assert!(file.exists(), "recovery file must survive a recover");
+    let _ = std::fs::remove_file(&file);
 }
