@@ -77,12 +77,26 @@ pub const BROWSER_SEARCH_MAX_W: f32 = 200.0;
 pub const STROKE_HANDLE: f32 = 1.5;
 pub const STROKE_CANVAS: f32 = 2.0;
 
-/// Output setup window: size, first position, screen list column, canvas width.
-pub const OUTPUT_WIN_W: f32 = 820.0;
+/// Output setup window: first position, minimum size, tree column, properties column, the
+/// help panel under the tree and the Cancel / Save row. The window itself is sized from the
+/// screen (large, resizable); the canvas takes what the columns leave.
 pub const OUTPUT_WIN_X: f32 = 60.0;
 pub const OUTPUT_WIN_Y: f32 = 80.0;
-pub const OUTPUT_LIST_W: f32 = 190.0;
-pub const OUTPUT_CANVAS_W: f32 = 340.0;
+pub const OUTPUT_MIN_W: f32 = 860.0;
+pub const OUTPUT_MIN_H: f32 = 500.0;
+pub const OUTPUT_LIST_W: f32 = 250.0;
+pub const OUTPUT_PROPS_W: f32 = 330.0;
+pub const OUTPUT_HELP_H: f32 = 92.0;
+pub const OUTPUT_FOOTER_H: f32 = 32.0;
+/// Output canvas: dash and gap of the outline of an unselected slice, how far past the
+/// content the wheel can zoom, and the strength of the guide image under the slices.
+pub const CANVAS_DASH: f32 = 6.0;
+pub const CANVAS_GAP: f32 = 4.0;
+pub const CANVAS_ZOOM_MIN: f32 = 0.02;
+pub const CANVAS_ZOOM_MAX: f32 = 8.0;
+pub const GUIDE_ALPHA: f32 = 0.5;
+/// Indent of a slice row under its screen in the tree.
+pub const TREE_INDENT: f32 = 18.0;
 
 /// Canvas handles: radius, grab radius as a multiple of it, grid snap step.
 pub const HANDLE_R: f32 = 6.0;

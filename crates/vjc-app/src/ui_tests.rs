@@ -107,6 +107,37 @@ fn click(h: &mut Harness<'_, State>, label: &str) {
     settle(h);
 }
 
+/// Clicks a control that may be below the fold of the properties panel: scrolls to it first.
+fn click_far(h: &mut Harness<'_, State>, label: &str) {
+    h.get_by_label(label).scroll_to_me();
+    h.run_steps(30); // the scroll is animated
+    click(h, label);
+}
+
+/// "+" menu of the Output setup tree, then one of its entries.
+fn plus_menu(h: &mut Harness<'_, State>, entry: &str) {
+    click(h, "Add");
+    click(h, entry);
+}
+
+fn add_screen(h: &mut Harness<'_, State>) {
+    plus_menu(h, "Add screen");
+}
+
+fn add_slice(h: &mut Harness<'_, State>) {
+    plus_menu(h, "Add slice");
+}
+
+/// Switches the setup window to its Input or Output tab. The menu bar also has an "Output":
+/// the tab is the lower of the two.
+fn click_tab(h: &mut Harness<'_, State>, label: &str) {
+    h.query_all_by_label(label)
+        .max_by(|a, b| a.rect().min.y.total_cmp(&b.rect().min.y))
+        .unwrap_or_else(|| panic!("tab {label}"))
+        .click();
+    settle(h);
+}
+
 fn exists(h: &Harness<'_, State>, label: &str) -> bool {
     h.query_all_by_label(label).next().is_some()
 }
@@ -945,9 +976,11 @@ fn output_setup_add_screen_and_slice() {
     click(&mut h, "Output");
     click(&mut h, "Setup...");
     assert!(h.state().output_setup_open);
-    assert!(exists(&h, "Add slice") || exists(&h, "Add"));
+    assert!(exists(&h, "Add") && exists(&h, "Save & Close") && exists(&h, "Cancel"));
     click(&mut h, "Add");
+    click(&mut h, "Add screen");
     assert_eq!(h.state().project.output.screens.len(), 1);
+    click(&mut h, "Add");
     click(&mut h, "Add slice");
     let scr = &h.state().project.output.screens[0];
     assert_eq!(scr.slices.len(), 1);
@@ -959,7 +992,7 @@ fn output_setup_artnet_device_shows_fixture_editor() {
     let mut h = app();
     click(&mut h, "Output");
     click(&mut h, "Setup...");
-    click(&mut h, "Add");
+    add_screen(&mut h);
     let id = h.state().project.output.screens[0].id;
     h.state_mut().exec(Command::SetScreenDevice {
         screen: id,
@@ -987,7 +1020,7 @@ fn output_setup_artnet_add_fixture_and_flip() {
     let mut h = app();
     click(&mut h, "Output");
     click(&mut h, "Setup...");
-    click(&mut h, "Add");
+    add_screen(&mut h);
     let id = h.state().project.output.screens[0].id;
     h.state_mut().exec(Command::SetScreenDevice {
         screen: id,
@@ -1025,13 +1058,18 @@ fn output_setup_soft_edge_and_mask() {
     let mut h = app();
     click(&mut h, "Output");
     click(&mut h, "Setup...");
-    click(&mut h, "Add");
-    click(&mut h, "Add slice");
+    add_screen(&mut h);
+    add_slice(&mut h);
     let sl = |h: &Harness<'_, State>| h.state().project.output.screens[0].slices[0].clone();
     assert!(sl(&h).soft_edge.is_none() && sl(&h).mask.is_none());
-    click(&mut h, "Enabled");
+    click_far(&mut h, "Enabled");
     assert_eq!(sl(&h).soft_edge.unwrap().left, 0.1);
     // Drag the left slider to about half of its 0..0.5 range.
+    h.query_all_by_role(egui::accesskit::Role::Slider)
+        .find(|n| n.accesskit_node().label().as_deref() == Some("Edge left"))
+        .expect("Edge left slider")
+        .scroll_to_me();
+    h.run_steps(30);
     let rect = h
         .query_all_by_role(egui::accesskit::Role::Slider)
         .find(|n| n.accesskit_node().label().as_deref() == Some("Edge left"))
@@ -1041,14 +1079,13 @@ fn output_setup_soft_edge_and_mask() {
     let left = sl(&h).soft_edge.unwrap().left;
     assert!(left > 0.25 && left <= 0.5, "{left}");
     // The drag is undoable (it may coalesce with the toggle that enabled the edge).
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert!(sl(&h).soft_edge.is_none_or(|e| e.left == 0.1));
-    click(&mut h, "Create mask");
+    click_far(&mut h, "Create mask");
     assert_eq!(sl(&h).mask.unwrap().len(), 4);
     assert!(h.state().edit_mask);
     // Mask lifecycle.
-    click(&mut h, "Clear mask");
+    click_far(&mut h, "Clear mask");
     assert!(sl(&h).mask.is_none());
     snap(&mut h, "10-output-soft-edge");
 }
@@ -2210,13 +2247,12 @@ fn output_setup_pixel_perfect_toggle_and_free_resolution() {
     let mut h = app();
     click(&mut h, "Output");
     click(&mut h, "Setup...");
-    click(&mut h, "Add");
+    add_screen(&mut h);
     let id = h.state().project.output.screens[0].id;
     assert!(!h.state().project.output.screens[0].pixel_perfect);
     click(&mut h, "Pixel-perfect (nearest)");
     assert!(h.state().project.output.screens[0].pixel_perfect);
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert!(!h.state().project.output.screens[0].pixel_perfect);
     // The size is free and independent of the composition.
     h.state_mut().exec(Command::SetScreenSize {
@@ -2265,7 +2301,9 @@ fn output_menu_test_card_identify_fps_and_display_info() {
 /// Opens Output setup on one 1920x1080 screen "Wall" with one slice whose output is the
 /// 480x270 rectangle at (100, 200); returns the harness.
 fn precise_slice_setup() -> Harness<'static, State> {
-    let mut h = app();
+    // Short frames: the numeric rows open on a double-click.
+    let state = small_grid(State::headless(prefs()));
+    let mut h = app_with_dt(state, egui::vec2(1280.0, 800.0), 0.02);
     let mut scr = vjc_core::mapping::new_screen("Wall", 1920, 1080);
     let mut sl = vjc_core::mapping::new_slice(1920, 1080);
     sl.output_mesh = vec![
@@ -2282,6 +2320,9 @@ fn precise_slice_setup() -> Harness<'static, State> {
     settle(&mut h);
     click(&mut h, "Output");
     click(&mut h, "Setup...");
+    // The slice is selected and the Output tab shows where it lands on the screen.
+    click(&mut h, "Slice 1");
+    click_tab(&mut h, "Output");
     h
 }
 
@@ -2293,13 +2334,10 @@ fn out_rect(h: &Harness<'_, State>) -> vjc_core::slice_geom::Rect {
     vjc_core::slice_geom::bbox(&first_slice(h).output_mesh).unwrap()
 }
 
-/// Types `text` into the field that shows `shown`, then Enter.
+/// Types `text` into the numeric row that shows `shown` (double-click opens it), then Enter.
 fn type_in_field(h: &mut Harness<'_, State>, shown: &str, text: &str) {
-    h.query_all_by_value(shown)
-        .next()
-        .unwrap_or_else(|| panic!("no field showing {shown}"))
-        .click();
-    settle(h);
+    let at = h.get_by_label(shown).rect().center();
+    double_click_at(h, at);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     settle(h);
     h.event(egui::Event::Text(text.into()));
@@ -2322,8 +2360,7 @@ fn slice_inspector_math_fields_buttons_and_undo() {
     type_in_field(&mut h, "100", "+10");
     assert_eq!(out_rect(&h).x, 110.0);
     // Both field edits coalesce into one undo step.
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert_eq!(h.state().project, before, "fields are undoable");
     // Quarter turn swaps the box; flips keep it.
     click(&mut h, "Rotate 90");
@@ -2336,14 +2373,13 @@ fn slice_inspector_math_fields_buttons_and_undo() {
         h.state().project.composition.width,
         h.state().project.composition.height,
     );
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert!(!vjc_core::mapping::slice_unscaled(comp, &first_slice(&h)));
     assert_eq!(out_rect(&h).w, 480.0);
     click(&mut h, "Match output shape");
     assert!(vjc_core::mapping::slice_unscaled(comp, &first_slice(&h)));
     // Duplicate selects the copy right after the original.
-    click(&mut h, "Duplicate slice");
+    click_far(&mut h, "Duplicate slice");
     let slices = &h.state().project.output.screens[0].slices;
     assert_eq!(slices.len(), 2);
     assert_ne!(slices[0].id, slices[1].id);
@@ -2361,6 +2397,8 @@ fn slice_inspector_moves_slice_to_another_screen() {
         index: 1,
     });
     settle(&mut h);
+    h.get_by_label("Move to screen").scroll_to_me();
+    h.run_steps(30);
     click(&mut h, "Move to screen");
     // The name is also in the screen list: the last one is the menu entry.
     h.query_all_by_label("Wall B").last().unwrap().click();
@@ -2369,22 +2407,25 @@ fn slice_inspector_moves_slice_to_another_screen() {
     assert!(out.screens[0].slices.is_empty());
     assert_eq!(out.screens[1].slices.len(), 1);
     assert_eq!(h.state().sel_screen, Some(bid));
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert_eq!(h.state().project.output.screens[0].slices.len(), 1);
 }
 
-/// Top-left of the output canvas: just under its caption.
+/// Top-left of the content of the setup canvas (the screen on the Output tab).
 fn out_canvas_origin(h: &Harness<'_, State>) -> egui::Pos2 {
-    let r = h.get_by_label_contains("Output (mesh").rect();
-    egui::pos2(r.left(), r.bottom() + 4.0)
+    overview_rect(h).min
+}
+
+/// Canvas points per screen pixel of a 1920 px wide screen.
+fn out_k(h: &Harness<'_, State>) -> f32 {
+    overview_rect(h).width() / 1920.0
 }
 
 #[test]
 fn arrow_keys_move_the_slice_one_pixel_and_ten_with_shift() {
     let mut h = precise_slice_setup();
-    let o = out_canvas_origin(&h);
-    h.hover_at(o + egui::vec2(170.0, 90.0));
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    h.hover_at(o + egui::vec2(340.0 * k, 335.0 * k));
     settle(&mut h);
     h.key_press(egui::Key::ArrowRight);
     settle(&mut h);
@@ -2405,7 +2446,7 @@ fn out_xs(h: &Harness<'_, State>) -> Vec<f32> {
 
 /// Two slices selected together (Duplicate selects the copy; shift-click adds the first).
 fn two_slices_selected(h: &mut Harness<'_, State>) {
-    click(h, "Duplicate slice");
+    click_far(h, "Duplicate slice");
     let scr = h.state().project.output.screens[0].clone();
     h.state_mut().click_slice(&scr, scr.slices[0].id, true);
     settle(h);
@@ -2416,20 +2457,18 @@ fn two_slices_selected(h: &mut Harness<'_, State>) {
 fn multi_selected_slices_move_together_as_one_undo_step() {
     let mut h = precise_slice_setup();
     two_slices_selected(&mut h);
-    let o = out_canvas_origin(&h);
-    h.hover_at(o + egui::vec2(170.0, 90.0));
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    h.hover_at(o + egui::vec2(340.0 * k, 335.0 * k));
     settle(&mut h);
     h.key_press(egui::Key::ArrowRight);
     settle(&mut h);
     assert_eq!(out_xs(&h), vec![101.0, 101.0], "both slices moved");
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert_eq!(out_xs(&h), vec![100.0, 100.0], "one undo reverts both");
     // Remove deletes every selected slice in one step.
-    click(&mut h, "Remove slices");
+    click_far(&mut h, "Remove slices");
     assert!(h.state().project.output.screens[0].slices.is_empty());
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert_eq!(h.state().project.output.screens[0].slices.len(), 2);
 }
 
@@ -2474,8 +2513,7 @@ fn selection_changes_only_after_add_or_move_slice_succeed() {
 #[test]
 fn dragging_the_slice_body_snaps_to_the_screen_edge() {
     let mut h = precise_slice_setup();
-    let o = out_canvas_origin(&h);
-    let k = 340.0 / 1920.0;
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
     // Inside the slice (100..580 x 200..470 px), away from its corners.
     let from = o + egui::vec2(340.0 * k, 335.0 * k);
     // About 100 px left: the left edge ends within a few px of the screen edge.
@@ -2500,8 +2538,8 @@ fn arrow_nudge_stops_on_a_guide_instead_of_crossing_it() {
     h.state_mut().exec(cmd);
     settle(&mut h);
     assert_eq!(out_rect(&h).x, 3.0);
-    let o = out_canvas_origin(&h);
-    h.hover_at(o + egui::vec2(60.0, 90.0));
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    h.hover_at(o + egui::vec2(340.0 * k, 335.0 * k));
     settle(&mut h);
     h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowLeft);
     settle(&mut h);
@@ -2511,8 +2549,9 @@ fn arrow_nudge_stops_on_a_guide_instead_of_crossing_it() {
 /// Drags the output handle of the top-left corner (100, 200) to canvas offset `to_x`,
 /// holding `mods`; returns the resulting x in pixels.
 fn drag_corner_to(h: &mut Harness<'_, State>, to_x: f32, mods: egui::Modifiers) -> f32 {
-    let o = out_canvas_origin(h);
-    let k = 340.0 / 1920.0;
+    // The point handles belong to Edit points; the box handles resize.
+    click(h, "Edit points");
+    let (o, k) = (out_canvas_origin(h), out_k(h));
     let from = o + egui::vec2(100.0 * k, 200.0 * k);
     let to = o + egui::vec2(to_x, 200.0 * k);
     let button = |pos, pressed| egui::Event::PointerButton {
@@ -2541,12 +2580,14 @@ fn drag_corner_to(h: &mut Harness<'_, State>, to_x: f32, mods: egui::Modifiers) 
 
 #[test]
 fn dragging_a_corner_snaps_to_the_screen_centre_and_alt_disables_it() {
-    // 170 canvas px is the centre (960 px); 167 is 3 canvas px short of it.
+    // 960 px is the centre; 3 canvas points short of it is within the snap reach.
     let mut h = precise_slice_setup();
-    let x = drag_corner_to(&mut h, 167.0, egui::Modifiers::NONE);
+    let short = 960.0 * out_k(&h) - 3.0;
+    let x = drag_corner_to(&mut h, short, egui::Modifiers::NONE);
     assert_eq!(x, 960.0, "snapped to the screen centre");
     let mut h = precise_slice_setup();
-    let x = drag_corner_to(&mut h, 167.0, egui::Modifiers::ALT);
+    let short = 960.0 * out_k(&h) - 3.0;
+    let x = drag_corner_to(&mut h, short, egui::Modifiers::ALT);
     assert!(
         (x - 960.0).abs() > 5.0 && (x - 940.0).abs() < 30.0,
         "free: {x}"
@@ -2570,8 +2611,7 @@ fn slice_source_dropdown_routes_a_layer_and_undoes() {
     click(&mut h, "Source");
     click(&mut h, "Layer: Layer 1");
     assert_eq!(first_slice(&h).source, SliceSource::Layer(layer));
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert_eq!(first_slice(&h).source, SliceSource::Composition);
     // The menu also offers the preview.
     click(&mut h, "Source");
@@ -2630,8 +2670,7 @@ fn output_presets_save_load_rename_delete_with_undo() {
     assert_eq!((&a.name, a.width, a.height), (&b.name, b.width, b.height));
     assert_eq!(a.slices[0].output_mesh, b.slices[0].output_mesh);
     assert_eq!(h.state().sel_screen, Some(a.id));
-    h.state_mut().undo();
-    settle(&mut h);
+    click(&mut h, "Undo edit");
     assert_eq!(h.state().project.output, before_edit);
     // Rename (type the new name first), then the two-step delete.
     h.state_mut().preset_text = "Venue B".into();
@@ -2837,7 +2876,7 @@ fn stale_multi_selection_is_pruned_after_undo() {
     let mut h = precise_slice_setup();
     two_slices_selected(&mut h);
     assert_eq!(h.state().sel_slices.len(), 2);
-    h.state_mut().undo(); // undoes the Duplicate: the copy is gone
+    click(&mut h, "Undo edit"); // undoes the Duplicate: the copy is gone
     assert!(h.state().sel_slices.is_empty(), "stale ids must be dropped");
     // negative control: without pruning the ids stay
     let mut h = precise_slice_setup();
@@ -4331,9 +4370,9 @@ fn whole_gig_through_the_ui() {
     // 12. Output screen with two slices and a test card.
     click_top(&mut h, "Output");
     click(&mut h, "Setup...");
-    click(&mut h, "Add");
-    click(&mut h, "Add slice");
-    click(&mut h, "Add slice");
+    add_screen(&mut h);
+    add_slice(&mut h);
+    add_slice(&mut h);
     let scr = h.state().project.output.screens[0].clone();
     assert_eq!(scr.slices.len(), 2);
     // The setup window opens over the menu bar: drag it down by its title, like a user.
@@ -4349,6 +4388,10 @@ fn whole_gig_through_the_ui() {
     settle(&mut h);
     assert!(h.state().test_cards.contains(&scr.id));
 
+    // The setup is applied as one step when the window closes.
+    click(&mut h, "Save & Close");
+    assert!(!h.state().output_setup_open);
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 2);
     // 13. Save, reopen in a fresh app, the structure survived.
     let path = dir.join("gig.vjc");
     assert!(h.state_mut().save_to(path.clone()), "{}", h.state().status);
@@ -7320,13 +7363,17 @@ fn overview_setup_dt(dt: f32) -> Harness<'static, State> {
     settle(&mut h);
     click(&mut h, "Output");
     click(&mut h, "Setup...");
+    click_tab(&mut h, "Output");
+    // The first slice is the one being edited (its sections are on the right).
+    click(&mut h, "Slice 1");
     h
 }
 
+/// Where the setup canvas drew its content last frame.
 fn overview_rect(h: &Harness<'_, State>) -> egui::Rect {
     h.ctx
-        .data(|d| d.get_temp::<egui::Rect>(crate::slice_overview::rect_id()))
-        .expect("overview drawn")
+        .data(|d| d.get_temp::<egui::Rect>(crate::output_canvas::rect_id()))
+        .expect("canvas drawn")
 }
 
 /// Screen pixel (1920x1080 space) -> overview canvas point.
@@ -7369,10 +7416,9 @@ fn selected_ids(h: &Harness<'_, State>) -> Vec<usize> {
     scr.slices
         .iter()
         .enumerate()
-        .filter(|(i, s)| {
+        .filter(|(_, s)| {
             st.sel_slices.contains(&s.id)
                 || (st.sel_slices.is_empty() && st.sel_slice == Some(s.id))
-                || (st.sel_slice.is_none() && *i == 0)
         })
         .map(|(i, _)| i)
         .collect()
@@ -7427,6 +7473,9 @@ fn double_clicking_a_slice_previews_its_layer() {
 fn shift_click_on_a_slice_section_folds_all_of_them() {
     let mut h = overview_setup();
     let header = |h: &Harness<'_, State>, t: &str| h.get_by_label(t).rect().center();
+    // The sections sit below the numeric rows: bring them in view (the click is by position).
+    h.get_by_label("Mask").scroll_to_me();
+    h.run_steps(30);
     let click_at = |h: &mut Harness<'_, State>, at: egui::Pos2, mods: egui::Modifiers| {
         let button = |pressed| egui::Event::PointerButton {
             pos: at,
@@ -7457,4 +7506,558 @@ fn shift_click_on_a_slice_section_folds_all_of_them() {
     let at = header(&h, "Mask");
     click_at(&mut h, at, egui::Modifiers::SHIFT);
     assert!(exists(&h, "Rectangle") && exists(&h, "Enabled"));
+}
+
+// ---- Output setup window: tree, tabs, canvas, working copy ---------------------------------
+
+/// A coloured test card (bars, reversed bars, ramp, checker) standing in for the composition
+/// texture, which needs a GPU compositor the headless tests do not have.
+fn test_card(w: usize, h: usize) -> egui::ColorImage {
+    let bars: [[u8; 3]; 7] = [
+        [235, 235, 235],
+        [235, 235, 16],
+        [16, 235, 235],
+        [16, 235, 16],
+        [235, 16, 235],
+        [235, 16, 16],
+        [16, 16, 235],
+    ];
+    let mut px = vec![egui::Color32::BLACK; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b] = if y < h * 2 / 3 {
+                bars[x * 7 / w]
+            } else if y < h * 3 / 4 {
+                bars[6 - x * 7 / w]
+            } else {
+                let ramp = (x * 215 / w) as u8;
+                let v = ramp + if (x / 12 + y / 12) % 2 == 0 { 40 } else { 0 };
+                [v, v, v]
+            };
+            px[y * w + x] = egui::Color32::from_rgb(r, g, b);
+        }
+    }
+    egui::ColorImage::new([w, h], px)
+}
+
+/// Six slices of a 1920x1080 screen laid out like a stage: a wide slice over a lower one in
+/// the centre, and two tall slices on each side. Each reads the part of the composition it
+/// sits over, so the picture is continuous across them.
+fn stage_screen() -> vjc_model::Screen {
+    let mut scr = vjc_core::mapping::new_screen("Stage", 1920, 1080);
+    let (w, h) = (1920.0, 1080.0);
+    for (name, (x, y, sw, sh)) in [
+        ("Centre", (480.0, 0.0, 960.0, 700.0)),
+        ("Lower centre", (480.0, 700.0, 960.0, 380.0)),
+        ("Left outer", (0.0, 0.0, 240.0, 1080.0)),
+        ("Left inner", (240.0, 0.0, 240.0, 1080.0)),
+        ("Right inner", (1440.0, 0.0, 240.0, 1080.0)),
+        ("Right outer", (1680.0, 0.0, 240.0, 1080.0)),
+    ] {
+        let mut sl = vjc_core::mapping::new_slice(1920, 1080);
+        sl.name = name.into();
+        sl.input = vec![
+            (x / w, y / h),
+            ((x + sw) / w, y / h),
+            ((x + sw) / w, (y + sh) / h),
+            (x / w, (y + sh) / h),
+        ];
+        sl.output_mesh = vec![(x, y), (x + sw, y), (x, y + sh), (x + sw, y + sh)];
+        scr.slices.push(sl);
+    }
+    scr
+}
+
+/// The stage on a 1600x1000 app with a coloured test-card generator playing, the Output setup
+/// window open and the card texture standing in for the composition. Keep the handle alive.
+fn stage_setup() -> (Harness<'static, State>, egui::TextureHandle) {
+    let state = small_grid(State::headless(prefs()));
+    let mut h = app_with_dt(state, egui::vec2(1600.0, 1000.0), 0.02);
+    let (lid, pos) = cell_center(&h, 0, 1);
+    let (gen_id, _) = vjc_fx::GENERATORS
+        .iter()
+        .find(|(k, _)| *k == "bars")
+        .copied()
+        .expect("bars generator");
+    browser_drag(&mut h, "Generators", &fx_label(gen_id), pos);
+    assert!(h.state().gens.contains_key(&lid), "the test card plays");
+    let tex = h.ctx.load_texture(
+        "test-card",
+        test_card(480, 270),
+        egui::TextureOptions::LINEAR,
+    );
+    h.state_mut().comp_tex = Some(tex.id());
+    h.state_mut().exec(Command::AddScreen {
+        screen: stage_screen(),
+        index: 0,
+    });
+    settle(&mut h);
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    (h, tex)
+}
+
+fn slices_of(h: &Harness<'_, State>) -> Vec<vjc_model::Slice> {
+    h.state().project.output.screens[0].slices.clone()
+}
+
+fn slice_named(h: &Harness<'_, State>, name: &str) -> vjc_model::Slice {
+    slices_of(h)
+        .into_iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("slice {name}"))
+}
+
+fn win_tab(h: &Harness<'_, State>) -> crate::output_ui::OutTab {
+    h.state().out_win.as_ref().expect("window open").tab
+}
+
+#[test]
+fn output_tree_selects_and_renames_in_place() {
+    let (mut h, _tex) = stage_setup();
+    // The tree lists the screen with its device and size, then the slices.
+    assert!(exists(&h, "Stage") && exists(&h, "Centre") && exists(&h, "Right outer"));
+    assert!(has_text(&h, "Window (1920x1080)") || exists(&h, "Window (1920x1080)"));
+    click(&mut h, "Left inner");
+    assert_eq!(h.state().sel_slice, Some(slice_named(&h, "Left inner").id));
+    // Properties follow the selection: slice fields on the right.
+    assert!(exists(&h, "Rotate 90") && !exists(&h, "Pixel-perfect (nearest)"));
+    // Double-click renames in place: Enter commits as a command.
+    let at = h.get_by_label("Left inner").rect().center();
+    double_click_at(&mut h, at);
+    assert!(
+        h.state().out_win.as_ref().unwrap().rename.is_some(),
+        "rename mode"
+    );
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("Wing".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert!(h.state().out_win.as_ref().unwrap().rename.is_none());
+    assert_eq!(slices_of(&h)[3].name, "Wing");
+    assert!(exists(&h, "Wing") && !exists(&h, "Left inner"));
+    click(&mut h, "Undo edit");
+    assert_eq!(slices_of(&h)[3].name, "Left inner", "rename is undoable");
+    // Escape leaves the name alone.
+    let at = h.get_by_label("Left inner").rect().center();
+    double_click_at(&mut h, at);
+    h.event(egui::Event::Text("zzz".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert_eq!(slices_of(&h)[3].name, "Left inner");
+    // Selecting the screen shows the screen fields; its row renames too.
+    click(&mut h, "Stage");
+    assert_eq!(h.state().sel_slice, None);
+    assert!(exists(&h, "Pixel-perfect (nearest)"));
+    let at = h.get_by_label("Stage").rect().center();
+    double_click_at(&mut h, at);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("Wall".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(h.state().project.output.screens[0].name, "Wall");
+}
+
+#[test]
+fn output_tabs_switch_between_input_and_output() {
+    use crate::output_ui::OutTab;
+    let (mut h, _tex) = stage_setup();
+    assert_eq!(win_tab(&h), OutTab::Input);
+    let input_rect = overview_rect(&h);
+    // The Input canvas is the composition (16:9 here), the Output one the screen.
+    click_tab(&mut h, "Output");
+    assert_eq!(win_tab(&h), OutTab::Output);
+    assert!(
+        h.state().out_preview_screen().is_some(),
+        "the screen is rendered for it"
+    );
+    let out_rect = overview_rect(&h);
+    assert!(out_rect.width() > 0.0 && input_rect.width() > 0.0);
+    click_tab(&mut h, "Input");
+    assert_eq!(win_tab(&h), OutTab::Input);
+    assert!(
+        h.state().out_preview_screen().is_none(),
+        "no render needed on Input"
+    );
+}
+
+#[test]
+fn output_cancel_restores_and_leaves_no_history() {
+    let (mut h, _tex) = stage_setup();
+    let before = h.state().project.clone();
+    let can_undo = h.state().history.can_undo();
+    click(&mut h, "Centre");
+    add_slice(&mut h);
+    click(&mut h, "Is Key");
+    assert_eq!(slices_of(&h).len(), 7, "the preview shows the edits");
+    click(&mut h, "Cancel");
+    assert!(!h.state().output_setup_open && h.state().out_win.is_none());
+    assert_eq!(h.state().project.output, before.output);
+    assert_eq!(
+        h.state().history.can_undo(),
+        can_undo,
+        "nothing was recorded"
+    );
+    // Closing with the title bar's X is a cancel too.
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    add_slice(&mut h);
+    assert_eq!(slices_of(&h).len(), 7);
+    let win = h.state().out_win.as_ref().unwrap().rect;
+    let x = egui::pos2(win.max.x - 19.0, win.min.y + 18.0);
+    h.hover_at(x);
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: x,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+    settle(&mut h);
+    assert!(!h.state().output_setup_open);
+    assert_eq!(slices_of(&h).len(), 6);
+}
+
+#[test]
+fn output_save_and_close_is_one_undo_step() {
+    let (mut h, _tex) = stage_setup();
+    let before = h.state().project.output.clone();
+    h.state_mut().history_now = None;
+    // Several different edits in the window...
+    click(&mut h, "Centre");
+    click(&mut h, "Is Key");
+    add_slice(&mut h);
+    click(&mut h, "Stage");
+    click(&mut h, "Pixel-perfect (nearest)");
+    add_screen(&mut h);
+    assert_eq!(h.state().project.output.screens.len(), 2);
+    let edited = h.state().project.output.clone();
+    assert_ne!(edited, before);
+    let was = h.state().history.can_undo();
+    click(&mut h, "Save & Close");
+    assert!(!h.state().output_setup_open && h.state().out_win.is_none());
+    assert_eq!(h.state().project.output, edited);
+    assert!(h.state().dirty);
+    // ...are ONE step for the project history.
+    h.state_mut().undo();
+    assert_eq!(
+        h.state().project.output,
+        before,
+        "one undo reverts every edit"
+    );
+    assert_eq!(h.state().history.can_undo(), was);
+    h.state_mut().redo();
+    assert_eq!(h.state().project.output, edited);
+}
+
+#[test]
+fn output_multi_select_edit_sets_every_slice_in_one_step() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Left outer");
+    // Shift-click adds, like the old slice buttons did.
+    for name in ["Left inner", "Right inner"] {
+        let at = h.get_by_label(name).rect().center();
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        h.hover_at(at);
+        h.step();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+            h.step();
+        }
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        settle(&mut h);
+    }
+    assert_eq!(h.state().sel_slices.len(), 3);
+    assert!(exists(&h, "Multiple slices"));
+    let keyed = |h: &Harness<'_, State>| slices_of(h).iter().filter(|s| s.is_key).count();
+    assert_eq!(keyed(&h), 0);
+    click_far(&mut h, "Is Key");
+    assert_eq!(keyed(&h), 3, "every selected slice is a key now");
+    let outside = slice_named(&h, "Centre");
+    assert!(!outside.is_key, "the others are untouched");
+    // A numeric row: the + button on Brightness raises all three.
+    let row_y = h.get_by_label("Brightness").rect().center().y;
+    h.query_all_by_label("Increase")
+        .find(|n| (n.rect().center().y - row_y).abs() < 4.0)
+        .expect("brightness +")
+        .click();
+    settle(&mut h);
+    let bright: Vec<f32> = slices_of(&h)
+        .iter()
+        .filter(|s| s.name.starts_with("Left") || s.name == "Right inner")
+        .map(|s| s.color.brightness)
+        .collect();
+    assert!(bright.iter().all(|b| *b > 1.0), "{bright:?}");
+    // Both edits are undone one step at a time, each as a whole.
+    click(&mut h, "Undo edit");
+    assert!(slices_of(&h).iter().all(|s| s.color.brightness == 1.0));
+    assert_eq!(keyed(&h), 3);
+    click(&mut h, "Undo edit");
+    assert_eq!(keyed(&h), 0);
+}
+
+#[test]
+fn output_canvas_drag_moves_the_slice_in_one_step() {
+    let (mut h, _tex) = stage_setup();
+    click_tab(&mut h, "Output");
+    click(&mut h, "Centre");
+    let before = slice_named(&h, "Centre");
+    let r0 = vjc_core::slice_geom::bbox(&before.output_mesh).unwrap();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    // Drag the body (centre of the slice) 60 canvas points right and 30 down.
+    let from = o + egui::vec2((r0.x + r0.w / 2.0) * k, (r0.y + r0.h / 2.0) * k);
+    h.state_mut().snap = false;
+    drag(&mut h, from, from + egui::vec2(60.0, 30.0));
+    let r1 = vjc_core::slice_geom::bbox(&slice_named(&h, "Centre").output_mesh).unwrap();
+    assert!(
+        (r1.x - r0.x - 60.0 / k).abs() < 40.0 && r1.x > r0.x,
+        "moved right: {r0:?} -> {r1:?}"
+    );
+    assert!(r1.y > r0.y, "moved down");
+    assert_eq!((r1.w, r1.h), (r0.w, r0.h), "size is kept");
+    // The whole drag is one undo step.
+    click(&mut h, "Undo edit");
+    assert_eq!(slice_named(&h, "Centre").output_mesh, before.output_mesh);
+    click(&mut h, "Redo edit");
+    assert_eq!(
+        vjc_core::slice_geom::bbox(&slice_named(&h, "Centre").output_mesh).unwrap(),
+        r1
+    );
+}
+
+#[test]
+fn output_canvas_corner_drag_resizes_and_shift_keeps_the_aspect() {
+    let (mut h, _tex) = stage_setup();
+    click_tab(&mut h, "Output");
+    click(&mut h, "Centre");
+    let r0 = vjc_core::slice_geom::bbox(&slice_named(&h, "Centre").output_mesh).unwrap();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    h.state_mut().snap = false;
+    // Bottom-right corner handle, dragged left.
+    let corner = o + egui::vec2((r0.x + r0.w) * k, (r0.y + r0.h) * k);
+    drag(&mut h, corner, corner - egui::vec2(80.0, 0.0));
+    let r1 = vjc_core::slice_geom::bbox(&slice_named(&h, "Centre").output_mesh).unwrap();
+    assert!(
+        r1.w < r0.w && (r1.x - r0.x).abs() < 1.0 && (r1.h - r0.h).abs() < 1.0,
+        "{r1:?}"
+    );
+    click(&mut h, "Undo edit");
+    // With Shift the corner keeps the shape.
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::SHIFT,
+    };
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    h.hover_at(corner);
+    h.step();
+    h.event(button(corner, true));
+    h.step();
+    for i in 1..=12 {
+        h.event(egui::Event::PointerMoved(
+            corner - egui::vec2(8.0 * i as f32, 0.0),
+        ));
+        h.step();
+    }
+    h.event(button(corner - egui::vec2(96.0, 0.0), false));
+    settle(&mut h);
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    settle(&mut h);
+    let r2 = vjc_core::slice_geom::bbox(&slice_named(&h, "Centre").output_mesh).unwrap();
+    assert!(
+        ((r2.w / r2.h) - (r0.w / r0.h)).abs() < 0.01 && r2.w < r0.w,
+        "aspect kept: {r0:?} -> {r2:?}"
+    );
+}
+
+#[test]
+fn output_help_panel_follows_the_hovered_control() {
+    let (mut h, _tex) = stage_setup();
+    assert!(has_text(&h, crate::output_hints::IDLE) || exists(&h, crate::output_hints::IDLE));
+    h.get_by_label("Save & Close").hover();
+    settle(&mut h);
+    let save = crate::output_hints::text("save").unwrap();
+    assert!(exists(&h, save), "help for Save & Close");
+    h.get_by_label("Cancel").hover();
+    settle(&mut h);
+    let cancel = crate::output_hints::text("cancel").unwrap();
+    assert!(
+        exists(&h, cancel) && !exists(&h, save),
+        "text changed with the hover"
+    );
+    // Off every control the idle line is back.
+    h.hover_at(egui::pos2(5.0, 995.0));
+    settle(&mut h);
+    assert!(!exists(&h, cancel));
+}
+
+#[test]
+fn output_toolbar_zoom_grid_snap_and_wheel() {
+    use crate::output_ui::GridKind;
+    let (mut h, _tex) = stage_setup();
+    click_tab(&mut h, "Output");
+    let fit = overview_rect(&h);
+    // Zoom dropdown: 100% shows the screen 1:1, bigger than the canvas; Fit comes back.
+    click(&mut h, "Zoom");
+    click(&mut h, "100%");
+    assert_eq!(h.state().out_win.as_ref().unwrap().zoom, Some(1.0));
+    assert!((overview_rect(&h).width() - 1920.0).abs() < 1.0);
+    click(&mut h, "Zoom");
+    click(&mut h, "Fit");
+    assert_eq!(h.state().out_win.as_ref().unwrap().zoom, None);
+    assert!((overview_rect(&h).width() - fit.width()).abs() < 1.0);
+    // The wheel zooms around the pointer.
+    h.hover_at(fit.center());
+    h.step();
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 120.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    settle(&mut h);
+    assert!(
+        overview_rect(&h).width() > fit.width() * 1.05,
+        "wheel zoomed in"
+    );
+    // Grid dropdown and snap.
+    click(&mut h, "Grid lines");
+    click(&mut h, "3x3");
+    assert_eq!(h.state().out_win.as_ref().unwrap().grid, GridKind::Three);
+    click(&mut h, "Snap");
+    assert!(h.state().snap);
+    // The hand tool pans instead of editing.
+    click(&mut h, "Hand tool");
+    assert!(h.state().out_win.as_ref().unwrap().hand);
+    let c = overview_rect(&h).center();
+    drag(&mut h, c, c + egui::vec2(40.0, 25.0));
+    let pan = h.state().out_win.as_ref().unwrap().pan;
+    assert!(pan.x > 20.0 && pan.y > 10.0, "panned {pan:?}");
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 6);
+    assert!(
+        !h.state().out_win.as_ref().unwrap().can_undo(),
+        "no edit was made"
+    );
+}
+
+#[test]
+fn output_plus_menu_adds_grid_and_context_menu_edits_slices() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click(&mut h, "Add");
+    click_menu(&mut h, "Add grid of slices");
+    click(&mut h, "3 x 3");
+    let slices = slices_of(&h);
+    assert_eq!(slices.len(), 15, "nine more slices");
+    // One undo step removes the whole grid.
+    click(&mut h, "Undo edit");
+    assert_eq!(slices_of(&h).len(), 6);
+    // Right-click a row: duplicate, then delete through the menu.
+    h.get_by_label("Centre").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Duplicate");
+    assert_eq!(slices_of(&h).len(), 7);
+    assert_eq!(slices_of(&h)[1].output_mesh, slices_of(&h)[0].output_mesh);
+    // The X on the selected row (the copy, second in the list) deletes it.
+    h.query_all_by_label("Delete slice")
+        .max_by(|a, b| a.rect().min.y.total_cmp(&b.rect().min.y))
+        .unwrap()
+        .click();
+    settle(&mut h);
+    assert_eq!(slices_of(&h).len(), 6);
+}
+
+#[test]
+fn output_guide_image_loads_from_a_dropped_file() {
+    let dir = presets_tmp("guide");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("guide.png");
+    image::RgbaImage::from_pixel(64, 36, image::Rgba([255, 0, 128, 255]))
+        .save(&png)
+        .unwrap();
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click_tab(&mut h, "Output");
+    let id = h.state().project.output.screens[0].id;
+    assert!(State::guide_texture(&h.ctx, id).is_none());
+    // A file dropped over the window is the guide, not a clip for the grid.
+    let at = h.get_by_label("Remove guide").rect().center();
+    h.hover_at(at);
+    h.step();
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(png.clone())));
+    settle(&mut h);
+    assert!(
+        State::guide_texture(&h.ctx, id).is_some(),
+        "{}",
+        h.state().status
+    );
+    assert!(h.state().project.composition.layers.iter().all(|l| {
+        let deck = h.state().project.composition.current_deck;
+        vjc_core::clip_in(&h.state().project, deck, l.id, 0).is_none()
+    }));
+    assert!(exists(&h, "Guide"));
+    click(&mut h, "Remove guide");
+    assert!(State::guide_texture(&h.ctx, id).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 20 - 23: the rebuilt window with a stage-like layout.
+#[test]
+fn output_setup_snapshots() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Centre");
+    snap(&mut h, "20-output-input-tab");
+    click_tab(&mut h, "Output");
+    snap(&mut h, "21-output-output-tab");
+    // Several slices: the side strips.
+    for name in ["Left outer", "Left inner", "Right inner", "Right outer"] {
+        let at = h.get_by_label(name).rect().center();
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        h.hover_at(at);
+        h.step();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+            h.step();
+        }
+        h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        settle(&mut h);
+    }
+    snap(&mut h, "22-output-multi");
+    // The screen: its fields and a guide image under the slices.
+    let dir = presets_tmp("snap-guide");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("guide.png");
+    let mut img = image::RgbaImage::from_pixel(192, 108, image::Rgba([40, 60, 90, 255]));
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        if x % 16 == 0 || y % 12 == 0 {
+            *p = image::Rgba([230, 230, 230, 255]);
+        }
+    }
+    img.save(&png).unwrap();
+    click(&mut h, "Stage");
+    let id = h.state().project.output.screens[0].id;
+    let ctx = h.ctx.clone();
+    h.state_mut().load_guide(&ctx, id, &png);
+    settle(&mut h);
+    snap(&mut h, "23-output-screen-props");
+    let _ = std::fs::remove_dir_all(&dir);
 }

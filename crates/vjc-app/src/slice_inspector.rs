@@ -1,30 +1,17 @@
-//! Precise slice editing in the Output setup: numeric X/Y/W/H and rotation in pixels for
-//! the input selection and the output mesh (with simple math in the fields), quarter
-//! turns, flips, "match output shape", duplicate, move to another screen, and the helpers
-//! the canvases use for arrow-key nudging and snapping to guides.
+//! Helpers of the Output setup canvas for precise slice editing: arrow-key nudging, snapping
+//! to guides, and moving the selected slices together. The numeric fields are in
+//! `output_props`.
 //! The maths lives in `vjc_core::slice_geom`; every edit is one undoable Command.
 
 use crate::State;
 use crate::theme::SP_4;
-use crate::widgets::{self, Kind};
 use eframe::egui;
 use vjc_core::Command;
-use vjc_core::slice_geom::{self, Field, Op, Side};
-use vjc_model::{Screen, Slice, SliceSource};
+use vjc_core::slice_geom::{self, Op, Side};
+use vjc_model::{Screen, Slice};
 
 /// Distance, in canvas pixels, at which a dragged point jumps to a guide.
 pub(crate) const GUIDE_PX: f32 = SP_4;
-
-/// Range the pixel fields accept (far beyond any real screen).
-const PX_RANGE: std::ops::RangeInclusive<f32> = -1.0e6..=1.0e6;
-
-/// A numeric field that evaluates simple math (`/3`, `*2`, `+10`, `-10`, `1920/4`) against
-/// its current value when typed into. Returns the new value when it changed.
-fn math_field(ui: &mut egui::Ui, value: f32) -> Option<f32> {
-    let mut v = value;
-    let r = widgets::field_num(ui, &mut v, PX_RANGE, 0.0); // typed only: one undo step per edit
-    (r.changed() && (v - value).abs() > 1e-4).then_some(v)
-}
 
 /// Arrow keys over `rect` as a move in pixels: 1 px, 10 px with Shift. `None` when the
 /// pointer is elsewhere or no arrow was pressed.
@@ -174,183 +161,5 @@ impl State {
             side,
             (want.x + sh.0 - cur.x, want.y + sh.1 - cur.y),
         )
-    }
-
-    /// Dropdown of what the slice shows: composition, preview, one layer or one group.
-    fn source_picker(
-        &mut self,
-        ui: &mut egui::Ui,
-        scr: &Screen,
-        sl: &Slice,
-        cmds: &mut Vec<Command>,
-    ) {
-        let comp = &self.project.composition;
-        let current = match sl.source {
-            SliceSource::Composition => "Composition".to_string(),
-            SliceSource::Preview => "Preview".to_string(),
-            SliceSource::Layer(id) => comp
-                .layers
-                .iter()
-                .find(|l| l.id == id)
-                .map_or("Layer (missing)".to_string(), |l| {
-                    format!("Layer: {}", l.name)
-                }),
-            SliceSource::Group(id) => comp
-                .groups
-                .iter()
-                .find(|g| g.id == id)
-                .map_or("Group (missing)".to_string(), |g| {
-                    format!("Group: {}", g.name)
-                }),
-        };
-        let mut choices = vec![
-            ("Composition".to_string(), SliceSource::Composition),
-            ("Preview".to_string(), SliceSource::Preview),
-        ];
-        choices.extend(
-            comp.layers
-                .iter()
-                .map(|l| (format!("Layer: {}", l.name), SliceSource::Layer(l.id))),
-        );
-        choices.extend(
-            comp.groups
-                .iter()
-                .map(|g| (format!("Group: {}", g.name), SliceSource::Group(g.id))),
-        );
-        egui::ComboBox::from_label("Source")
-            .selected_text(current)
-            .show_ui(ui, |ui| {
-                for (label, source) in choices {
-                    if crate::widgets::choice(ui, sl.source == source, label).clicked()
-                        && sl.source != source
-                    {
-                        cmds.push(Command::SetSliceSource {
-                            screen: scr.id,
-                            slice: sl.id,
-                            source,
-                        });
-                    }
-                }
-            });
-    }
-
-    pub(crate) fn slice_inspector(
-        &mut self,
-        ui: &mut egui::Ui,
-        scr: &Screen,
-        sl: &Slice,
-        cmds: &mut Vec<Command>,
-    ) {
-        let c = &self.project.composition;
-        let comp = (c.width, c.height);
-        let side = self.geom_side;
-        widgets::section(ui, "Slice (px)", |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.geom_side, Side::Input, "Input");
-                ui.selectable_value(&mut self.geom_side, Side::Output, "Output");
-                ui.weak("fields take math: /3  *2  +10  -10");
-            });
-            if let Some(v) = slice_geom::readout(sl, side, comp) {
-                ui.horizontal(|ui| {
-                    for (n, (label, f)) in [
-                        ("X", Field::X),
-                        ("Y", Field::Y),
-                        ("W", Field::W),
-                        ("H", Field::H),
-                        ("Rot", Field::Rot),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        ui.label(label);
-                        if let Some(new) = math_field(ui, v[n])
-                            && let Some(cmd) =
-                                slice_geom::edit(scr, sl, side, comp, Op::Set(f, new))
-                        {
-                            cmds.push(cmd);
-                        }
-                    }
-                });
-            }
-            ui.horizontal_wrapped(|ui| {
-                let mut ops = vec![];
-                for (label, op) in [
-                    ("Rotate 90", Op::Rotate(1)),
-                    ("Rotate 180", Op::Rotate(2)),
-                    ("Rotate 270", Op::Rotate(3)),
-                    ("Flip H", Op::FlipH),
-                    ("Flip V", Op::FlipV),
-                ] {
-                    if widgets::btn(ui, label, Kind::Secondary).clicked() {
-                        ops.push(op);
-                    }
-                }
-                if widgets::btn(ui, "Match output shape", Kind::Secondary)
-                    .on_hover_text("Copy the output rectangle to the input: 1:1 pixel map")
-                    .clicked()
-                    && let Some(cmd) = slice_geom::edit(scr, sl, Side::Input, comp, Op::MatchOutput)
-                {
-                    cmds.push(cmd);
-                }
-                for op in ops {
-                    if let Some(cmd) = slice_geom::edit(scr, sl, side, comp, op) {
-                        cmds.push(cmd);
-                    }
-                }
-            });
-            self.source_picker(ui, scr, sl, cmds);
-            ui.horizontal(|ui| {
-                if widgets::btn(ui, "Duplicate slice", Kind::Secondary).clicked() {
-                    let mut copy = sl.clone();
-                    copy.id = uuid::Uuid::new_v4();
-                    let at = scr
-                        .slices
-                        .iter()
-                        .position(|s| s.id == sl.id)
-                        .map_or(scr.slices.len(), |i| i + 1);
-                    cmds.push(Command::AddSlice {
-                        screen: scr.id,
-                        slice: copy,
-                        index: at,
-                    });
-                }
-                if widgets::btn(ui, "Mirror", Kind::Secondary)
-                    .on_hover_text("Duplicate and flip the copy horizontally (one undo step)")
-                    .clicked()
-                {
-                    cmds.push(slice_geom::mirror(
-                        scr,
-                        sl,
-                        side,
-                        comp,
-                        uuid::Uuid::new_v4(),
-                    ));
-                }
-                let others: Vec<(uuid::Uuid, String, usize)> = self
-                    .project
-                    .output
-                    .screens
-                    .iter()
-                    .filter(|s| s.id != scr.id)
-                    .map(|s| (s.id, s.name.clone(), s.slices.len()))
-                    .collect();
-                ui.add_enabled_ui(!others.is_empty(), |ui| {
-                    egui::ComboBox::from_label("Move to screen")
-                        .selected_text("Choose")
-                        .show_ui(ui, |ui| {
-                            for (id, name, n) in &others {
-                                if crate::widgets::choice(ui, false, name).clicked() {
-                                    cmds.push(Command::MoveSlice {
-                                        from: scr.id,
-                                        to: *id,
-                                        slice: sl.id,
-                                        index: *n,
-                                    });
-                                }
-                            }
-                        });
-                });
-            });
-        });
     }
 }

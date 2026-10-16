@@ -65,7 +65,7 @@ impl State {
         };
         let (screens, warnings) = presets::instantiate(&preset, env);
         let first = screens.first().map(|s| s.id);
-        if self.exec_ok(Command::SetOutputSetup { screens }) {
+        if self.output_exec(Command::SetOutputSetup { screens }) {
             self.sel_screen = first;
             self.sel_slice = None;
             self.sel_slices.clear();
