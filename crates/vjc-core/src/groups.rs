@@ -48,7 +48,7 @@ pub fn trigger_column_commands(
         .filter(|l| {
             let own =
                 crate::clip_in(p, deck, l.id, column).and_then(|k| k.extras.ignore_column_trigger);
-            !own.unwrap_or(p.composition.ignores_column(l)) && !p.composition.locked(l)
+            !own.unwrap_or(l.ignore_column_trigger) && !p.composition.locked(l)
         })
         .map(|l| {
             if crate::clip_in(p, deck, l.id, column).is_some() {

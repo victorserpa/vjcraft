@@ -9051,6 +9051,23 @@ mod tests {
     }
 
     #[test]
+    fn group_ignoring_column_triggers_still_runs_its_own_group_column() {
+        let (mut p, [_, l2, _]) = three_layers();
+        gen_cell(&mut p, l2, 0);
+        let mut g = vjc_model::LayerGroup::new("G");
+        g.ignore_column_trigger = true;
+        let gid = g.id;
+        p.composition.groups.push(g);
+        p.composition.layers[1].group = Some(gid);
+        let cmds = crate::groups::trigger_column_commands(&p, gid, A, 0);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::TriggerClip { layer, .. } if *layer == l2)),
+            "the group's own column trigger reaches its members"
+        );
+    }
+
+    #[test]
     fn group_ignore_lock_and_mask_commands_undo_and_apply_to_members() {
         let (mut p, [l1, l2, _]) = three_layers();
         gen_cell(&mut p, l1, 0);
