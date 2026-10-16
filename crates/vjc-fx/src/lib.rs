@@ -547,6 +547,56 @@ pub fn text_codes(s: &str) -> [f32; TEXT_CHARS] {
 pub struct Input {
     pub name: String,
     pub kind: InputKind,
+    /// Optional `"GROUP"` of the ISF input: the fold section it is shown in.
+    pub group: Option<String>,
+}
+
+/// Sections of the parameter panel as (title, input indices); `None` is the loose block
+/// shown first. Explicit `GROUP` wins; otherwise inputs that share a prefix before the
+/// first `_` (`blur_amount`, `blur_angle`) form a group named after it. A prefix used by a
+/// single input does not make a section. With no group at all the result is one loose block.
+pub fn param_groups(inputs: &[Input]) -> Vec<(Option<String>, Vec<usize>)> {
+    let prefix = |n: &str| {
+        n.split_once('_')
+            .map(|(p, _)| p)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    };
+    let shared = |p: &str| {
+        inputs
+            .iter()
+            .filter(|i| prefix(&i.name).as_deref() == Some(p))
+            .count()
+            > 1
+    };
+    let title = |s: &str| {
+        let mut c = s.chars();
+        c.next()
+            .map(|f| f.to_uppercase().chain(c).collect::<String>())
+            .unwrap_or_default()
+    };
+    let mut out: Vec<(Option<String>, Vec<usize>)> = vec![(None, vec![])];
+    for (i, inp) in inputs.iter().enumerate() {
+        let g = inp
+            .group
+            .clone()
+            .filter(|g| !g.trim().is_empty())
+            .or_else(|| prefix(&inp.name).filter(|p| shared(p)).map(|p| title(&p)));
+        match g {
+            None => out[0].1.push(i),
+            Some(g) => match out
+                .iter_mut()
+                .find(|(t, _)| t.as_deref() == Some(g.as_str()))
+            {
+                Some((_, v)) => v.push(i),
+                None => out.push((Some(g), vec![i])),
+            },
+        }
+    }
+    if out[0].1.is_empty() && out.len() > 1 {
+        out.remove(0);
+    }
+    out
 }
 
 /// An ISF `"TYPE": "audio"` (waveform) or `"audioFFT"` (spectrum) input: a one row texture
@@ -1001,7 +1051,12 @@ pub fn parse(src: &str) -> Result<Isf, FxError> {
         {
             return err(format!("invalid input name {name}"));
         }
-        inputs.push(Input { name, kind });
+        let group = i
+            .get("GROUP")
+            .and_then(|v| v.as_str())
+            .map(|g| g.trim().chars().take(40).collect::<String>())
+            .filter(|g| !g.is_empty());
+        inputs.push(Input { name, kind, group });
     }
     if inputs.iter().map(|i| i.kind.slots()).sum::<usize>() >= MAX_SLOTS {
         return err("too many inputs");
@@ -1598,6 +1653,45 @@ void main() {{ gl_FragColor = vec4(1.0); }}"#
         ] {
             assert_eq!(declared_input(b, &n), None, "{b}");
         }
+    }
+
+    fn inp(name: &str, group: Option<&str>) -> Input {
+        Input {
+            name: name.into(),
+            kind: InputKind::Bool { default: false },
+            group: group.map(String::from),
+        }
+    }
+
+    #[test]
+    fn groups_come_from_group_key_or_shared_name_prefix() {
+        let v = [
+            inp("mix", None),
+            inp("blur_amount", None),
+            inp("blur_angle", None),
+            inp("tint", Some("Color")),
+            inp("gain", Some("Color")),
+            inp("solo_one", None),
+        ];
+        let g = param_groups(&v);
+        assert_eq!(g[0], (None, vec![0, 5]));
+        assert_eq!(g[1], (Some("Blur".into()), vec![1, 2]));
+        assert_eq!(g[2], (Some("Color".into()), vec![3, 4]));
+        assert_eq!(g.len(), 3);
+    }
+
+    #[test]
+    fn negative_control_no_shared_names_means_no_sections() {
+        let v = [inp("a_x", None), inp("b_y", None), inp("c", None)];
+        assert_eq!(param_groups(&v), vec![(None, vec![0, 1, 2])]);
+    }
+
+    #[test]
+    fn group_key_is_parsed_from_the_header() {
+        let src = r#"/*{"INPUTS":[{"NAME":"inputImage","TYPE":"image"},
+          {"NAME":"a","TYPE":"bool","GROUP":"Look"}]}*/
+          void main() { gl_FragColor = IMG_THIS_PIXEL(inputImage); }"#;
+        assert_eq!(parse(src).unwrap().inputs[0].group.as_deref(), Some("Look"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 pub mod effect_presets;
 pub mod media;
 pub mod output_presets;
+pub mod param_presets;
 pub mod prefs;
 
 use serde_json::Value;

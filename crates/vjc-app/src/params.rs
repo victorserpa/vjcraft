@@ -667,7 +667,96 @@ fn anim_menu(
         }
         None => {}
     }
+    ui.separator();
+    presets_menu(ui, id, cur, &mut a, &mut changed);
     changed.then_some(a)
+}
+
+/// What the animation popup asks the app to do with the saved presets (the popup has no
+/// access to the prefs; the app drains these every frame).
+#[derive(Clone, Debug, PartialEq)]
+pub enum PresetReq {
+    Save(String, Animation),
+    Delete(String),
+    Export,
+    Import,
+}
+
+fn preset_keys() -> (egui::Id, egui::Id) {
+    (
+        egui::Id::new("anim-preset-list"),
+        egui::Id::new("anim-preset-req"),
+    )
+}
+
+/// App side: makes the saved animation presets visible to every animation popup.
+pub fn publish_presets(ctx: &egui::Context, list: std::sync::Arc<Vec<(String, Animation)>>) {
+    ctx.data_mut(|d| d.insert_temp(preset_keys().0, list));
+}
+
+/// App side: the requests the popups made since the last call.
+pub fn take_preset_reqs(ctx: &egui::Context) -> Vec<PresetReq> {
+    ctx.data_mut(|d| d.remove_temp::<Vec<PresetReq>>(preset_keys().1))
+        .unwrap_or_default()
+}
+
+fn ask(ui: &egui::Ui, r: PresetReq) {
+    ui.data_mut(|d| {
+        d.get_temp_mut_or_default::<Vec<PresetReq>>(preset_keys().1)
+            .push(r)
+    });
+}
+
+/// "Presets" submenu of the animation popup: apply a saved animation (mode + envelope) to
+/// this param, save the current one under a name, delete, export / import the file.
+fn presets_menu(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    cur: &Option<Animation>,
+    a: &mut Option<Animation>,
+    changed: &mut bool,
+) {
+    let list: std::sync::Arc<Vec<(String, Animation)>> =
+        ui.data(|d| d.get_temp(preset_keys().0)).unwrap_or_default();
+    ui.menu_button("Presets", |ui| {
+        if list.is_empty() {
+            ui.weak("No saved animations");
+        }
+        for (name, anim) in list.iter() {
+            ui.horizontal(|ui| {
+                if crate::widgets::btn(ui, name, crate::widgets::Kind::Secondary).clicked() {
+                    *a = Some(anim.clone());
+                    *changed = true;
+                    ui.close();
+                }
+                if crate::icons::button(ui, crate::icons::i::X, "Delete preset").clicked() {
+                    ask(ui, PresetReq::Delete(name.clone()));
+                }
+            });
+        }
+        ui.separator();
+        let key = id.with("preset-name");
+        let mut buf: String = ui.data(|d| d.get_temp(key)).unwrap_or_default();
+        crate::widgets::field_text_hint(ui, &mut buf, 140.0, "Preset name");
+        let can = cur.is_some() && !buf.trim().is_empty();
+        if crate::widgets::btn_if(ui, can, "Save current", crate::widgets::Kind::Secondary)
+            .clicked()
+            && let Some(an) = cur
+        {
+            ask(ui, PresetReq::Save(buf.trim().to_string(), an.clone()));
+            buf.clear();
+        }
+        ui.data_mut(|d| d.insert_temp(key, buf));
+        ui.separator();
+        if crate::widgets::btn(ui, "Export presets...", crate::widgets::Kind::Secondary).clicked() {
+            ask(ui, PresetReq::Export);
+            ui.close();
+        }
+        if crate::widgets::btn(ui, "Import presets...", crate::widgets::Kind::Secondary).clicked() {
+            ask(ui, PresetReq::Import);
+            ui.close();
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -760,10 +849,25 @@ fn slider_inner(
             .show_value(false)
             .trailing_fill(true)
             .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.4 });
-        if ui.add(s).changed() {
+        let sr = ui.add(s);
+        if sr.changed() {
             out = Some(x);
         }
         let reset = reset_to(&Value::Number(value), &Value::Number(default));
+        // Right click on the slider: reset to the default.
+        sr.interact(egui::Sense::click()).context_menu(|ui| {
+            if crate::widgets::btn_if(
+                ui,
+                reset.is_some(),
+                "Reset to default",
+                crate::widgets::Kind::Secondary,
+            )
+            .clicked()
+            {
+                out = Some(default.clamp(range.0, range.1));
+                ui.close();
+            }
+        });
         if crate::icons::button_enabled(
             ui,
             reset.is_some(),
