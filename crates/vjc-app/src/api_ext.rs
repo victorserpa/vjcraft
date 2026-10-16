@@ -697,6 +697,18 @@ fn image_reply(bytes: &[u8], jpeg: bool) -> Reply {
     )
 }
 
+/// Answers 503 to the jobs that waited past the TTL. Runs every UI frame, so the queue
+/// frees itself even when nothing renders (no permanent 429).
+pub fn snap_expire(jobs: &mut Vec<SnapJob>) {
+    jobs.retain(|j| {
+        if j.at.elapsed() > SNAP_TTL {
+            let _ = j.reply.try_send(Err(err(503, "snapshot timed out")));
+            return false;
+        }
+        true
+    });
+}
+
 /// Once per rendered frame: starts the readback of queued jobs from `tex` (the composition)
 /// and answers the ones whose buffer is mapped. Never waits. `blackout` sends black only.
 pub fn snap_service(
@@ -1040,5 +1052,22 @@ pub(crate) fn save_target(p: &std::path::Path) -> Result<std::path::PathBuf, &'s
         Ok(_) => Err("the target must be a regular file (no symlinks or directories)"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(full),
         Err(_) => Err("the target cannot be inspected"),
+    }
+}
+
+#[cfg(test)]
+mod snap_expire_tests {
+    use super::*;
+
+    #[test]
+    fn queue_expires_without_any_render() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut jobs = vec![SnapJob::new(false, tx)];
+        snap_expire(&mut jobs);
+        assert_eq!(jobs.len(), 1, "fresh job stays");
+        jobs[0].at -= SNAP_TTL + std::time::Duration::from_millis(10);
+        snap_expire(&mut jobs);
+        assert!(jobs.is_empty());
+        assert_eq!(rx.try_recv().unwrap().unwrap_err().status, 503);
     }
 }

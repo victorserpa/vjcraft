@@ -6272,6 +6272,7 @@ impl State {
             self.api.configure(cfg.clone());
             self.api_cfg = Some(cfg);
         }
+        api_ext::snap_expire(&mut self.snap_jobs);
         for _ in 0..api_io::MAX_PER_FRAME {
             let Ok(msg) = self.api.rx.try_recv() else {
                 break;
