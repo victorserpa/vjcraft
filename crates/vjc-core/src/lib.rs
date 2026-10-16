@@ -460,6 +460,11 @@ pub enum Command {
         black_bg: bool,
     },
     /// Screen output delay in ms (clamped to 0..=100). Coalesces.
+    /// Additive blend of overlapping slices, alpha 0 outside them (soft-edge blending).
+    SetScreenAdditive {
+        screen: Uuid,
+        on: bool,
+    },
     SetScreenDelay {
         screen: Uuid,
         delay_ms: u32,
@@ -3057,6 +3062,11 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 },
                 vec![],
             )
+        }
+        Command::SetScreenAdditive { screen, on } => {
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.additive_overlap, on);
+            undoable(Command::SetScreenAdditive { screen, on: prev }, vec![])
         }
         Command::SetScreenDelay { screen, delay_ms } => {
             let s = screen_mut(p, screen)?;
@@ -8215,6 +8225,28 @@ mod tests {
             h.undo(&mut p).unwrap().unwrap();
         }
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn screen_additive_overlap_sets_undoes_and_rejects_unknown_screens() {
+        let (mut p, sid, _) = one_screen_slice();
+        let before = p.clone();
+        let mut h = History::new();
+        let now = Instant::now();
+        assert!(!p.output.screens[0].additive_overlap);
+        let on = Command::SetScreenAdditive {
+            screen: sid,
+            on: true,
+        };
+        h.exec(&mut p, on, now).unwrap();
+        assert!(p.output.screens[0].additive_overlap);
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        let ghost = Command::SetScreenAdditive {
+            screen: uuid::Uuid::new_v4(),
+            on: true,
+        };
+        assert!(h.exec(&mut p, ghost, now).is_err());
     }
 
     #[test]

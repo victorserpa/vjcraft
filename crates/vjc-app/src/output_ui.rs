@@ -463,6 +463,16 @@ impl State {
                 });
             }
         });
+        widgets::section(ui, "Overlap", |ui| {
+            let mut on = c.additive_overlap;
+            if toggle(ui, &mut on, "Add overlapping slices (edge blend)").changed() {
+                cmds.push(Command::SetScreenAdditive { screen: c.id, on });
+            }
+            widgets::help(
+                ui,
+                "Slices add up where they overlap; outside them alpha is 0.",
+            );
+        });
         widgets::section(ui, "Delay", |ui| {
             let mut d = c.delay_ms as f32;
             let max = mapping::MAX_DELAY_MS as f32;

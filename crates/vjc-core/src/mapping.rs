@@ -77,6 +77,7 @@ pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
         enabled: true,
         color: Default::default(),
         delay_ms: 0,
+        additive_overlap: false,
     }
 }
 

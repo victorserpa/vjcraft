@@ -1479,6 +1479,11 @@ pub struct Screen {
     /// Output delay in milliseconds (0..=100), to line screens up. 0 = no queue.
     #[serde(default)]
     pub delay_ms: u32,
+    /// Edge blending for projector overlap: slices are added where they overlap and the
+    /// area outside every slice has alpha 0 instead of black. Off = later slices cover
+    /// earlier ones over black.
+    #[serde(default)]
+    pub additive_overlap: bool,
 }
 
 fn default_true() -> bool {
@@ -2863,5 +2868,34 @@ mod tests {
         let old: LayerGroup = serde_json::from_value(v).unwrap();
         assert_eq!(old.mask_mode, MaskMode::Off);
         assert!(!old.ignore_column_trigger && !old.lock_content);
+    }
+
+    #[test]
+    fn old_screen_without_additive_overlap_loads_off() {
+        let scr = Screen {
+            id: Uuid::new_v4(),
+            name: "S".into(),
+            device: OutputDevice::Window,
+            width: 8,
+            height: 8,
+            slices: vec![],
+            pixel_perfect: false,
+            enabled: true,
+            color: Default::default(),
+            delay_ms: 0,
+            additive_overlap: true,
+        };
+        let mut v = serde_json::to_value(&scr).unwrap();
+        assert!(
+            serde_json::from_value::<Screen>(v.clone())
+                .unwrap()
+                .additive_overlap
+        );
+        v.as_object_mut().unwrap().remove("additive_overlap");
+        assert!(
+            !serde_json::from_value::<Screen>(v)
+                .unwrap()
+                .additive_overlap
+        );
     }
 }
