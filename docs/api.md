@@ -102,9 +102,9 @@ change goes through the same commands as the UI (undo, dirty flag, locks); a com
 | Route | Body / query | Does |
 | --- | --- | --- |
 | `POST /composition/load` | `{"path": "/abs/x.vjc", "force": false}` | Opens a project. 409 when there are unsaved changes unless `force` is true. |
-| `POST /composition/save` | `{"path": "/abs/x.vjc"}` (optional once the project has a file) | Saves. |
+| `POST /composition/save` | `{"path": "/abs/x.vjc"}` (optional once the project has a file) | Saves. No extension becomes `.vjc`; any other extension, or a missing parent directory, is 422. |
 | `POST /clips/open` | `{"layer":1,"column":2,"paths":["/abs/a.mp4","/abs/dir"]}` | Like dropping files from that cell on: one per column in name order, missing columns are added, one undo step. **Never triggers a clip** unless a cell of the range is already on air (then that cell reloads). Black-out stays on. Max 128 files. |
-| `GET /can-open?path=/abs/a.mp4` or `POST /can-open {"paths":[...]}` | | `{"results":[{"path","ok","kind","codec","width","height","fps","duration","reason"}]}`; does not touch the project. |
+| `GET /can-open?path=/abs/a.mp4` or `POST /can-open {"paths":[...]}` | | `{"results":[{"path","ok","kind","codec","width","height","fps","duration","reason"}]}`; does not touch the project. Needs the PIN when one is set, GET included. |
 | `POST /clips/add` | `{"layer","column","path"}` | Puts one file in a cell without triggering it. |
 | `POST /clips/remove` | `{"layer","column"}` | Empties a cell. |
 | `POST /clips/move` | `{"from":{"layer","column"},"to":{...},"copy":false}` | Moves or copies a clip (reorder inside a layer or across layers). |

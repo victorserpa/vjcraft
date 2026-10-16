@@ -7148,6 +7148,37 @@ fn rest_open(
     rx.try_recv().expect("answered in the same call")
 }
 
+fn rest_save(st: &mut State, path: &str) -> api_io::Reply {
+    let body = serde_json::json!({ "path": path });
+    let req = api_io::parse_route(
+        "POST",
+        "/api/v1/composition/save",
+        body.to_string().as_bytes(),
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    st.api_handle(req, tx);
+    rx.try_recv().expect("answered in the same call")
+}
+
+#[test]
+fn rest_save_refuses_other_extensions_and_missing_dirs() {
+    let d = multi_dir("rest-save");
+    let txt = d.join("notes.txt");
+    std::fs::write(&txt, "keep").unwrap();
+    let mut h = app();
+    let r = rest_save(h.state_mut(), txt.to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+    assert_eq!(std::fs::read_to_string(&txt).unwrap(), "keep");
+    let r = rest_save(h.state_mut(), d.join("no/such/dir/a.vjc").to_str().unwrap());
+    assert_eq!(r.unwrap_err().status, 422);
+    let r = rest_save(h.state_mut(), d.join("plain").to_str().unwrap());
+    assert!(r.is_ok());
+    assert!(d.join("plain.vjc").is_file());
+    let r = rest_save(h.state_mut(), d.join("UP.VJC").to_str().unwrap());
+    assert!(r.is_ok());
+}
+
 fn top_layer_no(h: &Harness<'_, State>) -> usize {
     h.state().project.composition.layers.len()
 }

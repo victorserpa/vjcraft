@@ -6291,8 +6291,15 @@ impl State {
             "save" => {
                 let ok = match path_of("path") {
                     Some(mut p) => {
-                        if p.extension().is_none() {
-                            p.set_extension("vjc");
+                        match p.extension() {
+                            None => {
+                                p.set_extension("vjc");
+                            }
+                            Some(e) if e.eq_ignore_ascii_case("vjc") => {}
+                            Some(_) => return bad(422, "path must end in .vjc"),
+                        }
+                        if !p.parent().is_some_and(|d| d.is_dir()) {
+                            return bad(422, "the parent directory does not exist");
                         }
                         self.save_to(p)
                     }

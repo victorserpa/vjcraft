@@ -726,6 +726,14 @@ fn handle_http(mut rq: tiny_http::Request, link: &Link, any: bool, port: u16) {
             return Ok(Out::Json(json!({"pin_required": link.pin.is_some()})));
         }
         let mut body = Vec::new();
+        // can-open probes the filesystem, so it needs the PIN even as a GET.
+        if method == "GET" && path == "/api/v1/can-open" {
+            let given = request_pin(&rq, query);
+            let ip = rq.remote_addr().map(|a| a.ip());
+            if let Err((code, m)) = pin_gate(link, ip, given.as_deref()) {
+                return Err(err(code, m));
+            }
+        }
         if method == "POST" {
             let given = request_pin(&rq, query);
             let ip = rq.remote_addr().map(|a| a.ip());
@@ -1781,11 +1789,19 @@ mod tests {
             "",
         );
         assert_eq!(st, 403);
-        // can-open is answered by the server thread and reads without a PIN.
-        let (st, v) = http(
+        // can-open probes the filesystem: it needs the PIN, even as a GET.
+        let (st, _) = http(
             a,
             "GET",
             "/api/v1/can-open?path=/no/such/file.mp4",
+            None,
+            "",
+        );
+        assert_eq!(st, 401);
+        let (st, v) = http(
+            a,
+            "GET",
+            "/api/v1/can-open?path=/no/such/file.mp4&pin=77",
             None,
             "",
         );
