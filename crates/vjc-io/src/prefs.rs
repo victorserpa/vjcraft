@@ -469,7 +469,22 @@ pub struct Layout {
     pub grid: bool,
     /// Speed sliders of the master, groups and clips (hidden = less clutter, speeds stay).
     pub speed_sliders: bool,
+    /// Interface parts hidden by the user (keys of `VIEW_TOGGLES`).
+    pub hidden: Vec<String>,
 }
+
+/// Parts of the interface the View menu can show or hide: (key, menu label).
+pub const VIEW_TOGGLES: [(&str, &str); 9] = [
+    ("crossfader", "Crossfader"),
+    ("dashboard", "Dashboard"),
+    ("autopilot", "Autopilot sections"),
+    ("cue-points", "Cue points"),
+    ("transition", "Transition controls"),
+    ("layer-transport", "Layer transport controls"),
+    ("undo", "Undo toolbar"),
+    ("column-triggers", "Column triggers"),
+    ("audio", "Audio controls"),
+];
 
 impl Default for Layout {
     fn default() -> Self {
@@ -483,11 +498,25 @@ impl Default for Layout {
             params_h: 400.0,
             grid: true,
             speed_sliders: true,
+            hidden: vec![],
         }
     }
 }
 
 impl Layout {
+    /// Whether the interface part `key` (see `VIEW_TOGGLES`) is hidden.
+    pub fn is_hidden(&self, key: &str) -> bool {
+        self.hidden.iter().any(|h| h == key)
+    }
+
+    /// Hides or shows the interface part `key`.
+    pub fn set_hidden(&mut self, key: &str, hide: bool) {
+        self.hidden.retain(|h| h != key);
+        if hide {
+            self.hidden.push(key.to_owned());
+        }
+    }
+
     /// The built-in layouts, in menu order.
     pub fn presets() -> Vec<Layout> {
         let d = Layout::default();
@@ -515,6 +544,10 @@ impl Layout {
     }
 
     fn sanitize(&mut self) {
+        self.hidden
+            .retain(|k| VIEW_TOGGLES.iter().any(|(key, _)| key == k));
+        self.hidden.sort();
+        self.hidden.dedup();
         self.name = self.name.trim().to_owned();
         for v in [
             &mut self.browser_w,
@@ -745,6 +778,20 @@ fn merge_unknown(new: &mut serde_json::Value, old: &serde_json::Value, known: &s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hidden_view_parts_roundtrip_and_unknown_keys_are_dropped() {
+        let mut p = super::Prefs::default();
+        p.layouts.current.set_hidden("crossfader", true);
+        p.layouts.current.set_hidden("undo", true);
+        p.layouts.current.set_hidden("undo", false);
+        let (back, _) = super::Prefs::from_json(&serde_json::to_string(&p).unwrap());
+        assert!(back.layouts.current.is_hidden("crossfader"));
+        assert!(!back.layouts.current.is_hidden("undo"));
+        let (old, _) =
+            super::Prefs::from_json(r#"{"layouts":{"current":{"hidden":["x","audio"]}}}"#);
+        assert_eq!(old.layouts.current.hidden, vec!["audio".to_owned()]);
+    }
+
     #[test]
     fn new_prefs_fields_roundtrip_and_default_when_missing() {
         let mut p = super::Prefs::default();

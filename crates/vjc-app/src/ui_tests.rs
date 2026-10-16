@@ -8311,3 +8311,29 @@ fn prefs_defaults_and_web_tabs_render() {
     assert!(exists(&h, "Web remote PIN"));
     snap(&mut h, "42-prefs-web");
 }
+
+#[test]
+fn view_menu_toggle_hides_its_panel_and_persists_in_the_layout() {
+    let mut h = app();
+    settle(&mut h);
+    assert!(exists(&h, "Crossfader (expanded)"));
+    assert!(exists(&h, "Undo"));
+    click(&mut h, "View");
+    snap(&mut h, "43-view-menu");
+    click(&mut h, "Crossfader");
+    settle(&mut h);
+    assert!(h.state().prefs.layouts.current.is_hidden("crossfader"));
+    assert!(!exists(&h, "Crossfader (expanded)"), "section is gone");
+    assert!(exists(&h, "Undo"), "others stay");
+    // The toolbar toggle hides undo/redo.
+    click(&mut h, "View");
+    click(&mut h, "Undo toolbar");
+    settle(&mut h);
+    assert!(!exists(&h, "Undo"));
+    assert!(!exists(&h, "Redo"));
+    // Showing it again brings the section back.
+    click(&mut h, "View");
+    click(&mut h, "Crossfader");
+    settle(&mut h);
+    assert!(exists(&h, "Crossfader (expanded)"));
+}

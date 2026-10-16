@@ -373,6 +373,7 @@ pub fn column_head(
     name: &str,
     selected: bool,
     r: &egui::Response,
+    triggers: bool,
 ) {
     let p = ui.painter();
     let top = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), theme::COLUMN_HEAD_H));
@@ -392,13 +393,15 @@ pub fn column_head(
             lift
         },
     );
-    p.text(
-        top.center(),
-        Align2::CENTER_CENTER,
-        crate::icons::i::PLAY,
-        theme::icon_font(theme::FS_XS),
-        theme::TEXT_MUTED,
-    );
+    if triggers {
+        p.text(
+            top.center(),
+            Align2::CENTER_CENTER,
+            crate::icons::i::PLAY,
+            theme::icon_font(theme::FS_XS),
+            theme::TEXT_MUTED,
+        );
+    }
     let ink = if selected {
         theme::ON_ACCENT
     } else {
