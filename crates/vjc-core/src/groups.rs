@@ -165,6 +165,11 @@ pub(crate) fn apply(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 vec![],
             )
         }
+        Command::SetGroupBus { group, bus } => {
+            let gi = check_group(p, group)?;
+            let prev = std::mem::replace(&mut p.composition.groups[gi].crossfader_bus, bus);
+            undoable(Command::SetGroupBus { group, bus: prev }, vec![])
+        }
         Command::SetGroupSolo { group, solo } => {
             let gi = check_group(p, group)?;
             let prev = std::mem::replace(&mut p.composition.groups[gi].solo, solo);

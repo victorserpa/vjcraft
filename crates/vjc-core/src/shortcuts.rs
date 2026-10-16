@@ -707,6 +707,24 @@ pub fn resolve_with(p: &Project, ctx: &Ctx, address: &str, value: f64) -> Option
         ["comp", "master", "bypass"] => Some(Command::SetMasterBypass {
             bypass: value >= 0.5,
         }),
+        ["comp", "crossfader", "go", side @ ("a" | "b")] => Some(Command::GoCrossfader {
+            bus: if *side == "a" {
+                vjc_model::Bus::A
+            } else {
+                vjc_model::Bus::B
+            },
+            pressed: fire,
+        }),
+        ["comp", "crossfader", "curve"] => value.is_finite().then(|| Command::SetCrossfaderCurve {
+            curve: super::crossfader::CrossfadeCurve::ALL[(value.round().max(0.0) as usize)
+                .min(super::crossfader::CrossfadeCurve::ALL.len() - 1)],
+        }),
+        ["comp", "crossfader", "behaviour"] => {
+            let all = vjc_model::CrossfadeBehaviour::ALL;
+            value.is_finite().then(|| Command::SetCrossfaderBehaviour {
+                behaviour: all[(value.round().max(0.0) as usize).min(all.len() - 1)],
+            })
+        }
         ["comp", "crossfader"] => Some(Command::SetCrossfader {
             value: value.clamp(0.0, 1.0),
         }),

@@ -264,6 +264,9 @@ pub struct LayerGroup {
     /// Collapsed in the grid UI (its layers are hidden).
     #[serde(default)]
     pub folded: bool,
+    /// Crossfader bus of the group; layers without a bus of their own follow it.
+    #[serde(default)]
+    pub crossfader_bus: Option<Bus>,
 }
 
 impl LayerGroup {
@@ -276,6 +279,7 @@ impl LayerGroup {
             bypass: false,
             speed: 1.0,
             folded: false,
+            crossfader_bus: None,
         }
     }
 }
@@ -1045,6 +1049,23 @@ pub enum CrossfadeBehaviour {
     #[default]
     Fade,
     Cut,
+    /// Hard switch like Cut, and the Go commands hold the far bus only while pressed.
+    CutReturn,
+    /// Hard switch with no overlap: the middle already belongs to B.
+    Jump,
+}
+
+impl CrossfadeBehaviour {
+    pub const ALL: [CrossfadeBehaviour; 4] = [Self::Fade, Self::Cut, Self::CutReturn, Self::Jump];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fade => "Fade",
+            Self::Cut => "Cut",
+            Self::CutReturn => "Cut & return",
+            Self::Jump => "Jump",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

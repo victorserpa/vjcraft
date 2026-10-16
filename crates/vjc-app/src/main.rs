@@ -4522,13 +4522,13 @@ impl State {
             let opacity = (vjc_core::anim::effective_number(&l.track.opacity, &lctx)
                 * vjc_core::crossfader::layer_gain(
                     c.crossfader.as_ref(),
-                    l.crossfader_bus.as_ref(),
+                    vjc_core::crossfader::effective_bus(l, &c.groups),
                     cf_pos,
                 )) as f32;
             let blend = vjc_core::blend::effective_blend(
                 &vjc_core::crossfader::layer_blend(
                     c.crossfader.as_ref(),
-                    l.crossfader_bus.as_ref(),
+                    vjc_core::crossfader::effective_bus(l, &c.groups),
                     &l.track.blend,
                 ),
                 clip.and_then(|k| k.blend_override.as_ref()),
@@ -8027,10 +8027,7 @@ impl State {
                     }
                 });
             });
-            let behaviours = [
-                (vjc_model::CrossfadeBehaviour::Fade, "Fade".to_string()),
-                (vjc_model::CrossfadeBehaviour::Cut, "Cut".to_string()),
-            ];
+            let behaviours = vjc_model::CrossfadeBehaviour::ALL.map(|b| (b, b.label().to_string()));
             let cur = c
                 .crossfader
                 .as_ref()
@@ -8398,6 +8395,19 @@ impl State {
             }
             let (mut solo, mut bypass) = (g.solo, g.bypass);
             ui.horizontal(|ui| {
+                for (txt, bus) in [("A", vjc_model::Bus::A), ("B", vjc_model::Bus::B)] {
+                    let on = g.crossfader_bus == Some(bus.clone());
+                    if ui
+                        .selectable_label(on, txt)
+                        .on_hover_text(format!("Group on crossfader bus {txt}"))
+                        .clicked()
+                    {
+                        cmds.push(Command::SetGroupBus {
+                            group: gid,
+                            bus: if on { None } else { Some(bus) },
+                        });
+                    }
+                }
                 if icons::toggle(ui, &mut solo, icons::i::HEADPHONES, "Solo").changed() {
                     cmds.push(Command::SetGroupSolo { group: gid, solo });
                 }

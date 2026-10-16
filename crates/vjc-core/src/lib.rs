@@ -301,6 +301,18 @@ pub enum Command {
     SetCrossfaderBehaviour {
         behaviour: vjc_model::CrossfadeBehaviour,
     },
+    /// Moves the crossfader to bus A (0) or B (1). `pressed = false` is the release of the
+    /// button: with the Cut & return behaviour it goes back to the opposite bus, otherwise
+    /// it does nothing. Undoable.
+    GoCrossfader {
+        bus: vjc_model::Bus,
+        pressed: bool,
+    },
+    /// Assigns a whole group to crossfader bus A or B (None = unaffected). Undoable.
+    SetGroupBus {
+        group: GroupId,
+        bus: Option<vjc_model::Bus>,
+    },
     /// Blend mode of the layers on a crossfader bus (`None` = their own). Undoable.
     SetCrossfaderBlend {
         blend: Option<BlendMode>,
@@ -1202,6 +1214,19 @@ fn anim_param_mut(p: &mut Project, t: AnimTarget) -> Result<&mut Param, Error> {
             Ok(effects::track_mut(p, target)?.transform.field_mut(field))
         }
     }
+}
+
+fn set_crossfader(p: &mut Project, value: f64) -> Result<Applied, Error> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(Error::InvalidValue);
+    }
+    let cf = p
+        .composition
+        .crossfader
+        .get_or_insert_with(crossfader::new_crossfader);
+    let prev = number(&cf.position.value);
+    cf.position.set_number(value);
+    undoable(Command::SetCrossfader { value: prev }, vec![])
 }
 
 fn undoable(inverse: Command, events: Vec<Event>) -> Result<Applied, Error> {
@@ -2486,17 +2511,21 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             let prev = std::mem::replace(&mut p.composition.layers[i].crossfader_bus, bus);
             undoable(Command::SetLayerBus { layer, bus: prev }, vec![])
         }
-        Command::SetCrossfader { value } => {
-            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                return Err(Error::InvalidValue);
+        Command::SetCrossfader { value } => set_crossfader(p, value),
+        Command::GoCrossfader { bus, pressed } => {
+            let to_b = matches!(bus, vjc_model::Bus::B);
+            if pressed {
+                return set_crossfader(p, if to_b { 1.0 } else { 0.0 });
             }
-            let cf = p
-                .composition
-                .crossfader
-                .get_or_insert_with(crossfader::new_crossfader);
-            let prev = number(&cf.position.value);
-            cf.position.set_number(value);
-            undoable(Command::SetCrossfader { value: prev }, vec![])
+            let returns = p.composition.crossfader.as_ref().map(|c| c.behaviour)
+                == Some(vjc_model::CrossfadeBehaviour::CutReturn);
+            if !returns {
+                return Ok(Applied {
+                    inverse: None,
+                    events: vec![],
+                });
+            }
+            set_crossfader(p, if to_b { 0.0 } else { 1.0 })
         }
         Command::SetCrossfaderCurve { curve } => {
             let cf = p
@@ -3960,6 +3989,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
         | Command::SetGroupBlend { .. }
         | Command::SetGroupBypass { .. }
         | Command::SetGroupSolo { .. }
+        | Command::SetGroupBus { .. }
         | Command::SetGroupSpeed { .. }
         | Command::MoveLayerToGroup { .. }
         | Command::MoveLayerOutOfGroup { .. } => groups::apply(p, cmd),
@@ -4326,7 +4356,7 @@ mod tests {
     const A: DeckId = Uuid::from_u128(1);
     use vjc_model::{ShortcutMode, Transition};
 
-    fn layer(n: usize) -> Layer {
+    pub(crate) fn layer(n: usize) -> Layer {
         Layer {
             color: None,
             folded: false,
