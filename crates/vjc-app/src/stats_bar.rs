@@ -25,6 +25,7 @@ pub fn cpu_percent(cpu_before: f64, cpu_after: f64, wall: f64) -> f64 {
 }
 
 /// User + system CPU seconds used by this process so far.
+#[cfg(unix)]
 pub fn process_cpu_secs() -> f64 {
     let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage fills the struct it is given; RUSAGE_SELF is always valid.
@@ -36,6 +37,12 @@ pub fn process_cpu_secs() -> f64 {
     };
     let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 / 1e6;
     t(ru.ru_utime) + t(ru.ru_stime)
+}
+
+/// Not measured on this platform yet: the bar shows 0% CPU.
+#[cfg(not(unix))]
+pub fn process_cpu_secs() -> f64 {
+    0.0
 }
 
 /// "1.5 GB", "320 MB".
