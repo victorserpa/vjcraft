@@ -1755,6 +1755,41 @@ mod tests {
         assert!(pin_gate(&link, Some(b), Some("1")).is_ok());
     }
 
+    /// The page's inline script must parse: a syntax error leaves the remote blank.
+    /// Uses `node --check` when node is installed; skips otherwise.
+    #[test]
+    fn page_script_parses() {
+        let Ok(out) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("node not found: skipped");
+            return;
+        };
+        assert!(out.status.success());
+        let page = web::PAGE;
+        let mut js = String::new();
+        let mut rest = page;
+        while let Some(i) = rest.find("<script>") {
+            let body = &rest[i + 8..];
+            let j = body.find("</script>").expect("closed script");
+            js.push_str(&body[..j]);
+            js.push('\n');
+            rest = &body[j..];
+        }
+        assert!(!js.trim().is_empty(), "inline script found");
+        let path = std::env::temp_dir().join(format!("vjc_page_{}.js", std::process::id()));
+        std::fs::write(&path, js).unwrap();
+        let st = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            st.status.success(),
+            "{}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+    }
+
     #[test]
     fn page_retries_thumbs_and_thumb_route_revalidates() {
         assert!(web::PAGE.contains("THUMB_RETRY"));

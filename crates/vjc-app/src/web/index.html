@@ -230,7 +230,7 @@ function connect() {
   ws = new WebSocket(scheme + "://" + location.hostname + ":" + port + "/api/v1/ws" + q);
   let opened = false;
   ws.onopen = () => opened = true;
-  ws.addEventListener("open", () => ws.send(JSON.stringify({ subscribe: ["/comp/tempo/bpm", "/comp/master/opacity", "/comp/crossfader"] }));
+  ws.addEventListener("open", () => ws.send(JSON.stringify({ subscribe: ["/comp/tempo/bpm", "/comp/master/opacity", "/comp/crossfader"] })));
   ws.onmessage = () => refreshSoon();
   ws.onclose = async () => {
     $("live").className = "dot"; clearTimeout(timer);
