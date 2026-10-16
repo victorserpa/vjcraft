@@ -5,6 +5,7 @@ use crate::theme::{
     RADIUS_SM, SP_1, SP_2, SP_4, STATUS_H, STROKE_W, SURFACE_RAISED, TEXT, TEXT_MUTED, TOAST_TTL_S,
     TOAST_W, WARN, bold_font,
 };
+use crate::theme::{PROP_BAND_H, PROP_DIVIDER, PROP_ZEBRA, SECTION_BG, SP_3};
 use eframe::egui::{self, RichText, Stroke};
 
 /// Button emphasis: the main action, a plain one, or a destructive one.
@@ -161,21 +162,27 @@ pub fn fold_section(ui: &mut egui::Ui, group: &str, title: &str, body: impl FnOn
     } else {
         crate::icons::i::CARET_RIGHT
     };
-    let r = ui
-        .horizontal(|ui| {
-            let c = ui.add(
-                egui::Label::new(crate::icons::glyph(caret).color(TEXT_MUTED))
+    let r = egui::Frame::new()
+        .fill(SECTION_BG)
+        .inner_margin(egui::Margin::symmetric(SP_3 as i8, SP_1 as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let c = ui.add(
+                    egui::Label::new(crate::icons::glyph(caret).color(TEXT_MUTED))
+                        .sense(egui::Sense::click()),
+                );
+                let t = ui.add(
+                    egui::Label::new(
+                        RichText::new(title)
+                            .font(bold_font(ui.ctx(), FS_SM))
+                            .color(TEXT),
+                    )
                     .sense(egui::Sense::click()),
-            );
-            let t = ui.add(
-                egui::Label::new(
-                    RichText::new(title)
-                        .font(bold_font(ui.ctx(), FS_SM))
-                        .color(TEXT),
-                )
-                .sense(egui::Sense::click()),
-            );
-            c.union(t)
+                );
+                c.union(t)
+            })
+            .inner
         })
         .inner;
     if r.clicked() {
@@ -192,11 +199,72 @@ pub fn fold_section(ui: &mut egui::Ui, group: &str, title: &str, body: impl FnOn
             })
         });
     }
-    ui.separator();
     if open {
+        prop_reset(ui);
         body(ui);
     }
     ui.add_space(SP_4);
+}
+
+/// Non-folding header band for a whole panel ("Screen", "Slice").
+pub fn prop_header(ui: &mut egui::Ui, title: &str) {
+    egui::Frame::new()
+        .fill(SECTION_BG)
+        .inner_margin(egui::Margin::symmetric(SP_3 as i8, SP_1 as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(title)
+                    .font(bold_font(ui.ctx(), FS_SM))
+                    .color(TEXT),
+            );
+        });
+    prop_reset(ui);
+}
+
+fn zebra_key() -> egui::Id {
+    egui::Id::new("prop-zebra-n")
+}
+
+/// Restarts the zebra: the next `prop_row` is a plain row.
+pub fn prop_reset(ui: &egui::Ui) {
+    ui.data_mut(|d| d.insert_temp(zebra_key(), 0_u32));
+}
+
+/// One property row: a band `PROP_BAND_H` high across the panel, alternating fills and a 1px
+/// divider under it. With a `label` it sits right-aligned in the label column (see
+/// `params::row_label`) and `body` fills the value column; without one `body` draws its own
+/// label, as the slider rows do.
+pub fn prop_row<R>(
+    ui: &mut egui::Ui,
+    label: Option<&str>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let n: u32 = ui.data(|d| d.get_temp(zebra_key())).unwrap_or(0);
+    ui.data_mut(|d| d.insert_temp(zebra_key(), n + 1));
+    let fill = if n % 2 == 1 {
+        PROP_ZEBRA
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let out = egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::symmetric(SP_3 as i8, 1))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(PROP_BAND_H - 2.0);
+            ui.horizontal(|ui| {
+                if let Some(l) = label {
+                    crate::params::row_label(ui, l);
+                }
+                body(ui)
+            })
+            .inner
+        });
+    let r = out.response.rect;
+    ui.painter()
+        .hline(r.x_range(), r.bottom(), Stroke::new(STROKE_W, PROP_DIVIDER));
+    out.inner
 }
 
 /// Small muted help line.

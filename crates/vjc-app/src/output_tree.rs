@@ -6,8 +6,8 @@ use crate::icons;
 use crate::output_hints::{self, hint};
 use crate::output_ui::OutTab;
 use crate::theme::{
-    BG, BORDER, FS_SM, FS_XS, ON_ACCENT, RADIUS_SM, SP_2, SP_3, TEXT, TEXT_MUTED, TREE_INDENT,
-    bold_font,
+    ACCENT, BG, BORDER, FS_SM, FS_XS, ON_ACCENT, RADIUS_SM, SP_2, SP_3, SURFACE_RAISED, TEXT,
+    TEXT_MUTED, TREE_INDENT, TREE_SCREEN_H, bold_font,
 };
 use crate::widgets;
 use eframe::egui::{self, RichText};
@@ -26,6 +26,23 @@ pub(crate) fn slice_label(i: usize, s: &Slice) -> String {
     } else {
         s.name.clone()
     }
+}
+
+/// "1 slice" / "8 slices": the count shown on a screen row.
+pub(crate) fn slice_count_label(n: usize) -> String {
+    if n == 1 {
+        "1 slice".into()
+    } else {
+        format!("{n} slices")
+    }
+}
+
+/// "Screen N" with the lowest N (from the count + 1 up) that no screen uses yet.
+pub(crate) fn next_screen_name(screens: &[Screen]) -> String {
+    (screens.len() + 1..)
+        .map(|n| format!("Screen {n}"))
+        .find(|name| screens.iter().all(|s| s.name != *name))
+        .unwrap_or_default()
 }
 
 /// Square mask inset from the slice edges.
@@ -84,14 +101,15 @@ pub(crate) fn grid_of_slices(scr: &Screen, cols: u32, rows: u32) -> Option<Comma
 
 /// A tree row of `width`: the label left-aligned on a fill when selected or hovered.
 fn tree_row(ui: &mut egui::Ui, width: f32, on: bool, label: &str) -> egui::Response {
-    let h = ui.spacing().interact_size.y;
+    let h = TREE_SCREEN_H;
     let (rect, r) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
     r.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, label.to_owned())
     });
-    let v = ui.style().interact_selectable(&r, on);
-    if on || r.hovered() {
-        ui.painter().rect_filled(rect, RADIUS_SM, v.weak_bg_fill);
+    if on {
+        ui.painter().rect_filled(rect, RADIUS_SM, ACCENT);
+    } else if r.hovered() {
+        ui.painter().rect_filled(rect, RADIUS_SM, SURFACE_RAISED);
     }
     ui.painter().text(
         rect.left_center() + egui::vec2(SP_3, 0.0),
@@ -102,6 +120,9 @@ fn tree_row(ui: &mut egui::Ui, width: f32, on: bool, label: &str) -> egui::Respo
     );
     r
 }
+
+/// Room kept right of a screen name for its slice count.
+const COUNT_W: f32 = 56.0;
 
 /// How a rename ended.
 enum Renamed {
@@ -164,7 +185,7 @@ impl State {
         let mut grid = self.out_win.as_ref().map_or((3, 2), |w| w.add_grid);
         let r = ui.menu_button(icons::glyph(icons::i::PLUS), |ui| {
             if ui.button("Add screen").clicked() {
-                let s = mapping::new_screen(&format!("Screen {}", screens.len() + 1), cw, ch);
+                let s = mapping::new_screen(&next_screen_name(screens), cw, ch);
                 cmds.push(Command::AddScreen {
                     screen: s,
                     index: screens.len(),
@@ -287,8 +308,11 @@ impl State {
                 }
                 return None;
             }
-            let w = ui.available_width();
-            Some(hint(tree_row(ui, w, on, &scr.name), "tree-screen"))
+            let count = slice_count_label(scr.slices.len());
+            let w = (ui.available_width() - COUNT_W).max(20.0);
+            let r = hint(tree_row(ui, w, on, &scr.name), "tree-screen");
+            ui.label(RichText::new(count).size(FS_XS).color(TEXT_MUTED));
+            Some(r)
         });
         if let Some(r) = row.inner {
             if r.clicked() {
@@ -331,7 +355,7 @@ impl State {
             ui.add_space(TREE_INDENT + SP_3);
             ui.label(
                 RichText::new(format!(
-                    "{} ({}x{})",
+                    "{} \u{b7} {}x{}",
                     self.device_label(scr),
                     scr.width,
                     scr.height
@@ -341,8 +365,31 @@ impl State {
             );
         });
         if !folded {
+            let key = egui::Id::new("out-tree-slice-h");
+            let known: Option<f32> = ui.data(|d| d.get_temp(key));
             for (i, sl) in scr.slices.iter().enumerate() {
+                let y = ui.cursor().top();
+                // A row wholly outside the scroll viewport is only skipped over, not built.
+                let clip = ui.clip_rect();
+                let busy = self.sel_slice == Some(sl.id)
+                    || self.sel_slices.contains(&sl.id)
+                    || self
+                        .out_win
+                        .as_ref()
+                        .and_then(|w| w.rename.as_ref())
+                        .is_some_and(|(id, _)| *id == sl.id);
+                if let Some(h) = known
+                    && !busy
+                    && (y > clip.bottom() || y + h < clip.top())
+                {
+                    ui.add_space(h);
+                    continue;
+                }
                 self.tree_slice(ui, scr, screens, (i, sl), cmds);
+                let h = ui.cursor().top() - y;
+                if known != Some(h) {
+                    ui.data_mut(|d| d.insert_temp(key, h));
+                }
             }
         }
         ui.add_space(SP_2);

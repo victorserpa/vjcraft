@@ -295,6 +295,14 @@ pub const PROP_ROW_H: f32 = 20.0;
 /// Param label column: minimum width and the cap above which labels are truncated.
 pub const PARAM_LABEL_MIN: f32 = 60.0;
 pub const PARAM_LABEL_MAX: f32 = 180.0;
+/// Property row band (label column + value column): total height, label column width, the
+/// alternate row fill and the 1px divider under each row.
+pub const PROP_BAND_H: f32 = 22.0;
+pub const PROP_LABEL_W: f32 = 84.0;
+pub const PROP_ZEBRA: Color32 = Color32::from_rgb(0x2b, 0x2f, 0x36);
+pub const PROP_DIVIDER: Color32 = Color32::from_rgb(0x33, 0x37, 0x40);
+/// Tree row: screen header height, and the slice-count / sub-line colour.
+pub const TREE_SCREEN_H: f32 = 22.0;
 pub const SECTION_HEAD: Color32 = Color32::from_rgb(150, 160, 178);
 
 /// Clip scrub bar: height, marker grab distance (px) and the shade over the part outside in..out.
@@ -421,6 +429,8 @@ mod tests {
             ("text", TEXT),
             ("text-muted", TEXT_MUTED),
             ("accent", ACCENT),
+            ("prop-zebra", PROP_ZEBRA),
+            ("prop-divider", PROP_DIVIDER),
             ("on-accent", ON_ACCENT),
             ("danger", DANGER),
             ("playing", CELL_PLAYING),
@@ -452,6 +462,9 @@ mod tests {
             ("status_h", STATUS_H),
             ("section_row_h", SECTION_ROW_H),
             ("param_value_w", PROP_VALUE_W),
+            ("prop_band_h", PROP_BAND_H),
+            ("prop_label_w", PROP_LABEL_W),
+            ("tree_screen_h", TREE_SCREEN_H),
             ("monitor_col_w", MONITOR_COL_W),
             ("monitor_min_w", MONITOR_MIN_W),
             ("clip_panel_w", CLIP_PANEL_W),

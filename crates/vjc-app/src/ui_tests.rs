@@ -7617,7 +7617,7 @@ fn output_tree_selects_and_renames_in_place() {
     let (mut h, _tex) = stage_setup();
     // The tree lists the screen with its device and size, then the slices.
     assert!(exists(&h, "Stage") && exists(&h, "Centre") && exists(&h, "Right outer"));
-    assert!(has_text(&h, "Window (1920x1080)") || exists(&h, "Window (1920x1080)"));
+    assert!(exists(&h, "Window \u{b7} 1920x1080"));
     click(&mut h, "Left inner");
     assert_eq!(h.state().sel_slice, Some(slice_named(&h, "Left inner").id));
     // Properties follow the selection: slice fields on the right.
@@ -8013,6 +8013,174 @@ fn output_guide_image_loads_from_a_dropped_file() {
     click(&mut h, "Remove guide");
     assert!(State::guide_texture(&h.ctx, id).is_none());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stage setup with `n` extra screens of mixed sizes, the first `with_slices` screens full of
+/// slices. Screen 0 is the stage.
+fn many_screens(n: usize) -> (Harness<'static, State>, egui::TextureHandle) {
+    let (mut h, tex) = stage_setup();
+    let sizes = [
+        (1920, 1080),
+        (1920, 1200),
+        (1280, 720),
+        (3840, 2160),
+        (1024, 768),
+    ];
+    for i in 0..n {
+        let (w, hh) = sizes[i % sizes.len()];
+        let mut s = vjc_core::mapping::new_screen(&format!("Wall {}", i + 2), w, hh);
+        if i % 3 == 1 {
+            s.device = vjc_model::OutputDevice::Syphon;
+        }
+        let count = h.state().project.output.screens.len();
+        h.state_mut().exec(Command::AddScreen {
+            screen: s,
+            index: count,
+        });
+    }
+    settle(&mut h);
+    (h, tex)
+}
+
+fn add_slices(h: &mut Harness<'_, State>, screen: usize, n: usize) {
+    let scr = h.state().project.output.screens[screen].clone();
+    for k in 0..n {
+        h.state_mut().exec(Command::AddSlice {
+            screen: scr.id,
+            slice: vjc_core::mapping::new_slice(scr.width, scr.height),
+            index: scr.slices.len() + k,
+        });
+    }
+    settle(h);
+}
+
+#[test]
+fn output_many_screens_render_and_scroll() {
+    let (mut h, _tex) = many_screens(11);
+    for s in 1..12 {
+        add_slices(&mut h, s, 8);
+    }
+    let screens = h.state().project.output.screens.clone();
+    assert_eq!(screens.len(), 12);
+    assert!(screens.iter().skip(1).all(|s| s.slices.len() == 8));
+    // The first screens are on view; the last one is below the fold until scrolled to.
+    assert!(exists(&h, "Wall 2"));
+    let last = h.get_by_label("Wall 12").rect().min.y;
+    let first = h.get_by_label("Wall 2").rect().min.y;
+    assert!(last > first, "rows keep their order");
+    // Scrolling the list brings the last screen into the window.
+    let area = h.get_by_label("Wall 2").rect().center();
+    h.hover_at(area);
+    for _ in 0..40 {
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -400.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+    settle(&mut h);
+    let y = h.get_by_label("Wall 12").rect().min.y;
+    assert!(y < 1000.0 && y > 0.0, "last screen scrolled into view: {y}");
+    // The help panel stays pinned at the bottom.
+    assert!(exists(&h, "Help"));
+}
+
+#[test]
+fn output_each_screen_keeps_its_own_resolution_and_device() {
+    let (mut h, _tex) = many_screens(3);
+    let ids: Vec<_> = h
+        .state()
+        .project
+        .output
+        .screens
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    h.state_mut().exec(Command::SetScreenSize {
+        screen: ids[2],
+        width: 1600,
+        height: 900,
+    });
+    h.state_mut().exec(Command::SetScreenDevice {
+        screen: ids[3],
+        device: vjc_model::OutputDevice::Ndi,
+    });
+    settle(&mut h);
+    let s = h.state().project.output.screens.clone();
+    assert_eq!((s[0].width, s[0].height), (1920, 1080));
+    assert_eq!((s[1].width, s[1].height), (1920, 1080));
+    assert_eq!((s[2].width, s[2].height), (1600, 900));
+    assert_eq!((s[3].width, s[3].height), (1280, 720));
+    assert_eq!(s[2].device, vjc_model::OutputDevice::Syphon);
+    assert_eq!(s[3].device, vjc_model::OutputDevice::Ndi);
+    assert_eq!(s[0].device, vjc_model::OutputDevice::Window);
+    // The tree sub-lines say so, and selecting a screen shows its own size in the props.
+    assert!(exists(&h, "Syphon \u{b7} 1600x900"));
+    assert!(exists(&h, "NDI \u{b7} 1280x720"));
+    click(&mut h, "Wall 3");
+    assert_eq!(h.state().sel_screen, Some(ids[2]));
+}
+
+#[test]
+fn output_add_menu_adds_default_screen_and_rename_works() {
+    let (mut h, _tex) = many_screens(1);
+    click(&mut h, "Add");
+    click(&mut h, "Add screen");
+    let s = h.state().project.output.screens.clone();
+    assert_eq!(s.len(), 3);
+    assert_eq!(s[2].name, "Screen 3");
+    assert_eq!(s[2].device, vjc_model::OutputDevice::Window);
+    let comp = &h.state().project.composition;
+    assert_eq!((s[2].width, s[2].height), (comp.width, comp.height));
+    // Rename the new screen in place.
+    let at = h.get_by_label("Screen 3").rect().center();
+    double_click_at(&mut h, at);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("Back wall".into()));
+    settle(&mut h);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert_eq!(h.state().project.output.screens[2].name, "Back wall");
+    assert!(exists(&h, "Back wall"));
+}
+
+#[test]
+fn output_screen_row_shows_the_slice_count() {
+    use crate::output_tree::slice_count_label;
+    assert_eq!(slice_count_label(0), "0 slices");
+    assert_eq!(slice_count_label(1), "1 slice");
+    assert_eq!(slice_count_label(8), "8 slices");
+    let (mut h, _tex) = many_screens(1);
+    add_slices(&mut h, 1, 3);
+    assert!(exists(&h, "3 slices"));
+    assert!(exists(&h, "6 slices"), "the stage has six");
+}
+
+#[test]
+fn output_canvas_lists_the_slices_of_the_selected_screen() {
+    let (mut h, _tex) = many_screens(1);
+    add_slices(&mut h, 1, 2);
+    click(&mut h, "Wall 2");
+    assert_eq!(h.state().sel_slice, None);
+    let (scr, sl) = h
+        .state()
+        .out_selected(&h.state().project.output.screens)
+        .unwrap();
+    assert_eq!(scr.name, "Wall 2");
+    assert!(sl.is_none() && scr.slices.len() == 2);
+}
+
+// 30, 31: many screens and the property rows.
+#[test]
+fn output_many_screens_and_slice_props_snapshots() {
+    let (mut h, _tex) = many_screens(7);
+    add_slices(&mut h, 1, 6);
+    click(&mut h, "Wall 2");
+    snap(&mut h, "30-output-many-screens");
+    click(&mut h, "Slice 2");
+    snap(&mut h, "31-output-slice-props");
 }
 
 // 20 - 23: the rebuilt window with a stage-like layout.
