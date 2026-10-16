@@ -11568,6 +11568,8 @@ impl eframe::App for State {
         if self.show_stats {
             let fps = effective_fps(self.project.composition.fps, self.prefs.video.max_fps);
             self.stats.frame(t0, self.is_live(), fps);
+        } else {
+            self.stats.reset();
         }
         self.output_window(&ctx);
         self.frame_ms.push(t0.elapsed().as_secs_f32() * 1000.0);

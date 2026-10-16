@@ -15,8 +15,12 @@ pub struct Log {
     /// While paused, incoming messages are counted but not kept.
     paused: bool,
     missed: usize,
-    /// Text of the line the user clicked (what "Copy" puts on the clipboard).
-    selected: Option<String>,
+    /// Sequence number of the line the user clicked (what "Copy" puts on the clipboard).
+    /// By number, not text: repeated messages are equal lines, and an evicted line
+    /// takes the selection with it.
+    selected: Option<u64>,
+    /// Sequence number of `lines[0]`.
+    first: u64,
 }
 
 impl Log {
@@ -27,6 +31,10 @@ impl Log {
         }
         if self.lines.len() == MAX_LINES {
             self.lines.pop_front();
+            self.first += 1;
+            if self.selected.is_some_and(|s| s < self.first) {
+                self.selected = None;
+            }
         }
         self.lines.push_back(line);
     }
@@ -40,6 +48,7 @@ impl Log {
     }
 
     pub fn clear(&mut self) {
+        self.first += self.lines.len() as u64;
         self.lines.clear();
         self.selected = None;
         self.missed = 0;
@@ -60,14 +69,28 @@ impl Log {
         self.missed
     }
 
-    pub fn select(&mut self, line: Option<String>) {
-        self.selected = line;
+    /// Lines with their sequence number.
+    pub fn numbered(&self) -> impl Iterator<Item = (u64, &String)> {
+        (self.first..).zip(self.lines.iter())
+    }
+
+    pub fn selected(&self) -> Option<u64> {
+        self.selected
+    }
+
+    /// Selects the line with sequence number `seq` (None = no selection).
+    pub fn select(&mut self, seq: Option<u64>) {
+        self.selected =
+            seq.filter(|s| (self.first..self.first + self.lines.len() as u64).contains(s));
     }
 
     /// What Copy puts on the clipboard: the selected line, else every line.
     pub fn copy_text(&self) -> String {
-        match &self.selected {
-            Some(l) => l.clone(),
+        match self
+            .selected
+            .and_then(|s| self.numbered().find(|(n, _)| *n == s))
+        {
+            Some((_, l)) => l.clone(),
             None => self.lines.iter().cloned().collect::<Vec<_>>().join("\n"),
         }
     }
@@ -151,14 +174,14 @@ pub fn window(ctx: &egui::Context, title: &str, log: &mut Log, hint: &str) -> bo
                         help(ui, "Nothing received yet.");
                     }
                     let mut pick = None;
-                    for l in log.lines() {
-                        let on = log.selected.as_deref() == Some(l.as_str());
+                    for (n, l) in log.numbered() {
+                        let on = log.selected() == Some(n);
                         let t = egui::RichText::new(l)
                             .monospace()
                             .size(crate::theme::FS_XS)
                             .color(crate::theme::TEXT);
                         if ui.selectable_label(on, t).clicked() {
-                            pick = Some(if on { None } else { Some(l.clone()) });
+                            pick = Some(if on { None } else { Some(n) });
                         }
                     }
                     if let Some(p) = pick {
@@ -210,10 +233,30 @@ mod tests {
         l.push("a".into());
         l.push("b".into());
         assert_eq!(l.copy_text(), "a\nb");
-        l.select(Some("b".into()));
+        l.select(Some(1));
         assert_eq!(l.copy_text(), "b");
         l.clear();
         assert_eq!(l.copy_text(), "");
+    }
+
+    #[test]
+    fn selection_is_by_line_and_clears_when_evicted() {
+        let mut l = Log::default();
+        l.push("same".into());
+        l.push("same".into());
+        l.select(Some(1));
+        assert_eq!(l.selected(), Some(1), "the second of two equal lines");
+        for i in 0..MAX_LINES - 1 {
+            l.push(i.to_string());
+        }
+        assert_eq!(l.selected(), Some(1), "still in the buffer");
+        l.push("x".into());
+        l.push("y".into());
+        assert_eq!(l.selected(), None, "evicted: nothing selected");
+        assert!(
+            l.copy_text().contains('\n'),
+            "Copy falls back to everything"
+        );
     }
 
     #[test]

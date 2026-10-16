@@ -41,6 +41,18 @@ fn clean(name: &str) -> Option<String> {
     (!n.is_empty()).then_some(n)
 }
 
+/// An imported dial with a usable range: finite numbers, lo <= hi (swapped when reversed)
+/// and the value inside it. None for a dial that cannot be repaired.
+fn valid_dial(mut d: DialSlot) -> Option<DialSlot> {
+    let (lo, hi) = d.range;
+    if !(lo.is_finite() && hi.is_finite() && d.value.is_finite()) {
+        return None;
+    }
+    d.range = (lo.min(hi), lo.max(hi));
+    d.value = d.value.clamp(d.range.0, d.range.1);
+    Some(d)
+}
+
 impl Presets {
     /// Saves under `name`, replacing a preset with the same name. False for an empty name
     /// or a full list.
@@ -97,7 +109,7 @@ impl Presets {
             n += usize::from(next.save_animation(&p.name, p.animation));
         }
         for p in inc.dashboards {
-            let dials = p.dials.into_iter().take(8).collect();
+            let dials = p.dials.into_iter().take(8).filter_map(valid_dial).collect();
             n += usize::from(next.save_dashboard(&p.name, dials));
         }
         *self = next;
@@ -116,6 +128,23 @@ mod tests {
             curve: Curve::Sine,
             motion: Default::default(),
         }
+    }
+
+    #[test]
+    fn imported_dials_get_a_sane_range_and_value() {
+        let slot = |value: f64, range: (f64, f64)| DialSlot {
+            name: "d".into(),
+            value,
+            range,
+        };
+        let mut src = Presets::default();
+        src.save_dashboard("x", vec![slot(5.0, (10.0, 0.0)), slot(99.0, (0.0, 1.0))]);
+        let mut dst = Presets::default();
+        dst.import_json(&src.to_json()).unwrap();
+        let d = &dst.dashboards[0].dials;
+        assert_eq!(d.len(), 2);
+        assert_eq!((d[0].range, d[0].value), ((0.0, 10.0), 5.0));
+        assert_eq!(d[1].value, 1.0, "clamped into the range");
     }
 
     #[test]
