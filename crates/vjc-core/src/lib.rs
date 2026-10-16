@@ -450,6 +450,12 @@ pub enum Command {
         slice: Uuid,
         index: usize,
     },
+    /// Moves a slice to `index` inside its screen (later slices draw over earlier ones). Undoable.
+    ReorderSlice {
+        screen: Uuid,
+        slice: Uuid,
+        index: usize,
+    },
     /// Mask polygon in normalized screen coordinates (3..=32 points); `None` clears it.
     /// Coalesces.
     SetSliceMask {
@@ -3009,6 +3015,29 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 Command::MoveSlice {
                     from: to,
                     to: from,
+                    slice,
+                    index: i,
+                },
+                vec![],
+            )
+        }
+        Command::ReorderSlice {
+            screen,
+            slice,
+            index,
+        } => {
+            let scr = screen_mut(p, screen)?;
+            let i = scr
+                .slices
+                .iter()
+                .position(|x| x.id == slice)
+                .ok_or(Error::NoSlice)?;
+            let sl = scr.slices.remove(i);
+            let at = index.min(scr.slices.len());
+            scr.slices.insert(at, sl);
+            undoable(
+                Command::ReorderSlice {
+                    screen,
                     slice,
                     index: i,
                 },

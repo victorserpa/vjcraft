@@ -8379,3 +8379,113 @@ fn clip_menu_entries_run_the_clip_commands() {
     click(&mut h, "Off");
     assert_eq!(clip(&h).extras.ignore_column_trigger, Some(false));
 }
+
+#[test]
+fn output_led_grid_draws_over_the_canvas_and_shows_in_output() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click_tab(&mut h, "Output");
+    let drawn = |h: &Harness<'_, State>| {
+        h.ctx
+            .data(|d| d.get_temp::<usize>(crate::output_extras::led_drawn_id()))
+            .unwrap_or(0)
+    };
+    assert_eq!(drawn(&h), 0, "off by default");
+    click(&mut h, "Grid lines");
+    click(&mut h, "LED grid");
+    assert!(h.state().out_win.as_ref().unwrap().led_grid);
+    assert_eq!(h.state().out_win.as_ref().unwrap().led_cell, 8);
+    // Cells of 8 px are too small for the zoomed-out canvas: nothing is drawn yet.
+    h.state_mut().out_win.as_mut().unwrap().led_cell = 40;
+    settle(&mut h);
+    assert!(drawn(&h) > 20, "lines drawn: {}", drawn(&h));
+    click(&mut h, "Show in output");
+    assert!(h.state().out_win.as_ref().unwrap().show_in_output);
+    snap(&mut h, "45-output-led-grid");
+    // Control: switching it off clears the lines.
+    click(&mut h, "LED grid");
+    assert_eq!(drawn(&h), 0);
+}
+
+#[test]
+fn output_slice_menu_centres_orders_and_copies_slices() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click_tab(&mut h, "Output");
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    snap(&mut h, "46-output-slice-menu");
+    click(&mut h, "Centre X");
+    let b = slice_named(&h, "Left outer");
+    let x0 = b.output_mesh.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+    let x1 = b.output_mesh.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+    assert!(
+        ((x0 + x1) / 2.0 - 960.0).abs() < 0.5,
+        "centred, got {x0}..{x1}"
+    );
+    // Bring forward: the slice moves one place later in the list.
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Bring forward");
+    let names: Vec<String> = slices_of(&h).into_iter().map(|s| s.name).collect();
+    assert_eq!(names[3], "Left outer");
+    // Mirror Y flips in place: the order of the mesh rows swaps.
+    let before = slice_named(&h, "Left outer").output_mesh;
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Mirror Y");
+    let after = slice_named(&h, "Left outer").output_mesh;
+    assert_eq!(after[0].1, before[2].1);
+    // Copy then paste adds a shifted copy with a fresh id.
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Copy");
+    assert_eq!(h.state().slice_clip.len(), 1);
+    h.get_by_label("Left outer").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Paste");
+    let all = slices_of(&h);
+    assert_eq!(all.len(), 7);
+    let copies: Vec<_> = all.iter().filter(|s| s.name == "Left outer").collect();
+    assert_eq!(copies.len(), 2);
+    assert_ne!(copies[0].id, copies[1].id);
+    // Cut removes the slice and keeps it on the clipboard.
+    h.get_by_label("Centre").click_secondary();
+    settle(&mut h);
+    click(&mut h, "Cut");
+    assert_eq!(slices_of(&h).len(), 6);
+    assert_eq!(h.state().slice_clip[0].name, "Centre");
+}
+
+#[test]
+fn output_plus_menu_adds_an_artnet_screen_and_mesh_subdivisions_resize() {
+    let (mut h, _tex) = stage_setup();
+    click(&mut h, "Stage");
+    click(&mut h, "Add");
+    click(&mut h, "Add Art-Net output (DMX universe, fixtures)");
+    let screens = &h.state().project.output.screens;
+    assert_eq!(screens.len(), 2);
+    assert!(matches!(
+        screens[1].device,
+        vjc_model::OutputDevice::ArtNet { .. }
+    ));
+    // Subdivisions of the warp mesh: 3 x 3 points instead of 2 x 2.
+    let (scr, sl) = {
+        let s = &h.state().project.output.screens[0];
+        (s.id, s.slices[0].id)
+    };
+    assert_eq!(
+        h.state().project.output.screens[0].slices[0]
+            .output_mesh
+            .len(),
+        4
+    );
+    h.state_mut().exec(Command::SetSliceMeshSize {
+        screen: scr,
+        slice: sl,
+        cols: 3,
+        rows: 3,
+    });
+    let m = &h.state().project.output.screens[0].slices[0];
+    assert_eq!((m.mesh_cols, m.output_mesh.len()), (3, 9));
+}

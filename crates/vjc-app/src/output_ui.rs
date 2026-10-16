@@ -79,6 +79,15 @@ pub(crate) struct OutWin {
     /// Grid size the "Add grid of slices" entry creates.
     pub(crate) add_grid: (u32, u32),
     pub(crate) guide_on: bool,
+    /// Slice outlines and names are drawn on the canvas.
+    pub(crate) show_slices: bool,
+    /// LED cell grid over the canvas, and its cell size in content pixels.
+    pub(crate) led_grid: bool,
+    pub(crate) led_cell: u32,
+    /// Slice numbers are drawn big over the slices.
+    pub(crate) identify: bool,
+    /// The LED grid and the slice numbers also show on the output windows.
+    pub(crate) show_in_output: bool,
     /// Tree row being renamed and its text.
     pub(crate) rename: Option<(Uuid, String)>,
     /// Screens folded in the tree.
@@ -326,6 +335,11 @@ impl State {
             grid_custom: (4, 4),
             add_grid: (3, 2),
             guide_on: true,
+            show_slices: true,
+            led_grid: false,
+            led_cell: crate::output_extras::LED_CELL_DEFAULT,
+            identify: false,
+            show_in_output: false,
             rename: None,
             folded: HashSet::new(),
             rect: egui::Rect::NOTHING,

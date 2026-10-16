@@ -33,6 +33,7 @@ mod netout;
 mod osc_io;
 mod output_artnet;
 mod output_canvas;
+mod output_extras;
 mod output_hints;
 mod output_overlay;
 mod output_presets_ui;
@@ -348,6 +349,8 @@ struct State {
     blackouts: std::collections::HashSet<Uuid>,
     /// Pixel-map grid tile size per screen (runtime only).
     pixel_grids: HashMap<Uuid, (u32, u32)>,
+    /// Slices copied in the Output setup (internal clipboard).
+    slice_clip: Vec<vjc_model::Slice>,
     /// FPS overlay on every output.
     show_fps: bool,
     /// When "Identify displays" was pressed (shows for `output_overlay::IDENTIFY_FOR`).
@@ -1982,6 +1985,7 @@ impl State {
             test_cards: Default::default(),
             blackouts: Default::default(),
             pixel_grids: Default::default(),
+            slice_clip: vec![],
             show_fps: false,
             identify_at: None,
             display_info_open: false,
@@ -11314,7 +11318,16 @@ impl State {
             let learning = self.learn;
             let card = self.test_cards.contains(&sid);
             let black = self.blackouts.contains(&sid);
-            let grid = self.pixel_grids.get(&sid).copied();
+            let mirror = self.out_win.as_ref().filter(|w| w.show_in_output);
+            let slice_ids = mirror.is_some_and(|w| w.identify);
+            let grid = self.pixel_grids.get(&sid).copied().or_else(|| {
+                mirror.filter(|w| w.led_grid).map(|w| {
+                    (
+                        w.led_cell.max(output_overlay::MIN_TILE),
+                        w.led_cell.max(output_overlay::MIN_TILE),
+                    )
+                })
+            });
             let mut toggle_black = false;
             let identify = output_overlay::identifying(self.identify_at, std::time::Instant::now());
             let number = self
@@ -11365,6 +11378,7 @@ impl State {
                                 blackout: black,
                                 grid,
                                 identify: identify.then_some(number),
+                                slice_ids,
                                 fps: show_fps.then_some(meter.fps),
                             },
                         );

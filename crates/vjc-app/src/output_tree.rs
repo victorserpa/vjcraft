@@ -3,6 +3,7 @@
 
 use crate::State;
 use crate::icons;
+use crate::output_extras::Axis;
 use crate::output_hints::{self, hint};
 use crate::output_ui::OutTab;
 use crate::theme::{
@@ -186,6 +187,18 @@ impl State {
         let r = ui.menu_button(icons::glyph(icons::i::PLUS), |ui| {
             if ui.button("Add screen").clicked() {
                 let s = mapping::new_screen(&next_screen_name(screens), cw, ch);
+                cmds.push(Command::AddScreen {
+                    screen: s,
+                    index: screens.len(),
+                });
+                ui.close();
+            }
+            if ui
+                .button("Add Art-Net output (DMX universe, fixtures)")
+                .clicked()
+            {
+                let s = crate::output_extras::artnet_screen(&next_screen_name(screens), cw, ch);
+                self.sel_screen = Some(s.id);
                 cmds.push(Command::AddScreen {
                     screen: s,
                     index: screens.len(),
@@ -482,6 +495,55 @@ impl State {
                 cmds.extend(self.mirror_cmd(scr, &ids));
                 ui.close();
             }
+            ui.separator();
+            for (label, axis, flip) in [
+                ("Centre X", Axis::X, false),
+                ("Centre Y", Axis::Y, false),
+                ("Mirror X", Axis::X, true),
+                ("Mirror Y", Axis::Y, true),
+            ] {
+                let cmd = if flip {
+                    self.flip_cmd(scr, &ids, axis)
+                } else {
+                    self.centre_cmd(scr, &ids, axis)
+                };
+                if ui
+                    .add_enabled(cmd.is_some(), egui::Button::new(label))
+                    .clicked()
+                {
+                    cmds.extend(cmd);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            for (label, fwd) in [("Bring forward", true), ("Send backward", false)] {
+                let cmd = self.order_cmd(scr, sl.id, fwd);
+                if ui
+                    .add_enabled(cmd.is_some(), egui::Button::new(label))
+                    .clicked()
+                {
+                    cmds.extend(cmd);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Copy").clicked() {
+                self.copy_slices(scr, &ids);
+                ui.close();
+            }
+            if ui.button("Cut").clicked() {
+                self.copy_slices(scr, &ids);
+                cmds.extend(self.remove_cmd(scr, &ids));
+                ui.close();
+            }
+            if ui
+                .add_enabled(!self.slice_clip.is_empty(), egui::Button::new("Paste"))
+                .clicked()
+            {
+                cmds.extend(self.paste_cmd(scr));
+                ui.close();
+            }
+            ui.separator();
             let others: Vec<&Screen> = screens.iter().filter(|s| s.id != scr.id).collect();
             ui.add_enabled_ui(!others.is_empty(), |ui| {
                 ui.menu_button("Move to screen", |ui| {

@@ -352,6 +352,8 @@ pub fn tile_color(key: &str) -> Color32 {
 /// Output test card, identify and FPS overlays (drawn over a screen's output).
 pub const TESTCARD_GRID: Color32 = Color32::from_rgb(90, 90, 100);
 /// Pixel-map grid lines (panel tile borders).
+/// LED cell grid over the Output setup canvas.
+pub const LED_GRID: Color32 = Color32::from_rgba_premultiplied(0, 60, 40, 60);
 pub const PIXEL_GRID: Color32 = Color32::from_rgb(0, 255, 160);
 pub const TESTCARD_BORDER: Color32 = Color32::WHITE;
 pub const TESTCARD_SLICE: Color32 = Color32::from_rgb(255, 210, 60);
