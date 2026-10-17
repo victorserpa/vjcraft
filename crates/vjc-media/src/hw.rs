@@ -12,22 +12,22 @@ use ff::ffi::{AVHWDeviceType, AVPixelFormat};
 #[cfg(target_os = "macos")]
 const DEVICE: Option<AVHWDeviceType> = Some(AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
 #[cfg(target_os = "macos")]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
 
 #[cfg(target_os = "windows")]
 const DEVICE: Option<AVHWDeviceType> = Some(AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
 #[cfg(target_os = "windows")]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_D3D11;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_D3D11;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const DEVICE: Option<AVHWDeviceType> = Some(AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI);
 #[cfg(all(unix, not(target_os = "macos")))]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VAAPI;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VAAPI;
 
 #[cfg(not(any(unix, windows)))]
 const DEVICE: Option<AVHWDeviceType> = None;
 #[cfg(not(any(unix, windows)))]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NONE;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NONE;
 
 /// How a decoder is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,8 +100,12 @@ static CAP: AtomicUsize = AtomicUsize::new(8);
 
 /// Sets the Video > "Hardware decoding" preference. Applies to clips opened afterwards.
 pub fn configure(enabled: bool, max_sessions: usize) {
-    MODE.store(u8::from(enabled), Ordering::Relaxed);
+    let was = MODE.swap(u8::from(enabled), Ordering::Relaxed);
     CAP.store(max_sessions, Ordering::Relaxed);
+    if enabled && was == 0 {
+        // Off -> Auto: the first session is still cold.
+        let _ = warm_up();
+    }
 }
 
 /// Hardware sessions currently open.
@@ -127,23 +131,75 @@ const WARM_CLIP: &[u8] = include_bytes!("../assets/warm.h264");
 
 /// Creating the device alone is cheap; the ~1.3 s goes into the first decode session, so
 /// decode a tiny frame through a real hardware decoder.
-fn warm_session() {
-    let Some(codec) = ff::decoder::find(ff::codec::Id::H264) else {
-        return;
-    };
+fn warm_session() -> Result<(), String> {
+    let codec = ff::decoder::find(ff::codec::Id::H264).ok_or("no H.264 decoder")?;
     let mut ctx = ff::codec::context::Context::new_with_codec(codec);
     if !attach(&mut ctx, Hw::On) {
-        return;
+        return Err("hardware device unavailable".into());
     }
-    let Ok(mut dec) = ctx.decoder().video() else {
-        return;
-    };
+    let mut dec = ctx
+        .decoder()
+        .video()
+        .map_err(|e| format!("open decoder: {e}"))?;
     let pkt = ff::Packet::copy(WARM_CLIP);
-    if dec.send_packet(&pkt).is_ok() {
-        let _ = dec.send_eof();
-        let mut f = ff::frame::Video::empty();
-        let _ = dec.receive_frame(&mut f);
+    dec.send_packet(&pkt).map_err(|e| format!("send: {e}"))?;
+    let _ = dec.send_eof();
+    let mut f = ff::frame::Video::empty();
+    dec.receive_frame(&mut f)
+        .map_err(|e| format!("receive: {e}"))
+}
+
+/// Progress of the warm-up: 0 not started, 1 running, 2 finished (ok or not).
+pub(crate) struct WarmGate {
+    state: std::sync::Mutex<u8>,
+    cv: std::sync::Condvar,
+}
+
+impl WarmGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }
     }
+
+    fn set(&self, v: u8) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = v;
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn start(&self) {
+        self.set(1);
+    }
+
+    pub(crate) fn finish(&self) {
+        self.set(2);
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) != 0
+    }
+
+    /// Blocks while a warm-up is running, for at most `max`. True when none is running
+    /// (anymore), false on timeout.
+    pub(crate) fn wait(&self, max: std::time::Duration) -> bool {
+        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, max, |s| *s == 1)
+            .unwrap_or_else(|e| e.into_inner());
+        *g != 1
+    }
+}
+
+pub(crate) static WARM: WarmGate = WarmGate::new();
+
+/// Longest a new hardware clip waits for a warm-up already in flight.
+pub(crate) const WARM_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// True once a warm-up thread was started (by `warm_up` or a pref change).
+pub fn warm_up_started() -> bool {
+    WARM.started()
 }
 
 /// Pays the one-time cost of the first hardware session (about 1.3 s with VideoToolbox) in
@@ -158,10 +214,19 @@ pub fn warm_up() -> Option<std::thread::JoinHandle<()>> {
     }
     let mut handle = None;
     ONCE.call_once(|| {
+        WARM.start();
         handle = std::thread::Builder::new()
             .name("vjc-hw-warm".into())
-            .spawn(warm_session)
+            .spawn(|| {
+                if let Err(e) = warm_session() {
+                    eprintln!("vjc-media: hardware warm-up failed: {e}");
+                }
+                WARM.finish();
+            })
             .ok();
+        if handle.is_none() {
+            WARM.finish();
+        }
     });
     handle
 }
@@ -172,15 +237,39 @@ unsafe extern "C" fn get_format(
     _ctx: *mut ff::ffi::AVCodecContext,
     fmts: *const AVPixelFormat,
 ) -> AVPixelFormat {
+    unsafe { select_format(fmts, HW_FORMAT) }
+}
+
+/// True when `f` is a hardware-accelerated pixel format (needs a device).
+fn is_hwaccel_format(f: AVPixelFormat) -> bool {
     unsafe {
+        let d = ff::ffi::av_pix_fmt_desc_get(f);
+        !d.is_null() && (*d).flags & ff::ffi::AV_PIX_FMT_FLAG_HWACCEL as u64 != 0
+    }
+}
+
+/// `want` if offered, else the first software format of the NONE-terminated list (FFmpeg
+/// semantics: never hand back another hwaccel format we have no device for), else NONE.
+///
+/// # Safety
+/// `fmts` must point to a list terminated by `AV_PIX_FMT_NONE`.
+pub(crate) unsafe fn select_format(
+    fmts: *const AVPixelFormat,
+    want: AVPixelFormat,
+) -> AVPixelFormat {
+    unsafe {
+        let mut sw = AVPixelFormat::AV_PIX_FMT_NONE;
         let mut p = fmts;
         while *p != AVPixelFormat::AV_PIX_FMT_NONE {
-            if *p == HW_FORMAT {
-                return HW_FORMAT;
+            if *p == want {
+                return want;
+            }
+            if sw == AVPixelFormat::AV_PIX_FMT_NONE && !is_hwaccel_format(*p) {
+                sw = *p;
             }
             p = p.add(1);
         }
-        *fmts
+        sw
     }
 }
 

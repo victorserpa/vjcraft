@@ -176,13 +176,24 @@ fn dropping_a_hw_player_does_not_block() {
     );
 }
 
-unsafe extern "C" {
-    fn clock() -> std::os::raw::c_long;
+/// Process CPU time (all threads) in seconds.
+#[cfg(unix)]
+fn cpu_secs() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
-/// Process CPU time (all threads) in seconds.
+/// Process CPU time (all threads) in seconds. MSVC `clock()` ticks in milliseconds.
+#[cfg(windows)]
 fn cpu_secs() -> f64 {
-    unsafe { clock() as f64 / 1_000_000.0 }
+    unsafe extern "C" {
+        fn clock() -> std::os::raw::c_long;
+    }
+    unsafe { clock() as f64 / 1000.0 }
 }
 
 fn bench(clip: &Path, hw: Hw, label: &str) {
@@ -213,5 +224,124 @@ fn hw_benchmark() {
         };
         bench(&clip, Hw::Off, label);
         bench(&clip, Hw::On, label);
+    }
+}
+
+#[test]
+fn fallback_does_not_re_emit_earlier_frames() {
+    let dir = tmp("reemit");
+    let Some(clip) = make_clip(&dir, "640x360", 2) else {
+        return;
+    };
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    let mut last = f64::NEG_INFINITY;
+    for _ in 0..15 {
+        last = sc.next().expect("frame").0;
+    }
+    sc.fall_back_to_software("test").unwrap();
+    for _ in 0..10 {
+        let (t, _) = sc.next().expect("frame after fallback");
+        assert!(t > last, "re-emitted pts {t} after {last}");
+        last = t;
+    }
+}
+
+#[test]
+fn format_choice_prefers_hw_then_first_software_format() {
+    use ff::ffi::AVPixelFormat as P;
+    let other_hw = if hw::HW_FORMAT == P::AV_PIX_FMT_VAAPI {
+        P::AV_PIX_FMT_CUDA
+    } else {
+        P::AV_PIX_FMT_VAAPI
+    };
+    let list = [
+        other_hw,
+        P::AV_PIX_FMT_YUV420P,
+        P::AV_PIX_FMT_NV12,
+        P::AV_PIX_FMT_NONE,
+    ];
+    let got = unsafe { hw::select_format(list.as_ptr(), hw::HW_FORMAT) };
+    assert_eq!(
+        got,
+        P::AV_PIX_FMT_YUV420P,
+        "must skip other hwaccel formats"
+    );
+    let list = [
+        other_hw,
+        P::AV_PIX_FMT_YUV420P,
+        hw::HW_FORMAT,
+        P::AV_PIX_FMT_NONE,
+    ];
+    assert_eq!(
+        unsafe { hw::select_format(list.as_ptr(), hw::HW_FORMAT) },
+        hw::HW_FORMAT
+    );
+    let only_hw = [other_hw, P::AV_PIX_FMT_NONE];
+    assert_eq!(
+        unsafe { hw::select_format(only_hw.as_ptr(), hw::HW_FORMAT) },
+        P::AV_PIX_FMT_NONE
+    );
+}
+
+#[test]
+fn warm_gate_makes_waiters_wait_for_the_warm_up() {
+    let g = Arc::new(hw::WarmGate::new());
+    assert!(g.wait(Duration::from_millis(1)), "nothing in flight");
+    g.start();
+    assert!(
+        !g.wait(Duration::from_millis(50)),
+        "times out while running"
+    );
+    let g2 = g.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        g2.finish();
+    });
+    let t0 = Instant::now();
+    assert!(g.wait(Duration::from_secs(5)));
+    assert!(t0.elapsed() >= Duration::from_millis(80));
+    t.join().unwrap();
+}
+
+#[test]
+fn open_scrub_waits_for_a_warm_up_in_flight() {
+    let dir = tmp("waitwarm");
+    let Some(clip) = make_clip(&dir, "320x180", 1) else {
+        return;
+    };
+    hw::WARM.start();
+    let p = Player::open_scrub_hw(&clip, Hw::On);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        p.latest_frame().is_none(),
+        "must not start a second cold session"
+    );
+    hw::WARM.finish();
+    wait_frame(&p);
+    assert!(p.latest_frame().is_some());
+}
+
+#[test]
+fn idle_clip_gives_back_its_session_and_retakes_it() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let dir = tmp("idle");
+    let Some(clip) = make_clip(&dir, "640x360", 2) else {
+        return;
+    };
+    let p = Player::open_scrub_hw(&clip, Hw::On);
+    wait_frame(&p);
+    assert_eq!(p.decode_status(), Some("hw"));
+    let t = Instant::now();
+    while p.decode_status() != Some("sw") {
+        assert!(t.elapsed().as_secs() < 3, "idle clip kept its hw session");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    p.set_position(0.5);
+    let t = Instant::now();
+    while p.decode_status() != Some("hw") {
+        assert!(t.elapsed().as_secs() < 3, "active clip did not get hw back");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

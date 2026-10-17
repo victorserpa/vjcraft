@@ -32,7 +32,10 @@ pub mod snapshot;
 #[cfg(test)]
 use hw::HwSlots;
 use hw::{Hw, HwSlot};
-pub use hw::{active_sessions, configure as configure_hw_decode, warm_up as warm_up_hw_decode};
+pub use hw::{
+    active_sessions, configure as configure_hw_decode, warm_up as warm_up_hw_decode,
+    warm_up_started as hw_warm_up_started,
+};
 
 /// A decoded RGBA8 frame (tightly packed, `width * 4` bytes per row).
 #[derive(Clone)]
@@ -228,6 +231,10 @@ impl Player {
                             Err(e) => *lock(&s.error) = Some(e),
                         }
                         return;
+                    }
+                    if hw == Hw::On {
+                        // A warm-up in flight finishes sooner than a second cold session.
+                        hw::WARM.wait(hw::WARM_WAIT);
                     }
                     if let Err(e) = run_scrub(&p, &s, hw) {
                         *lock(&s.error) = Some(e.to_string());
@@ -615,6 +622,11 @@ struct Scrubber {
     hap: bool,
     /// Hardware session slot, held while the decoder runs on the GPU.
     slot: Option<HwSlot<'static>>,
+    /// How this stream was asked to decode (to take a slot again after idling in software).
+    hw_mode: Hw,
+    /// pts of the last frame emitted before a decoder swap; earlier or equal frames that
+    /// the re-seek decodes again are dropped (NaN = none).
+    floor: f64,
     /// Where the hw/sw status is published (the player's).
     status: Option<Arc<AtomicU8>>,
 }
@@ -669,6 +681,8 @@ impl Scrubber {
             last: None,
             hap,
             slot,
+            hw_mode: hw,
+            floor: f64::NAN,
             status: None,
         })
     }
@@ -691,23 +705,50 @@ impl Scrubber {
     /// back to where it was. The slot is released.
     fn fall_back_to_software(&mut self, why: &str) -> Result<(), ff::Error> {
         eprintln!("vjc-media: hardware decode stopped ({why}), using software");
+        self.swap_decoder(false)
+    }
+
+    /// Replaces the decoder (hardware when `hw` and a slot is free, else software) and
+    /// returns to the last frame handed out. Frames at or before it are dropped when
+    /// decoding resumes from the keyframe.
+    fn swap_decoder(&mut self, hw: bool) -> Result<(), ff::Error> {
         let params = self
             .ictx
             .stream(self.stream_idx)
             .ok_or(ff::Error::StreamNotFound)?
             .parameters();
         self.slot = None;
-        self.decoder = ff::codec::context::Context::from_parameters(params)?
-            .decoder()
-            .video()?;
-        self.scaler = None;
-        let at = if self.last_t.is_finite() {
-            self.last_t
+        let slot = if hw {
+            hw::SLOTS.try_acquire(hw::cap())
         } else {
-            0.0
+            None
         };
+        let (decoder, slot) = open_decoder(params, self.hw_mode, slot)?;
+        self.decoder = decoder;
+        self.slot = slot;
+        self.scaler = None;
+        let emitted = self.last_t;
+        let at = if emitted.is_finite() { emitted } else { 0.0 };
         self.publish_status();
-        self.seek(at)
+        self.seek(at)?;
+        self.floor = emitted;
+        Ok(())
+    }
+
+    /// Gives the hardware session back (clip idle) and keeps decoding in software.
+    fn release_hw(&mut self) {
+        if self.is_hw() {
+            let _ = self.swap_decoder(false);
+        }
+    }
+
+    /// Tries to take a hardware session again (clip active). False when none is free.
+    fn acquire_hw(&mut self) -> bool {
+        if self.is_hw() || self.hap || self.hw_mode != Hw::On {
+            return self.is_hw();
+        }
+        let _ = self.swap_decoder(true);
+        self.is_hw()
     }
 
     /// Converts a decoded frame to RGBA.
@@ -766,6 +807,12 @@ impl Scrubber {
                     .timestamp()
                     .map(|p| p as f64 * self.tb)
                     .unwrap_or(self.count as f64 / self.fps);
+                if self.floor.is_finite() {
+                    if t <= self.floor {
+                        continue;
+                    }
+                    self.floor = f64::NAN;
+                }
                 match self.convert(src) {
                     Ok(frame) => {
                         self.last_t = t;
@@ -873,6 +920,7 @@ impl Scrubber {
         self.decoder.flush();
         self.eof = false;
         self.last_t = f64::NAN;
+        self.floor = f64::NAN;
         Ok(())
     }
 
@@ -924,6 +972,13 @@ struct Learned {
     exact: bool,
     cache: Option<(Vec<(f64, Frame)>, u64)>,
 }
+
+/// A clip whose position has not moved for this long gives its hardware session back.
+const HW_IDLE: Duration = if cfg!(test) {
+    Duration::from_millis(150)
+} else {
+    Duration::from_secs(1)
+};
 
 /// Longest time spent measuring a long clip before an estimated duration is published.
 const LEARN_LIMIT: Duration = Duration::from_secs(2);
@@ -1126,6 +1181,8 @@ fn scrub_loop(
     let mut shown = f64::NAN;
     let mut shown_idx = usize::MAX;
     let mut was_sequential = true;
+    let mut idle_since = Instant::now();
+    let mut upgrade_pending = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let r = f64::from_bits(refined.load(Ordering::Relaxed));
         if r.is_finite() && r > 0.0 && r != sc.duration {
@@ -1162,10 +1219,22 @@ fn scrub_loop(
         }
         let pos = f64::from_bits(shared.position.load(Ordering::Relaxed));
         if pos == shown {
+            if idle_since.elapsed() >= HW_IDLE && !upgrade_pending {
+                // Preloaded or parked clip: give the session to clips that are playing.
+                sc.release_hw();
+                upgrade_pending = sc.hw_mode == Hw::On && !sc.hap;
+            }
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
         shown = pos;
+        idle_since = Instant::now();
+        if upgrade_pending {
+            upgrade_pending = false;
+            if cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
+                sc.acquire_hw();
+            }
+        }
         let target = pos_to_pts(start, sc.duration, pos);
         // Streaming uses the cache only if one is left over from unknown duration.
         match &cache {
