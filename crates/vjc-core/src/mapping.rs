@@ -46,6 +46,9 @@ pub fn new_slice(w: u32, h: u32) -> Slice {
         mask_invert: false,
         is_key: false,
         black_bg: false,
+        shape: Default::default(),
+        mesh_mode: Default::default(),
+        mesh_tangents: vec![],
     }
 }
 
@@ -79,6 +82,7 @@ pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
         color: Default::default(),
         delay_ms: 0,
         additive_overlap: false,
+        output_mask: None,
     }
 }
 

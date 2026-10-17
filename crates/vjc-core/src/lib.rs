@@ -19,6 +19,9 @@ pub mod playback;
 pub mod playhead;
 pub mod rehearsal;
 pub mod shortcuts;
+pub mod slice_adv;
+#[cfg(test)]
+mod slice_adv_tests;
 pub mod slice_geom;
 pub mod timecode;
 pub mod transform;
@@ -507,6 +510,36 @@ pub enum Command {
     SetScreenColor {
         screen: Uuid,
         color: vjc_model::ScreenColor,
+    },
+    /// Outline of a slice: rectangle or polygon (3..=63 points). One undo step.
+    SetSliceShape {
+        screen: Uuid,
+        slice: Uuid,
+        shape: vjc_model::SliceShape,
+    },
+    /// Linear or Bezier warp plus the handles per mesh point. One undo step.
+    SetSliceMeshMode {
+        screen: Uuid,
+        slice: Uuid,
+        mode: vjc_model::MeshMode,
+        tangents: Vec<((f32, f32), (f32, f32))>,
+    },
+    /// Output mask of a screen; `None` clears it. One undo step.
+    SetScreenMask {
+        screen: Uuid,
+        mask: Option<vjc_model::Mask>,
+    },
+    /// Replaces the meshes of several slices at once (same grids); one undo step.
+    SetSliceMeshes {
+        screen: Uuid,
+        meshes: Vec<(Uuid, Vec<(f32, f32)>)>,
+    },
+    /// Resizes a multi-selection from its group bounding box onto `to` = (x, y, w, h) in
+    /// output pixels. One undo step.
+    ResizeSlices {
+        screen: Uuid,
+        slices: Vec<Uuid>,
+        to: (f32, f32, f32, f32),
     },
     /// Whole mesh plus its column count (rows = len / cols).
     SetSliceMesh {
@@ -3219,6 +3252,11 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             s.mesh_cols = cols;
             undoable(inverse, vec![])
         }
+        Command::SetSliceShape { .. }
+        | Command::SetSliceMeshMode { .. }
+        | Command::SetScreenMask { .. }
+        | Command::SetSliceMeshes { .. }
+        | Command::ResizeSlices { .. } => todo!(),
         Command::SetSliceMeshSize {
             screen,
             slice,

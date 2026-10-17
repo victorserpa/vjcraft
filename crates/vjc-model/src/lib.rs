@@ -1484,6 +1484,9 @@ pub struct Screen {
     /// earlier ones over black.
     #[serde(default)]
     pub additive_overlap: bool,
+    /// Output mask: the screen shows only inside it (black outside).
+    #[serde(default)]
+    pub output_mask: Option<Mask>,
 }
 
 fn default_true() -> bool {
@@ -1682,6 +1685,70 @@ pub struct Slice {
     /// Black BG: a black backdrop under the slice (transparent areas turn black).
     #[serde(default)]
     pub black_bg: bool,
+    /// Outline of the slice on the output: a plain rectangle or a free polygon
+    /// (normalized to the screen).
+    #[serde(default)]
+    pub shape: SliceShape,
+    /// How the warp mesh is interpolated between its points.
+    #[serde(default)]
+    pub mesh_mode: MeshMode,
+    /// Bezier handles per mesh point (same order as `output_mesh`): the offset of the
+    /// handle toward the next column and toward the next row, in output pixels. Empty or
+    /// shorter than the mesh = zero handles.
+    #[serde(default)]
+    pub mesh_tangents: Vec<((f32, f32), (f32, f32))>,
+}
+
+/// Outline of a slice.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum SliceShape {
+    #[default]
+    Rect,
+    /// Closed polygon, normalized 0..1 on the screen (3..=64 points).
+    Polygon(Vec<(f32, f32)>),
+}
+
+/// Interpolation of the warp mesh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeshMode {
+    #[default]
+    Linear,
+    Bezier,
+}
+
+/// A shape for a new slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShapePreset {
+    Rect,
+    Circle,
+    Triangle,
+    Hexagon,
+}
+
+impl ShapePreset {
+    pub const ALL: [ShapePreset; 4] = [
+        ShapePreset::Rect,
+        ShapePreset::Circle,
+        ShapePreset::Triangle,
+        ShapePreset::Hexagon,
+    ];
+}
+
+/// A mask on a whole output screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Mask {
+    /// Clicked polygon, normalized to the screen.
+    Polygon(Vec<(f32, f32)>),
+    /// Freehand stroke already simplified to a polygon.
+    Path(Vec<(f32, f32)>),
+}
+
+impl Mask {
+    pub fn points(&self) -> &[(f32, f32)] {
+        match self {
+            Mask::Polygon(p) | Mask::Path(p) => p,
+        }
+    }
 }
 
 /// Multipliers applied to the slice's RGB after the soft edge: 1.0 = unchanged.
@@ -2887,6 +2954,7 @@ mod tests {
             color: Default::default(),
             delay_ms: 0,
             additive_overlap: true,
+            output_mask: None,
         };
         let mut v = serde_json::to_value(&scr).unwrap();
         assert!(
