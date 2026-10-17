@@ -583,3 +583,43 @@ fn handles_sit_on_the_outline_and_resizing_from_it_resizes_the_outline() {
     );
     assert!(r2.x.abs() < 0.1 && r2.y.abs() < 0.1, "{r2:?}");
 }
+
+#[test]
+fn undo_of_a_mesh_change_restores_stale_length_tangents_exactly() {
+    let (mut p, sid, ids) = setup();
+    let tangents = vec![
+        ((1.0, 2.0), (3.0, 4.0)),
+        ((5.0, 6.0), (7.0, 8.0)),
+        ((9.0, 1.0), (2.0, 3.0)),
+    ];
+    // Loaded file: 4-point mesh, 3 handles.
+    p.output.screens[0].slices[0].mesh_tangents = tangents.clone();
+    let before = p.clone();
+    let mesh: Vec<Pt> = vec![
+        (0.0, 0.0),
+        (100.0, 0.0),
+        (0.0, 25.0),
+        (100.0, 25.0),
+        (0.0, 50.0),
+        (100.0, 50.0),
+    ];
+    let mut h = History::new();
+    h.exec(
+        &mut p,
+        Command::SetSliceMesh {
+            screen: sid,
+            slice: ids[0],
+            mesh,
+            cols: 2,
+        },
+        Instant::now(),
+    )
+    .unwrap();
+    assert!(p.output.screens[0].slices[0].mesh_tangents.is_empty());
+    h.undo(&mut p).unwrap().unwrap();
+    assert_eq!(p.output.screens[0].slices[0].mesh_tangents, tangents);
+    assert_eq!(p, before);
+    h.redo(&mut p).unwrap().unwrap();
+    h.undo(&mut p).unwrap().unwrap();
+    assert_eq!(p.output.screens[0].slices[0].mesh_tangents, tangents);
+}

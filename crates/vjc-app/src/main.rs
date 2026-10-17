@@ -3707,6 +3707,8 @@ impl State {
                 }
                 self.dirty = true;
                 self.prune_col_sel();
+                // Mask points may have been added or removed.
+                self.poly.sel_omask = None;
                 self.handle(ev);
             }
             Some(Err(e)) => self.status = format!("Undo failed: {e}"),
@@ -3725,6 +3727,7 @@ impl State {
                 }
                 self.dirty = true;
                 self.prune_col_sel();
+                self.poly.sel_omask = None;
                 self.handle(ev);
             }
             Some(Err(e)) => self.status = format!("Redo failed: {e}"),

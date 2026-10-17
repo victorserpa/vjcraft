@@ -905,6 +905,7 @@ impl State {
                 self.poly.sel = sel;
             }
         } else if omask_edit && let Some(m) = &scr.output_mask {
+            self.poly.follow_screen(scr.id);
             let mut sel = self.poly.sel_omask;
             let (sid, pen) = (scr.id, matches!(m, vjc_model::Mask::Path(_)));
             let set = move |pts: Vec<(f32, f32)>| Command::SetScreenMask {
