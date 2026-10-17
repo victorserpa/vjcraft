@@ -1,7 +1,7 @@
 # VJCraft
 
 An open-source, GPL-3.0 live-visuals (VJ) application written in Rust.
-Free, open and built for the long show. Early release (v0.1.0).
+Free, open and built for the long show. Alpha release (v0.1.0).
 
 **Clean-room.** The design comes from public documentation and observation of file
 formats only. No third-party code, assets, names or icons are included.
@@ -15,9 +15,12 @@ VJCraft is not affiliated with, endorsed by, or derived from any commercial VJ s
 
 ## Install (macOS, Apple Silicon)
 
-1. `brew install ffmpeg` (the app links the Homebrew ffmpeg libraries).
-2. Build the disk image: `scripts/package-macos.sh`. It writes `target/dist/VJCraft-<version>-macos.dmg` (ad-hoc signed, not notarized).
-3. Open the .dmg, drag VJCraft to Applications. First launch: right-click > Open.
+1. Download `VJCraft-<version>-macos.dmg` from [Releases](https://github.com/victorserpa/vjcraft/releases).
+2. Open the .dmg and drag VJCraft to Applications.
+3. First launch: right-click the app > Open. The build is ad-hoc signed and not notarized.
+
+FFmpeg ships inside the app; nothing else is needed. To build the disk image yourself, run
+`scripts/package-macos.sh`. It writes `target/dist/VJCraft-<version>-macos.dmg`.
 
 Optional: NDI Tools for NDI, ONNX models for Depth and Remove Background (`docs/ml.md`).
 
