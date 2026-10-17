@@ -843,4 +843,13 @@ mod tests {
         assert!(!part.exists());
         assert!(keep.exists(), "only .part files are deleted");
     }
+
+    #[test]
+    fn free_space_reads_the_volume_of_an_existing_or_missing_path() {
+        let d = tmp("space");
+        let a = free_space(&d).expect("temp volume");
+        assert!(a.total > 0 && a.free <= a.total);
+        let b = free_space(&d.join("not").join("yet")).expect("walks up to the parent");
+        assert_eq!(a.total, b.total);
+    }
 }

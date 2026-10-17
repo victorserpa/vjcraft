@@ -12567,4 +12567,50 @@ mod remap_tests {
             "removed column drops it"
         );
     }
+
+    #[test]
+    fn data_dir_per_platform() {
+        use std::ffi::OsString;
+        let env = |k: &str| -> Option<OsString> {
+            match k {
+                "APPDATA" => Some(r"C:\Users\v\AppData\Roaming".into()),
+                "XDG_DATA_HOME" => Some("/x/share".into()),
+                "HOME" => Some("/h".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            platform_data_dir("windows", &env),
+            Some(PathBuf::from(r"C:\Users\v\AppData\Roaming").join("VJCraft"))
+        );
+        assert_eq!(
+            platform_data_dir("linux", &env),
+            Some(PathBuf::from("/x/share/vjcraft"))
+        );
+        let no_xdg = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
+        assert_eq!(
+            platform_data_dir("linux", &no_xdg),
+            Some(PathBuf::from("/h/.local/share/vjcraft"))
+        );
+        assert_eq!(
+            platform_data_dir("macos", &env),
+            Some(PathBuf::from("/h/Library/Application Support/VJCraft"))
+        );
+        let empty_xdg = |k: &str| match k {
+            "XDG_DATA_HOME" => Some(OsString::new()),
+            "HOME" => Some(OsString::from("/h")),
+            _ => None,
+        };
+        assert_eq!(
+            platform_data_dir("linux", &empty_xdg),
+            Some(PathBuf::from("/h/.local/share/vjcraft"))
+        );
+    }
+
+    #[test]
+    fn local_clock_has_the_hh_mm_ss_shape() {
+        let c = local_clock();
+        assert_eq!(c.len(), 8, "{c}");
+        assert_eq!(&c[2..3], ":");
+    }
 }

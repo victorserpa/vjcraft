@@ -580,6 +580,21 @@ mod tests {
     }
 
     #[test]
+    fn windows_exit_codes_are_classified() {
+        // Force Quit / Task Manager "End task" = TerminateProcess(1): a user stop.
+        assert!(ChildEnd::Code(1).is_clean_on(true));
+        assert!(ChildEnd::Code(0).is_clean_on(true));
+        // Ctrl-C / console close: STATUS_CONTROL_C_EXIT.
+        assert!(ChildEnd::Code(0xC000013Au32 as i32).is_clean_on(true));
+        // Panic (101) and a fast-fail abort (STATUS_STACK_BUFFER_OVERRUN) are crashes.
+        assert!(!ChildEnd::Code(101).is_clean_on(true));
+        assert!(!ChildEnd::Code(0xC0000409u32 as i32).is_clean_on(true));
+        assert!(!ChildEnd::Code(0xC0000005u32 as i32).is_clean_on(true));
+        // Off Windows, exit code 1 stays a crash.
+        assert!(!ChildEnd::Code(1).is_clean_on(false));
+    }
+
+    #[test]
     fn restart_budget_slides() {
         let t0 = Instant::now();
         let mut l = RestartLimit::new();
