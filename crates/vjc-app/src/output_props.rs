@@ -290,10 +290,10 @@ impl State {
                 if let Some(m) = &scr.output_mask {
                     toggle(ui, &mut self.poly.edit_omask, "Edit output mask points");
                     let n = m.points().len();
-                    let can_rm = n > 3 && self.poly.sel.is_some_and(|i| i < n);
+                    let can_rm = n > 3 && self.poly.sel_omask.is_some_and(|i| i < n);
                     if widgets::btn_if(ui, can_rm, "Remove output mask point", Kind::Secondary)
                         .clicked()
-                        && let Some(i) = self.poly.sel.take()
+                        && let Some(i) = self.poly.sel_omask.take()
                     {
                         let mut p = m.points().to_vec();
                         p.remove(i);
@@ -307,7 +307,7 @@ impl State {
                     }
                     if widgets::btn(ui, "Clear output mask", Kind::Secondary).clicked() {
                         self.poly.edit_omask = false;
-                        self.poly.sel = None;
+                        self.poly.sel_omask = None;
                         cmds.push(Command::SetScreenMask {
                             screen: scr.id,
                             mask: None,

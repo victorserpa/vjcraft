@@ -64,6 +64,8 @@ pub(crate) struct PolyUi {
     pub(crate) edit_omask: bool,
     /// Selected point of the polygon being edited.
     pub(crate) sel: Option<usize>,
+    /// Selected point of the output mask (kept apart from the outline selection).
+    pub(crate) sel_omask: Option<usize>,
 }
 
 /// The command a finished drawing asks for; `None` when the polygon is not valid.
@@ -176,12 +178,18 @@ impl State {
                 rect.min.y + q.1 * rect.height(),
             )
         };
+        // Enter and Backspace belong to a focused text field; the canvas takes them only
+        // when it is the focused widget or nothing is, and the pointer is over it.
+        let canvas_keys = resp.hovered()
+            && ui
+                .ctx()
+                .memory(|m| m.focused().is_none_or(|f| f == resp.id));
         let (shift, esc, enter, back) = ui.input(|i| {
             (
                 i.modifiers.shift,
                 i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Backspace),
+                canvas_keys && i.key_pressed(egui::Key::Enter),
+                canvas_keys && i.key_pressed(egui::Key::Backspace),
             )
         });
         let mut done: Option<Vec<Pt>> = None;
@@ -296,7 +304,7 @@ impl State {
             (DrawFor::OutputMask, _) => {
                 self.sel_screen = Some(scr.id);
                 self.poly.edit_omask = true;
-                self.poly.sel = None;
+                self.poly.sel_omask = None;
             }
             (DrawFor::SliceMask(_), _) => {
                 self.edit_mask = true;

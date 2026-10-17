@@ -8669,3 +8669,41 @@ fn polygon_presets_and_curved_mesh_from_the_menus() {
     let sl = h.state().project.output.screens[0].slices[1].clone();
     assert_eq!(sl.mesh_mode, vjc_model::MeshMode::Bezier);
 }
+
+#[test]
+fn enter_is_not_taken_by_the_drawing_canvas_when_the_pointer_is_elsewhere() {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add polygon slice", "Draw points");
+    for (x, y) in [(900.0, 200.0), (1500.0, 200.0), (1500.0, 800.0)] {
+        click_at(&mut h, o + egui::vec2(x * k, y * k));
+    }
+    h.hover_at(egui::pos2(1.0, 1.0));
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    assert!(h.state().poly.draw.is_some(), "Enter went to the canvas");
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 1);
+}
+
+#[test]
+fn outline_and_output_mask_point_selection_are_separate() {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add output mask", "Draw with pen");
+    let path: Vec<egui::Pos2> = (0..=150)
+        .map(|i| {
+            let a = i as f32 / 150.0 * std::f32::consts::TAU;
+            o + egui::vec2((960.0 + 500.0 * a.cos()) * k, (540.0 + 300.0 * a.sin()) * k)
+        })
+        .collect();
+    drag_path(&mut h, &path);
+    // Drawing the mask leaves no mask point selected, and picking one does not touch
+    // the outline selection.
+    assert_eq!(h.state().poly.sel_omask, None);
+    h.state_mut().poly.sel = Some(3);
+    h.state_mut().poly.sel_omask = Some(5);
+    settle(&mut h);
+    assert_eq!(h.state().poly.sel, Some(3));
+    assert_eq!(h.state().poly.sel_omask, Some(5));
+}

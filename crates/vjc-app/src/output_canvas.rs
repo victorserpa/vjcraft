@@ -671,8 +671,8 @@ impl State {
             p.galley(at, galley, TEXT);
         }
         // Primary slice: its rectangle and handles.
-        let sel_rect =
-            prim.and_then(|sl| slice_geom::bbox(&slice_geom::side_points(sl, side, comp)));
+        let dims = (scr.width, scr.height);
+        let sel_rect = prim.and_then(|sl| slice_geom::handle_rect(sl, side, comp, dims));
         let hit_handle = |at: egui::Pos2| {
             let r = sel_rect?;
             handle_pts(r)
@@ -749,7 +749,7 @@ impl State {
                     }
                     let sl = scr.slices.iter().find(|s| s.id == id)?;
                     let start = if prim.is_some_and(|p| p.id == id) || !sel_ids.contains(&id) {
-                        slice_geom::bbox(&slice_geom::side_points(sl, side, comp))?
+                        slice_geom::handle_rect(sl, side, comp, dims)?
                     } else {
                         sel_rect?
                     };
@@ -794,7 +794,8 @@ impl State {
                         q = (mapping::snap(q.0, step.0), mapping::snap(q.1, step.1));
                         let r = resized(start, handle, q, mods.shift);
                         let pts = slice_geom::side_points(sl, side, comp);
-                        let new = slice_geom::fit_to_rect(&pts, r);
+                        let from = slice_geom::handle_rect(sl, side, comp, dims).unwrap_or(start);
+                        let new = slice_geom::fit_from(&pts, from, r);
                         if new != pts {
                             dragged_body = Some(set_pts(scr, sl, side, comp, new));
                         }
@@ -904,7 +905,7 @@ impl State {
                 self.poly.sel = sel;
             }
         } else if omask_edit && let Some(m) = &scr.output_mask {
-            let mut sel = self.poly.sel;
+            let mut sel = self.poly.sel_omask;
             let (sid, pen) = (scr.id, matches!(m, vjc_model::Mask::Path(_)));
             let set = move |pts: Vec<(f32, f32)>| Command::SetScreenMask {
                 screen: sid,
@@ -924,7 +925,7 @@ impl State {
                 &set,
                 cmds,
             );
-            self.poly.sel = sel;
+            self.poly.sel_omask = sel;
         }
         if let Some(c) = dragged_body {
             cmds.push(c);

@@ -546,3 +546,40 @@ fn duplicate_slice_ids_are_rejected() {
     assert!(apply(&mut p, c).is_err());
     assert_eq!(p, before);
 }
+
+#[test]
+fn handles_sit_on_the_outline_and_resizing_from_it_resizes_the_outline() {
+    use crate::slice_geom::{Side, fit_from, handle_rect};
+    let (mut p, sid, id) = hex_setup();
+    let sl = p.output.screens[0].slices[2].clone();
+    let r = handle_rect(&sl, Side::Output, (1920, 1080), (200, 100)).unwrap();
+    // The hexagon spans 0.1..0.9 of a 200 x 100 screen, not the whole mesh.
+    assert!(
+        (r.x - 20.0).abs() < 0.5 && (r.w - 160.0).abs() < 0.5,
+        "{r:?}"
+    );
+    let to = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 80.0,
+        h: 40.0,
+    };
+    let mesh = fit_from(&sl.output_mesh, r, to);
+    apply(
+        &mut p,
+        Command::SetSliceMesh {
+            screen: sid,
+            slice: id,
+            mesh,
+            cols: 2,
+        },
+    )
+    .unwrap();
+    let sl = p.output.screens[0].slices[2].clone();
+    let r2 = handle_rect(&sl, Side::Output, (1920, 1080), (200, 100)).unwrap();
+    assert!(
+        (r2.w - 80.0).abs() < 0.1 && (r2.h - 40.0).abs() < 0.1,
+        "{r2:?}"
+    );
+    assert!(r2.x.abs() < 0.1 && r2.y.abs() < 0.1, "{r2:?}");
+}

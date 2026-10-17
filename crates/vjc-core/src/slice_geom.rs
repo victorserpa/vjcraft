@@ -48,9 +48,14 @@ pub fn bbox(pts: &[Pt]) -> Option<Rect> {
 /// Maps the bounding box of `pts` onto `to` (translate + scale, keeps the shape). A
 /// degenerate source axis is spread evenly; sizes are clamped to [`MIN_SIZE`].
 pub fn fit_to_rect(pts: &[Pt], to: Rect) -> Vec<Pt> {
-    let Some(from) = bbox(pts) else {
-        return pts.to_vec();
-    };
+    match bbox(pts) {
+        Some(from) => fit_from(pts, from, to),
+        None => pts.to_vec(),
+    }
+}
+
+/// Maps `pts` so that the rectangle `from` lands on `to` (sizes never below `MIN_SIZE`).
+pub fn fit_from(pts: &[Pt], from: Rect, to: Rect) -> Vec<Pt> {
     let (w, h) = (to.w.max(MIN_SIZE), to.h.max(MIN_SIZE));
     pts.iter()
         .map(|p| {
@@ -67,6 +72,20 @@ pub fn fit_to_rect(pts: &[Pt], to: Rect) -> Vec<Pt> {
             (to.x + u * w, to.y + v * h)
         })
         .collect()
+}
+
+/// Rectangle the transform handles of a slice sit on: the polygon outline on the output
+/// side (the mesh of a polygon slice spans the whole screen), else the bounds of its points.
+pub fn handle_rect(sl: &Slice, side: Side, comp: (u32, u32), screen: (u32, u32)) -> Option<Rect> {
+    if side == Side::Output
+        && let vjc_model::SliceShape::Polygon(poly) = &sl.shape
+        && poly.len() >= 3
+    {
+        let (w, h) = (screen.0 as f32, screen.1 as f32);
+        let px: Vec<Pt> = poly.iter().map(|p| (p.0 * w, p.1 * h)).collect();
+        return bbox(&px);
+    }
+    bbox(&side_points(sl, side, comp))
 }
 
 pub fn translate(pts: &[Pt], dx: f32, dy: f32) -> Vec<Pt> {
