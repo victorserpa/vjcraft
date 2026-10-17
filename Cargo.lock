@@ -4716,6 +4716,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vjc-ffgl"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "vjc-fx",
+]
+
+[[package]]
 name = "vjc-fx"
 version = "0.1.0"
 dependencies = [
