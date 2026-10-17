@@ -41,7 +41,11 @@ impl Plugin {
             return Err("GETINFO failed".into());
         }
         let i = unsafe { &*p };
-        let text = |b: &[u8]| String::from_utf8_lossy(b).trim_end_matches(['\0', ' ']).to_string();
+        let text = |b: &[u8]| {
+            String::from_utf8_lossy(b)
+                .trim_end_matches(['\0', ' '])
+                .to_string()
+        };
         if self.uint(FF_INITIALISE, 0) == FF_FAIL {
             return Err("INITIALISE failed".into());
         }
@@ -49,14 +53,26 @@ impl Plugin {
         let mut params = Vec::new();
         for k in 0..n {
             let ty = self.uint(FF_GETPARAMETERTYPE, k);
-            let kind = if ty == FF_TYPE_BOOLEAN { ParamKind::Bool } else { ParamKind::Float };
+            let kind = if ty == FF_TYPE_BOOLEAN {
+                ParamKind::Bool
+            } else {
+                ParamKind::Float
+            };
             let default = f32::from_bits(self.uint(FF_GETPARAMETERDEFAULT, k));
-            params.push(ParamInfo { name: self.name(k), kind, default });
+            params.push(ParamInfo {
+                name: self.name(k),
+                kind,
+                default,
+            });
         }
         Ok(PluginInfo {
             id: text(&i.plugin_unique_id),
             name: text(&i.plugin_name),
-            kind: if i.plugin_type == FF_SOURCE { Kind::Source } else { Kind::Effect },
+            kind: if i.plugin_type == FF_SOURCE {
+                Kind::Source
+            } else {
+                Kind::Effect
+            },
             params,
         })
     }
@@ -80,20 +96,42 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
         },
         Request::Set { index, value } => match cur {
             Some(p) => {
-                let s = SetParameterStruct { index, value: FFMixed { u: value.to_bits() } };
-                p.call(FF_SETPARAMETER, FFMixed { p: &s as *const _ as *mut c_void });
+                let s = SetParameterStruct {
+                    index,
+                    value: FFMixed { u: value.to_bits() },
+                };
+                p.call(
+                    FF_SETPARAMETER,
+                    FFMixed {
+                        p: &s as *const _ as *mut c_void,
+                    },
+                );
                 Response::Done
             }
-            None => Response::Err { msg: "no plugin loaded".into() },
+            None => Response::Err {
+                msg: "no plugin loaded".into(),
+            },
         },
         Request::Get { index } => match cur {
-            Some(p) => Response::Value { value: f32::from_bits(p.uint(FF_GETPARAMETER, index)) },
-            None => Response::Err { msg: "no plugin loaded".into() },
+            Some(p) => Response::Value {
+                value: f32::from_bits(p.uint(FF_GETPARAMETER, index)),
+            },
+            None => Response::Err {
+                msg: "no plugin loaded".into(),
+            },
         },
         Request::Process { shm, w, h } => {
-            let Some(p) = cur else { return Response::Err { msg: "no plugin loaded".into() } };
+            let Some(p) = cur else {
+                return Response::Err {
+                    msg: "no plugin loaded".into(),
+                };
+            };
             let n = w as usize * h as usize * 4;
-            let file = match std::fs::OpenOptions::new().read(true).write(true).open(&shm) {
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&shm)
+            {
                 Ok(f) => f,
                 Err(e) => return Response::Err { msg: e.to_string() },
             };
@@ -102,13 +140,27 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
                 Err(e) => return Response::Err { msg: e.to_string() },
             };
             if map.len() < 2 * n {
-                return Response::Err { msg: "mapping too small".into() };
+                return Response::Err {
+                    msg: "mapping too small".into(),
+                };
             }
             let (a, b) = map.split_at_mut(n);
-            let s = CpuFrameStruct { input: a.as_ptr(), output: b.as_mut_ptr(), width: w, height: h };
-            let r = p.call(FF_PROCESS_CPU_EXT, FFMixed { p: &s as *const _ as *mut c_void });
+            let s = CpuFrameStruct {
+                input: a.as_ptr(),
+                output: b.as_mut_ptr(),
+                width: w,
+                height: h,
+            };
+            let r = p.call(
+                FF_PROCESS_CPU_EXT,
+                FFMixed {
+                    p: &s as *const _ as *mut c_void,
+                },
+            );
             if unsafe { r.u } == FF_FAIL {
-                return Response::Err { msg: "plugin has no CPU path (needs the OpenGL host, stage 2)".into() };
+                return Response::Err {
+                    msg: "plugin has no CPU path (needs the OpenGL host, stage 2)".into(),
+                };
             }
             Response::Done
         }

@@ -12,10 +12,25 @@ fn plugin_dir() -> &'static Path {
     D.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("vjc-ffgl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let ext = if cfg!(target_os = "macos") { "dylib" } else if cfg!(windows) { "dll" } else { "so" };
+        let ext = if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(windows) {
+            "dll"
+        } else {
+            "so"
+        };
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gain_plugin.rs");
         let st = std::process::Command::new("rustc")
-            .args(["--edition", "2024", "--crate-type", "cdylib", "--crate-name", "gain_plugin", "-O", "-o"])
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "cdylib",
+                "--crate-name",
+                "gain_plugin",
+                "-O",
+                "-o",
+            ])
             .arg(dir.join(format!("gain.{ext}")))
             .arg(src)
             .status()
@@ -26,7 +41,14 @@ fn plugin_dir() -> &'static Path {
 }
 
 fn plugin() -> String {
-    std::fs::read_dir(plugin_dir()).unwrap().flatten().next().unwrap().path().to_string_lossy().to_string()
+    std::fs::read_dir(plugin_dir())
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path()
+        .to_string_lossy()
+        .to_string()
 }
 
 fn frame(v: u8) -> Frame {
@@ -38,7 +60,11 @@ fn frame(v: u8) -> Frame {
 }
 
 fn effect(timeout_ms: u64) -> FfglEffect {
-    FfglEffect::new(&plugin(), Path::new(HELPER), Duration::from_millis(timeout_ms))
+    FfglEffect::new(
+        &plugin(),
+        Path::new(HELPER),
+        Duration::from_millis(timeout_ms),
+    )
 }
 
 #[test]
@@ -90,11 +116,22 @@ fn parameter_mapping_roundtrip() {
         e.set_param(0, v);
         assert_eq!(e.get_param(0), Some(v));
     }
-    let (entries, _) = scan(&[plugin_dir().into()], &std::env::temp_dir().join("vjc-ffgl-map.json"), Path::new(HELPER));
+    let (entries, _) = scan(
+        &[plugin_dir().into()],
+        &std::env::temp_dir().join("vjc-ffgl-map.json"),
+        Path::new(HELPER),
+    );
     let ins = inputs(&entries[0].info);
     assert_eq!(ins.len(), 3);
     assert_eq!(ins[0].name, "Gain");
-    assert_eq!(ins[0].kind, vjc_fx::InputKind::Float { min: 0.0, max: 1.0, default: 0.5 });
+    assert_eq!(
+        ins[0].kind,
+        vjc_fx::InputKind::Float {
+            min: 0.0,
+            max: 1.0,
+            default: 0.5
+        }
+    );
 }
 
 #[test]
@@ -114,7 +151,8 @@ fn scan_lists_effect_and_caches_by_mtime() {
     // touching the file invalidates the entry
     let p = Path::new(&a[0].path);
     let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
-    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5)).unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
     let (_, loads) = scan(&dirs, &cache, Path::new(HELPER));
     assert_eq!(loads, 1);
 }
@@ -124,6 +162,10 @@ fn scan_skips_a_file_that_is_not_a_plugin() {
     let d = std::env::temp_dir().join(format!("vjc-ffgl-bad-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(d.join("junk.dylib"), b"not a library").unwrap();
-    let (e, _) = scan(&[d], &std::env::temp_dir().join("vjc-ffgl-bad.json"), Path::new(HELPER));
+    let (e, _) = scan(
+        &[d],
+        &std::env::temp_dir().join("vjc-ffgl-bad.json"),
+        Path::new(HELPER),
+    );
     assert!(e.is_empty());
 }

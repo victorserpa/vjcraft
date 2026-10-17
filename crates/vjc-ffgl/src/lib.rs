@@ -32,13 +32,20 @@ pub struct Helper {
 /// Helper binary next to the running executable.
 pub fn helper_path() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
-    let name = if cfg!(windows) { "vjc-ffgl-helper.exe" } else { "vjc-ffgl-helper" };
+    let name = if cfg!(windows) {
+        "vjc-ffgl-helper.exe"
+    } else {
+        "vjc-ffgl-helper"
+    };
     let beside = exe.with_file_name(name);
     if beside.exists() {
         return beside;
     }
     // test binaries live in target/<profile>/deps
-    exe.parent().and_then(|d| d.parent()).map(|d| d.join(name)).unwrap_or(beside)
+    exe.parent()
+        .and_then(|d| d.parent())
+        .map(|d| d.join(name))
+        .unwrap_or(beside)
 }
 
 impl Helper {
@@ -69,7 +76,10 @@ impl Helper {
     /// One request/response with a deadline. On timeout the helper is killed.
     pub fn request(&mut self, req: &Request, timeout: Duration) -> Result<Response, HostError> {
         let line = serde_json::to_string(req).unwrap();
-        if writeln!(self.stdin, "{line}").and_then(|_| self.stdin.flush()).is_err() {
+        if writeln!(self.stdin, "{line}")
+            .and_then(|_| self.stdin.flush())
+            .is_err()
+        {
             return Err(HostError::Died);
         }
         match self.rx.recv_timeout(timeout) {
@@ -136,11 +146,17 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
     let mut helper: Option<Helper> = None;
     let mut next = BTreeMap::new();
     for d in dirs {
-        let Ok(rd) = std::fs::read_dir(d) else { continue };
+        let Ok(rd) = std::fs::read_dir(d) else {
+            continue;
+        };
         let mut files: Vec<PathBuf> = rd
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| EXTS.contains(&e)))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| EXTS.contains(&e))
+            })
             .collect();
         files.sort();
         for f in files {
@@ -159,7 +175,11 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
             let r = h.request(&Request::Info { path: key.clone() }, Duration::from_secs(5));
             match r {
                 Ok(Response::Info { info }) => {
-                    let e = Entry { path: key.clone(), mtime: mt, info };
+                    let e = Entry {
+                        path: key.clone(),
+                        mtime: mt,
+                        info,
+                    };
                     next.insert(key, e.clone());
                     found.push(e);
                 }
@@ -171,7 +191,10 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
     if let Some(dir) = cache_file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(cache_file, serde_json::to_vec(&Cache { entries: next }).unwrap());
+    let _ = std::fs::write(
+        cache_file,
+        serde_json::to_vec(&Cache { entries: next }).unwrap(),
+    );
     (found, loads)
 }
 
@@ -188,8 +211,14 @@ pub fn inputs(info: &PluginInfo) -> Vec<vjc_fx::Input> {
             name: p.name.clone(),
             group: None,
             kind: match p.kind {
-                ParamKind::Bool => vjc_fx::InputKind::Bool { default: p.default >= 0.5 },
-                ParamKind::Float => vjc_fx::InputKind::Float { min: 0.0, max: 1.0, default: p.default as f64 },
+                ParamKind::Bool => vjc_fx::InputKind::Bool {
+                    default: p.default >= 0.5,
+                },
+                ParamKind::Float => vjc_fx::InputKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    default: p.default as f64,
+                },
             },
         })
         .collect()
@@ -225,8 +254,12 @@ impl FfglEffect {
     pub fn new(path: &str, helper_bin: &Path, timeout: Duration) -> FfglEffect {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let shm_path = std::env::temp_dir().join(format!("vjc-ffgl-{}-{n}-{t}.shm", std::process::id()));
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let shm_path =
+            std::env::temp_dir().join(format!("vjc-ffgl-{}-{n}-{t}.shm", std::process::id()));
         let mut e = FfglEffect {
             path: path.into(),
             helper_bin: helper_bin.into(),
@@ -245,7 +278,12 @@ impl FfglEffect {
     pub fn enable(&mut self) {
         self.helper = None;
         let r = Helper::spawn(&self.helper_bin).and_then(|mut h| {
-            let r = h.request(&Request::Load { path: self.path.clone() }, self.timeout)?;
+            let r = h.request(
+                &Request::Load {
+                    path: self.path.clone(),
+                },
+                self.timeout,
+            )?;
             Ok((h, r))
         });
         match r {
@@ -254,7 +292,13 @@ impl FfglEffect {
                     self.params = info.params.iter().map(|p| p.default).collect();
                 }
                 for (i, v) in self.params.iter().enumerate() {
-                    let _ = h.request(&Request::Set { index: i as u32, value: *v }, self.timeout);
+                    let _ = h.request(
+                        &Request::Set {
+                            index: i as u32,
+                            value: *v,
+                        },
+                        self.timeout,
+                    );
                 }
                 self.helper = Some(h);
                 self.status = Status::Running;
@@ -269,12 +313,17 @@ impl FfglEffect {
         if index < self.params.len() {
             self.params[index] = value;
         }
-        self.call(Request::Set { index: index as u32, value });
+        self.call(Request::Set {
+            index: index as u32,
+            value,
+        });
     }
 
     /// Read a parameter back from the plugin.
     pub fn get_param(&mut self, index: usize) -> Option<f32> {
-        match self.call(Request::Get { index: index as u32 }) {
+        match self.call(Request::Get {
+            index: index as u32,
+        }) {
             Some(Response::Value { value }) => Some(value),
             _ => None,
         }
@@ -295,7 +344,11 @@ impl FfglEffect {
     /// Process a frame. Never fails: when the plugin is stopped, crashes or times out the
     /// input comes back unchanged and `status` says why.
     pub fn process(&mut self, input: &Frame) -> Frame {
-        let pass = || Frame { w: input.w, h: input.h, rgba: input.rgba.clone() };
+        let pass = || Frame {
+            w: input.w,
+            h: input.h,
+            rgba: input.rgba.clone(),
+        };
         if self.helper.is_none() {
             return pass();
         }
@@ -322,10 +375,18 @@ impl FfglEffect {
         let (map, _) = self.map.as_mut().unwrap();
         map[..n].copy_from_slice(&input.rgba);
         let shm = self.shm_path.to_string_lossy().to_string();
-        match self.call(Request::Process { shm, w: input.w, h: input.h }) {
+        match self.call(Request::Process {
+            shm,
+            w: input.w,
+            h: input.h,
+        }) {
             Some(Response::Done) => {
                 let (map, _) = self.map.as_ref().unwrap();
-                Frame { w: input.w, h: input.h, rgba: map[n..2 * n].to_vec() }
+                Frame {
+                    w: input.w,
+                    h: input.h,
+                    rgba: map[n..2 * n].to_vec(),
+                }
             }
             _ => pass(),
         }

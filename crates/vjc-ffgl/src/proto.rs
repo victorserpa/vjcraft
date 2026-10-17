@@ -6,13 +6,26 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Request {
     /// Load the library, read its info and parameters, unload again (used by the scan).
-    Info { path: String },
+    Info {
+        path: String,
+    },
     /// Load and instantiate; the helper keeps the instance until `Quit`.
-    Load { path: String },
-    Set { index: u32, value: f32 },
-    Get { index: u32 },
+    Load {
+        path: String,
+    },
+    Set {
+        index: u32,
+        value: f32,
+    },
+    Get {
+        index: u32,
+    },
     /// Process one frame: input RGBA8 at offset 0, output RGBA8 right after it, in the mapping at `shm`.
-    Process { shm: String, w: u32, h: u32 },
+    Process {
+        shm: String,
+        w: u32,
+        h: u32,
+    },
     Quit,
 }
 
