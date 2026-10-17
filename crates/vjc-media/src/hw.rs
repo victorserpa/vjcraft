@@ -5,29 +5,31 @@
 //! (NV12/P010) and use the normal swscale path; zero-copy into wgpu is a follow-up.
 
 use ffmpeg_next as ff;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use ff::ffi::{AVHWDeviceType, AVPixelFormat};
 
 #[cfg(target_os = "macos")]
 const DEVICE: Option<AVHWDeviceType> = Some(AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
 #[cfg(target_os = "macos")]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
 
 #[cfg(target_os = "windows")]
 const DEVICE: Option<AVHWDeviceType> = Some(AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
 #[cfg(target_os = "windows")]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_D3D11;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_D3D11;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const DEVICE: Option<AVHWDeviceType> = Some(AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI);
 #[cfg(all(unix, not(target_os = "macos")))]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VAAPI;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_VAAPI;
 
 #[cfg(not(any(unix, windows)))]
 const DEVICE: Option<AVHWDeviceType> = None;
 #[cfg(not(any(unix, windows)))]
-const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NONE;
+pub(crate) const HW_FORMAT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NONE;
 
 /// How a decoder is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +64,12 @@ pub(crate) struct HwSlots {
 pub(crate) struct HwSlot<'a>(&'a HwSlots);
 
 impl HwSlots {
+    pub(crate) const fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+
     pub(crate) fn try_acquire(&self, cap: usize) -> Option<HwSlot<'_>> {
         let mut cur = self.active.load(Ordering::Relaxed);
         loop {
@@ -91,17 +99,92 @@ impl Drop for HwSlot<'_> {
     }
 }
 
-pub(crate) static SLOTS: HwSlots = HwSlots {
-    active: AtomicUsize::new(0),
-};
+/// Per-clip bookkeeping for reclaiming sessions on demand: a clip keeps its session while
+/// idle, and is asked to give it up only when a clip that is on air cannot get one.
+pub(crate) struct Holder {
+    /// The clip currently holds a hardware session.
+    holds: AtomicBool,
+    /// Milliseconds (since `epoch`) of the clip's last position change.
+    last_active: AtomicU64,
+    /// Set by a clip that needs a session: give yours up at the next tick if still idle.
+    evict: AtomicBool,
+}
+
+static HOLDERS: Mutex<Vec<Weak<Holder>>> = Mutex::new(Vec::new());
+
+fn now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+impl Holder {
+    pub(crate) fn new() -> Arc<Holder> {
+        let h = Arc::new(Holder {
+            holds: AtomicBool::new(false),
+            last_active: AtomicU64::new(now_ms()),
+            evict: AtomicBool::new(false),
+        });
+        let mut l = HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+        l.retain(|w| w.strong_count() > 0);
+        l.push(Arc::downgrade(&h));
+        h
+    }
+
+    pub(crate) fn set_holds(&self, v: bool) {
+        self.holds.store(v, Ordering::Relaxed);
+    }
+
+    /// The clip's position just changed: it is on air.
+    pub(crate) fn touch(&self) {
+        self.last_active.store(now_ms(), Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> u64 {
+        now_ms().saturating_sub(self.last_active.load(Ordering::Relaxed))
+    }
+
+    /// True once if another clip asked for this one's session.
+    pub(crate) fn take_evict(&self) -> bool {
+        self.evict.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Asks the least recently used idle holder (idle for at least `idle`, other than `me`) to
+/// give its session up. False when no holder is idle.
+pub(crate) fn evict_idle_holder(me: &Holder, idle: Duration) -> bool {
+    let l = HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    let best = l
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|h| {
+            !std::ptr::eq(Arc::as_ptr(h), me)
+                && h.holds.load(Ordering::Relaxed)
+                && !h.evict.load(Ordering::Relaxed)
+                && h.idle_for() >= idle.as_millis() as u64
+        })
+        .max_by_key(|h| h.idle_for());
+    match best {
+        Some(h) => {
+            h.evict.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+pub(crate) static SLOTS: HwSlots = HwSlots::new();
 
 static MODE: AtomicU8 = AtomicU8::new(1); // 1 = Auto, 0 = Off
 static CAP: AtomicUsize = AtomicUsize::new(8);
 
 /// Sets the Video > "Hardware decoding" preference. Applies to clips opened afterwards.
 pub fn configure(enabled: bool, max_sessions: usize) {
-    MODE.store(u8::from(enabled), Ordering::Relaxed);
+    let was = MODE.swap(u8::from(enabled), Ordering::Relaxed);
     CAP.store(max_sessions, Ordering::Relaxed);
+    if enabled && was == 0 {
+        // Off -> Auto: the first session is still cold.
+        let _ = warm_up();
+    }
 }
 
 /// Hardware sessions currently open.
@@ -127,23 +210,75 @@ const WARM_CLIP: &[u8] = include_bytes!("../assets/warm.h264");
 
 /// Creating the device alone is cheap; the ~1.3 s goes into the first decode session, so
 /// decode a tiny frame through a real hardware decoder.
-fn warm_session() {
-    let Some(codec) = ff::decoder::find(ff::codec::Id::H264) else {
-        return;
-    };
+fn warm_session() -> Result<(), String> {
+    let codec = ff::decoder::find(ff::codec::Id::H264).ok_or("no H.264 decoder")?;
     let mut ctx = ff::codec::context::Context::new_with_codec(codec);
     if !attach(&mut ctx, Hw::On) {
-        return;
+        return Err("hardware device unavailable".into());
     }
-    let Ok(mut dec) = ctx.decoder().video() else {
-        return;
-    };
+    let mut dec = ctx
+        .decoder()
+        .video()
+        .map_err(|e| format!("open decoder: {e}"))?;
     let pkt = ff::Packet::copy(WARM_CLIP);
-    if dec.send_packet(&pkt).is_ok() {
-        let _ = dec.send_eof();
-        let mut f = ff::frame::Video::empty();
-        let _ = dec.receive_frame(&mut f);
+    dec.send_packet(&pkt).map_err(|e| format!("send: {e}"))?;
+    let _ = dec.send_eof();
+    let mut f = ff::frame::Video::empty();
+    dec.receive_frame(&mut f)
+        .map_err(|e| format!("receive: {e}"))
+}
+
+/// Progress of the warm-up: 0 not started, 1 running, 2 finished (ok or not).
+pub(crate) struct WarmGate {
+    state: std::sync::Mutex<u8>,
+    cv: std::sync::Condvar,
+}
+
+impl WarmGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }
     }
+
+    fn set(&self, v: u8) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = v;
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn start(&self) {
+        self.set(1);
+    }
+
+    pub(crate) fn finish(&self) {
+        self.set(2);
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) != 0
+    }
+
+    /// Blocks while a warm-up is running, for at most `max`. True when none is running
+    /// (anymore), false on timeout.
+    pub(crate) fn wait(&self, max: std::time::Duration) -> bool {
+        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, max, |s| *s == 1)
+            .unwrap_or_else(|e| e.into_inner());
+        *g != 1
+    }
+}
+
+pub(crate) static WARM: WarmGate = WarmGate::new();
+
+/// Longest a new hardware clip waits for a warm-up already in flight.
+pub(crate) const WARM_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// True once a warm-up thread was started (by `warm_up` or a pref change).
+pub fn warm_up_started() -> bool {
+    WARM.started()
 }
 
 /// Pays the one-time cost of the first hardware session (about 1.3 s with VideoToolbox) in
@@ -158,10 +293,19 @@ pub fn warm_up() -> Option<std::thread::JoinHandle<()>> {
     }
     let mut handle = None;
     ONCE.call_once(|| {
+        WARM.start();
         handle = std::thread::Builder::new()
             .name("vjc-hw-warm".into())
-            .spawn(warm_session)
+            .spawn(|| {
+                if let Err(e) = warm_session() {
+                    eprintln!("vjc-media: hardware warm-up failed: {e}");
+                }
+                WARM.finish();
+            })
             .ok();
+        if handle.is_none() {
+            WARM.finish();
+        }
     });
     handle
 }
@@ -172,15 +316,39 @@ unsafe extern "C" fn get_format(
     _ctx: *mut ff::ffi::AVCodecContext,
     fmts: *const AVPixelFormat,
 ) -> AVPixelFormat {
+    unsafe { select_format(fmts, HW_FORMAT) }
+}
+
+/// True when `f` is a hardware-accelerated pixel format (needs a device).
+fn is_hwaccel_format(f: AVPixelFormat) -> bool {
     unsafe {
+        let d = ff::ffi::av_pix_fmt_desc_get(f);
+        !d.is_null() && (*d).flags & ff::ffi::AV_PIX_FMT_FLAG_HWACCEL as u64 != 0
+    }
+}
+
+/// `want` if offered, else the first software format of the NONE-terminated list (FFmpeg
+/// semantics: never hand back another hwaccel format we have no device for), else NONE.
+///
+/// # Safety
+/// `fmts` must point to a list terminated by `AV_PIX_FMT_NONE`.
+pub(crate) unsafe fn select_format(
+    fmts: *const AVPixelFormat,
+    want: AVPixelFormat,
+) -> AVPixelFormat {
+    unsafe {
+        let mut sw = AVPixelFormat::AV_PIX_FMT_NONE;
         let mut p = fmts;
         while *p != AVPixelFormat::AV_PIX_FMT_NONE {
-            if *p == HW_FORMAT {
-                return HW_FORMAT;
+            if *p == want {
+                return want;
+            }
+            if sw == AVPixelFormat::AV_PIX_FMT_NONE && !is_hwaccel_format(*p) {
+                sw = *p;
             }
             p = p.add(1);
         }
-        *fmts
+        sw
     }
 }
 

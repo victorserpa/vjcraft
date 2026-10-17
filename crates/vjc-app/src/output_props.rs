@@ -277,6 +277,7 @@ impl State {
 
     /// Output mask of the screen: draw it, edit its points, clear it.
     fn output_mask_rows(&mut self, ui: &mut egui::Ui, scr: &Screen, cmds: &mut Vec<Command>) {
+        self.poly.follow_screen(scr.id);
         row(ui, "screen-mask", |ui| {
             widgets::section(ui, "Output mask", |ui| {
                 ui.horizontal_wrapped(|ui| {

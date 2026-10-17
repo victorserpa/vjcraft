@@ -4,6 +4,7 @@
 
 use super::*;
 use std::process::Command;
+use std::sync::Mutex;
 
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("vjc-hw-{}-{name}", std::process::id()));
@@ -144,6 +145,7 @@ fn session_cap_sends_extra_clips_to_software() {
 
 #[test]
 fn player_reports_hw_or_sw_status() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tmp("status");
     let Some(clip) = make_clip(&dir, "640x360", 1) else {
         return;
@@ -162,6 +164,7 @@ fn player_reports_hw_or_sw_status() {
 
 #[test]
 fn dropping_a_hw_player_does_not_block() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tmp("drop");
     let Some(clip) = make_clip(&dir, "640x360", 1) else {
         return;
@@ -176,13 +179,24 @@ fn dropping_a_hw_player_does_not_block() {
     );
 }
 
-unsafe extern "C" {
-    fn clock() -> std::os::raw::c_long;
+/// Process CPU time (all threads) in seconds.
+#[cfg(unix)]
+fn cpu_secs() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
-/// Process CPU time (all threads) in seconds.
+/// Process CPU time (all threads) in seconds. MSVC `clock()` ticks in milliseconds.
+#[cfg(windows)]
 fn cpu_secs() -> f64 {
-    unsafe { clock() as f64 / 1_000_000.0 }
+    unsafe extern "C" {
+        fn clock() -> std::os::raw::c_long;
+    }
+    unsafe { clock() as f64 / 1000.0 }
 }
 
 fn bench(clip: &Path, hw: Hw, label: &str) {
@@ -214,4 +228,208 @@ fn hw_benchmark() {
         bench(&clip, Hw::Off, label);
         bench(&clip, Hw::On, label);
     }
+}
+
+#[test]
+fn fallback_does_not_re_emit_earlier_frames() {
+    let dir = tmp("reemit");
+    let Some(clip) = make_clip(&dir, "640x360", 2) else {
+        return;
+    };
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    let mut last = f64::NEG_INFINITY;
+    for _ in 0..15 {
+        last = sc.next().expect("frame").0;
+    }
+    sc.fall_back_to_software("test").unwrap();
+    for _ in 0..10 {
+        let (t, _) = sc.next().expect("frame after fallback");
+        assert!(t > last, "re-emitted pts {t} after {last}");
+        last = t;
+    }
+}
+
+#[test]
+fn format_choice_prefers_hw_then_first_software_format() {
+    use ff::ffi::AVPixelFormat as P;
+    let other_hw = if hw::HW_FORMAT == P::AV_PIX_FMT_VAAPI {
+        P::AV_PIX_FMT_CUDA
+    } else {
+        P::AV_PIX_FMT_VAAPI
+    };
+    let list = [
+        other_hw,
+        P::AV_PIX_FMT_YUV420P,
+        P::AV_PIX_FMT_NV12,
+        P::AV_PIX_FMT_NONE,
+    ];
+    let got = unsafe { hw::select_format(list.as_ptr(), hw::HW_FORMAT) };
+    assert_eq!(
+        got,
+        P::AV_PIX_FMT_YUV420P,
+        "must skip other hwaccel formats"
+    );
+    let list = [
+        other_hw,
+        P::AV_PIX_FMT_YUV420P,
+        hw::HW_FORMAT,
+        P::AV_PIX_FMT_NONE,
+    ];
+    assert_eq!(
+        unsafe { hw::select_format(list.as_ptr(), hw::HW_FORMAT) },
+        hw::HW_FORMAT
+    );
+    let only_hw = [other_hw, P::AV_PIX_FMT_NONE];
+    assert_eq!(
+        unsafe { hw::select_format(only_hw.as_ptr(), hw::HW_FORMAT) },
+        P::AV_PIX_FMT_NONE
+    );
+}
+
+#[test]
+fn warm_gate_makes_waiters_wait_for_the_warm_up() {
+    let g = Arc::new(hw::WarmGate::new());
+    assert!(g.wait(Duration::from_millis(1)), "nothing in flight");
+    g.start();
+    assert!(
+        !g.wait(Duration::from_millis(50)),
+        "times out while running"
+    );
+    let g2 = g.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        g2.finish();
+    });
+    let t0 = Instant::now();
+    assert!(g.wait(Duration::from_secs(5)));
+    assert!(t0.elapsed() >= Duration::from_millis(80));
+    t.join().unwrap();
+}
+
+/// Tests that touch the process-wide warm gate or open `Hw::On` players take this lock.
+static WARM_TESTS: Mutex<()> = Mutex::new(());
+
+/// Marks a warm-up as running and always finishes it again, even if the test panics.
+struct WarmRunning;
+
+impl WarmRunning {
+    fn start() -> Self {
+        hw::WARM.start();
+        WarmRunning
+    }
+}
+
+impl Drop for WarmRunning {
+    fn drop(&mut self) {
+        hw::WARM.finish();
+    }
+}
+
+#[test]
+fn open_scrub_waits_for_a_warm_up_in_flight() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tmp("waitwarm");
+    let Some(clip) = make_clip(&dir, "320x180", 1) else {
+        return;
+    };
+    let warm = WarmRunning::start();
+    let p = Player::open_scrub_hw(&clip, Hw::On);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        p.latest_frame().is_none(),
+        "must not start a second cold session"
+    );
+    drop(warm);
+    wait_frame(&p);
+    assert!(p.latest_frame().is_some());
+}
+
+#[test]
+fn warm_guard_finishes_the_gate_when_the_test_panics() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let r = std::panic::catch_unwind(|| {
+        let _w = WarmRunning::start();
+        panic!("boom");
+    });
+    assert!(r.is_err());
+    assert!(hw::WARM.wait(Duration::from_millis(1)), "gate left running");
+}
+
+/// A raw Annex B H.264 stream: no container, so the frames carry no pts.
+fn make_raw_h264(dir: &Path) -> Option<PathBuf> {
+    let out = dir.join("raw.h264");
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("testsrc2=size=64x64:rate=25")
+        .args([
+            "-t", "2", "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p",
+        ])
+        .args(["-f", "h264"])
+        .arg(&out)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("skipped: no ffmpeg CLI with libx264");
+        return None;
+    }
+    Some(out)
+}
+
+#[test]
+fn frames_without_pts_are_not_all_dropped_below_the_floor() {
+    let dir = tmp("nopts");
+    let Some(clip) = make_raw_h264(&dir) else {
+        return;
+    };
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    // The state right after a swap that had already emitted 5 frames' worth of time.
+    sc.floor = 5.0 / sc.fps;
+    let (t, _) = sc.next().expect("every frame was dropped below the floor");
+    assert!(t > 5.0 / sc.fps, "t {t}");
+}
+
+#[test]
+fn acquire_without_a_free_slot_leaves_the_decoder_alone() {
+    static NONE_FREE: hw::HwSlots = hw::HwSlots::new();
+    let dir = tmp("noslot");
+    let Some(clip) = make_clip(&dir, "320x180", 1) else {
+        return;
+    };
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    sc.hw_mode = Hw::On;
+    for _ in 0..5 {
+        sc.next().expect("frame");
+    }
+    assert!(!sc.acquire_hw_from(&NONE_FREE, 0));
+    assert!(sc.floor.is_nan(), "decoder was swapped without a slot");
+    assert_eq!(NONE_FREE.active(), 0);
+}
+
+#[test]
+fn failed_swap_keeps_the_old_decoder_and_its_slot() {
+    static LOCAL: hw::HwSlots = hw::HwSlots::new();
+    let dir = tmp("swapfail");
+    let Some(clip) = make_clip(&dir, "320x180", 1) else {
+        return;
+    };
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    for _ in 0..5 {
+        sc.next().expect("frame");
+    }
+    sc.slot = LOCAL.try_acquire(1);
+    let r = sc.swap_decoder_with(None, |_, _, _| Err(ff::Error::DecoderNotFound));
+    assert!(r.is_err());
+    assert!(sc.slot.is_some(), "slot dropped by a failed swap");
+    assert_eq!(LOCAL.active(), 1);
+    assert!(sc.next().is_some(), "old decoder no longer works");
 }

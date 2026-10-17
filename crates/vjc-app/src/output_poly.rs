@@ -66,6 +66,19 @@ pub(crate) struct PolyUi {
     pub(crate) sel: Option<usize>,
     /// Selected point of the output mask (kept apart from the outline selection).
     pub(crate) sel_omask: Option<usize>,
+    /// Screen `sel_omask` belongs to.
+    omask_screen: Option<Uuid>,
+}
+
+impl PolyUi {
+    /// The output-mask point index only means something on one screen: drop it when the
+    /// screen being edited changes.
+    pub(crate) fn follow_screen(&mut self, screen: Uuid) {
+        if self.omask_screen != Some(screen) {
+            self.omask_screen = Some(screen);
+            self.sel_omask = None;
+        }
+    }
 }
 
 /// The command a finished drawing asks for; `None` when the polygon is not valid.
@@ -476,6 +489,18 @@ mod tests {
 
     fn scr() -> Screen {
         mapping::new_screen("t", 1920, 1080)
+    }
+
+    #[test]
+    fn output_mask_point_selection_is_dropped_on_screen_change() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut p = PolyUi::default();
+        p.follow_screen(a);
+        p.sel_omask = Some(4);
+        p.follow_screen(a);
+        assert_eq!(p.sel_omask, Some(4));
+        p.follow_screen(b);
+        assert_eq!(p.sel_omask, None);
     }
 
     #[test]

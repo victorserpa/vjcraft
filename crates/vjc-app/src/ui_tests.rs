@@ -8707,3 +8707,29 @@ fn outline_and_output_mask_point_selection_are_separate() {
     assert_eq!(h.state().poly.sel, Some(3));
     assert_eq!(h.state().poly.sel_omask, Some(5));
 }
+
+#[test]
+fn undo_and_redo_clear_the_output_mask_point_selection() {
+    let mut h = app();
+    let scr = vjc_core::mapping::new_screen("Wall", 1920, 1080);
+    let id = scr.id;
+    h.state_mut().exec(Command::AddScreen {
+        screen: scr,
+        index: 0,
+    });
+    h.state_mut().exec(Command::SetScreenMask {
+        screen: id,
+        mask: Some(vjc_model::Mask::Polygon(vec![
+            (0.1, 0.1),
+            (0.9, 0.1),
+            (0.5, 0.9),
+            (0.5, 0.5),
+        ])),
+    });
+    h.state_mut().poly.sel_omask = Some(3);
+    h.state_mut().undo();
+    assert_eq!(h.state().poly.sel_omask, None);
+    h.state_mut().poly.sel_omask = Some(3);
+    h.state_mut().redo();
+    assert_eq!(h.state().poly.sel_omask, None);
+}

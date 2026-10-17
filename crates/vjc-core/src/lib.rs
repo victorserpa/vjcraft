@@ -517,6 +517,13 @@ pub enum Command {
         slice: Uuid,
         shape: vjc_model::SliceShape,
     },
+    /// Puts the tangents back exactly as they were, even when their length no longer
+    /// matches the mesh (inverse of a mesh change that dropped stale tangents).
+    RestoreSliceTangents {
+        screen: Uuid,
+        slice: Uuid,
+        tangents: Vec<((f32, f32), (f32, f32))>,
+    },
     /// Linear or Bezier warp plus the handles per mesh point. One undo step.
     SetSliceMeshMode {
         screen: Uuid,
@@ -3298,10 +3305,9 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 inverse = Command::Batch {
                     commands: vec![
                         inverse,
-                        Command::SetSliceMeshMode {
+                        Command::RestoreSliceTangents {
                             screen,
                             slice,
-                            mode: s.mesh_mode,
                             tangents,
                         },
                     ],
@@ -3309,6 +3315,22 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             }
             s.mesh_cols = cols;
             undoable(inverse, vec![])
+        }
+        Command::RestoreSliceTangents {
+            screen,
+            slice,
+            tangents,
+        } => {
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.mesh_tangents, tangents);
+            undoable(
+                Command::RestoreSliceTangents {
+                    screen,
+                    slice,
+                    tangents: prev,
+                },
+                vec![],
+            )
         }
         Command::SetSliceShape {
             screen,
