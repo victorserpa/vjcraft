@@ -4,6 +4,7 @@
 
 use super::*;
 use std::process::Command;
+use std::sync::Mutex;
 
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("vjc-hw-{}-{name}", std::process::id()));
@@ -144,6 +145,7 @@ fn session_cap_sends_extra_clips_to_software() {
 
 #[test]
 fn player_reports_hw_or_sw_status() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tmp("status");
     let Some(clip) = make_clip(&dir, "640x360", 1) else {
         return;
@@ -162,6 +164,7 @@ fn player_reports_hw_or_sw_status() {
 
 #[test]
 fn dropping_a_hw_player_does_not_block() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tmp("drop");
     let Some(clip) = make_clip(&dir, "640x360", 1) else {
         return;
@@ -303,45 +306,130 @@ fn warm_gate_makes_waiters_wait_for_the_warm_up() {
     t.join().unwrap();
 }
 
+/// Tests that touch the process-wide warm gate or open `Hw::On` players take this lock.
+static WARM_TESTS: Mutex<()> = Mutex::new(());
+
+/// Marks a warm-up as running and always finishes it again, even if the test panics.
+struct WarmRunning;
+
+impl WarmRunning {
+    fn start() -> Self {
+        hw::WARM.start();
+        WarmRunning
+    }
+}
+
+impl Drop for WarmRunning {
+    fn drop(&mut self) {
+        hw::WARM.finish();
+    }
+}
+
 #[test]
 fn open_scrub_waits_for_a_warm_up_in_flight() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tmp("waitwarm");
     let Some(clip) = make_clip(&dir, "320x180", 1) else {
         return;
     };
-    hw::WARM.start();
+    let warm = WarmRunning::start();
     let p = Player::open_scrub_hw(&clip, Hw::On);
     std::thread::sleep(Duration::from_millis(400));
     assert!(
         p.latest_frame().is_none(),
         "must not start a second cold session"
     );
-    hw::WARM.finish();
+    drop(warm);
     wait_frame(&p);
     assert!(p.latest_frame().is_some());
 }
 
 #[test]
-fn idle_clip_gives_back_its_session_and_retakes_it() {
-    if !cfg!(target_os = "macos") {
-        return;
+fn warm_guard_finishes_the_gate_when_the_test_panics() {
+    let _serial = WARM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let r = std::panic::catch_unwind(|| {
+        let _w = WarmRunning::start();
+        panic!("boom");
+    });
+    assert!(r.is_err());
+    assert!(hw::WARM.wait(Duration::from_millis(1)), "gate left running");
+}
+
+/// A raw Annex B H.264 stream: no container, so the frames carry no pts.
+fn make_raw_h264(dir: &Path) -> Option<PathBuf> {
+    let out = dir.join("raw.h264");
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("testsrc2=size=64x64:rate=25")
+        .args([
+            "-t", "2", "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p",
+        ])
+        .args(["-f", "h264"])
+        .arg(&out)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("skipped: no ffmpeg CLI with libx264");
+        return None;
     }
-    let dir = tmp("idle");
-    let Some(clip) = make_clip(&dir, "640x360", 2) else {
+    Some(out)
+}
+
+#[test]
+fn frames_without_pts_are_not_all_dropped_below_the_floor() {
+    let dir = tmp("nopts");
+    let Some(clip) = make_raw_h264(&dir) else {
         return;
     };
-    let p = Player::open_scrub_hw(&clip, Hw::On);
-    wait_frame(&p);
-    assert_eq!(p.decode_status(), Some("hw"));
-    let t = Instant::now();
-    while p.decode_status() != Some("sw") {
-        assert!(t.elapsed().as_secs() < 3, "idle clip kept its hw session");
-        std::thread::sleep(Duration::from_millis(20));
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    // The state right after a swap that had already emitted 5 frames' worth of time.
+    sc.floor = 5.0 / sc.fps;
+    let (t, _) = sc.next().expect("every frame was dropped below the floor");
+    assert!(t > 5.0 / sc.fps, "t {t}");
+}
+
+#[test]
+fn acquire_without_a_free_slot_leaves_the_decoder_alone() {
+    static NONE_FREE: hw::HwSlots = hw::HwSlots::new();
+    let dir = tmp("noslot");
+    let Some(clip) = make_clip(&dir, "320x180", 1) else {
+        return;
+    };
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    sc.hw_mode = Hw::On;
+    for _ in 0..5 {
+        sc.next().expect("frame");
     }
-    p.set_position(0.5);
-    let t = Instant::now();
-    while p.decode_status() != Some("hw") {
-        assert!(t.elapsed().as_secs() < 3, "active clip did not get hw back");
-        std::thread::sleep(Duration::from_millis(20));
+    assert!(!sc.acquire_hw_from(&NONE_FREE, 0));
+    assert!(sc.floor.is_nan(), "decoder was swapped without a slot");
+    assert_eq!(NONE_FREE.active(), 0);
+}
+
+#[test]
+fn failed_swap_keeps_the_old_decoder_and_its_slot() {
+    static LOCAL: hw::HwSlots = hw::HwSlots::new();
+    let dir = tmp("swapfail");
+    let Some(clip) = make_clip(&dir, "320x180", 1) else {
+        return;
+    };
+    let mut sc = Scrubber::open_with_hw(&clip, false, Hw::Off).unwrap();
+    for _ in 0..5 {
+        sc.next().expect("frame");
     }
+    sc.slot = LOCAL.try_acquire(1);
+    let r = sc.swap_decoder_with(None, |_, _, _| Err(ff::Error::DecoderNotFound));
+    assert!(r.is_err());
+    assert!(sc.slot.is_some(), "slot dropped by a failed swap");
+    assert_eq!(LOCAL.active(), 1);
+    assert!(sc.next().is_some(), "old decoder no longer works");
 }
