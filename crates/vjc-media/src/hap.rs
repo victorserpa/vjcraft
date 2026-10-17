@@ -112,6 +112,9 @@ fn u32s(b: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+/// Bytes a declared size may exceed the expected plane by.
+const SLACK: usize = 4096;
+
 /// One piece of second-stage data: where it comes from, how it is packed.
 struct Chunk<'a> {
     src: &'a [u8],
@@ -137,8 +140,17 @@ fn unpack(chunk: &Chunk, dst: &mut [u8]) -> Result<(), String> {
 }
 
 /// Second stage over all chunks, spread over threads when there are several.
-fn unpack_all(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
-    let total: usize = chunks.iter().map(|c| c.size).sum();
+fn unpack_all(chunks: &[Chunk], max: usize) -> Result<Vec<u8>, String> {
+    let total = chunks
+        .iter()
+        .try_fold(0usize, |a, c| a.checked_add(c.size))
+        .unwrap_or(usize::MAX);
+    // The sizes come from the file: check them before allocating anything.
+    if total > max.saturating_add(SLACK) {
+        return Err(format!(
+            "hap: declares {total} bytes, the picture needs {max}"
+        ));
+    }
     let mut out = vec![0u8; total];
     let mut jobs: Vec<(&Chunk, &mut [u8])> = Vec::with_capacity(chunks.len());
     let mut rest = out.as_mut_slice();
@@ -182,16 +194,22 @@ fn unpack_all(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
 }
 
 /// Payload of a texture section after both stages, for the compressor in `ty`'s high nibble.
-fn texture_data(ty: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+fn texture_data(ty: u8, payload: &[u8], max: usize) -> Result<Vec<u8>, String> {
     match ty >> 4 {
+        COMP_NONE if payload.len() > max.saturating_add(SLACK) => {
+            Err("hap: texture longer than the picture needs".into())
+        }
         COMP_NONE => Ok(payload.to_vec()),
         COMP_SNAPPY => {
             let size = snap::raw::decompress_len(payload).map_err(|e| format!("hap: {e}"))?;
-            unpack_all(&[Chunk {
-                src: payload,
-                snappy: true,
-                size,
-            }])
+            unpack_all(
+                &[Chunk {
+                    src: payload,
+                    snappy: true,
+                    size,
+                }],
+                max,
+            )
         }
         COMP_COMPLEX => {
             let (hdr, len, t) = section(payload)?;
@@ -250,7 +268,7 @@ fn texture_data(ty: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
                 };
                 chunks.push(Chunk { src, snappy, size });
             }
-            unpack_all(&chunks)
+            unpack_all(&chunks, max)
         }
         c => Err(format!("hap: unknown compressor {c:#x}")),
     }
@@ -278,8 +296,12 @@ pub fn parse(packet: &[u8], width: u32, height: u32) -> Result<HapFrame, String>
         }
         (
             HapFormat::YcoCgAlpha,
-            texture_data(t1, &body[h1..h1 + l1])?,
-            Some(texture_data(t2, &rest[h2..h2 + l2])?),
+            texture_data(t1, &body[h1..h1 + l1], plane_bytes(tw, th, 16))?,
+            Some(texture_data(
+                t2,
+                &rest[h2..h2 + l2],
+                plane_bytes(tw, th, 8),
+            )?),
         )
     } else {
         let format = match ty & 0xF {
@@ -290,7 +312,11 @@ pub fn parse(packet: &[u8], width: u32, height: u32) -> Result<HapFrame, String>
             TEX_BC4 => HapFormat::AlphaOnly,
             t => return Err(format!("hap: unsupported texture format {t:#x}")),
         };
-        (format, texture_data(ty, body)?, None)
+        (
+            format,
+            texture_data(ty, body, plane_bytes(tw, th, format.block_bytes()))?,
+            None,
+        )
     };
     if color.len() != plane_bytes(tw, th, format.block_bytes()) {
         return Err(format!(
@@ -701,6 +727,21 @@ mod tests {
         assert!(parse(&good, 32, 32).is_err(), "size mismatch");
         assert!(parse(&good[..good.len() / 2], 16, 16).is_err(), "truncated");
         assert!(parse(&[1, 2], 16, 16).is_err());
+    }
+
+    #[test]
+    fn rejects_a_huge_snappy_declaration_before_allocating() {
+        // Snappy preamble: varint 2^32-1 (4 GB), then a few junk bytes.
+        let lie = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x01, 0x02];
+        let pkt = testgen::wrap(0xB1, &lie);
+        let e = parse(&pkt, 16, 16).err().expect("must be refused");
+        assert!(e.contains("declares"), "{e}");
+        // Also through the chunked layout.
+        let mut instr = testgen::wrap(SEC_COMPRESSORS, &[COMP_SNAPPY]);
+        instr.extend(testgen::wrap(SEC_SIZES, &(lie.len() as u32).to_le_bytes()));
+        let mut body = testgen::wrap(SEC_INSTR, &instr);
+        body.extend(lie);
+        assert!(parse(&testgen::wrap(0xC1, &body), 16, 16).is_err());
     }
 
     #[test]

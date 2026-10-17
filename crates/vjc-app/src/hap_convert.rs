@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use vjc_model::{ColumnIdx, DeckId, LayerId};
+use vjc_model::{ClipId, ColumnIdx, DeckId, LayerId};
 
 const GB: u64 = 1_000_000_000;
 /// Free space is checked this often while ffmpeg runs.
@@ -94,8 +94,18 @@ pub fn reserve_bytes(total: u64, pref_gb: Option<u32>) -> u64 {
     }
 }
 
-/// Refuses when the estimate plus the reserve does not fit.
+/// Refuses when the estimate plus the reserve does not fit. An estimate of 0 means the
+/// duration or fps is unknown: then twice the reserve must be free.
 pub fn check_space(estimate: u64, space: Space, reserve: u64) -> Result<(), String> {
+    if estimate == 0 && space.free < reserve.saturating_mul(2) {
+        return Err(format!(
+            "Cannot estimate the size of this HAP file (unknown duration or frame rate) and \
+             only {} are free; {} must be free to try. Pick another folder \
+             (Preferences > General) or free some space.",
+            human(space.free),
+            human(reserve.saturating_mul(2))
+        ));
+    }
     if estimate.saturating_add(reserve) > space.free {
         return Err(format!(
             "Not enough disk space: the HAP file needs about {}, {} are free and {} must stay free. \
@@ -343,6 +353,8 @@ pub struct Request {
     pub variant: Variant,
     /// Clip to offer to swap when it finishes.
     pub cell: Option<(DeckId, LayerId, ColumnIdx)>,
+    /// Id of the clip in `cell` when the question was asked.
+    pub clip: Option<ClipId>,
     pub out_dir: Option<PathBuf>,
     pub reserve_gb: Option<u32>,
     pub width: u32,
@@ -363,7 +375,17 @@ impl Request {
     }
 }
 
+/// Whether the swap offer still applies: the cell must hold the same clip, still playing
+/// the same source file. `found` is the clip in the cell now: `(id, source path)`.
+pub fn swap_check(found: Option<(ClipId, Option<&Path>)>, req: &Request) -> Result<(), String> {
+    match found {
+        Some((id, Some(path))) if Some(id) == req.clip && path == req.src => Ok(()),
+        _ => Err("The clip changed while converting; not swapped".into()),
+    }
+}
+
 struct Running {
+    handle: Option<std::thread::JoinHandle<()>>,
     req: Request,
     rx: Receiver<Update>,
     cancel: Arc<AtomicBool>,
@@ -392,14 +414,31 @@ impl Converter {
 
     /// Checks the space and queues the request.
     pub fn submit(&mut self, req: Request) -> Result<(), String> {
-        let dir = req
-            .out_dir
-            .clone()
-            .or_else(|| req.src.parent().map(Path::to_path_buf));
-        let space = dir
+        let space = Self::out_dir(&req)
             .as_deref()
             .and_then(free_space)
             .ok_or("Cannot read the free space of the output volume")?;
+        self.submit_with(req, space)
+    }
+
+    fn out_dir(req: &Request) -> Option<PathBuf> {
+        req.out_dir
+            .clone()
+            .or_else(|| req.src.parent().map(Path::to_path_buf))
+    }
+
+    /// `submit` with the free space of the output volume given. Jobs already queued or
+    /// running into the same folder will still write their estimate: it counts against it.
+    fn submit_with(&mut self, req: Request, mut space: Space) -> Result<(), String> {
+        let dir = Self::out_dir(&req);
+        let pending: u64 = self
+            .queue
+            .iter()
+            .chain(self.current.iter().map(|r| &r.req))
+            .filter(|r| Self::out_dir(r) == dir)
+            .map(Request::estimate)
+            .fold(0, u64::saturating_add);
+        space.free = space.free.saturating_sub(pending);
         check_space(
             req.estimate(),
             space,
@@ -407,6 +446,23 @@ impl Converter {
         )?;
         self.queue.push_back(req);
         Ok(())
+    }
+
+    /// App quit: stops the running ffmpeg, deletes its .part file and drops the queue.
+    /// Waits a bounded time for the worker to finish the cleanup.
+    pub fn shutdown(&mut self) {
+        self.cancel_current();
+        if let Some(mut r) = self.current.take()
+            && let Some(h) = r.handle.take()
+        {
+            let t = Instant::now();
+            while !h.is_finished() && t.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
     }
 
     pub fn cancel_current(&mut self) {
@@ -462,7 +518,7 @@ impl Converter {
         let cancel = Arc::new(AtomicBool::new(false));
         let (c2, r2) = (cancel.clone(), req.clone());
         let reg = self.registry.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             if !ffmpeg_has_hap() {
                 let _ = tx.send(Update::Failed(
                     "This ffmpeg cannot write HAP (it needs the snappy library: brew reinstall ffmpeg with snappy)".into(),
@@ -490,6 +546,7 @@ impl Converter {
             );
         });
         self.current = Some(Running {
+            handle: Some(handle),
             req,
             rx,
             cancel,
@@ -549,6 +606,7 @@ mod tests {
             src: d.join("a.mp4"),
             variant: Variant::Hap,
             cell: None,
+            clip: None,
             out_dir: None,
             reserve_gb: Some(100_000),
             width: 1920,
@@ -565,6 +623,118 @@ mod tests {
             ..req
         };
         assert!(c.submit(ok).is_ok());
+    }
+
+    fn req(dur: f64) -> Request {
+        Request {
+            src: PathBuf::from("/v/a.mp4"),
+            variant: Variant::Hap,
+            cell: None,
+            clip: None,
+            out_dir: Some(PathBuf::from("/out")),
+            reserve_gb: Some(1),
+            width: 1000,
+            height: 1000,
+            fps: 1.0,
+            duration: dur,
+        }
+    }
+
+    #[test]
+    fn submit_counts_queued_and_running_estimates() {
+        // 100 s of 1000x1000x1 fps HAP = 60 MB x 1.0 ... sized against a 10 GB volume.
+        let space = Space {
+            free: 10 * GB,
+            total: 100 * GB,
+        };
+        let one = req(1.0).estimate();
+        // Each job takes a bit over a third of the room above the 1 GB reserve.
+        let secs = (3.5 * GB as f64 / one as f64).ceil();
+        let mut c = Converter::default();
+        assert!(c.submit_with(req(secs), space).is_ok());
+        assert!(c.submit_with(req(secs), space).is_ok());
+        let e = c.submit_with(req(secs), space).unwrap_err();
+        assert!(e.contains("Not enough disk space"), "{e}");
+        assert_eq!(c.queue.len(), 2);
+        // Another folder is another budget.
+        let mut other = req(secs);
+        other.out_dir = Some(PathBuf::from("/elsewhere"));
+        assert!(c.submit_with(other, space).is_ok());
+    }
+
+    #[test]
+    fn unknown_estimate_needs_twice_the_reserve() {
+        let space = |free| Space {
+            free,
+            total: 100 * GB,
+        };
+        let e = check_space(0, space(15 * GB), 10 * GB).unwrap_err();
+        assert!(e.contains("Cannot estimate"), "{e}");
+        assert!(check_space(0, space(20 * GB), 10 * GB).is_ok());
+        // Control: a known estimate keeps the ordinary rule.
+        assert!(check_space(1, space(15 * GB), 10 * GB).is_ok());
+    }
+
+    #[test]
+    fn swap_only_when_the_cell_still_holds_the_same_clip_and_source() {
+        let id = ClipId::from_u128(1);
+        let mut r = req(1.0);
+        r.clip = Some(id);
+        let src = r.src.clone();
+        assert!(swap_check(Some((id, Some(&src))), &r).is_ok());
+        // Another clip moved into the cell.
+        let e = swap_check(Some((ClipId::from_u128(2), Some(&src))), &r).unwrap_err();
+        assert!(e.contains("not swapped"), "{e}");
+        // Same clip, source relinked elsewhere.
+        assert!(swap_check(Some((id, Some(Path::new("/v/b.mp4")))), &r).is_err());
+        // Source no longer a file, or the cell emptied.
+        assert!(swap_check(Some((id, None)), &r).is_err());
+        assert!(swap_check(None, &r).is_err());
+    }
+
+    #[test]
+    fn shutdown_kills_the_child_and_deletes_the_part() {
+        let d = tmp("quit");
+        let out = d.join("q.hap.mov");
+        let part = part_of(&out);
+        let pidf = d.join("pid");
+        let cmd = fake(&format!(
+            "echo data > '{}'; echo $$ > '{}'; exec sleep 60",
+            part.display(),
+            pidf.display()
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        let (c2, p2, o2) = (cancel.clone(), part.clone(), out.clone());
+        let free: FreeFn = Arc::new(|_| None);
+        let handle = std::thread::spawn(move || {
+            run_job(cmd, (&p2, &o2), 1.0, 0, &c2, &free, None, &tx);
+        });
+        let t = Instant::now();
+        while !pidf.exists() || std::fs::read_to_string(&pidf).unwrap().trim().is_empty() {
+            assert!(t.elapsed().as_secs() < 5);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = std::fs::read_to_string(&pidf).unwrap().trim().to_string();
+        let mut c = Converter::default();
+        c.queue.push_back(req(1.0));
+        c.current = Some(Running {
+            handle: Some(handle),
+            req: req(1.0),
+            rx,
+            cancel,
+            progress: 0.0,
+        });
+        c.shutdown();
+        assert!(!c.busy());
+        assert!(!part.exists(), "the .part file must be deleted");
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "ffmpeg child must be dead");
     }
 
     #[test]

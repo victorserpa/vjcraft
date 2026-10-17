@@ -450,6 +450,60 @@ mod tests {
         }
     }
 
+    /// The HAP frame goes through the compositor's real layer slot (same texture, format
+    /// and usage the app uses), with validation errors captured, for an 8-bit and a 16-bit
+    /// composition.
+    #[test]
+    fn hap_frame_renders_into_the_real_compositor_layer_slot() {
+        use crate::compositor::{Compositor, LayerDraw};
+        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((device, queue)) = device(true) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("vjc-hapgpu-slot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slot.mov");
+        write_clip(&path, Kind::Hap, (62, 34), 3, 2).unwrap();
+        let reference = vjc_media::decode_n(&path, 1).unwrap().remove(0);
+        let hap = first_hap_frame(&path)
+            .hap
+            .clone()
+            .expect("compressed frame");
+        let id = LayerId::from_u128(1);
+        for fmt in [crate::compositor::FORMAT, wgpu::TextureFormat::Rgba16Float] {
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let mut comp = Compositor::with_format(&device, 62, 34, fmt);
+            comp.hap_in.insert(id, hap.clone());
+            // The slot is made from this placeholder; the HAP pass overwrites it.
+            let blank = vec![0u8; 62 * 34 * 4];
+            let layer = [LayerDraw {
+                id,
+                opacity: 1.0,
+                blend: Default::default(),
+                fit: Default::default(),
+                effects: vec![],
+                frame: Some((62, 34, &blank, 1)),
+                generator: None,
+                transition: None,
+                transform: crate::compositor::Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
+            let err = pollster::block_on(scope.pop());
+            assert!(err.is_none(), "{fmt:?}: validation error {err:?}");
+            assert_eq!((w, h), (62, 34));
+            let max = got
+                .iter()
+                .zip(reference.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(max <= 16, "{fmt:?}: pixels differ by {max}");
+        }
+    }
+
     #[test]
     fn without_bc_feature_there_is_no_gpu_path_and_frames_still_arrive() {
         let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());

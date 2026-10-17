@@ -447,6 +447,7 @@ enum CellAct {
 struct HapAsk {
     src: PathBuf,
     cell: Option<(DeckId, LayerId, u32)>,
+    clip: Option<vjc_model::ClipId>,
     /// Chosen variant; `None` = the default for the source.
     variant: Option<hap_convert::Variant>,
 }
@@ -2706,6 +2707,7 @@ impl State {
             self.hap_ask = Some(HapAsk {
                 src,
                 cell: None,
+                clip: None,
                 variant: None,
             });
         }
@@ -2812,6 +2814,7 @@ impl State {
                     src: ask.src.clone(),
                     variant: ask.variant.unwrap_or(Variant::Hap),
                     cell: ask.cell,
+                    clip: ask.clip,
                     out_dir: general.hap_folder.clone(),
                     reserve_gb: general.hap_reserve_gb,
                     width: i.width,
@@ -2842,9 +2845,19 @@ impl State {
             });
             if yes {
                 if let Some((deck, layer, column)) = req.cell {
-                    self.exec(Command::SetMediaPaths {
-                        changes: vec![(deck, layer, column, out)],
+                    let found = vjc_core::clip_in(&self.project, deck, layer, column).map(|c| {
+                        let path = match &c.source {
+                            vjc_model::Source::File { path } => Some(path.as_path()),
+                            _ => None,
+                        };
+                        (c.id, path)
                     });
+                    match hap_convert::swap_check(found, &req) {
+                        Ok(()) => self.exec(Command::SetMediaPaths {
+                            changes: vec![(deck, layer, column, out)],
+                        }),
+                        Err(e) => self.status = e,
+                    }
                 }
                 self.hap_swap = None;
             } else if no || esc {
@@ -4137,6 +4150,7 @@ impl State {
                     self.hap_ask = Some(HapAsk {
                         src: path.clone(),
                         cell: Some((deck, layer, column)),
+                        clip: Some(k.id),
                         variant: None,
                     });
                 }
@@ -11851,6 +11865,7 @@ impl eframe::App for State {
 
     /// Closing the app mid-recording still writes the mp4 trailer (bounded wait).
     fn on_exit(&mut self) {
+        self.hap.shutdown();
         if self.prefs_dirty {
             self.save_prefs();
         }
