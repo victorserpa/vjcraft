@@ -9,3 +9,4 @@ ffmpeg-next = "9.0.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 cpal = { version = "0.18.2", default-features = false }
 rustfft = "6.4"
+snap = "1"
