@@ -411,8 +411,32 @@ pub fn stall_due(
     Some(stale)
 }
 
+/// Most report files kept in the crash dir; older ones are deleted so it never grows unbounded.
+pub const MAX_REPORTS: usize = 50;
+
+/// Deletes the oldest files in `dir` until at most `keep` remain.
+pub fn prune_reports(dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let extra = files.len() - keep;
+    for (_, p) in files.into_iter().take(extra) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// Writes `stall-<stamp>.txt` into `dir`. On macOS adds a thread dump from `sample`.
 pub fn write_stall(dir: &Path, stalled_ms: u64, dump: bool) -> Option<PathBuf> {
+    prune_reports(dir, MAX_REPORTS.saturating_sub(2));
     let mut body = format!(
         "{}main loop did not tick for {stalled_ms} ms (possible deadlock); not killed\n{}",
         header(),
@@ -630,5 +654,18 @@ mod tests {
         let t = std::fs::read_to_string(&p).unwrap();
         assert!(t.contains("did not tick for 2500 ms") && t.contains("VJCraft"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn crash_dir_is_pruned_to_the_cap() {
+        let dir = std::env::temp_dir().join(format!("vjc-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..60 {
+            std::fs::write(dir.join(format!("stall-{i:03}.txt")), b"x").unwrap();
+        }
+        prune_reports(&dir, 10);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
