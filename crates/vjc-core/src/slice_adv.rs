@@ -161,7 +161,8 @@ pub fn follow_outline(sl: &mut vjc_model::Slice, new: &[Pt], screen: (u32, u32))
     };
     let old = &sl.output_mesh;
     let cols = sl.mesh_cols as usize;
-    if cols < 2 || old.len() != new.len() || old.len() < cols * 2 || old.len() % cols != 0 {
+    if cols < 2 || old.len() != new.len() || old.len() < cols * 2 || !old.len().is_multiple_of(cols)
+    {
         return;
     }
     let (a, b, c) = (old[0], old[cols - 1], old[old.len() - cols]);
