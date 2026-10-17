@@ -1391,6 +1391,35 @@ fn set_crossfader(p: &mut Project, value: f64) -> Result<Applied, Error> {
     undoable(Command::SetCrossfader { value: prev }, vec![])
 }
 
+fn apply_inner_meshes(
+    scr: &mut vjc_model::Screen,
+    screen: Uuid,
+    meshes: Vec<(Uuid, Vec<(f32, f32)>)>,
+) -> Result<Applied, Error> {
+    for (id, m) in &meshes {
+        let sl = scr
+            .slices
+            .iter()
+            .find(|s| s.id == *id)
+            .ok_or(Error::NoSlice)?;
+        if !mapping::mesh_valid(m, sl.mesh_cols) {
+            return Err(Error::InvalidValue);
+        }
+    }
+    let mut prev = vec![];
+    for (id, m) in meshes {
+        let sl = scr.slices.iter_mut().find(|s| s.id == id).unwrap();
+        prev.push((id, std::mem::replace(&mut sl.output_mesh, m)));
+    }
+    undoable(
+        Command::SetSliceMeshes {
+            screen,
+            meshes: prev,
+        },
+        vec![],
+    )
+}
+
 fn undoable(inverse: Command, events: Vec<Event>) -> Result<Applied, Error> {
     Ok(Applied {
         inverse: Some(inverse),
@@ -3252,11 +3281,115 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             s.mesh_cols = cols;
             undoable(inverse, vec![])
         }
-        Command::SetSliceShape { .. }
-        | Command::SetSliceMeshMode { .. }
-        | Command::SetScreenMask { .. }
-        | Command::SetSliceMeshes { .. }
-        | Command::ResizeSlices { .. } => todo!(),
+        Command::SetSliceShape {
+            screen,
+            slice,
+            shape,
+        } => {
+            let shape = match shape {
+                vjc_model::SliceShape::Rect => vjc_model::SliceShape::Rect,
+                vjc_model::SliceShape::Polygon(pts) => {
+                    vjc_model::SliceShape::Polygon(slice_adv::clamp_poly(&pts)?)
+                }
+            };
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.shape, shape);
+            undoable(
+                Command::SetSliceShape {
+                    screen,
+                    slice,
+                    shape: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceMeshMode {
+            screen,
+            slice,
+            mode,
+            tangents,
+        } => {
+            let s = slice_mut(p, screen, slice)?;
+            let ok = tangents.is_empty() || tangents.len() == s.output_mesh.len();
+            let finite = tangents.iter().all(|(a, b)| {
+                [a.0, a.1, b.0, b.1]
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= 1.0e6)
+            });
+            if !ok || !finite {
+                return Err(Error::InvalidValue);
+            }
+            let inverse = Command::SetSliceMeshMode {
+                screen,
+                slice,
+                mode: std::mem::replace(&mut s.mesh_mode, mode),
+                tangents: std::mem::replace(&mut s.mesh_tangents, tangents),
+            };
+            undoable(inverse, vec![])
+        }
+        Command::SetScreenMask { screen, mask } => {
+            let mask = match mask {
+                None => None,
+                Some(vjc_model::Mask::Polygon(pts)) => {
+                    Some(vjc_model::Mask::Polygon(slice_adv::clamp_poly(&pts)?))
+                }
+                Some(vjc_model::Mask::Path(pts)) => {
+                    Some(vjc_model::Mask::Path(slice_adv::clamp_poly(&pts)?))
+                }
+            };
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.output_mask, mask);
+            undoable(Command::SetScreenMask { screen, mask: prev }, vec![])
+        }
+        Command::SetSliceMeshes { screen, meshes } => {
+            let scr = screen_mut(p, screen)?;
+            for (id, m) in &meshes {
+                let sl = scr
+                    .slices
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .ok_or(Error::NoSlice)?;
+                if m.len() != sl.output_mesh.len() || !mapping::mesh_valid(m, sl.mesh_cols) {
+                    return Err(Error::InvalidValue);
+                }
+            }
+            let mut prev = vec![];
+            for (id, m) in meshes {
+                let sl = scr.slices.iter_mut().find(|s| s.id == id).unwrap();
+                prev.push((id, std::mem::replace(&mut sl.output_mesh, m)));
+            }
+            undoable(
+                Command::SetSliceMeshes {
+                    screen,
+                    meshes: prev,
+                },
+                vec![],
+            )
+        }
+        Command::ResizeSlices { screen, slices, to } => {
+            let (x, y, w, h) = to;
+            let min = slice_geom::MIN_SIZE;
+            if slices.is_empty()
+                || ![x, y, w, h].iter().all(|v| v.is_finite())
+                || w < min
+                || h < min
+            {
+                return Err(Error::InvalidValue);
+            }
+            let scr = screen_mut(p, screen)?;
+            let mut old = vec![];
+            for id in &slices {
+                let sl = scr
+                    .slices
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .ok_or(Error::NoSlice)?;
+                old.push(sl.output_mesh.clone());
+            }
+            let new = slice_adv::resize_group(&old, slice_geom::Rect { x, y, w, h });
+            let meshes: Vec<_> = slices.into_iter().zip(new).collect();
+            apply_inner_meshes(scr, screen, meshes)
+        }
         Command::SetSliceMeshSize {
             screen,
             slice,

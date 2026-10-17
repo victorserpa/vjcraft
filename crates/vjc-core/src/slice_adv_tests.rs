@@ -91,7 +91,10 @@ fn point_in_polygon_basics() {
         (0.0, 2.0),
     ];
     assert!(point_in_polygon(&l, (0.5, 1.5)));
-    assert!(!point_in_polygon(&l, (1.5, 1.5)), "concave notch is outside");
+    assert!(
+        !point_in_polygon(&l, (1.5, 1.5)),
+        "concave notch is outside"
+    );
 }
 
 #[test]
@@ -211,7 +214,7 @@ fn pen_stroke_simplifies_below_64_points() {
         .collect();
     let s = simplify_stroke(&stroke, 0.0005, 63);
     assert!(s.len() >= 3 && s.len() < 64, "{}", s.len());
-    assert!(mapping::mask_valid(&s));
+    assert!(clamp_poly(&s).is_ok());
     // A straight line collapses to its ends.
     let line: Vec<Pt> = (0..100).map(|i| (i as f32 / 99.0, 0.5)).collect();
     assert_eq!(simplify_stroke(&line, 0.001, 63).len(), 2);
@@ -220,7 +223,10 @@ fn pen_stroke_simplifies_below_64_points() {
 #[test]
 fn shift_snaps_to_15_degrees() {
     let p = snap_angle((0.0, 0.0), (10.0, 1.0), 15.0);
-    assert!((p.1).abs() < 1e-3 && (p.0 - (101.0f32).sqrt()).abs() < 1e-3, "{p:?}");
+    assert!(
+        (p.1).abs() < 1e-3 && (p.0 - (101.0f32).sqrt()).abs() < 1e-3,
+        "{p:?}"
+    );
     let q = snap_angle((5.0, 5.0), (5.0 + 10.0, 5.0 + 9.0), 15.0);
     let ang = (q.1 - 5.0).atan2(q.0 - 5.0).to_degrees();
     assert!((ang - 45.0).abs() < 1e-2, "{ang}");
@@ -242,10 +248,12 @@ fn presets_have_expected_vertex_counts_and_stay_in_rect() {
         assert_eq!(preset_polygon(pr, r).len(), n, "{pr:?}");
     }
     let c = preset_polygon(ShapePreset::Circle, r);
-    assert!(c.len() >= 16 && mapping::mask_valid(&c));
+    assert!(c.len() >= 16 && clamp_poly(&c).is_ok());
     for pr in ShapePreset::ALL {
         for p in preset_polygon(pr, r) {
-            assert!(p.0 >= 0.2 - 1e-4 && p.0 <= 0.7 + 1e-4 && p.1 >= 0.1 - 1e-4 && p.1 <= 0.5 + 1e-4);
+            assert!(
+                p.0 >= 0.2 - 1e-4 && p.0 <= 0.7 + 1e-4 && p.1 >= 0.1 - 1e-4 && p.1 <= 0.5 + 1e-4
+            );
         }
     }
 }
