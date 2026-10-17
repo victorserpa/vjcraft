@@ -134,6 +134,18 @@ pub struct Video {
     /// Ask for a 10-bit (Rgb10a2) output surface; read at startup, falls back to 8-bit when
     /// the adapter or surface cannot do it.
     pub output_10bit: bool,
+    /// GPU video decode (H.264, HEVC, ProRes); Auto falls back to software per clip.
+    pub hw_decode: HwDecode,
+    /// Most clips decoding on the GPU media engine at once; the rest decode in software.
+    pub hw_sessions: u32,
+}
+
+/// Video > "Hardware decoding".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HwDecode {
+    #[default]
+    Auto,
+    Off,
 }
 
 impl Default for Video {
@@ -147,6 +159,8 @@ impl Default for Video {
             max_fps: 0,
             folder_sequence: true,
             output_10bit: false,
+            hw_decode: HwDecode::Auto,
+            hw_sessions: 8,
         }
     }
 }

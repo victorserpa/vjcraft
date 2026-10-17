@@ -14,7 +14,7 @@ pub mod record;
 
 use ffmpeg_next as ff;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -24,9 +24,15 @@ pub mod audio;
 pub mod audio_fx;
 pub mod capture;
 pub mod hap;
+mod hw;
 pub mod ltc_in;
 pub mod sequence;
 pub mod snapshot;
+
+#[cfg(test)]
+use hw::HwSlots;
+use hw::{Hw, HwSlot};
+pub use hw::{active_sessions, configure as configure_hw_decode};
 
 /// A decoded RGBA8 frame (tightly packed, `width * 4` bytes per row).
 #[derive(Clone)]
@@ -109,6 +115,8 @@ pub(crate) struct Shared {
     position: AtomicU64,
     /// True while playback only moves forward (streaming is enough).
     sequential: AtomicBool,
+    /// Decoder in use: see `hw::ST_*` (0 = not known yet).
+    hw: Arc<AtomicU8>,
 }
 
 impl Shared {
@@ -120,6 +128,7 @@ impl Shared {
             duration: AtomicU64::new(0),
             position: AtomicU64::new(0.0f64.to_bits()),
             sequential: AtomicBool::new(true),
+            hw: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -192,6 +201,16 @@ impl Player {
     /// Starts decoding `path` in a background thread. Open errors are reported via `error()`.
     /// The frame shown follows `set_position`.
     pub fn open_scrub(path: impl AsRef<Path>) -> Player {
+        Self::open_scrub_hw(path, hw::preferred())
+    }
+
+    /// "hw" or "sw" once the decoder is known (None for images, live sources, or before
+    /// the first frame).
+    pub fn decode_status(&self) -> Option<&'static str> {
+        hw::status_label(self.shared.hw.load(Ordering::Relaxed))
+    }
+
+    fn open_scrub_hw(path: impl AsRef<Path>, hw: Hw) -> Player {
         let path = path.as_ref().to_path_buf();
         let shared = Arc::new(Shared::new());
         let (s, p) = (shared.clone(), path.clone());
@@ -210,7 +229,7 @@ impl Player {
                         }
                         return;
                     }
-                    if let Err(e) = run_scrub(&p, &s) {
+                    if let Err(e) = run_scrub(&p, &s, hw) {
                         *lock(&s.error) = Some(e.to_string());
                     }
                 })
@@ -553,6 +572,29 @@ fn hap_probe(path: &Path) -> bool {
     false
 }
 
+/// Opens the video decoder, on the hardware device when `slot` was granted and the device
+/// can be created, otherwise in software. The returned slot is `Some` only if hardware
+/// is attached.
+fn open_decoder(
+    params: ff::codec::Parameters,
+    hw: Hw,
+    slot: Option<HwSlot<'static>>,
+) -> Result<(ff::decoder::Video, Option<HwSlot<'static>>), ff::Error> {
+    if slot.is_some() {
+        let mut ctx = ff::codec::context::Context::from_parameters(params.clone())?;
+        if hw::attach(&mut ctx, hw)
+            && let Ok(d) = ctx.decoder().video()
+        {
+            return Ok((d, slot));
+        }
+        eprintln!("vjc-media: hardware decode unavailable, using software");
+    }
+    let d = ff::codec::context::Context::from_parameters(params)?
+        .decoder()
+        .video()?;
+    Ok((d, None))
+}
+
 /// Sequential decoder with seek, no pacing. Frames come out with their pts in seconds.
 struct Scrubber {
     ictx: ff::format::context::Input,
@@ -571,21 +613,25 @@ struct Scrubber {
     last: Option<Frame>,
     /// HAP packets go to the GPU undecoded (the decoder is never fed).
     hap: bool,
+    /// Hardware session slot, held while the decoder runs on the GPU.
+    slot: Option<HwSlot<'static>>,
+    /// Where the hw/sw status is published (the player's).
+    status: Option<Arc<AtomicU8>>,
 }
 
 impl Scrubber {
     /// CPU path: every codec decodes to RGBA through FFmpeg.
     fn open(path: &Path) -> Result<Scrubber, ff::Error> {
-        Self::open_with(path, false)
+        Self::open_with_hw(path, false, Hw::Off)
     }
 
     /// Player path: HAP stays block-compressed when the GPU can take it.
-    fn open_player(path: &Path) -> Result<Scrubber, ff::Error> {
+    fn open_player(path: &Path, hw: Hw) -> Result<Scrubber, ff::Error> {
         let hap = hap::gpu_supported() && hap_probe(path);
-        Self::open_with(path, hap)
+        Self::open_with_hw(path, hap, if hap { Hw::Off } else { hw })
     }
 
-    fn open_with(path: &Path, hap: bool) -> Result<Scrubber, ff::Error> {
+    fn open_with_hw(path: &Path, hap: bool, hw: Hw) -> Result<Scrubber, ff::Error> {
         ff::init()?;
         let ictx = ff::format::input(&path)?;
         let (stream_idx, tb, fps, params) = {
@@ -601,9 +647,12 @@ impl Scrubber {
             };
             (st.index(), f64::from(st.time_base()), fps, st.parameters())
         };
-        let decoder = ff::codec::context::Context::from_parameters(params)?
-            .decoder()
-            .video()?;
+        let slot = if hw == Hw::Off {
+            None
+        } else {
+            hw::SLOTS.try_acquire(hw::cap())
+        };
+        let (decoder, slot) = open_decoder(params, hw, slot)?;
         let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
         Ok(Scrubber {
             ictx,
@@ -619,7 +668,46 @@ impl Scrubber {
             last_t: f64::NAN,
             last: None,
             hap,
+            slot,
+            status: None,
         })
+    }
+
+    /// True while frames come from the hardware decoder.
+    fn is_hw(&self) -> bool {
+        self.slot.is_some()
+    }
+
+    fn publish_status(&self) {
+        if let Some(s) = &self.status {
+            s.store(
+                if self.is_hw() { hw::ST_HW } else { hw::ST_SW },
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Reopens the stream's decoder in software after the hardware one failed, and goes
+    /// back to where it was. The slot is released.
+    fn fall_back_to_software(&mut self, why: &str) -> Result<(), ff::Error> {
+        eprintln!("vjc-media: hardware decode stopped ({why}), using software");
+        let params = self
+            .ictx
+            .stream(self.stream_idx)
+            .ok_or(ff::Error::StreamNotFound)?
+            .parameters();
+        self.slot = None;
+        self.decoder = ff::codec::context::Context::from_parameters(params)?
+            .decoder()
+            .video()?;
+        self.scaler = None;
+        let at = if self.last_t.is_finite() {
+            self.last_t
+        } else {
+            0.0
+        };
+        self.publish_status();
+        self.seek(at)
     }
 
     /// Converts a decoded frame to RGBA.
@@ -640,13 +728,45 @@ impl Scrubber {
             };
         }
         let mut decoded = ff::frame::Video::empty();
+        let mut sw = ff::frame::Video::empty();
         loop {
-            if self.decoder.receive_frame(&mut decoded).is_ok() {
-                let t = decoded
+            let got = self.decoder.receive_frame(&mut decoded);
+            if let Err(e) = &got
+                && self.is_hw()
+                && !matches!(
+                    e,
+                    ff::Error::Eof
+                        | ff::Error::Other {
+                            errno: ff::util::error::EAGAIN
+                        }
+                )
+            {
+                let why = e.to_string();
+                if self.fall_back_to_software(&why).is_err() {
+                    return None;
+                }
+                continue;
+            }
+            if got.is_ok() {
+                let from_gpu = hw::is_hw_frame(&decoded);
+                if from_gpu {
+                    if let Err(e) = hw::download(&decoded, &mut sw) {
+                        if self.fall_back_to_software(&e.to_string()).is_err() {
+                            return None;
+                        }
+                        continue;
+                    }
+                } else if self.is_hw() {
+                    // This stream (profile, bit depth) is not supported on the GPU.
+                    self.slot = None;
+                    self.publish_status();
+                }
+                let src = if from_gpu { &sw } else { &decoded };
+                let t = src
                     .timestamp()
                     .map(|p| p as f64 * self.tb)
                     .unwrap_or(self.count as f64 / self.fps);
-                match self.convert(&decoded) {
+                match self.convert(src) {
                     Ok(frame) => {
                         self.last_t = t;
                         self.last = Some(frame.clone());
@@ -668,7 +788,20 @@ impl Scrubber {
                     if pkt.stream() == self.stream_idx
                         && let Err(e) = self.decoder.send_packet(&pkt)
                     {
-                        eprintln!("vjc-media: packet skipped: {e}");
+                        if self.is_hw()
+                            && !matches!(
+                                e,
+                                ff::Error::Other {
+                                    errno: ff::util::error::EAGAIN
+                                }
+                            )
+                        {
+                            if self.fall_back_to_software(&e.to_string()).is_err() {
+                                return None;
+                            }
+                        } else {
+                            eprintln!("vjc-media: packet skipped: {e}");
+                        }
                     }
                 }
                 Err(e) => {
@@ -904,8 +1037,10 @@ struct Cache {
     _res: Reservation,
 }
 
-fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
-    let mut sc = Scrubber::open_player(path)?;
+fn run_scrub(path: &Path, shared: &Shared, hw: Hw) -> Result<(), ff::Error> {
+    let mut sc = Scrubber::open_player(path, hw)?;
+    sc.status = Some(shared.hw.clone());
+    sc.publish_status();
     let mut seq = 0u64;
     let publish = |f: &Frame, seq: &mut u64| {
         *seq += 1;

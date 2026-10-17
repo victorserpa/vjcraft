@@ -1888,6 +1888,14 @@ fn new_layer(n: usize) -> Layer {
 }
 
 /// New project: default grid plus the user's composition and shortcut prefs.
+/// Pushes the Video > Hardware decoding prefs to the decoders (clips opened afterwards).
+fn apply_hw_decode(prefs: &Prefs) {
+    vjc_media::configure_hw_decode(
+        prefs.video.hw_decode == vjc_io::prefs::HwDecode::Auto,
+        prefs.video.hw_sessions as usize,
+    );
+}
+
 fn fresh_project(prefs: &Prefs) -> Project {
     let mut project = Project::new("Untitled");
     let c = &mut project.composition;
@@ -1933,6 +1941,7 @@ impl State {
     }
 
     fn build(prefs: Prefs, live: bool) -> Self {
+        apply_hw_decode(&prefs);
         let project = fresh_project(&prefs);
         State {
             tex_cap: 16384,
@@ -10081,14 +10090,29 @@ impl State {
         };
         match &k.source {
             vjc_model::Source::File { path } => {
+                let status = self
+                    .dest_of(Some(deck), layer, column)
+                    .and_then(|dest| self.players.get(&dest))
+                    .and_then(|(_, _, p)| p.decode_status());
                 let info = self.src_info.get(path);
                 if info.is_none() {
                     // The probe runs on a thread; look again shortly.
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(100));
                 }
-                let line = source_info::describe(path, info);
-                ui.label(line).on_hover_text(path.display().to_string());
+                let mut line = source_info::describe(path, info);
+                if let Some(st) = status {
+                    line = format!("{line} · {st}");
+                }
+                ui.label(line).on_hover_text(format!(
+                    "{}\nDecoder: {}",
+                    path.display(),
+                    match status {
+                        Some("hw") => "hardware",
+                        Some(_) => "software",
+                        None => "not started",
+                    }
+                ));
             }
             vjc_model::Source::Sequence { pattern, fps } => {
                 ui.label(format!("Image sequence: {}", pattern.display()));

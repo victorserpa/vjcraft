@@ -194,7 +194,7 @@ fn built_ffmpeg_writes_hap_variants_the_native_path_reads_like_ffmpeg() {
         let out = d.join(format!("{name}.mov"));
         convert(&bin, &raw, &out, name);
         assert!(hap_probe(&out), "{name}: native path rejects the file");
-        let mut sc = Scrubber::open_with(&out, true).unwrap();
+        let mut sc = Scrubber::open_with_hw(&out, true, Hw::Off).unwrap();
         let mut n = 0;
         let mut first = None;
         while let Some((_, f)) = sc.next() {
