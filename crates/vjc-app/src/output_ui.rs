@@ -350,6 +350,7 @@ impl State {
         self.sel_pt_out = None;
         self.sel_mask_pt = None;
         self.edit_mask = false;
+        self.poly = Default::default();
     }
 
     /// Cancel: the live project gets its screens back and the working copy is dropped.

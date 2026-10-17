@@ -46,6 +46,9 @@ pub fn new_slice(w: u32, h: u32) -> Slice {
         mask_invert: false,
         is_key: false,
         black_bg: false,
+        shape: Default::default(),
+        mesh_mode: Default::default(),
+        mesh_tangents: vec![],
     }
 }
 
@@ -79,6 +82,7 @@ pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
         color: Default::default(),
         delay_ms: 0,
         additive_overlap: false,
+        output_mask: None,
     }
 }
 
@@ -274,6 +278,23 @@ pub fn slice_vertices(w: u32, h: u32, s: &Slice) -> Vec<Vertex> {
 
 /// Like `slice_vertices` plus the slice-surface coordinate `(s, t)` in 0..1 (for soft edge).
 pub fn slice_vertices_st(w: u32, h: u32, s: &Slice) -> Vec<[f32; 6]> {
+    if s.mesh_mode == vjc_model::MeshMode::Bezier && mesh_valid(&s.output_mesh, s.mesh_cols) {
+        // Dense grid on the Bezier surface; the input quad is interpolated by index, so the
+        // tessellated slice maps the same region.
+        let (mesh, cols) = crate::slice_adv::tessellate_bezier(
+            &s.output_mesh,
+            s.mesh_cols,
+            &s.mesh_tangents,
+            BEZIER_SUBDIV,
+        );
+        let dense = Slice {
+            output_mesh: mesh,
+            mesh_cols: cols,
+            mesh_mode: vjc_model::MeshMode::Linear,
+            ..s.clone()
+        };
+        return slice_vertices_st(w, h, &dense);
+    }
     let cols = s.mesh_cols;
     if !mesh_valid(&s.output_mesh, cols) {
         return vec![];
@@ -301,8 +322,11 @@ pub fn slice_vertices_st(w: u32, h: u32, s: &Slice) -> Vec<[f32; 6]> {
     out
 }
 
-/// Most points a slice mask may have (the shader holds them in a fixed uniform array).
-pub const MAX_MASK_POINTS: usize = 32;
+/// Most points a slice mask may have (the shader holds them in a fixed uniform array);
+/// the same cap as polygon slices and output masks.
+pub const MAX_MASK_POINTS: usize = crate::slice_adv::MAX_POLY_POINTS;
+/// Steps per mesh cell when a Bezier mesh is tessellated for drawing.
+pub const BEZIER_SUBDIV: u32 = 8;
 pub const MAX_SOFT_WIDTH: f32 = 0.5;
 pub const GAMMA_RANGE: (f32, f32) = (0.1, 5.0);
 

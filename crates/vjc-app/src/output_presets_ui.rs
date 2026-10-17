@@ -73,6 +73,7 @@ impl State {
             self.sel_pt_out = None;
             self.sel_mask_pt = None;
             self.edit_mask = false;
+            self.poly = Default::default();
             self.closed_screens.clear();
             self.test_cards.clear();
             let n = warnings.len();

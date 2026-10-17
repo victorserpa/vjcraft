@@ -88,7 +88,7 @@ impl View {
 
 /// Outline of a slice in content pixels: the edge of the warp mesh (Output) or the input
 /// polygon (Input).
-fn outline(sl: &Slice, side: Side, comp: (u32, u32)) -> Vec<(f32, f32)> {
+fn outline(sl: &Slice, side: Side, comp: (u32, u32), screen: (u32, u32)) -> Vec<(f32, f32)> {
     match side {
         Side::Input => {
             let (cw, ch) = (comp.0.max(1) as f32, comp.1.max(1) as f32);
@@ -98,6 +98,12 @@ fn outline(sl: &Slice, side: Side, comp: (u32, u32)) -> Vec<(f32, f32)> {
                 .collect()
         }
         Side::Output => {
+            if let vjc_model::SliceShape::Polygon(poly) = &sl.shape
+                && poly.len() >= 3
+            {
+                let (w, h) = (screen.0 as f32, screen.1 as f32);
+                return poly.iter().map(|p| (p.0 * w, p.1 * h)).collect();
+            }
             let cols = sl.mesh_cols.max(2) as usize;
             let m = &sl.output_mesh;
             if !mapping::mesh_valid(m, sl.mesh_cols) {
@@ -603,7 +609,7 @@ impl State {
             .collect();
         let vis = ui.visuals().clone();
         for (i, sl) in scr.slices.iter().enumerate() {
-            let poly = outline(sl, side, comp);
+            let poly = outline(sl, side, comp, (scr.width, scr.height));
             if poly.len() < 3 {
                 continue;
             }
@@ -665,8 +671,8 @@ impl State {
             p.galley(at, galley, TEXT);
         }
         // Primary slice: its rectangle and handles.
-        let sel_rect =
-            prim.and_then(|sl| slice_geom::bbox(&slice_geom::side_points(sl, side, comp)));
+        let dims = (scr.width, scr.height);
+        let sel_rect = prim.and_then(|sl| slice_geom::handle_rect(sl, side, comp, dims));
         let hit_handle = |at: egui::Pos2| {
             let r = sel_rect?;
             handle_pts(r)
@@ -679,7 +685,7 @@ impl State {
         };
         let slice_at = |at: egui::Pos2| {
             let u = view.unit(at);
-            let hit = |s: &&Slice| inside(&outline(s, side, comp), u);
+            let hit = |s: &&Slice| inside(&outline(s, side, comp, (scr.width, scr.height)), u);
             scr.slices
                 .iter()
                 .filter(|s| sel_ids.contains(&s.id))
@@ -689,8 +695,18 @@ impl State {
         };
         let mut dragged_body: Option<Command> = None;
         let points_mode = mode == OutMode::Points;
+        let out_tab = tab == OutTab::Output;
+        let drawing = out_tab && self.poly.draw.is_some();
+        let outline_edit = out_tab
+            && !drawing
+            && self.poly.edit_outline
+            && prim.is_some_and(|s| matches!(s.shape, vjc_model::SliceShape::Polygon(_)));
+        let omask_edit = out_tab && !drawing && self.poly.edit_omask && scr.output_mask.is_some();
+        let poly_busy = drawing || outline_edit || omask_edit;
         let mask_edit =
-            self.edit_mask && tab == OutTab::Output && prim.is_some_and(|s| s.mask.is_some());
+            !poly_busy && self.edit_mask && out_tab && prim.is_some_and(|s| s.mask.is_some());
+        // Every mode that owns the pointer on the canvas.
+        let locked = mask_edit || poly_busy;
         if hand {
             ui.ctx().set_cursor_icon(if resp.dragged() {
                 egui::CursorIcon::Grabbing
@@ -713,7 +729,7 @@ impl State {
                 if hand || resp.drag_started_by(egui::PointerButton::Middle) {
                     return Some(Grab::Pan);
                 }
-                if points_mode || mask_edit {
+                if points_mode || locked {
                     return None;
                 }
                 if let (Some(h), Some(r)) = (hit_handle(at), sel_rect) {
@@ -733,7 +749,7 @@ impl State {
                     }
                     let sl = scr.slices.iter().find(|s| s.id == id)?;
                     let start = if prim.is_some_and(|p| p.id == id) || !sel_ids.contains(&id) {
-                        slice_geom::bbox(&slice_geom::side_points(sl, side, comp))?
+                        slice_geom::handle_rect(sl, side, comp, dims)?
                     } else {
                         sel_rect?
                     };
@@ -778,7 +794,8 @@ impl State {
                         q = (mapping::snap(q.0, step.0), mapping::snap(q.1, step.1));
                         let r = resized(start, handle, q, mods.shift);
                         let pts = slice_geom::side_points(sl, side, comp);
-                        let new = slice_geom::fit_to_rect(&pts, r);
+                        let from = slice_geom::handle_rect(sl, side, comp, dims).unwrap_or(start);
+                        let new = slice_geom::fit_from(&pts, from, r);
                         if new != pts {
                             dragged_body = Some(set_pts(scr, sl, side, comp, new));
                         }
@@ -838,7 +855,8 @@ impl State {
         ui.data_mut(|d| d.insert_temp::<Option<Grab>>(gid, grab));
         // Handles of the primary slice (Transform) or its points (Edit points).
         if let (Some(sl), false) = (prim, hand) {
-            if mask_edit {
+            if poly_busy {
+            } else if mask_edit {
                 if let Some(m) = &sl.mask {
                     self.mask_canvas(ui, &resp, (scr, sl), m, view.rect, canvas, cmds);
                 }
@@ -846,6 +864,9 @@ impl State {
                 if let Some(c) = self.points_canvas(ui, &resp, (scr, sl), side, comp, view, canvas)
                 {
                     dragged_body = dragged_body.or(Some(c));
+                }
+                if side == Side::Output {
+                    self.bezier_handles(ui, (scr, sl), (view.rect, view.scale), canvas, cmds);
                 }
             } else if let Some(r) = sel_rect {
                 let v = &vis;
@@ -860,13 +881,59 @@ impl State {
                 }
             }
         }
+        if drawing {
+            self.draw_canvas(ui, &resp, scr, (view.rect, canvas), cmds);
+        } else if outline_edit && let Some(sl) = prim {
+            if let vjc_model::SliceShape::Polygon(poly) = &sl.shape {
+                let mut sel = self.poly.sel;
+                let (sid, slid) = (scr.id, sl.id);
+                let set = move |pts: Vec<(f32, f32)>| Command::SetSliceShape {
+                    screen: sid,
+                    slice: slid,
+                    shape: vjc_model::SliceShape::Polygon(pts),
+                };
+                self.poly_canvas(
+                    ui,
+                    &resp,
+                    (egui::Id::new(("slice-shape", sl.id)), space),
+                    poly,
+                    (view.rect, canvas),
+                    &mut sel,
+                    &set,
+                    cmds,
+                );
+                self.poly.sel = sel;
+            }
+        } else if omask_edit && let Some(m) = &scr.output_mask {
+            let mut sel = self.poly.sel_omask;
+            let (sid, pen) = (scr.id, matches!(m, vjc_model::Mask::Path(_)));
+            let set = move |pts: Vec<(f32, f32)>| Command::SetScreenMask {
+                screen: sid,
+                mask: Some(if pen {
+                    vjc_model::Mask::Path(pts)
+                } else {
+                    vjc_model::Mask::Polygon(pts)
+                }),
+            };
+            self.poly_canvas(
+                ui,
+                &resp,
+                (egui::Id::new(("screen-mask", scr.id)), space),
+                m.points(),
+                (view.rect, canvas),
+                &mut sel,
+                &set,
+                cmds,
+            );
+            self.poly.sel_omask = sel;
+        }
         if let Some(c) = dragged_body {
             cmds.push(c);
         }
         // Clicks: select the slice under the pointer, or nothing.
         if resp.clicked()
             && !hand
-            && !mask_edit
+            && !locked
             && let Some(at) = resp.interact_pointer_pos()
         {
             let on_point = points_mode && (self.sel_pt_in.is_some() || self.sel_pt_out.is_some());
@@ -890,7 +957,7 @@ impl State {
         // Arrow keys move the selection one pixel (ten with Shift) while the pointer is over
         // the canvas and no single point is chosen.
         if !hand
-            && !mask_edit
+            && !locked
             && let Some(sl) = prim
             && (!points_mode || (self.sel_pt_in.is_none() && self.sel_pt_out.is_none()))
             && let Some(by) = arrow_move(ui, canvas)
@@ -1107,64 +1174,24 @@ impl State {
         clip: egui::Rect,
         cmds: &mut Vec<Command>,
     ) {
-        let _ = scr;
-        let px = |q: (f32, f32)| {
-            egui::pos2(
-                rect.min.x + q.0 * rect.width(),
-                rect.min.y + q.1 * rect.height(),
-            )
-        };
-        let col = ui.visuals().selection.stroke.color;
-        let pts: Vec<egui::Pos2> = m.iter().map(|q| px(*q)).collect();
-        ui.painter_at(clip).add(egui::Shape::closed_line(
-            pts,
-            egui::Stroke::new(STROKE_CANVAS, col),
-        ));
-        let id = egui::Id::new(("slice-mask", sl.id));
-        // The selection may come from another slice's mask: drop it if out of range.
-        let mut sel = self.sel_mask_pt.filter(|&i| i < m.len());
-        let moved = handles(
-            ui,
-            resp,
-            id,
-            (rect, (1.0, 1.0)),
-            m,
-            &mut sel,
-            Opts {
-                snap: (0.0, 0.0),
-                keys: true,
-                body: None,
-                clip,
-            },
-        )
-        .moved;
-        let set = |mask: Vec<(f32, f32)>| Command::SetSliceMask {
-            screen: scr.id,
-            slice: sl.id,
+        let (sid, slid) = (scr.id, sl.id);
+        let set = move |mask: Vec<(f32, f32)>| Command::SetSliceMask {
+            screen: sid,
+            slice: slid,
             mask: Some(mask),
         };
-        if let Some((i, q)) = moved.filter(|&(i, _)| i < m.len()) {
-            let mut mask = m.to_vec();
-            mask[i] = q;
-            cmds.push(set(mask));
-        } else if let Some(at) = ui.input(|i| {
-            (i.pointer.primary_clicked() && resp.hovered())
-                .then(|| i.pointer.interact_pos())
-                .flatten()
-        }) {
-            let q = (
-                (at.x - rect.min.x) / rect.width(),
-                (at.y - rect.min.y) / rect.height(),
-            );
-            let radius = HANDLE_R * HANDLE_GRAB_K / rect.width();
-            if mapping::hit_test(m, q, radius).is_none() && m.len() < mapping::MAX_MASK_POINTS {
-                let i = mapping::nearest_edge_insert(m, q);
-                let mut mask = m.to_vec();
-                mask.insert(i, q);
-                sel = Some(i);
-                cmds.push(set(mask));
-            }
-        }
+        let mut sel = self.sel_mask_pt;
+        let size = (scr.width.max(1) as f32, scr.height.max(1) as f32);
+        self.poly_canvas(
+            ui,
+            resp,
+            (egui::Id::new(("slice-mask", sl.id)), size),
+            m,
+            (rect, clip),
+            &mut sel,
+            &set,
+            cmds,
+        );
         self.sel_mask_pt = sel;
     }
 
