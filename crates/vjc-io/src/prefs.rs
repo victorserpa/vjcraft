@@ -1134,6 +1134,20 @@ mod tests {
         let back: Video = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
         assert_eq!(back.max_fps, 30);
     }
+
+    #[test]
+    fn hw_decode_defaults_to_auto_with_eight_sessions() {
+        let v: Video = serde_json::from_str("{}").unwrap();
+        assert_eq!(v.hw_decode, HwDecode::Auto);
+        assert_eq!(v.hw_sessions, 8);
+        let v = Video {
+            hw_decode: HwDecode::Off,
+            hw_sessions: 3,
+            ..Video::default()
+        };
+        let back: Video = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!((back.hw_decode, back.hw_sessions), (HwDecode::Off, 3));
+    }
 }
 
 #[cfg(test)]
