@@ -349,3 +349,29 @@ fn shape_mode_and_mask_commands_are_one_undo_step_and_validate() {
     };
     assert!(h.exec(&mut p, wrong, now).is_err());
 }
+
+#[test]
+fn preset_slices_carry_their_outline_and_drawn_polygons_validate() {
+    use crate::slice_adv::{polygon_slice, preset_slice};
+    let (w, h) = (1920, 1080);
+    let rect = preset_slice(w, h, ShapePreset::Rect);
+    assert_eq!(rect.shape, SliceShape::Rect);
+    for (preset, n) in [
+        (ShapePreset::Triangle, 3),
+        (ShapePreset::Hexagon, 6),
+        (ShapePreset::Circle, 32),
+    ] {
+        let s = preset_slice(w, h, preset);
+        let SliceShape::Polygon(p) = &s.shape else {
+            panic!("{preset:?}");
+        };
+        assert_eq!(p.len(), n);
+        assert!(p.iter().all(|q| (0.0..=1.0).contains(&q.0) && (0.0..=1.0).contains(&q.1)));
+        assert!(mapping::mesh_valid(&s.output_mesh, s.mesh_cols));
+    }
+    let tri = [(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)];
+    assert!(polygon_slice(w, h, &tri).is_some());
+    assert!(polygon_slice(w, h, &tri[..2]).is_none());
+    let many: Vec<Pt> = (0..64).map(|i| (i as f32 / 64.0, 0.5)).collect();
+    assert!(polygon_slice(w, h, &many).is_none(), "over the 63 cap");
+}

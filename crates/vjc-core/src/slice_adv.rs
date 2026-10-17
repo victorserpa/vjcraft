@@ -152,6 +152,46 @@ pub fn preset_polygon(preset: ShapePreset, r: Rect) -> Vec<Pt> {
     }
 }
 
+/// Margin kept around a preset slice, as a fraction of the screen.
+pub const PRESET_INSET: f32 = 0.1;
+
+/// A slice on a `w` x `h` screen shaped like `preset` (the rectangle preset is a plain
+/// slice). The warp mesh is the whole screen; the outline is a normalized polygon inset by
+/// `PRESET_INSET`.
+pub fn preset_slice(w: u32, h: u32, preset: ShapePreset) -> vjc_model::Slice {
+    let mut s = crate::mapping::new_slice(w, h);
+    if preset != ShapePreset::Rect {
+        let r = Rect {
+            x: PRESET_INSET,
+            y: PRESET_INSET,
+            w: 1.0 - 2.0 * PRESET_INSET,
+            h: 1.0 - 2.0 * PRESET_INSET,
+        };
+        s.shape = vjc_model::SliceShape::Polygon(preset_polygon(preset, r));
+        s.name = preset_name(preset).into();
+    }
+    s
+}
+
+/// Slice for a drawn polygon (normalized points, 3..=`MAX_POLY_POINTS`); `None` when invalid.
+pub fn polygon_slice(w: u32, h: u32, pts: &[Pt]) -> Option<vjc_model::Slice> {
+    let pts = clamp_poly(pts).ok()?;
+    let mut s = crate::mapping::new_slice(w, h);
+    s.shape = vjc_model::SliceShape::Polygon(pts);
+    s.name = "Polygon".into();
+    Some(s)
+}
+
+/// Name a preset slice starts with.
+pub fn preset_name(preset: ShapePreset) -> &'static str {
+    match preset {
+        ShapePreset::Rect => "Rectangle",
+        ShapePreset::Circle => "Circle",
+        ShapePreset::Triangle => "Triangle",
+        ShapePreset::Hexagon => "Hexagon",
+    }
+}
+
 /// Result of a click while drawing a polygon.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DrawStep {
