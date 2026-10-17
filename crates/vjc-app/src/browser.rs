@@ -1180,6 +1180,7 @@ mod tests {
             height: 1,
             data: Arc::new(vec![0; bytes]),
             seq: 1,
+            hap: None,
         })
     }
 

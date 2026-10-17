@@ -18,6 +18,7 @@ mod frame_stats;
 mod fx;
 mod fx_thumbs;
 mod grid_ui;
+mod hap_gpu;
 mod help;
 mod hold;
 mod icons;
@@ -5045,7 +5046,11 @@ impl State {
             .filter(|(d, c, _)| *d == deck && *c == column)
             .and_then(|(_, _, p)| p.latest_frame());
         let shot = match playing {
-            Some(f) => Some((f.width, f.height, f.data.to_vec())),
+            Some(f) if f.hap.is_none() => Some((f.width, f.height, f.data.to_vec())),
+            Some(_) => frame
+                .wgpu_render_state()
+                .zip(self.comp.as_ref())
+                .and_then(|(rs, comp)| comp.read_rgba(&rs.device, &rs.queue)),
             None => frame
                 .wgpu_render_state()
                 .zip(self.comp.as_ref())
@@ -5221,6 +5226,7 @@ impl State {
                 vjc_core::anim::effective_number(&x.position, &actx)
             });
         let mut draws: Vec<LayerDraw> = vec![];
+        let mut hap_in: HashMap<LayerId, std::sync::Arc<vjc_media::hap::HapFrame>> = HashMap::new();
         // Group of each entry of `draws` (an outgoing transition source shares its layer's).
         let mut draw_groups: Vec<Option<vjc_model::GroupId>> = vec![];
         for (l, f) in &frames {
@@ -5334,6 +5340,9 @@ impl State {
                     &lctx,
                 );
                 draw_groups.push(l.group);
+                if let Some(h) = &of.hap {
+                    hap_in.insert(Uuid::from_u128(l.id.as_u128() ^ OUT_MASK), h.clone());
+                }
                 draws.push(LayerDraw {
                     id: Uuid::from_u128(l.id.as_u128() ^ OUT_MASK),
                     opacity,
@@ -5355,6 +5364,9 @@ impl State {
                 });
             }
             draw_groups.push(l.group);
+            if let Some(h) = f.as_ref().and_then(|f| f.hap.clone()) {
+                hap_in.insert(l.id, h);
+            }
             draws.push(LayerDraw {
                 id: l.id,
                 transition: cross.map(|(_, (k, p), _)| (k.shader_id(), p, false)),
@@ -5427,6 +5439,9 @@ impl State {
             let frame = prev_frame
                 .as_ref()
                 .map(|f| (f.width, f.height, f.data.as_slice(), f.seq));
+            if let Some(h) = prev_frame.as_ref().and_then(|f| f.hap.clone()) {
+                hap_in.insert(compositor::PREVIEW_CLIP_ID, h);
+            }
             if frame.is_some() || generator.is_some() {
                 draw_groups.push(None);
                 draws.push(LayerDraw {
@@ -5499,6 +5514,7 @@ impl State {
             &self.audio_react.detail.wave,
             self.audio_react.playing,
         );
+        comp.hap_in = hap_in;
         comp.render_routed(
             &rs.device,
             &rs.queue,
@@ -11708,6 +11724,8 @@ fn main() -> eframe::Result {
         c.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut d = base(adapter);
             d.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+            // HAP clips upload their blocks as BC textures when the GPU takes them.
+            d.required_features |= adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
             d
         });
     }
@@ -11722,6 +11740,7 @@ fn main() -> eframe::Result {
             wake::install(&cc.egui_ctx);
             let mut s = State::new(prefs);
             if let Some(rs) = &cc.wgpu_render_state {
+                vjc_media::hap::set_gpu_supported(hap_gpu::supported(&rs.device));
                 s.tex_cap = tex_cap_from(rs.adapter.limits().max_texture_dimension_2d);
                 if s.prefs.video.output_10bit {
                     let (_, note) = color_depth::select_output_format(true, &[rs.target_format]);
