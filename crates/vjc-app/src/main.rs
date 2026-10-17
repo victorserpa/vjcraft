@@ -1573,10 +1573,10 @@ fn browser_start(project: Option<&std::path::Path>, g: &vjc_io::prefs::General) 
     if let Some(d) = project.and_then(|p| p.parent()).filter(|d| d.is_dir()) {
         return d.to_path_buf();
     }
-    let home = std::env::var_os("HOME")
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .unwrap_or_default();
-    let movies = home.join("Movies");
+    let movies = home.join(if cfg!(windows) { "Videos" } else { "Movies" });
     if movies.is_dir() { movies } else { home }
 }
 
@@ -1611,19 +1611,38 @@ fn browser_fx() -> &'static [browser::FxEntry] {
     })
 }
 
-fn project_dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("", "", "VJCraft")
+/// Per-user app dir for `os` (a `std::env::consts::OS` name): Windows `%APPDATA%\\VJCraft`,
+/// Linux `$XDG_DATA_HOME/vjcraft` (else `~/.local/share/vjcraft`), macOS
+/// `~/Library/Application Support/VJCraft`. Data and config share it.
+fn platform_data_dir(
+    os: &str,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let get = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    match os {
+        "windows" => Some(get("APPDATA")?.join("VJCraft")),
+        "macos" => Some(get("HOME")?.join("Library/Application Support/VJCraft")),
+        _ => Some(
+            get("XDG_DATA_HOME")
+                .or_else(|| get("HOME").map(|h| h.join(".local/share")))?
+                .join("vjcraft"),
+        ),
+    }
+}
+
+fn app_dir() -> Option<PathBuf> {
+    platform_data_dir(std::env::consts::OS, &|k| std::env::var_os(k))
 }
 
 /// `VJC_DATA_DIR` (dev/testing) replaces the per-user data and config dir.
 fn data_dir_from(over: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match over.filter(|o| !o.is_empty()) {
         Some(o) => Some(PathBuf::from(o)),
-        None => Some(project_dirs()?.data_dir().to_path_buf()),
+        None => app_dir(),
     }
 }
 
-/// Per-user data dir (macOS: ~/Library/Application Support/VJCraft), or `VJC_DATA_DIR`.
+/// Per-user data dir (see `platform_data_dir`), or `VJC_DATA_DIR`.
 fn data_dir() -> Option<PathBuf> {
     data_dir_from(std::env::var_os("VJC_DATA_DIR"))
 }
@@ -1633,13 +1652,9 @@ fn recovery_path() -> Option<PathBuf> {
     Some(data_dir()?.join("recovery.vjc"))
 }
 
-/// Per-user config dir (macOS: ~/Library/Application Support/VJCraft) + prefs.json
+/// Per-user config dir (same as the data dir) + prefs.json
 fn prefs_path() -> Option<PathBuf> {
-    let dir = match std::env::var_os("VJC_DATA_DIR").filter(|o| !o.is_empty()) {
-        Some(o) => PathBuf::from(o),
-        None => project_dirs()?.config_dir().to_path_buf(),
-    };
-    Some(dir.join("prefs.json"))
+    Some(data_dir()?.join("prefs.json"))
 }
 
 /// Removes the recovery file (Don't Save, saved, discarded). Missing file is fine.
@@ -12060,8 +12075,32 @@ fn local_clock() -> String {
     }
 }
 
-/// UTC time of day where the local zone is not read (non-Unix targets).
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn local_clock() -> String {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        dow: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        ms: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(t: *mut SystemTime);
+    }
+    let mut t = SystemTime::default();
+    // SAFETY: GetLocalTime only writes the struct passed to it.
+    unsafe { GetLocalTime(&mut t) };
+    format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)
+}
+
+/// UTC time of day where the local zone is not read (other targets).
+#[cfg(not(any(unix, windows)))]
 fn local_clock() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
