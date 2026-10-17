@@ -843,4 +843,41 @@ mod tests {
         assert!(!part.exists());
         assert!(keep.exists(), "only .part files are deleted");
     }
+
+    fn fake_ffmpeg(path: &Path, tag: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\nif [ \"$2\" = -encoders ]; then echo ' V..... hap {tag}'; fi\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn bundled_ffmpeg_beats_path() {
+        let d = tmp("bundled");
+        let (macos, res) = (d.join("Contents/MacOS"), d.join("Contents/Resources"));
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("vjcraft");
+        // Nothing bundled: falls back to PATH.
+        assert_eq!(resolve_ffmpeg(&exe), PathBuf::from("ffmpeg"));
+        // A fake on PATH-like place does not matter; the bundle wins.
+        fake_ffmpeg(&res.join("ffmpeg"), "bundled");
+        assert_eq!(resolve_ffmpeg(&exe), res.join("ffmpeg"));
+        assert!(ffmpeg_has_hap_at(&resolve_ffmpeg(&exe)));
+        // Next to the exe (dev builds, portable layouts) is found too.
+        let d2 = tmp("beside");
+        fake_ffmpeg(&d2.join("ffmpeg"), "beside");
+        assert_eq!(resolve_ffmpeg(&d2.join("vjcraft")), d2.join("ffmpeg"));
+        // Control: a bundled binary that cannot write HAP is reported as such, not
+        // silently replaced by PATH.
+        let d3 = tmp("nohap");
+        std::fs::create_dir_all(d3.join("Contents/MacOS")).unwrap();
+        let p = d3.join("Contents/Resources/ffmpeg");
+        fake_ffmpeg(&p, "x");
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        assert!(!ffmpeg_has_hap_at(&resolve_ffmpeg(&d3.join("Contents/MacOS/vjcraft"))));
+    }
 }
