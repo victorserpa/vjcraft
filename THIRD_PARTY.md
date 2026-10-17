@@ -52,3 +52,9 @@ Copy of the `epaint` crate from crates.io, used through `[patch.crates-io]`, wit
 in `src/text/fonts.rs` (the galley cache keeps two generations, so an immediate viewport does
 not evict the main UI's text every frame). License: MIT OR Apache-2.0; used under MIT, see
 `vendor/epaint/LICENSE-MIT`. Copyright (c) 2018-2021 Emil Ernerfeldt.
+
+## snap 1.1.2
+
+Pure-Rust Snappy, used to unpack HAP video frames. License: BSD-3-Clause (compatible with
+GPL-3.0-only). No dependencies; its build script only generates lookup tables (no network,
+no downloads). Source: https://crates.io/crates/snap.

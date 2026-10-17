@@ -1571,6 +1571,10 @@ pub struct Compositor {
     /// Opaque black 1x1 texture, its uniform and bind group: draws the master fade.
     fade: (wgpu::Texture, wgpu::Buffer, wgpu::BindGroup),
     slots: HashMap<LayerId, Slot>,
+    /// HAP frames still block-compressed, by layer; set by the caller before each render.
+    /// The matching `LayerDraw.frame` carries the size and seq with an empty pixel slice.
+    pub hap_in: HashMap<LayerId, std::sync::Arc<vjc_media::hap::HapFrame>>,
+    hap: Option<crate::hap_gpu::HapGpu>,
     group: Option<GroupBuf>,
     /// Layers / groups rendered on their own because a slice routes them (only the ones
     /// in use are kept).
@@ -1980,6 +1984,8 @@ impl Compositor {
             blank,
             fade: (fade_tex, fade_buf, fade_bind),
             slots: HashMap::new(),
+            hap_in: HashMap::new(),
+            hap: crate::hap_gpu::HapGpu::new(device),
             group: None,
             routed: HashMap::new(),
             preview: None,
@@ -2624,6 +2630,10 @@ impl Compositor {
             .map(|l| l.id)
             .collect();
         self.slots.retain(|k, _| live.contains(k));
+        if let Some(h) = &mut self.hap {
+            let hap_live: Vec<LayerId> = self.hap_in.keys().copied().collect();
+            h.retain(&hap_live);
+        }
         for l in all_layers {
             let (w, h, data, seq) = match (&l.frame, &l.generator) {
                 (Some((w, h, data, seq)), _) => (*w, *h, Some(*data), *seq),
@@ -2686,7 +2696,15 @@ impl Compositor {
                 );
             }
             let slot = self.slots.get_mut(&l.id).unwrap();
-            if let Some(data) = data
+            if let Some(hf) = self.hap_in.get(&l.id) {
+                if slot.seq != seq
+                    && let Some(g) = &mut self.hap
+                {
+                    g.decode(device, queue, l.id, hf, &slot.view);
+                    slot.seq = seq;
+                }
+            } else if let Some(data) = data
+                && !data.is_empty()
                 && slot.seq != seq
             {
                 queue.write_texture(

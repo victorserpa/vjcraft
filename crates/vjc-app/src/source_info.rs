@@ -142,6 +142,7 @@ mod tests {
             height: h,
             fps,
             duration: 10.0,
+            alpha: false,
         }
     }
 

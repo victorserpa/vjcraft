@@ -23,6 +23,7 @@ pub mod analysis;
 pub mod audio;
 pub mod audio_fx;
 pub mod capture;
+pub mod hap;
 pub mod ltc_in;
 pub mod sequence;
 pub mod snapshot;
@@ -35,6 +36,15 @@ pub struct Frame {
     pub data: Arc<Vec<u8>>,
     /// Monotonic counter, increments per decoded frame (lets the renderer skip re-uploads).
     pub seq: u64,
+    /// HAP frame still block-compressed (`data` is empty then); the GPU decodes it.
+    pub hap: Option<Arc<hap::HapFrame>>,
+}
+
+impl Frame {
+    /// Bytes this frame holds in memory (cache accounting).
+    pub fn bytes(&self) -> usize {
+        self.hap.as_ref().map_or(self.data.len(), |h| h.bytes())
+    }
 }
 
 /// Global budget for fully cached clips, summed over every player.
@@ -266,6 +276,7 @@ impl Player {
                             height,
                             data: Arc::new(data),
                             seq,
+                            hap: None,
                         });
                         true
                     };
@@ -383,8 +394,8 @@ fn run_sequence(pattern: &Path, fps: f32, shared: &Shared) {
                 Some(f) => Some(f.clone()),
                 None => match load_image(&files[i]) {
                     Ok(f) => {
-                        if used + f.data.len() as u64 <= budget {
-                            used += f.data.len() as u64;
+                        if used + f.bytes() as u64 <= budget {
+                            used += f.bytes() as u64;
                             cache[i] = Some(f.clone());
                         }
                         Some(f)
@@ -427,6 +438,7 @@ fn load_image(path: &Path) -> Result<Frame, String> {
         height,
         data: Arc::new(img.into_raw()),
         seq: 1,
+        hap: None,
     })
 }
 
@@ -461,6 +473,7 @@ pub(crate) fn frame_to_rgba(
         height: h,
         data: Arc::new(data),
         seq,
+        hap: None,
     })
 }
 
@@ -476,6 +489,8 @@ pub struct SourceInfo {
     pub fps: f64,
     /// Length of the file in seconds; 0 when unknown.
     pub duration: f64,
+    /// The pixel format carries an alpha channel (or the decoder could not be opened: false).
+    pub alpha: bool,
 }
 
 /// Reads codec, size, frame rate and length of a video file. Blocks on file I/O: call it
@@ -492,10 +507,13 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
     };
     let params = st.parameters();
     let codec = params.id().name().to_string();
-    let (width, height) = ff::codec::context::Context::from_parameters(params)
+    let (width, height, alpha) = ff::codec::context::Context::from_parameters(params)
         .ok()
         .and_then(|c| c.decoder().video().ok())
-        .map_or((0, 0), |d| (d.width(), d.height()));
+        .map_or((0, 0, false), |d| {
+            let comps = d.format().descriptor().map_or(0, |x| x.nb_components());
+            (d.width(), d.height(), comps == 2 || comps == 4)
+        });
     let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
     Some(SourceInfo {
         codec,
@@ -503,7 +521,36 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
         height,
         fps,
         duration,
+        alpha,
     })
+}
+
+/// True when the first video packet of `path` is a HAP frame this module can parse.
+fn hap_probe(path: &Path) -> bool {
+    let Ok(mut ictx) = ff::format::input(&path) else {
+        return false;
+    };
+    let Some(st) = ictx.streams().best(ff::media::Type::Video) else {
+        return false;
+    };
+    let (idx, params) = (st.index(), st.parameters());
+    if params.id() != ff::codec::Id::HAP {
+        return false;
+    }
+    let Ok(dec) =
+        ff::codec::context::Context::from_parameters(params).and_then(|c| c.decoder().video())
+    else {
+        return false;
+    };
+    let mut pkt = ff::Packet::empty();
+    while pkt.read(&mut ictx).is_ok() {
+        if pkt.stream() == idx
+            && let Some(d) = pkt.data()
+        {
+            return hap::parse(d, dec.width(), dec.height()).is_ok();
+        }
+    }
+    false
 }
 
 /// Sequential decoder with seek, no pacing. Frames come out with their pts in seconds.
@@ -522,10 +569,23 @@ struct Scrubber {
     /// pts of the last frame handed out (NaN if none) and a copy of it.
     last_t: f64,
     last: Option<Frame>,
+    /// HAP packets go to the GPU undecoded (the decoder is never fed).
+    hap: bool,
 }
 
 impl Scrubber {
+    /// CPU path: every codec decodes to RGBA through FFmpeg.
     fn open(path: &Path) -> Result<Scrubber, ff::Error> {
+        Self::open_with(path, false)
+    }
+
+    /// Player path: HAP stays block-compressed when the GPU can take it.
+    fn open_player(path: &Path) -> Result<Scrubber, ff::Error> {
+        let hap = hap::gpu_supported() && hap_probe(path);
+        Self::open_with(path, hap)
+    }
+
+    fn open_with(path: &Path, hap: bool) -> Result<Scrubber, ff::Error> {
         ff::init()?;
         let ictx = ff::format::input(&path)?;
         let (stream_idx, tb, fps, params) = {
@@ -558,6 +618,7 @@ impl Scrubber {
             bytes_in: 0,
             last_t: f64::NAN,
             last: None,
+            hap,
         })
     }
 
@@ -570,6 +631,14 @@ impl Scrubber {
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
     /// frame skip it with a warning; they never end the stream.
     fn next(&mut self) -> Option<(f64, Frame)> {
+        if self.hap {
+            return loop {
+                let (t, pkt) = self.next_packet()?;
+                if let Some(f) = self.hap_frame(t, &pkt) {
+                    break Some((t, f));
+                }
+            };
+        }
         let mut decoded = ff::frame::Video::empty();
         loop {
             if self.decoder.receive_frame(&mut decoded).is_ok() {
@@ -613,6 +682,58 @@ impl Scrubber {
         }
     }
 
+    /// Next video packet of a HAP stream with its time, without touching the pixels.
+    fn next_packet(&mut self) -> Option<(f64, Vec<u8>)> {
+        loop {
+            if self.eof {
+                return None;
+            }
+            let mut pkt = ff::Packet::empty();
+            match pkt.read(&mut self.ictx) {
+                Ok(()) => {
+                    self.bytes_in += pkt.size() as u64;
+                    if pkt.stream() != self.stream_idx {
+                        continue;
+                    }
+                    let (Some(d), pts) = (pkt.data(), pkt.pts().or(pkt.dts())) else {
+                        continue;
+                    };
+                    self.count += 1;
+                    let t = pts.map_or(self.count as f64 / self.fps, |p| p as f64 * self.tb);
+                    return Some((t, d.to_vec()));
+                }
+                Err(e) => {
+                    if !matches!(e, ff::Error::Eof) {
+                        eprintln!("vjc-media: read error, treating as end of file: {e}");
+                    }
+                    self.eof = true;
+                }
+            }
+        }
+    }
+
+    /// Parses a HAP packet into a frame (snappy only; the GPU does the rest).
+    fn hap_frame(&mut self, t: f64, pkt: &[u8]) -> Option<Frame> {
+        match hap::parse(pkt, self.decoder.width(), self.decoder.height()) {
+            Ok(h) => {
+                let f = Frame {
+                    width: h.width,
+                    height: h.height,
+                    data: Arc::new(Vec::new()),
+                    seq: self.count,
+                    hap: Some(Arc::new(h)),
+                };
+                self.last_t = t;
+                self.last = Some(f.clone());
+                Some(f)
+            }
+            Err(e) => {
+                eprintln!("vjc-media: frame at {t:.3}s skipped: {e}");
+                None
+            }
+        }
+    }
+
     fn seek(&mut self, t: f64) -> Result<(), ff::Error> {
         let ts = (t.max(0.0) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
         self.ictx.seek(ts, ..ts)?;
@@ -636,6 +757,16 @@ impl Scrubber {
             }
         } else {
             self.seek(target)?;
+        }
+        if self.hap {
+            while let Some((t, pkt)) = self.next_packet() {
+                if t + half >= target
+                    && let Some(f) = self.hap_frame(t, &pkt)
+                {
+                    return Ok(Some(f));
+                }
+            }
+            return Ok(self.last.clone());
         }
         loop {
             match self.next() {
@@ -688,7 +819,7 @@ fn learn_duration(
     file_size: u64,
 ) -> Option<Learned> {
     let t0 = Instant::now();
-    let mut bytes = first.data.len() as u64;
+    let mut bytes = first.bytes() as u64;
     let mut frames = vec![(start, first)];
     let mut capped = false;
     loop {
@@ -701,7 +832,7 @@ fn learn_duration(
         }
         match sc.next() {
             Some(x) => {
-                bytes += x.1.data.len() as u64;
+                bytes += x.1.bytes() as u64;
                 frames.push(x);
             }
             None => break,
@@ -774,7 +905,7 @@ struct Cache {
 }
 
 fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
-    let mut sc = Scrubber::open(path)?;
+    let mut sc = Scrubber::open_player(path)?;
     let mut seq = 0u64;
     let publish = |f: &Frame, seq: &mut u64| {
         *seq += 1;
@@ -788,7 +919,7 @@ fn run_scrub(path: &Path, shared: &Shared) -> Result<(), ff::Error> {
         return Err(ff::Error::StreamNotFound);
     };
     publish(&first, &mut seq);
-    let frame_bytes = first.data.len() as u64;
+    let frame_bytes = first.bytes() as u64;
     let mut cache: Option<Cache> = None;
     // Unknown duration: decode once to learn it (bounded), then it is always cached.
     // Long clips publish an estimate after LEARN_LIMIT and refine it on a side thread.
@@ -978,6 +1109,7 @@ fn downscale(f: &Frame, max_side: u32) -> Frame {
         height: h,
         data: Arc::new(out),
         seq: 1,
+        hap: None,
     }
 }
 
@@ -1051,6 +1183,7 @@ mod tests {
                     height: 1,
                     data: Arc::new(vec![0; 4]),
                     seq: 0,
+                    hap: None,
                 };
                 (*t, f)
             })

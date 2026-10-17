@@ -700,6 +700,7 @@ fn file_clip(h: &mut Harness<'_, State>) -> (LayerId, DeckId) {
             height: 1080,
             fps: 25.0,
             duration: 10.0,
+            alpha: false,
         }),
     );
     st.selected = Some((lid, 0));
