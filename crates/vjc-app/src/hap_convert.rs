@@ -73,6 +73,15 @@ pub fn free_space(path: &Path) -> Option<Space> {
     while !p.exists() {
         p = p.parent()?;
     }
+    // GetDiskFreeSpaceExW wants a directory: for a file use its parent.
+    if cfg!(windows) && p.is_file() {
+        p = p.parent()?;
+    }
+    volume_space(p)
+}
+
+#[cfg(unix)]
+fn volume_space(p: &Path) -> Option<Space> {
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a valid NUL-terminated path and `st` a properly sized out struct.
@@ -84,6 +93,33 @@ pub fn free_space(path: &Path) -> Option<Space> {
         free: (st.f_bavail as u64).saturating_mul(frag),
         total: (st.f_blocks as u64).saturating_mul(frag),
     })
+}
+
+#[cfg(windows)]
+fn volume_space(p: &Path) -> Option<Space> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            avail: *mut u64,
+            total: *mut u64,
+            free: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is NUL-terminated and the three out pointers are valid u64s.
+    if unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) } == 0 {
+        return None;
+    }
+    // `avail` honours the per-user quota, like f_bavail.
+    Some(Space { free: avail, total })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_space(_: &Path) -> Option<Space> {
+    None
 }
 
 /// Free space a conversion must leave: the pref in GB, else max(10 GB, 10% of the volume).
@@ -842,5 +878,24 @@ mod tests {
         assert_eq!(reg.clean_stale(), 1);
         assert!(!part.exists());
         assert!(keep.exists(), "only .part files are deleted");
+    }
+
+    #[test]
+    fn free_space_reads_the_volume_of_an_existing_or_missing_path() {
+        let d = tmp("space");
+        let a = free_space(&d).expect("temp volume");
+        assert!(a.total > 0 && a.free <= a.total);
+        let b = free_space(&d.join("not").join("yet")).expect("walks up to the parent");
+        assert_eq!(a.total, b.total);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn free_space_of_a_file_uses_its_parent() {
+        let d = tmp("space_file");
+        let f = d.join("a.bin");
+        std::fs::write(&f, b"x").unwrap();
+        let a = free_space(&f).expect("file volume");
+        assert_eq!(a.total, free_space(&d).unwrap().total);
     }
 }

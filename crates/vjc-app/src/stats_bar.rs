@@ -39,8 +39,36 @@ pub fn process_cpu_secs() -> f64 {
     t(ru.ru_utime) + t(ru.ru_stime)
 }
 
-/// Not measured on this platform yet: the bar shows 0% CPU.
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn process_cpu_secs() -> f64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        lo: u32,
+        hi: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            h: isize,
+            c: *mut FileTime,
+            e: *mut FileTime,
+            k: *mut FileTime,
+            u: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut c, mut e, mut k, mut u) = Default::default();
+    // SAFETY: the pseudo-handle is always valid and the four out structs are writable.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) } == 0 {
+        return 0.0;
+    }
+    let secs = |t: &FileTime| ((u64::from(t.hi) << 32) | u64::from(t.lo)) as f64 * 1e-7;
+    secs(&k) + secs(&u)
+}
+
+/// Not measured on this platform: the bar shows 0% CPU.
+#[cfg(not(any(unix, windows)))]
 pub fn process_cpu_secs() -> f64 {
     0.0
 }

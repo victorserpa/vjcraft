@@ -1573,10 +1573,10 @@ fn browser_start(project: Option<&std::path::Path>, g: &vjc_io::prefs::General) 
     if let Some(d) = project.and_then(|p| p.parent()).filter(|d| d.is_dir()) {
         return d.to_path_buf();
     }
-    let home = std::env::var_os("HOME")
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .unwrap_or_default();
-    let movies = home.join("Movies");
+    let movies = home.join(if cfg!(windows) { "Videos" } else { "Movies" });
     if movies.is_dir() { movies } else { home }
 }
 
@@ -1611,19 +1611,62 @@ fn browser_fx() -> &'static [browser::FxEntry] {
     })
 }
 
-fn project_dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("", "", "VJCraft")
+#[derive(Clone, Copy, PartialEq)]
+enum DirKind {
+    Config,
+    Data,
+}
+
+/// Same locations the `directories` crate gave via `ProjectDirs::from("", "", "VJCraft")`,
+/// computed from an injected env so they are testable. macOS: `~/Library/Application
+/// Support/VJCraft` for both; Linux: `$XDG_CONFIG_HOME|~/.config` / `$XDG_DATA_HOME|
+/// ~/.local/share` + `vjcraft`; Windows: `%APPDATA%\VJCraft\config` and `\data`.
+/// Relative XDG values are ignored, as the spec says.
+fn platform_dir(
+    os: &str,
+    kind: DirKind,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let get = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let abs = |k: &str| get(k).filter(|p| p.is_absolute());
+    match os {
+        "windows" => {
+            let sub = if kind == DirKind::Config {
+                "config"
+            } else {
+                "data"
+            };
+            Some(get("APPDATA")?.join("VJCraft").join(sub))
+        }
+        "macos" => Some(get("HOME")?.join("Library/Application Support/VJCraft")),
+        _ => {
+            let (var, rel) = if kind == DirKind::Config {
+                ("XDG_CONFIG_HOME", ".config")
+            } else {
+                ("XDG_DATA_HOME", ".local/share")
+            };
+            Some(
+                abs(var)
+                    .or_else(|| get("HOME").map(|h| h.join(rel)))?
+                    .join("vjcraft"),
+            )
+        }
+    }
+}
+
+fn app_dir(kind: DirKind) -> Option<PathBuf> {
+    platform_dir(std::env::consts::OS, kind, &|k| std::env::var_os(k))
 }
 
 /// `VJC_DATA_DIR` (dev/testing) replaces the per-user data and config dir.
 fn data_dir_from(over: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match over.filter(|o| !o.is_empty()) {
         Some(o) => Some(PathBuf::from(o)),
-        None => Some(project_dirs()?.data_dir().to_path_buf()),
+        None => app_dir(DirKind::Data),
     }
 }
 
-/// Per-user data dir (macOS: ~/Library/Application Support/VJCraft), or `VJC_DATA_DIR`.
+/// Per-user data dir (see `platform_data_dir`), or `VJC_DATA_DIR`.
 fn data_dir() -> Option<PathBuf> {
     data_dir_from(std::env::var_os("VJC_DATA_DIR"))
 }
@@ -1633,11 +1676,11 @@ fn recovery_path() -> Option<PathBuf> {
     Some(data_dir()?.join("recovery.vjc"))
 }
 
-/// Per-user config dir (macOS: ~/Library/Application Support/VJCraft) + prefs.json
+/// Per-user config dir + prefs.json
 fn prefs_path() -> Option<PathBuf> {
     let dir = match std::env::var_os("VJC_DATA_DIR").filter(|o| !o.is_empty()) {
         Some(o) => PathBuf::from(o),
-        None => project_dirs()?.config_dir().to_path_buf(),
+        None => app_dir(DirKind::Config)?,
     };
     Some(dir.join("prefs.json"))
 }
@@ -12060,8 +12103,34 @@ fn local_clock() -> String {
     }
 }
 
-/// UTC time of day where the local zone is not read (non-Unix targets).
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn local_clock() -> String {
+    // Win32 SYSTEMTIME: the fields we never read still have to exist for the layout.
+    #[allow(dead_code)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        dow: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        ms: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(t: *mut SystemTime);
+    }
+    let mut t = SystemTime::default();
+    // SAFETY: GetLocalTime only writes the struct passed to it.
+    unsafe { GetLocalTime(&mut t) };
+    format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)
+}
+
+/// UTC time of day where the local zone is not read (other targets).
+#[cfg(not(any(unix, windows)))]
 fn local_clock() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12566,5 +12635,66 @@ mod remap_tests {
             !remap_command(&mut gone, &|_| None),
             "removed column drops it"
         );
+    }
+
+    #[test]
+    fn data_dir_per_platform() {
+        use std::ffi::OsString;
+        let env = |k: &str| -> Option<OsString> {
+            match k {
+                "APPDATA" => Some(r"C:\Users\v\AppData\Roaming".into()),
+                "XDG_DATA_HOME" => Some("/x/share".into()),
+                "XDG_CONFIG_HOME" => Some("/x/cfg".into()),
+                "HOME" => Some("/h".into()),
+                _ => None,
+            }
+        };
+        let (c, d) = (DirKind::Config, DirKind::Data);
+        let win = PathBuf::from(r"C:\Users\v\AppData\Roaming").join("VJCraft");
+        assert_eq!(platform_dir("windows", c, &env), Some(win.join("config")));
+        assert_eq!(platform_dir("windows", d, &env), Some(win.join("data")));
+        assert_eq!(
+            platform_dir("linux", c, &env),
+            Some("/x/cfg/vjcraft".into())
+        );
+        assert_eq!(
+            platform_dir("linux", d, &env),
+            Some("/x/share/vjcraft".into())
+        );
+        let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
+        assert_eq!(
+            platform_dir("linux", c, &home),
+            Some("/h/.config/vjcraft".into())
+        );
+        assert_eq!(
+            platform_dir("linux", d, &home),
+            Some("/h/.local/share/vjcraft".into())
+        );
+        let rel = |k: &str| match k {
+            "XDG_DATA_HOME" | "XDG_CONFIG_HOME" => Some(OsString::from("rel/dir")),
+            "HOME" => Some(OsString::from("/h")),
+            _ => None,
+        };
+        assert_eq!(
+            platform_dir("linux", c, &rel),
+            Some("/h/.config/vjcraft".into())
+        );
+        assert_eq!(
+            platform_dir("linux", d, &rel),
+            Some("/h/.local/share/vjcraft".into())
+        );
+        for k in [c, d] {
+            assert_eq!(
+                platform_dir("macos", k, &env),
+                Some("/h/Library/Application Support/VJCraft".into())
+            );
+        }
+    }
+
+    #[test]
+    fn local_clock_has_the_hh_mm_ss_shape() {
+        let c = local_clock();
+        assert_eq!(c.len(), 8, "{c}");
+        assert_eq!(&c[2..3], ":");
     }
 }

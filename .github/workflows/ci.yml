@@ -1,9 +1,9 @@
 name: CI
 
-# Only on main (and by hand): a private repository pays for every runner
-# minute. Linux, not macOS: a macOS minute costs ten Linux minutes, and
-# the macOS-only code is behind cfg(target_os = "macos").
+# The repository is public, so runners on all three OSes are free. GPU tests skip
+# themselves when there is no adapter.
 on:
+  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
@@ -14,23 +14,61 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     env:
       # Without debug info the test binaries link in less memory and time.
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      # Windows FFmpeg: BtbN LGPL (--enable-version3, no GPL, no nonfree) shared build,
+      # pinned by release tag and SHA-256 (verified before unzipping).
+      FFMPEG_TAG: autobuild-2026-10-16-13-04
+      FFMPEG_DIR_NAME: ffmpeg-n9.0.2-28-g669f5ab083-win64-lgpl-shared-9.0
+      FFMPEG_SHA256: 337bccf4f9ed8594255572907d0c3c19e673894713d63d92664d846c4ad183c8
     steps:
       - uses: actions/checkout@v4
-      # ffmpeg comes from the Ubuntu archive (the -dev packages ffmpeg-next links
-      # against), not brew: the version follows the runner image, and apt is retried
-      # because the mirrors fail now and then.
-      - name: Install system dependencies
+      # Linux: ffmpeg comes from the Ubuntu archive (the -dev packages ffmpeg-next links
+      # against); apt is retried because the mirrors fail now and then.
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get -o Acquire::Retries=3 update -qq
           sudo apt-get -o Acquire::Retries=3 install -y -qq pkg-config clang libclang-dev cmake \
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
             libavdevice-dev libswscale-dev libswresample-dev libasound2-dev \
             libudev-dev libxkbcommon-dev libwayland-dev libx11-dev
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+      - name: Cache FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-dl
+          key: ffmpeg-${{ env.FFMPEG_SHA256 }}
+      - name: Download FFmpeg (Windows)
+        if: runner.os == 'Windows' && steps.ffcache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ffmpeg-dl | Out-Null
+          $zip = "ffmpeg-dl/$env:FFMPEG_DIR_NAME.zip"
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/$env:FFMPEG_TAG/$env:FFMPEG_DIR_NAME.zip" -OutFile $zip
+          $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:FFMPEG_SHA256) { throw "FFmpeg checksum mismatch: $got" }
+          Expand-Archive $zip -DestinationPath ffmpeg-dl
+      - name: Point the build at FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $PWD "ffmpeg-dl/$env:FFMPEG_DIR_NAME"
+          "FFMPEG_DIR=$root" >> $env:GITHUB_ENV
+          "$root/bin" >> $env:GITHUB_PATH
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       # Reads rust-toolchain.toml, so CI and local builds use the same compiler.
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install

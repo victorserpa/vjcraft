@@ -163,6 +163,21 @@ impl ChildEnd {
     /// True for a user quit: exit code 0, or a termination request (SIGHUP/SIGINT/SIGTERM,
     /// e.g. Ctrl-C under `cargo run`), or SIGKILL (Force Quit / `kill -9` is intentional).
     pub fn is_clean(self) -> bool {
+        self.is_clean_on(cfg!(windows))
+    }
+
+    /// `is_clean` for a given platform (so both rules are testable everywhere).
+    ///
+    /// Windows has no signals. Force Quit and Task Manager "End task" call
+    /// `TerminateProcess` with exit code 1, and Ctrl-C ends with `STATUS_CONTROL_C_EXIT`
+    /// (0xC000013A): both count as a user stop. Ambiguous: a child that itself exits
+    /// with code 1 looks the same as TerminateProcess, so it is not relaunched either
+    /// (the app never exits with 1 on its own; panics are 101, aborts 0xC0000409).
+    pub fn is_clean_on(self, windows: bool) -> bool {
+        if windows {
+            return matches!(self, ChildEnd::Code(0 | 1))
+                || self == ChildEnd::Code(0xC000_013Au32 as i32);
+        }
         matches!(self, ChildEnd::Code(0) | ChildEnd::Signal(1 | 2 | 9 | 15))
     }
 }
@@ -323,7 +338,14 @@ fn alert(msg: &str) {
             ])
             .status();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        // msg.exe ships with every Windows edition except Home; failure is ignored.
+        let _ = std::process::Command::new("msg")
+            .args(["*", &format!("VJCraft crashed repeatedly: {msg}")])
+            .status();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     let _ = msg;
 }
 
@@ -577,6 +599,21 @@ mod tests {
             assert_eq!((out, n), (Outcome::Quit, 1));
         }
         assert!(!ChildEnd::Code(1).is_clean() && !ChildEnd::Signal(11).is_clean());
+    }
+
+    #[test]
+    fn windows_exit_codes_are_classified() {
+        // Force Quit / Task Manager "End task" = TerminateProcess(1): a user stop.
+        assert!(ChildEnd::Code(1).is_clean_on(true));
+        assert!(ChildEnd::Code(0).is_clean_on(true));
+        // Ctrl-C / console close: STATUS_CONTROL_C_EXIT.
+        assert!(ChildEnd::Code(0xC000013Au32 as i32).is_clean_on(true));
+        // Panic (101) and a fast-fail abort (STATUS_STACK_BUFFER_OVERRUN) are crashes.
+        assert!(!ChildEnd::Code(101).is_clean_on(true));
+        assert!(!ChildEnd::Code(0xC0000409u32 as i32).is_clean_on(true));
+        assert!(!ChildEnd::Code(0xC0000005u32 as i32).is_clean_on(true));
+        // Off Windows, exit code 1 stays a crash.
+        assert!(!ChildEnd::Code(1).is_clean_on(false));
     }
 
     #[test]
