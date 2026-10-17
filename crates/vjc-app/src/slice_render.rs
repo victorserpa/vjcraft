@@ -23,7 +23,8 @@ struct U {
     con: vec4<f32>,             // slice contrast, screen contrast, screen opacity, flags
                                 // flags bit 0 invert mask, bit 1 is key, bit 2 black bg
     sgain: vec4<f32>,           // screen rgb multiplier
-    pts: array<vec4<f32>, 16>,  // two mask points per entry
+    ext: vec4<f32>,             // slice shape point count, output mask point count
+    pts: array<vec4<f32>, 96>,  // two points per entry: mask 0.., shape 32.., output mask 64..
 };
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
@@ -47,25 +48,34 @@ fn contrast(c: vec3<f32>, k: f32) -> vec3<f32> {
     // Exactly 1.0 must not touch the pixel (no float round trip).
     return select(clamp((c - vec3(0.5)) * k + vec3(0.5), vec3(0.0), vec3(1.0)), c, k == 1.0);
 }
+fn inside(off: u32, n: u32, p: vec2<f32>) -> bool {
+    var res = false;
+    var j = n - 1u;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let a = pt(off + i);
+        let b = pt(off + j);
+        if ((a.y > p.y) != (b.y > p.y)
+            && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) {
+            res = !res;
+        }
+        j = i;
+    }
+    return res;
+}
 @fragment
 fn fs(in: VO) -> @location(0) vec4<f32> {
+    let p = in.pos.xy / u.misc.zw;
     let n = u32(u.misc.y);
-    if (n >= 3u) {
-        let p = in.pos.xy / u.misc.zw;
-        var inside = false;
-        var j = n - 1u;
-        for (var i = 0u; i < n; i = i + 1u) {
-            let a = pt(i);
-            let b = pt(j);
-            if ((a.y > p.y) != (b.y > p.y)
-                && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) {
-                inside = !inside;
-            }
-            j = i;
-        }
-        if (inside == ((u32(u.con.w) & 1u) != 0u)) {
-            discard;
-        }
+    if (n >= 3u && inside(0u, n, p) == ((u32(u.con.w) & 1u) != 0u)) {
+        discard;
+    }
+    let ns = u32(u.ext.x);
+    if (ns >= 3u && !inside(64u, ns, p)) {
+        discard;
+    }
+    let no = u32(u.ext.y);
+    if (no >= 3u && !inside(128u, no, p)) {
+        discard;
     }
     let lin = ramp(in.st.x, u.edge.x) * ramp(1.0 - in.st.x, u.edge.y)
         * ramp(in.st.y, u.edge.z) * ramp(1.0 - in.st.y, u.edge.w);
@@ -86,25 +96,46 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Uniform block size: 5 vec4 + 16 vec4 mask points.
-const UNIFORM_FLOATS: usize = 20 + 4 * (mapping::MAX_MASK_POINTS / 2);
+/// Points each polygon region (slice mask, slice shape, output mask) holds in the uniform.
+const REGION: usize = 64;
+/// Uniform block size: 6 vec4 + 3 regions of 32 vec4.
+const UNIFORM_FLOATS: usize = 24 + 3 * 2 * REGION;
 
 /// Packs the per-slice uniform (see `U` in the shader).
 fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
     let mut u = vec![0.0f32; UNIFORM_FLOATS];
+    let (mut n_mask, mut n_shape, mut n_out) = (0, 0, 0);
     if let Some(e) = &s.soft_edge {
         u[..4].copy_from_slice(&[e.left, e.right, e.top, e.bottom]);
         u[4] = e.gamma;
     } else {
         u[4] = 1.0;
     }
-    if let Some(m) = s.mask.as_ref().filter(|m| mapping::mask_valid(m)) {
-        u[5] = m.len() as f32;
-        for (i, p) in m.iter().enumerate() {
-            u[20 + 2 * i] = p.0;
-            u[21 + 2 * i] = p.1;
+    let mut put = |region: usize, pts: &[(f32, f32)]| {
+        for (i, p) in pts.iter().enumerate() {
+            u[24 + 2 * (region * REGION + i)] = p.0;
+            u[25 + 2 * (region * REGION + i)] = p.1;
         }
+    };
+    if let Some(m) = s.mask.as_ref().filter(|m| mapping::mask_valid(m)) {
+        put(0, m);
+        n_mask = m.len();
     }
+    if let vjc_model::SliceShape::Polygon(poly) = &s.shape
+        && mapping::mask_valid(poly)
+    {
+        put(1, poly);
+        n_shape = poly.len();
+    }
+    if let Some(m) = screen.output_mask.as_ref().map(|m| m.points())
+        && mapping::mask_valid(m)
+    {
+        put(2, m);
+        n_out = m.len();
+    }
+    u[5] = n_mask as f32;
+    u[20] = n_shape as f32;
+    u[21] = n_out as f32;
     u[6] = screen.width.max(1) as f32;
     u[7] = screen.height.max(1) as f32;
     u[8..11].copy_from_slice(&mapping::slice_gain(&s.color));
@@ -1127,5 +1158,99 @@ mod tests {
         assert_eq!(px(&inv, 4, 0, 0)[0], 0, "inside is cut");
         assert_eq!(px(&normal, 4, 3, 3)[0], 0);
         assert_eq!(px(&inv, 4, 3, 3)[0], 255, "outside is shown");
+    }
+
+    /// Writes a binary PPM of an RGBA readback to `target/ui-snapshots/` for eyeballing.
+    fn snapshot(name: &str, img: &[u8], w: usize) {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ppm = format!("P6\n{w} {}\n255\n", img.len() / 4 / w).into_bytes();
+        for p in img.chunks(4) {
+            ppm.extend_from_slice(&p[..3]);
+        }
+        std::fs::write(dir.join(format!("{name}.ppm")), ppm).unwrap();
+    }
+
+    fn square() -> Screen {
+        let mut screen = mapping::new_screen("t", 32, 32);
+        screen.slices.push(mapping::new_slice(32, 32));
+        screen
+    }
+
+    /// Rectangle shape: the whole screen is lit (baseline for the shapes below).
+    #[test]
+    fn gpu_snapshot_rect_shape_fills_the_slice() {
+        let screen = square();
+        let Some(img) = render_rgba(&screen, [255; 4]) else {
+            return;
+        };
+        snapshot("slice-shape-rect", &img, 32);
+        assert_eq!(px(&img, 32, 1, 1)[0], 255);
+        assert_eq!(px(&img, 32, 30, 30)[0], 255);
+    }
+
+    /// Polygon shape: a triangle (top-left, top-right, bottom-left) lights its half only.
+    #[test]
+    fn gpu_snapshot_polygon_shape_cuts_outside() {
+        let mut screen = square();
+        screen.slices[0].shape =
+            vjc_model::SliceShape::Polygon(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]);
+        let Some(img) = render_rgba(&screen, [255; 4]) else {
+            return;
+        };
+        snapshot("slice-shape-polygon", &img, 32);
+        assert_eq!(px(&img, 32, 4, 4)[0], 255, "inside");
+        assert_eq!(px(&img, 32, 28, 28)[0], 0, "outside");
+    }
+
+    /// Bezier mesh: handles on the top edge bend it down, so a pixel near the top middle goes
+    /// dark. Control: the same handles in Linear mode leave it lit.
+    #[test]
+    fn gpu_snapshot_bezier_mesh_bends_the_edge() {
+        let mut screen = square();
+        let sl = &mut screen.slices[0];
+        sl.mesh_tangents = vec![
+            ((0.0, 10.0), (0.0, 0.0)),
+            ((0.0, -10.0), (0.0, 0.0)),
+            ((0.0, 0.0), (0.0, 0.0)),
+            ((0.0, 0.0), (0.0, 0.0)),
+        ];
+        let linear = render_rgba(&screen, [255; 4]);
+        screen.slices[0].mesh_mode = vjc_model::MeshMode::Bezier;
+        let (Some(linear), Some(bez)) = (linear, render_rgba(&screen, [255; 4])) else {
+            return;
+        };
+        snapshot("slice-mesh-bezier", &bez, 32);
+        assert_eq!(px(&linear, 32, 16, 3)[0], 255, "linear control");
+        assert_eq!(px(&bez, 32, 16, 3)[0], 0, "bent edge");
+        assert_eq!(px(&bez, 32, 16, 16)[0], 255, "centre stays lit");
+        assert_eq!(px(&bez, 32, 1, 1)[0], 255, "corner stays lit");
+    }
+
+    /// Output mask: only the screen part inside it is shown, for every slice; a 63-point
+    /// mask (the shared cap) still works.
+    #[test]
+    fn gpu_snapshot_output_mask_cuts_the_screen() {
+        let mut screen = square();
+        let left = vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)];
+        screen.output_mask = Some(vjc_model::Mask::Polygon(left));
+        let Some(img) = render_rgba(&screen, [255; 4]) else {
+            return;
+        };
+        snapshot("output-mask", &img, 32);
+        assert_eq!(px(&img, 32, 4, 16)[0], 255, "inside");
+        assert_eq!(px(&img, 32, 28, 16)[0], 0, "outside");
+        // 63 points on a circle: the centre is inside, the corner is not.
+        let ring: Vec<(f32, f32)> = (0..63)
+            .map(|i| {
+                let a = i as f32 / 63.0 * std::f32::consts::TAU;
+                (0.5 + 0.4 * a.cos(), 0.5 + 0.4 * a.sin())
+            })
+            .collect();
+        screen.output_mask = Some(vjc_model::Mask::Path(ring));
+        let img = render_rgba(&screen, [255; 4]).unwrap();
+        assert_eq!(px(&img, 32, 16, 16)[0], 255);
+        assert_eq!(px(&img, 32, 1, 1)[0], 0);
     }
 }

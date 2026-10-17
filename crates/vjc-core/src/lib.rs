@@ -459,7 +459,7 @@ pub enum Command {
         slice: Uuid,
         index: usize,
     },
-    /// Mask polygon in normalized screen coordinates (3..=32 points); `None` clears it.
+    /// Mask polygon in normalized screen coordinates (3..=63 points); `None` clears it.
     /// Coalesces.
     SetSliceMask {
         screen: Uuid,
