@@ -1127,6 +1127,9 @@ pub fn decode_n(path: &Path, n: usize) -> Result<Vec<Frame>, ff::Error> {
 }
 
 #[cfg(test)]
+mod hap_ffmpeg_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

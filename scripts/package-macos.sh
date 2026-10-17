@@ -34,6 +34,20 @@ rm -rf "$APP" "$DMG" "$DIST/dmg-root"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/vjcraft "$APP/Contents/MacOS/vjcraft"
 
+# HAP-capable ffmpeg CLI for "Convert to HAP" (LGPL, static; built from pinned sources).
+# build-ffmpeg.sh is a no-op when target/ffmpeg matches its stamp (version + configure), so a
+# stale binary from an older configure is rebuilt. Set REQUIRE_FFMPEG=1 for release builds.
+if ! scripts/build-ffmpeg.sh; then
+  echo "WARNING: FFmpeg build failed; packaging without Convert to HAP support" >&2
+  [ "${REQUIRE_FFMPEG:-0}" = 1 ] && exit 1
+  rm -f target/ffmpeg/bin/ffmpeg
+fi
+if [ -x target/ffmpeg/bin/ffmpeg ]; then
+  cp target/ffmpeg/bin/ffmpeg "$APP/Contents/Resources/ffmpeg"
+else
+  echo "WARNING: no target/ffmpeg/bin/ffmpeg; app has no bundled ffmpeg" >&2
+fi
+
 # Icon: use assets/icon/VJCraft.icns if present, else a violet placeholder.
 if [ -f assets/icon/VJCraft.icns ]; then
   cp assets/icon/VJCraft.icns "$APP/Contents/Resources/VJCraft.icns"
@@ -96,6 +110,9 @@ fi
 for lib in "$APP"/Contents/Frameworks/*.dylib; do
   codesign "${SIGN_OPTS[@]}" "$lib"
 done
+if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
+  codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP/Contents/Resources/ffmpeg"
+fi
 codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP"
 codesign --verify --deep --strict "$APP"
 
