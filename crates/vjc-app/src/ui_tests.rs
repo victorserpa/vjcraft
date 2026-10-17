@@ -8635,10 +8635,15 @@ fn pen_stroke_becomes_an_output_mask_under_64_points() {
     let mut h = precise_slice_setup();
     let (o, k) = (out_canvas_origin(&h), out_k(&h));
     nested_menu(&mut h, "Add output mask", "Draw with pen");
-    let path: Vec<egui::Pos2> = (0..=120)
+    // A jittery circle: far more corners than the cap, so the simplifier has to cut.
+    let path: Vec<egui::Pos2> = (0..=150)
         .map(|i| {
-            let a = i as f32 / 120.0 * std::f32::consts::TAU;
-            o + egui::vec2((960.0 + 500.0 * a.cos()) * k, (540.0 + 300.0 * a.sin()) * k)
+            let a = i as f32 / 150.0 * std::f32::consts::TAU;
+            let r = if i % 2 == 0 { 1.0 } else { 0.9 };
+            o + egui::vec2(
+                (960.0 + 500.0 * r * a.cos()) * k,
+                (540.0 + 300.0 * r * a.sin()) * k,
+            )
         })
         .collect();
     drag_path(&mut h, &path);
