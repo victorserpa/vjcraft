@@ -1,6 +1,7 @@
 # Workflow
 
-- One issue → one branch → one PR that closes it. Repo: victorserpa/vjcraft (private).
+- Order for every non-trivial change: brainstorm → spec (docs/specs/, own PR) → tests that fail → code → `/objection` → merge. See docs/specs/README.md.
+- One issue → one branch → one PR that closes it. Repo: victorserpa/vjcraft (public).
 - Talk to the owner in pt-BR. Code, commits, PRs and issues in English.
 - Commits: no `Co-Authored-By` trailer.
 - Before every merge: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full `cargo test` locally. CI runs on main only; local is the gate.
