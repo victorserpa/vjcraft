@@ -1407,8 +1407,10 @@ fn apply_inner_meshes(
         }
     }
     let mut prev = vec![];
+    let dims = (scr.width, scr.height);
     for (id, m) in meshes {
         let sl = scr.slices.iter_mut().find(|s| s.id == id).unwrap();
+        slice_adv::follow_outline(sl, &m, dims);
         prev.push((id, std::mem::replace(&mut sl.output_mesh, m)));
     }
     undoable(
@@ -1418,6 +1420,11 @@ fn apply_inner_meshes(
         },
         vec![],
     )
+}
+
+fn has_duplicates(ids: impl Iterator<Item = Uuid>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter().any(|i| !seen.insert(i))
 }
 
 fn undoable(inverse: Command, events: Vec<Event>) -> Result<Applied, Error> {
@@ -3271,13 +3278,35 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             if !mapping::mesh_valid(&mesh, cols) {
                 return Err(Error::InvalidValue);
             }
+            let (w, h) = {
+                let scr = screen_mut(p, screen)?;
+                (scr.width, scr.height)
+            };
             let s = slice_mut(p, screen, slice)?;
-            let inverse = Command::SetSliceMesh {
+            if cols == s.mesh_cols {
+                slice_adv::follow_outline(s, &mesh, (w, h));
+            }
+            let stale = !s.mesh_tangents.is_empty() && s.mesh_tangents.len() != mesh.len();
+            let old_tangents = stale.then(|| std::mem::take(&mut s.mesh_tangents));
+            let mut inverse = Command::SetSliceMesh {
                 screen,
                 slice,
                 mesh: std::mem::replace(&mut s.output_mesh, mesh),
                 cols: s.mesh_cols,
             };
+            if let Some(tangents) = old_tangents {
+                inverse = Command::Batch {
+                    commands: vec![
+                        inverse,
+                        Command::SetSliceMeshMode {
+                            screen,
+                            slice,
+                            mode: s.mesh_mode,
+                            tangents,
+                        },
+                    ],
+                };
+            }
             s.mesh_cols = cols;
             undoable(inverse, vec![])
         }
@@ -3310,13 +3339,16 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             tangents,
         } => {
             let s = slice_mut(p, screen, slice)?;
-            let ok = tangents.is_empty() || tangents.len() == s.output_mesh.len();
+            let mut tangents = tangents;
+            if !tangents.is_empty() {
+                tangents.resize(s.output_mesh.len(), ((0.0, 0.0), (0.0, 0.0)));
+            }
             let finite = tangents.iter().all(|(a, b)| {
                 [a.0, a.1, b.0, b.1]
                     .iter()
                     .all(|v| v.is_finite() && v.abs() <= 1.0e6)
             });
-            if !ok || !finite {
+            if !finite {
                 return Err(Error::InvalidValue);
             }
             let inverse = Command::SetSliceMeshMode {
@@ -3342,6 +3374,9 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             undoable(Command::SetScreenMask { screen, mask: prev }, vec![])
         }
         Command::SetSliceMeshes { screen, meshes } => {
+            if has_duplicates(meshes.iter().map(|m| m.0)) {
+                return Err(Error::InvalidValue);
+            }
             let scr = screen_mut(p, screen)?;
             for (id, m) in &meshes {
                 let sl = scr
@@ -3353,18 +3388,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     return Err(Error::InvalidValue);
                 }
             }
-            let mut prev = vec![];
-            for (id, m) in meshes {
-                let sl = scr.slices.iter_mut().find(|s| s.id == id).unwrap();
-                prev.push((id, std::mem::replace(&mut sl.output_mesh, m)));
-            }
-            undoable(
-                Command::SetSliceMeshes {
-                    screen,
-                    meshes: prev,
-                },
-                vec![],
-            )
+            apply_inner_meshes(scr, screen, meshes)
         }
         Command::ResizeSlices { screen, slices, to } => {
             let (x, y, w, h) = to;
@@ -3373,6 +3397,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 || ![x, y, w, h].iter().all(|v| v.is_finite())
                 || w < min
                 || h < min
+                || has_duplicates(slices.iter().copied())
             {
                 return Err(Error::InvalidValue);
             }
@@ -3405,12 +3430,27 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 return Err(Error::InvalidValue);
             }
             let new = mapping::resample_mesh(&s.output_mesh, s.mesh_cols, cols, rows);
-            let inverse = Command::SetSliceMesh {
+            // Handles are indexed by grid position, so a new grid starts with zero handles.
+            let old_tangents = std::mem::take(&mut s.mesh_tangents);
+            let mut inverse = Command::SetSliceMesh {
                 screen,
                 slice,
                 mesh: std::mem::replace(&mut s.output_mesh, new),
                 cols: s.mesh_cols,
             };
+            if !old_tangents.is_empty() {
+                inverse = Command::Batch {
+                    commands: vec![
+                        inverse,
+                        Command::SetSliceMeshMode {
+                            screen,
+                            slice,
+                            mode: s.mesh_mode,
+                            tangents: old_tangents,
+                        },
+                    ],
+                };
+            }
             s.mesh_cols = cols;
             undoable(inverse, vec![])
         }

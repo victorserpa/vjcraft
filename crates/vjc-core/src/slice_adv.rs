@@ -152,6 +152,67 @@ pub fn preset_polygon(preset: ShapePreset, r: Rect) -> Vec<Pt> {
     }
 }
 
+/// When `new` is an affine image of the slice's current mesh (move, nudge, resize, rotate,
+/// flip), applies the same transform to a polygon outline so it keeps following the mesh.
+/// Point edits that are not affine leave the outline alone.
+pub fn follow_outline(sl: &mut vjc_model::Slice, new: &[Pt], screen: (u32, u32)) {
+    let vjc_model::SliceShape::Polygon(poly) = &mut sl.shape else {
+        return;
+    };
+    let old = &sl.output_mesh;
+    let cols = sl.mesh_cols as usize;
+    if cols < 2 || old.len() != new.len() || old.len() < cols * 2 || old.len() % cols != 0 {
+        return;
+    }
+    let (a, b, c) = (old[0], old[cols - 1], old[old.len() - cols]);
+    let (na, nb, nc) = (new[0], new[cols - 1], new[new.len() - cols]);
+    let (u, v) = ((b.0 - a.0, b.1 - a.1), (c.0 - a.0, c.1 - a.1));
+    let det = u.0 * v.1 - u.1 * v.0;
+    if det.abs() < 1e-3 {
+        return;
+    }
+    let (nu, nv) = ((nb.0 - na.0, nb.1 - na.1), (nc.0 - na.0, nc.1 - na.1));
+    // L = [nu nv] * [u v]^-1
+    let l = [
+        [
+            (nu.0 * v.1 - nv.0 * u.1) / det,
+            (nv.0 * u.0 - nu.0 * v.0) / det,
+        ],
+        [
+            (nu.1 * v.1 - nv.1 * u.1) / det,
+            (nv.1 * u.0 - nu.1 * v.0) / det,
+        ],
+    ];
+    let map = |p: Pt| {
+        (
+            l[0][0] * (p.0 - a.0) + l[0][1] * (p.1 - a.1) + na.0,
+            l[1][0] * (p.0 - a.0) + l[1][1] * (p.1 - a.1) + na.1,
+        )
+    };
+    let tol = 0.01
+        + 1e-5
+            * old
+                .iter()
+                .map(|p| p.0.abs().max(p.1.abs()))
+                .fold(0.0, f32::max);
+    let affine = old.iter().zip(new).all(|(o, n)| {
+        let m = map(*o);
+        (m.0 - n.0).abs() <= tol && (m.1 - n.1).abs() <= tol
+    });
+    if !affine {
+        return;
+    }
+    let (w, h) = (screen.0.max(1) as f32, screen.1.max(1) as f32);
+    let out: Vec<Pt> = poly
+        .iter()
+        .map(|p| map((p.0 * w, p.1 * h)))
+        .map(|p| (p.0 / w, p.1 / h))
+        .collect();
+    if out.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
+        *poly = out;
+    }
+}
+
 /// Margin kept around a preset slice, as a fraction of the screen.
 pub const PRESET_INSET: f32 = 0.1;
 

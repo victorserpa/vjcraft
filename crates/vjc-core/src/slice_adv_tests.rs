@@ -340,14 +340,15 @@ fn shape_mode_and_mask_commands_are_one_undo_step_and_validate() {
         p.output.screens[0].slices[0].shape,
         SliceShape::Polygon(hexagon())
     );
-    // Wrong tangent count is rejected.
+    // Wrong tangent count is normalized, not rejected (see stale_tangents tests).
     let wrong = Command::SetSliceMeshMode {
         screen: sid,
         slice: ids[0],
         mode: MeshMode::Bezier,
         tangents: vec![((0.0, 0.0), (0.0, 0.0)); 3],
     };
-    assert!(h.exec(&mut p, wrong, now).is_err());
+    h.exec(&mut p, wrong, now).unwrap();
+    assert_eq!(p.output.screens[0].slices[0].mesh_tangents.len(), 4);
 }
 
 #[test]
@@ -377,4 +378,171 @@ fn preset_slices_carry_their_outline_and_drawn_polygons_validate() {
     assert!(polygon_slice(w, h, &tri[..2]).is_none());
     let many: Vec<Pt> = (0..64).map(|i| (i as f32 / 64.0, 0.5)).collect();
     assert!(polygon_slice(w, h, &many).is_none(), "over the 63 cap");
+}
+
+fn hex_setup() -> (Project, Uuid, Uuid) {
+    let (mut p, sid, _) = setup();
+    let mut sl = preset_slice(200, 100, ShapePreset::Hexagon);
+    let id = sl.id;
+    sl.mesh_tangents = vec![];
+    p.output.screens[0].slices.push(sl);
+    (p, sid, id)
+}
+
+fn outline(p: &Project, id: Uuid) -> Vec<Pt> {
+    match &p.output.screens[0]
+        .slices
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap()
+        .shape
+    {
+        SliceShape::Polygon(v) => v.clone(),
+        _ => panic!("not a polygon"),
+    }
+}
+
+fn close(a: &[Pt], b: &[Pt]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| (x.0 - y.0).abs() < 1e-4 && (x.1 - y.1).abs() < 1e-4)
+}
+
+#[test]
+fn moving_a_polygon_slice_moves_its_outline_in_one_undo_step() {
+    let (mut p, sid, id) = hex_setup();
+    let before = p.clone();
+    let orig = outline(&p, id);
+    let mesh: Vec<Pt> = p.output.screens[0].slices[2]
+        .output_mesh
+        .iter()
+        .map(|q| (q.0 + 20.0, q.1 + 10.0))
+        .collect();
+    let mut h = History::new();
+    h.exec(
+        &mut p,
+        Command::SetSliceMesh {
+            screen: sid,
+            slice: id,
+            mesh,
+            cols: 2,
+        },
+        Instant::now(),
+    )
+    .unwrap();
+    // 20 px of 200 = 0.1, 10 px of 100 = 0.1.
+    let want: Vec<Pt> = orig.iter().map(|q| (q.0 + 0.1, q.1 + 0.1)).collect();
+    assert!(close(&outline(&p, id), &want));
+    h.undo(&mut p).unwrap().unwrap();
+    assert!(close(&outline(&p, id), &orig));
+    // Group resize and SetSliceMeshes carry the outline too.
+    h.exec(
+        &mut p,
+        Command::ResizeSlices {
+            screen: sid,
+            slices: vec![id],
+            to: (0.0, 0.0, 400.0, 200.0),
+        },
+        Instant::now(),
+    )
+    .unwrap();
+    let want: Vec<Pt> = orig.iter().map(|q| (q.0 * 2.0, q.1 * 2.0)).collect();
+    assert!(close(&outline(&p, id), &want));
+    h.undo(&mut p).unwrap().unwrap();
+    assert!(close(&outline(&p, id), &orig));
+    assert_eq!(
+        p.output.screens[0].slices[2].mesh_cols,
+        before.output.screens[0].slices[2].mesh_cols
+    );
+}
+
+#[test]
+fn point_edit_leaves_the_outline_alone() {
+    let (mut p, sid, id) = hex_setup();
+    let orig = outline(&p, id);
+    let mut mesh = p.output.screens[0].slices[2].output_mesh.clone();
+    mesh[3] = (mesh[3].0 + 5.0, mesh[3].1);
+    apply(
+        &mut p,
+        Command::SetSliceMesh {
+            screen: sid,
+            slice: id,
+            mesh,
+            cols: 2,
+        },
+    )
+    .unwrap();
+    assert!(close(&outline(&p, id), &orig));
+}
+
+#[test]
+fn mesh_mode_normalizes_stale_tangent_length() {
+    let (mut p, sid, ids) = setup();
+    let mut h = History::new();
+    let now = Instant::now();
+    for n in [3usize, 9] {
+        let c = Command::SetSliceMeshMode {
+            screen: sid,
+            slice: ids[0],
+            mode: MeshMode::Bezier,
+            tangents: vec![((1.0, 1.0), (2.0, 2.0)); n],
+        };
+        h.exec(&mut p, c, now).unwrap();
+        assert_eq!(p.output.screens[0].slices[0].mesh_tangents.len(), 4);
+    }
+    // Toggle back and undo never fail even when stored tangents are stale.
+    p.output.screens[0].slices[0].mesh_tangents = vec![((1.0, 0.0), (0.0, 0.0)); 7];
+    let c = Command::SetSliceMeshMode {
+        screen: sid,
+        slice: ids[0],
+        mode: MeshMode::Linear,
+        tangents: vec![],
+    };
+    h.exec(&mut p, c, now).unwrap();
+    h.undo(&mut p).unwrap().unwrap();
+}
+
+#[test]
+fn grid_size_change_resets_tangents_and_undo_restores_them() {
+    let (mut p, sid, ids) = setup();
+    let mut h = History::new();
+    let now = Instant::now();
+    let c = Command::SetSliceMeshMode {
+        screen: sid,
+        slice: ids[0],
+        mode: MeshMode::Bezier,
+        tangents: vec![((3.0, 0.0), (0.0, 3.0)); 4],
+    };
+    h.exec(&mut p, c, now).unwrap();
+    let before = p.clone();
+    let c = Command::SetSliceMeshSize {
+        screen: sid,
+        slice: ids[0],
+        cols: 3,
+        rows: 3,
+    };
+    h.exec(&mut p, c, now).unwrap();
+    assert!(p.output.screens[0].slices[0].mesh_tangents.is_empty());
+    h.undo(&mut p).unwrap().unwrap();
+    assert_eq!(p, before);
+}
+
+#[test]
+fn duplicate_slice_ids_are_rejected() {
+    let (mut p, sid, ids) = setup();
+    let before = p.clone();
+    let m = p.output.screens[0].slices[0].output_mesh.clone();
+    let c = Command::SetSliceMeshes {
+        screen: sid,
+        meshes: vec![(ids[0], m.clone()), (ids[0], m)],
+    };
+    assert!(apply(&mut p, c).is_err());
+    let c = Command::ResizeSlices {
+        screen: sid,
+        slices: vec![ids[0], ids[0]],
+        to: (0.0, 0.0, 50.0, 50.0),
+    };
+    assert!(apply(&mut p, c).is_err());
+    assert_eq!(p, before);
 }
