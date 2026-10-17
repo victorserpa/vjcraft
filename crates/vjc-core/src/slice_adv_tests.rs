@@ -366,7 +366,10 @@ fn preset_slices_carry_their_outline_and_drawn_polygons_validate() {
             panic!("{preset:?}");
         };
         assert_eq!(p.len(), n);
-        assert!(p.iter().all(|q| (0.0..=1.0).contains(&q.0) && (0.0..=1.0).contains(&q.1)));
+        assert!(
+            p.iter()
+                .all(|q| (0.0..=1.0).contains(&q.0) && (0.0..=1.0).contains(&q.1))
+        );
         assert!(mapping::mesh_valid(&s.output_mesh, s.mesh_cols));
     }
     let tri = [(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)];

@@ -38,6 +38,7 @@ mod output_canvas;
 mod output_extras;
 mod output_hints;
 mod output_overlay;
+mod output_poly;
 mod output_presets_ui;
 mod output_props;
 mod output_tree;
@@ -346,6 +347,8 @@ struct State {
     /// Output canvas edits the slice mask polygon instead of the warp mesh.
     edit_mask: bool,
     sel_mask_pt: Option<usize>,
+    /// Polygon drawing and point editing on the Output canvas.
+    poly: output_poly::PolyUi,
     /// Screens whose output window the user closed (runtime only).
     closed_screens: std::collections::HashSet<Uuid>,
     /// Dev rehearsal (VJC_REHEARSE): output windows open windowed, not fullscreen.
@@ -2106,6 +2109,7 @@ impl State {
             preset_warnings: vec![],
             edit_mask: false,
             sel_mask_pt: None,
+            poly: Default::default(),
             closed_screens: Default::default(),
             output_windowed: false,
             rehearsal: false,

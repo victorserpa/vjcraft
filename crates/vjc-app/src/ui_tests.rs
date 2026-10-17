@@ -8552,3 +8552,115 @@ fn recover_keeps_the_recovery_file() {
     assert!(file.exists(), "recovery file must survive a recover");
     let _ = std::fs::remove_file(&file);
 }
+
+/// Presses at the first point of `path`, moves through the rest and releases (a pen stroke).
+fn drag_path(h: &mut Harness<'_, State>, path: &[egui::Pos2]) {
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.hover_at(path[0]);
+    h.step();
+    h.event(button(path[0], true));
+    h.step();
+    for p in &path[1..] {
+        h.event(egui::Event::PointerMoved(*p));
+        h.step();
+    }
+    h.event(button(*path.last().unwrap(), false));
+    settle(h);
+}
+
+fn nested_menu(h: &mut Harness<'_, State>, parent: &str, entry: &str) {
+    click(h, "Add");
+    click(h, &format!("{parent} \u{23f5}"));
+    // The slice properties may show a button with the same name: the menu is the leftmost.
+    h.query_all_by_label(entry)
+        .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+        .unwrap_or_else(|| panic!("entry {entry}"))
+        .click();
+    settle(h);
+}
+
+#[test]
+fn polygon_slice_drawn_with_four_clicks_is_one_undo_step() {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add polygon slice", "Draw points");
+    assert!(h.state().poly.draw.is_some());
+    let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
+    for (x, y) in [
+        (900.0, 200.0),
+        (1500.0, 200.0),
+        (1500.0, 800.0),
+        (900.0, 800.0),
+    ] {
+        click_at(&mut h, at(x, y));
+    }
+    assert_eq!(
+        h.state().project.output.screens[0].slices.len(),
+        1,
+        "still open"
+    );
+    click_at(&mut h, at(900.0, 200.0));
+    let slices = h.state().project.output.screens[0].slices.clone();
+    assert_eq!(slices.len(), 2);
+    let vjc_model::SliceShape::Polygon(p) = &slices[1].shape else {
+        panic!("{:?}", slices[1].shape);
+    };
+    assert_eq!(p.len(), 4);
+    assert!((p[1].0 - 1500.0 / 1920.0).abs() < 0.01, "{p:?}");
+    assert!(h.state().poly.draw.is_none());
+    click(&mut h, "Undo edit");
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 1);
+    snap(&mut h, "polygon-slice-drawn");
+}
+
+#[test]
+fn escape_cancels_a_drawing_without_changing_the_project() {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add polygon slice", "Draw points");
+    click_at(&mut h, o + egui::vec2(900.0 * k, 200.0 * k));
+    h.key_press(egui::Key::Escape);
+    settle(&mut h);
+    assert!(h.state().poly.draw.is_none());
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 1);
+}
+
+#[test]
+fn pen_stroke_becomes_an_output_mask_under_64_points() {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add output mask", "Draw with pen");
+    let path: Vec<egui::Pos2> = (0..=120)
+        .map(|i| {
+            let a = i as f32 / 120.0 * std::f32::consts::TAU;
+            o + egui::vec2((960.0 + 500.0 * a.cos()) * k, (540.0 + 300.0 * a.sin()) * k)
+        })
+        .collect();
+    drag_path(&mut h, &path);
+    let Some(vjc_model::Mask::Path(p)) = h.state().project.output.screens[0].output_mask.clone()
+    else {
+        panic!("no path mask");
+    };
+    assert!((3..64).contains(&p.len()), "{}", p.len());
+    snap(&mut h, "output-mask-pen");
+    click(&mut h, "Undo edit");
+    assert!(h.state().project.output.screens[0].output_mask.is_none());
+}
+
+#[test]
+fn polygon_presets_and_curved_mesh_from_the_menus() {
+    let mut h = precise_slice_setup();
+    nested_menu(&mut h, "Add polygon slice", "Hexagon");
+    let scr = h.state().project.output.screens[0].clone();
+    assert_eq!(scr.slices.len(), 2);
+    assert!(matches!(&scr.slices[1].shape, vjc_model::SliceShape::Polygon(p) if p.len() == 6));
+    assert_eq!(scr.slices[1].name, "Hexagon");
+    click_far(&mut h, "Curved");
+    let sl = h.state().project.output.screens[0].slices[1].clone();
+    assert_eq!(sl.mesh_mode, vjc_model::MeshMode::Bezier);
+}

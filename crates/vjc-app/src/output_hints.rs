@@ -86,7 +86,9 @@ pub(crate) fn text(key: &str) -> Option<&'static str> {
             "A slice copies a region of the picture onto the screen. Double-click to rename, right-click for actions."
         }
         "tree-delete" => "Deletes this slice.",
-        "tree-add" => "Adds a screen, a slice, a mask, or a whole grid of slices.",
+        "tree-add" => {
+            "Adds a screen, a slice (plain, polygon or from a shape), a mask, an output mask, or a whole grid of slices."
+        }
         // Toolbar
         "tab-input" => "Input: the part of the composition each slice reads.",
         "tab-output" => "Output: where each slice lands on the screen.",
@@ -135,6 +137,15 @@ pub(crate) fn text(key: &str) -> Option<&'static str> {
             "Cuts the slice to a shape. Pick one, then edit its points on the Output tab."
         }
         "slice-mesh" => "How many points the warp mesh has across and down.",
+        "slice-curve" => {
+            "Linear joins the mesh points with straight lines. Curved bends them smoothly: select a point on the Output tab in Edit points mode and drag its two handles."
+        }
+        "slice-outline" => {
+            "Cuts the slice to a free polygon. Edit its points on the Output tab: drag to move, click an edge to add, Delete removes, Shift snaps to 15 degrees."
+        }
+        "screen-mask" => {
+            "Cuts the whole screen to a shape: everything outside it is black. Draw it with points or with the pen."
+        }
         "slice-actions" => "Copy, mirror, move to another screen or remove the selected slices.",
         "multi" => "You selected several slices. A change here is applied to all of them.",
         _ => return None,

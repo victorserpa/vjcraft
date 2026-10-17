@@ -6,12 +6,14 @@
 use crate::State;
 use crate::icons;
 use crate::output_hints::hint;
+use crate::output_poly::DrawFor;
 use crate::output_tree::{inset_mask, one_command, slice_label};
 use crate::params::{param_slider_step, text_field, text_field_free};
 use crate::theme::{self, COMBO_W_SM, FS_SM, PROP_LABEL_W, SP_2, SP_4, TEXT, bold_font};
 use crate::widgets::{self, Kind, toggle};
 use eframe::egui::{self, RichText};
 use uuid::Uuid;
+use vjc_core::slice_adv;
 use vjc_core::slice_geom::{self, Field, Op, Side};
 use vjc_core::{Command, mapping};
 use vjc_model::{OutputDevice, Screen, Slice, SliceColor, SliceSource, SoftEdge};
@@ -269,7 +271,53 @@ impl State {
                 );
             });
         });
+        self.output_mask_rows(ui, scr, cmds);
         self.artnet_setup(ui, scr, cmds);
+    }
+
+    /// Output mask of the screen: draw it, edit its points, clear it.
+    fn output_mask_rows(&mut self, ui: &mut egui::Ui, scr: &Screen, cmds: &mut Vec<Command>) {
+        row(ui, "screen-mask", |ui| {
+            widgets::section(ui, "Output mask", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::btn(ui, "Draw points", Kind::Secondary).clicked() {
+                        self.start_draw(DrawFor::OutputMask, false);
+                    }
+                    if widgets::btn(ui, "Draw with pen", Kind::Secondary).clicked() {
+                        self.start_draw(DrawFor::OutputMask, true);
+                    }
+                });
+                if let Some(m) = &scr.output_mask {
+                    toggle(ui, &mut self.poly.edit_omask, "Edit output mask points");
+                    let n = m.points().len();
+                    let can_rm = n > 3 && self.poly.sel.is_some_and(|i| i < n);
+                    if widgets::btn_if(ui, can_rm, "Remove output mask point", Kind::Secondary)
+                        .clicked()
+                        && let Some(i) = self.poly.sel.take()
+                    {
+                        let mut p = m.points().to_vec();
+                        p.remove(i);
+                        cmds.push(Command::SetScreenMask {
+                            screen: scr.id,
+                            mask: Some(match m {
+                                vjc_model::Mask::Path(_) => vjc_model::Mask::Path(p),
+                                vjc_model::Mask::Polygon(_) => vjc_model::Mask::Polygon(p),
+                            }),
+                        });
+                    }
+                    if widgets::btn(ui, "Clear output mask", Kind::Secondary).clicked() {
+                        self.poly.edit_omask = false;
+                        self.poly.sel = None;
+                        cmds.push(Command::SetScreenMask {
+                            screen: scr.id,
+                            mask: None,
+                        });
+                    }
+                } else {
+                    self.poly.edit_omask = false;
+                }
+            });
+        });
     }
 
     /// Where the screen is sent: nothing (a window), Syphon, NDI, Art-Net or a monitor.
@@ -363,6 +411,7 @@ impl State {
         self.colour_rows(ui, scr, sl, &ids, cmds);
         self.key_rows(ui, scr, sl, &ids, cmds);
         self.edge_rows(ui, scr, sl, &ids, true, cmds);
+        self.outline_rows(ui, scr, sl, cmds);
         self.mask_rows(ui, scr, sl, &ids, cmds);
         self.mesh_rows(ui, scr, sl, cmds);
         self.action_rows(ui, scr, sl, &ids, cmds);
@@ -810,8 +859,14 @@ impl State {
                     }
                 }
             });
+            if widgets::btn(ui, "Draw mask with pen", Kind::Secondary).clicked() {
+                self.start_draw(DrawFor::SliceMask(sl.id), true);
+            }
             if self.edit_mask && sl.mask.is_some() {
-                widgets::help(ui, "On the Output tab: click empty space to add a point.");
+                widgets::help(
+                    ui,
+                    "On the Output tab: click empty space to add a point, Delete removes the selected one, Shift snaps to 15 degrees.",
+                );
             }
             let mut inv = sl.mask_invert;
             if toggle(ui, &mut inv, "Invert mask").changed() {
@@ -824,9 +879,88 @@ impl State {
         });
     }
 
+    /// Outline of the slice: a rectangle, a preset shape or a free polygon.
+    fn outline_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        scr: &Screen,
+        sl: &Slice,
+        cmds: &mut Vec<Command>,
+    ) {
+        let set = |shape: vjc_model::SliceShape| Command::SetSliceShape {
+            screen: scr.id,
+            slice: sl.id,
+            shape,
+        };
+        widgets::fold_section(ui, "slice", "Outline", |ui| {
+            row(ui, "slice-outline", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for preset in vjc_model::ShapePreset::ALL {
+                        let name = slice_adv::preset_name(preset);
+                        if widgets::btn(ui, name, Kind::Secondary).clicked() {
+                            let shape = if preset == vjc_model::ShapePreset::Rect {
+                                vjc_model::SliceShape::Rect
+                            } else {
+                                let (x, y, w, h) = slice_bbox_norm(sl, scr);
+                                let r = slice_geom::Rect {
+                                    x,
+                                    y,
+                                    w: w - x,
+                                    h: h - y,
+                                };
+                                vjc_model::SliceShape::Polygon(slice_adv::preset_polygon(preset, r))
+                            };
+                            self.poly.sel = None;
+                            cmds.push(set(shape));
+                        }
+                    }
+                });
+                if let vjc_model::SliceShape::Polygon(p) = &sl.shape {
+                    toggle(ui, &mut self.poly.edit_outline, "Edit outline points");
+                    let can_rm = p.len() > 3 && self.poly.sel.is_some_and(|i| i < p.len());
+                    if widgets::btn_if(ui, can_rm, "Remove outline point", Kind::Secondary)
+                        .clicked()
+                        && let Some(i) = self.poly.sel.take()
+                    {
+                        let mut p = p.clone();
+                        p.remove(i);
+                        cmds.push(set(vjc_model::SliceShape::Polygon(p)));
+                    }
+                    if self.poly.edit_outline {
+                        widgets::help(
+                            ui,
+                            "On the Output tab: drag a point, click an edge to add one, Delete removes it, Shift snaps to 15 degrees.",
+                        );
+                    }
+                } else {
+                    self.poly.edit_outline = false;
+                }
+            });
+        });
+    }
+
     /// Warp mesh size of the slice.
     fn mesh_rows(&mut self, ui: &mut egui::Ui, scr: &Screen, sl: &Slice, cmds: &mut Vec<Command>) {
         widgets::fold_section(ui, "slice", "Warp mesh", |ui| {
+            row(ui, "slice-curve", |ui| {
+                ui.horizontal(|ui| {
+                    for (mode, label) in [
+                        (vjc_model::MeshMode::Linear, "Straight"),
+                        (vjc_model::MeshMode::Bezier, "Curved"),
+                    ] {
+                        if widgets::choice(ui, sl.mesh_mode == mode, label).clicked()
+                            && sl.mesh_mode != mode
+                        {
+                            cmds.push(Command::SetSliceMeshMode {
+                                screen: scr.id,
+                                slice: sl.id,
+                                mode,
+                                tangents: sl.mesh_tangents.clone(),
+                            });
+                        }
+                    }
+                });
+            });
             row(ui, "slice-mesh", |ui| {
                 ui.horizontal(|ui| {
                     let rows = mapping::rows_of(sl.output_mesh.len(), sl.mesh_cols);

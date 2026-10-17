@@ -5,6 +5,7 @@ use crate::State;
 use crate::icons;
 use crate::output_extras::Axis;
 use crate::output_hints::{self, hint};
+use crate::output_poly::DrawFor;
 use crate::output_ui::OutTab;
 use crate::theme::{
     ACCENT, BG, BORDER, FS_SM, FS_XS, ON_ACCENT, RADIUS_SM, SP_2, SP_3, SURFACE_RAISED, TEXT,
@@ -13,6 +14,7 @@ use crate::theme::{
 use crate::widgets;
 use eframe::egui::{self, RichText};
 use uuid::Uuid;
+use vjc_core::slice_adv;
 use vjc_core::slice_geom::{self, Side};
 use vjc_core::{Command, mapping};
 use vjc_model::{Screen, Slice};
@@ -174,7 +176,8 @@ impl State {
             });
     }
 
-    /// The "+" menu: add a screen, a slice, a mask, or a grid of slices.
+    /// The "+" menu: add a screen, a slice (plain, polygon or from a preset), a mask, an output
+    /// mask, or a grid of slices.
     fn add_menu(&mut self, ui: &mut egui::Ui, screens: &[Screen], cmds: &mut Vec<Command>) {
         let (cw, ch) = (
             self.project.composition.width.max(1),
@@ -217,6 +220,38 @@ impl State {
                 });
                 ui.close();
             }
+            ui.add_enabled_ui(scr.is_some(), |ui| {
+                ui.menu_button("Add polygon slice", |ui| {
+                    if ui.button("Draw points").clicked() {
+                        self.start_draw(DrawFor::Slice, false);
+                        ui.close();
+                    }
+                    ui.separator();
+                    for preset in vjc_model::ShapePreset::ALL {
+                        if ui.button(slice_adv::preset_name(preset)).clicked()
+                            && let Some(s) = scr
+                        {
+                            let slice = slice_adv::preset_slice(s.width, s.height, preset);
+                            self.sel_slice = Some(slice.id);
+                            self.sel_slices.clear();
+                            cmds.push(Command::AddSlice {
+                                screen: s.id,
+                                slice,
+                                index: s.slices.len(),
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Add output mask", |ui| {
+                    for (label, pen) in [("Draw points", false), ("Draw with pen", true)] {
+                        if ui.button(label).clicked() {
+                            self.start_draw(DrawFor::OutputMask, pen);
+                            ui.close();
+                        }
+                    }
+                });
+            });
             let can_mask = sel.is_some_and(|(_, sl)| sl.mask.is_none());
             if ui
                 .add_enabled(can_mask, egui::Button::new("Add mask"))
