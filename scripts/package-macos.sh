@@ -34,6 +34,10 @@ rm -rf "$APP" "$DMG" "$DIST/dmg-root"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/vjcraft "$APP/Contents/MacOS/vjcraft"
 
+# HAP-capable ffmpeg CLI for "Convert to HAP" (LGPL, static; built from pinned sources).
+scripts/build-ffmpeg.sh
+cp target/ffmpeg/bin/ffmpeg "$APP/Contents/Resources/ffmpeg"
+
 # Icon: use assets/icon/VJCraft.icns if present, else a violet placeholder.
 if [ -f assets/icon/VJCraft.icns ]; then
   cp assets/icon/VJCraft.icns "$APP/Contents/Resources/VJCraft.icns"
@@ -93,7 +97,7 @@ if [ "$SIGN_ID" = "-" ]; then
 else
   SIGN_OPTS=(--force --timestamp --options runtime -s "$SIGN_ID")
 fi
-for lib in "$APP"/Contents/Frameworks/*.dylib; do
+for lib in "$APP"/Contents/Frameworks/*.dylib "$APP/Contents/Resources/ffmpeg"; do
   codesign "${SIGN_OPTS[@]}" "$lib"
 done
 codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP"

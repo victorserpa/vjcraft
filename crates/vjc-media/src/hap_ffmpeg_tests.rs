@@ -54,9 +54,21 @@ fn raw_frames(n: usize) -> Vec<u8> {
 fn convert(bin: &Path, raw: &Path, out: &Path, format: &str) {
     let st = Command::new(bin)
         .args(["-hide_banner", "-nostdin", "-v", "error", "-y"])
-        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", "1920x1080", "-r", "25", "-i"])
+        .args([
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            "1920x1080",
+            "-r",
+            "25",
+            "-i",
+        ])
         .arg(raw)
-        .args(["-c:v", "hap", "-format", format, "-chunks", "4", "-f", "mov"])
+        .args([
+            "-c:v", "hap", "-format", format, "-chunks", "4", "-f", "mov",
+        ])
         .arg(out)
         .status()
         .unwrap();
@@ -120,7 +132,11 @@ fn decode_native(f: &hap::HapFrame) -> Vec<u8> {
     for by in 0..th / 4 {
         for bx in 0..tw / 4 {
             let blk = &f.color[(by * (tw / 4) + bx) * bb..][..bb];
-            let alpha = if bb == 16 { Some(bc4_block(&blk[..8])) } else { None };
+            let alpha = if bb == 16 {
+                Some(bc4_block(&blk[..8]))
+            } else {
+                None
+            };
             let rgb = bc1_block(&blk[bb - 8..], bb == 16);
             for i in 0..16 {
                 let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
@@ -131,7 +147,11 @@ fn decode_native(f: &hap::HapFrame) -> Vec<u8> {
                 let mut a = alpha.map_or(255, |a| a[i]);
                 if f.format == YcoCg {
                     // BC3 colour block carries Co, Cg, scale; the alpha block carries Y.
-                    let (co, cg, s) = (px[0] - 128.0, px[1] - 128.0, px[2] / 255.0 * 255.0 / 8.0 + 1.0);
+                    let (co, cg, s) = (
+                        px[0] - 128.0,
+                        px[1] - 128.0,
+                        px[2] / 255.0 * 255.0 / 8.0 + 1.0,
+                    );
                     let (co, cg, y) = (co / s, cg / s, a as f32);
                     px = [y + co - cg, y + cg, y - co - cg];
                     a = 255;
@@ -183,11 +203,16 @@ fn built_ffmpeg_writes_hap_variants_the_native_path_reads_like_ffmpeg() {
         }
         assert_eq!(n, 3, "{name}: frame count");
         let hf = first.unwrap().hap.expect("block-compressed frame");
-        assert_eq!((hf.width, hf.height, hf.format), (W as u32, H as u32, fmt), "{name}");
+        assert_eq!(
+            (hf.width, hf.height, hf.format),
+            (W as u32, H as u32, fmt),
+            "{name}"
+        );
         let native = decode_native(&hf);
         let ff = decode_n(&out, 1).unwrap().remove(0);
         assert_eq!((ff.width, ff.height), (W as u32, H as u32));
         let diff = mean_abs_diff(&native, &ff.data, channels);
+        eprintln!("{name}: mean diff {diff:.3}");
         assert!(diff < 2.5, "{name}: native vs FFmpeg mean diff {diff}");
     }
 }

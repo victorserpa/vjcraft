@@ -23,6 +23,13 @@
 - Video and audio decode. The .app/.dmg bundles the Homebrew build of the libav* libraries and their dependencies in `Contents/Frameworks` (copied by `scripts/bundle-dylibs.sh`, install names rewritten to `@rpath`). Binding crate `ffmpeg-next`: WTFPL. That Homebrew FFmpeg is configured with `--enable-gpl --enable-version3`, so the bundled libav* are GPL-3.0-or-later (LGPL-2.1+ otherwise); the project is GPL-3.0-only, so this is compatible, and the whole bundle is distributed under GPL-3.0. Source: https://ffmpeg.org (the corresponding source is the upstream release matching the bundled version; offer it with every .dmg).
 - Bundled libraries (versions as built by Homebrew at packaging time): libavcodec/avdevice/avfilter/avformat/avutil/swresample/swscale (GPL-3.0+ as configured), libx264 (GPL-2.0+), libx265 (GPL-2.0+), libvpx (BSD-3-Clause), libdav1d (BSD-2-Clause), libSvtAv1Enc (BSD-3-Clause-Clear + AOM patent license), libopus (BSD-3-Clause), libmp3lame (LGPL-2.0+), libmpg123 (LGPL-2.1), liblzma (0BSD / public domain), libvmaf (BSD-2-Clause+Patent), libssl/libcrypto (OpenSSL 3, Apache-2.0). Re-check the list and licenses whenever the Homebrew ffmpeg changes.
 
+## FFmpeg CLI with the HAP encoder (`scripts/build-ffmpeg.sh`)
+
+- Used only by "Convert to HAP" (`crates/vjc-app/src/hap_convert.rs`); playback keeps using the libav* libraries above. The .app ships it as `Contents/Resources/ffmpeg`; the converter looks there first (then beside the executable), then `ffmpeg` on PATH.
+- Built from the official FFmpeg 9.0.2 release tarball (https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz, SHA-256 `8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e`) with a minimal configuration: no `--enable-gpl`, `--enable-version3` or `--enable-nonfree`, so the binary is LGPL-2.1-or-later; the script checks this after the build. Statically linked (only system libraries remain dynamic). Source: https://ffmpeg.org (offer the tarball and `scripts/build-ffmpeg.sh` with every .dmg).
+- libsnappy 1.3.1, BSD-3-Clause, https://github.com/google/snappy (tarball SHA-256 `893f708a0bf4b5529d555ffcee390e940e932fcf90261f682604475a76cd0247`), linked statically into that binary for the HAP second-stage compression.
+- The script downloads only these two pinned files and refuses them on a checksum mismatch. Both checksums come from the Homebrew formulas (ffmpeg.org publishes only GPG signatures for current releases).
+
 ## tiny_http and tungstenite (Remote API)
 
 - Used by the optional Remote API (`crates/vjc-app/src/api_io.rs`): `tiny_http` 0.12 serves REST, `tungstenite` 0.30 (feature `handshake` only, no TLS) serves WebSocket. Both are off the network unless the user enables the API in Preferences.

@@ -218,9 +218,28 @@ pub fn ffmpeg_args(src: &Path, part: &Path, v: Variant) -> Vec<std::ffi::OsStrin
     a
 }
 
-/// Whether the ffmpeg on PATH can write HAP (its encoder needs libsnappy).
-pub fn ffmpeg_has_hap() -> bool {
-    Command::new("ffmpeg")
+/// The ffmpeg CLI to run: the one bundled with the app first (`Contents/Resources/ffmpeg`
+/// next to `Contents/MacOS/<exe>`, or `ffmpeg` beside the exe), then `ffmpeg` on PATH.
+pub fn resolve_ffmpeg(exe: &Path) -> PathBuf {
+    let Some(dir) = exe.parent() else {
+        return PathBuf::from("ffmpeg");
+    };
+    let bundled = dir.parent().map(|c| c.join("Resources/ffmpeg"));
+    bundled
+        .into_iter()
+        .chain([dir.join("ffmpeg")])
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"))
+}
+
+/// `resolve_ffmpeg` for the running executable.
+pub fn ffmpeg_program() -> PathBuf {
+    std::env::current_exe().map_or_else(|_| PathBuf::from("ffmpeg"), |e| resolve_ffmpeg(&e))
+}
+
+/// Whether this ffmpeg can write HAP (its encoder needs libsnappy).
+pub fn ffmpeg_has_hap_at(program: &Path) -> bool {
+    Command::new(program)
         .args(["-hide_banner", "-encoders"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(" hap "))
@@ -519,9 +538,10 @@ impl Converter {
         let (c2, r2) = (cancel.clone(), req.clone());
         let reg = self.registry.clone();
         let handle = std::thread::spawn(move || {
-            if !ffmpeg_has_hap() {
+            let program = ffmpeg_program();
+            if !ffmpeg_has_hap_at(&program) {
                 let _ = tx.send(Update::Failed(
-                    "This ffmpeg cannot write HAP (it needs the snappy library: brew reinstall ffmpeg with snappy)".into(),
+                    "This ffmpeg cannot write HAP (it needs the snappy library). The app bundle ships one; for a source build run scripts/build-ffmpeg.sh".into(),
                 ));
                 return;
             }
@@ -531,7 +551,7 @@ impl Converter {
                 let _ = std::fs::create_dir_all(d);
             }
             let total = free_space(&part).map_or(0, |s| s.total);
-            let mut cmd = Command::new("ffmpeg");
+            let mut cmd = Command::new(&program);
             cmd.args(ffmpeg_args(&r2.src, &part, r2.variant));
             let free: FreeFn = Arc::new(free_space);
             run_job(
@@ -878,6 +898,8 @@ mod tests {
         let p = d3.join("Contents/Resources/ffmpeg");
         fake_ffmpeg(&p, "x");
         std::fs::write(&p, "#!/bin/sh\n").unwrap();
-        assert!(!ffmpeg_has_hap_at(&resolve_ffmpeg(&d3.join("Contents/MacOS/vjcraft"))));
+        assert!(!ffmpeg_has_hap_at(&resolve_ffmpeg(
+            &d3.join("Contents/MacOS/vjcraft")
+        )));
     }
 }
