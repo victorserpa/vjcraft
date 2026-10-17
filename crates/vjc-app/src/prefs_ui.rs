@@ -6,6 +6,7 @@ use crate::widgets::{
 };
 use crate::{PrefsTab, State, api_io};
 use eframe::egui;
+use vjc_io::prefs::HwDecode;
 use vjc_model::FitMode;
 
 impl State {
@@ -333,6 +334,20 @@ impl State {
                             });
                         toggle(ui, &mut p.video.folder_sequence, "Dropped folder of numbered images becomes one sequence clip");
                         toggle(ui, &mut p.video.vsync, "VSync (applies on next launch)");
+                        egui::ComboBox::from_label("Hardware decoding")
+                            .selected_text(match p.video.hw_decode {
+                                HwDecode::Auto => "Auto",
+                                HwDecode::Off => "Off",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut p.video.hw_decode, HwDecode::Auto, "Auto");
+                                ui.selectable_value(&mut p.video.hw_decode, HwDecode::Off, "Off");
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label("Hardware decode sessions");
+                            field_int(ui, &mut p.video.hw_sessions, 0..=64, "", "");
+                        });
+                        help(ui, "Clips decoding on the GPU at once; the rest use software. Applies to clips opened afterwards.");
                         toggle(ui, &mut p.video.output_10bit, "10-bit output when the display allows it (applies on next launch)");
                     }
                     PrefsTab::Control => {
@@ -608,6 +623,7 @@ impl State {
                 }
             });
         if self.prefs != before {
+            crate::apply_hw_decode(&self.prefs);
             self.prefs_dirty = true;
         }
         if !open || done {
