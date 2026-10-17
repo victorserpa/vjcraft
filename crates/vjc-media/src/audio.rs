@@ -1091,7 +1091,7 @@ impl AudioPart {
     pub(crate) fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            crate::reap(t);
         }
         self.engine.remove_voice(&self.voice);
     }
@@ -1102,7 +1102,7 @@ impl Drop for AudioPart {
         // `stop()` consumes self and ends up here too; this covers a plain drop.
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            crate::reap(t);
         }
         self.engine.remove_voice(&self.voice);
     }

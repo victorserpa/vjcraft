@@ -339,7 +339,7 @@ impl Drop for Pub {
     fn drop(&mut self) {
         self.tx = None; // worker sees Disconnected and closes the socket
         if let Some(w) = self.worker.take() {
-            let _ = w.join();
+            vjc_media::reap(w);
         }
     }
 }

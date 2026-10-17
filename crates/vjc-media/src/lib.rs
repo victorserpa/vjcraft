@@ -136,6 +136,41 @@ fn guarded(shared: &Shared, what: &str, body: impl FnOnce()) {
     }
 }
 
+/// Pending joins above this count are logged: threads are not exiting.
+const REAPER_WARN: usize = 16;
+static REAP_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REAPER: std::sync::OnceLock<std::sync::mpsc::Sender<JoinHandle<()>>> =
+    std::sync::OnceLock::new();
+
+/// Hands a thread to the single long-lived `vjc-reaper`, which joins it off the caller's
+/// thread. Never blocks: a decode thread stuck in a long 4K decode must not stall the UI.
+pub fn reap(handle: JoinHandle<()>) {
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<JoinHandle<()>>();
+        let spawned = std::thread::Builder::new()
+            .name("vjc-reaper".into())
+            .spawn(move || {
+                while let Ok(h) = rx.recv() {
+                    let _ = h.join();
+                    REAP_PENDING.fetch_sub(1, Ordering::Relaxed);
+                }
+            });
+        if spawned.is_err() {
+            eprintln!("vjc-media: cannot start reaper, threads are detached");
+        }
+        tx
+    });
+    let n = REAP_PENDING.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > REAPER_WARN {
+        eprintln!("vjc-media: {n} threads waiting to be joined");
+    }
+    if let Err(e) = tx.send(handle) {
+        // Reaper gone: dropping the handle detaches the thread, which still exits on its own.
+        REAP_PENDING.fetch_sub(1, Ordering::Relaxed);
+        drop(e);
+    }
+}
+
 pub struct Player {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -310,7 +345,7 @@ impl Player {
             a.stop();
         }
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            reap(t);
         }
     }
 }
@@ -1071,6 +1106,18 @@ mod tests {
         assert_eq!(back.data, first.data);
         pl.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_a_player_stuck_in_a_long_decode_does_not_block() {
+        let pl = Player::open_external("net:slow", |_sink| {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        drop(pl);
+        assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
     }
 
     const SAMPLE: &str = "/Applications/Resolume Arena/media/AV/Beat 001.mov";
