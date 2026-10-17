@@ -1611,34 +1611,58 @@ fn browser_fx() -> &'static [browser::FxEntry] {
     })
 }
 
-/// Per-user app dir for `os` (a `std::env::consts::OS` name): Windows `%APPDATA%\\VJCraft`,
-/// Linux `$XDG_DATA_HOME/vjcraft` (else `~/.local/share/vjcraft`), macOS
-/// `~/Library/Application Support/VJCraft`. Data and config share it.
-fn platform_data_dir(
+#[derive(Clone, Copy, PartialEq)]
+enum DirKind {
+    Config,
+    Data,
+}
+
+/// Same locations the `directories` crate gave via `ProjectDirs::from("", "", "VJCraft")`,
+/// computed from an injected env so they are testable. macOS: `~/Library/Application
+/// Support/VJCraft` for both; Linux: `$XDG_CONFIG_HOME|~/.config` / `$XDG_DATA_HOME|
+/// ~/.local/share` + `vjcraft`; Windows: `%APPDATA%\VJCraft\config` and `\data`.
+/// Relative XDG values are ignored, as the spec says.
+fn platform_dir(
     os: &str,
+    kind: DirKind,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
     let get = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let abs = |k: &str| get(k).filter(|p| p.is_absolute());
     match os {
-        "windows" => Some(get("APPDATA")?.join("VJCraft")),
+        "windows" => {
+            let sub = if kind == DirKind::Config {
+                "config"
+            } else {
+                "data"
+            };
+            Some(get("APPDATA")?.join("VJCraft").join(sub))
+        }
         "macos" => Some(get("HOME")?.join("Library/Application Support/VJCraft")),
-        _ => Some(
-            get("XDG_DATA_HOME")
-                .or_else(|| get("HOME").map(|h| h.join(".local/share")))?
-                .join("vjcraft"),
-        ),
+        _ => {
+            let (var, rel) = if kind == DirKind::Config {
+                ("XDG_CONFIG_HOME", ".config")
+            } else {
+                ("XDG_DATA_HOME", ".local/share")
+            };
+            Some(
+                abs(var)
+                    .or_else(|| get("HOME").map(|h| h.join(rel)))?
+                    .join("vjcraft"),
+            )
+        }
     }
 }
 
-fn app_dir() -> Option<PathBuf> {
-    platform_data_dir(std::env::consts::OS, &|k| std::env::var_os(k))
+fn app_dir(kind: DirKind) -> Option<PathBuf> {
+    platform_dir(std::env::consts::OS, kind, &|k| std::env::var_os(k))
 }
 
 /// `VJC_DATA_DIR` (dev/testing) replaces the per-user data and config dir.
 fn data_dir_from(over: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match over.filter(|o| !o.is_empty()) {
         Some(o) => Some(PathBuf::from(o)),
-        None => app_dir(),
+        None => app_dir(DirKind::Data),
     }
 }
 
@@ -1652,9 +1676,13 @@ fn recovery_path() -> Option<PathBuf> {
     Some(data_dir()?.join("recovery.vjc"))
 }
 
-/// Per-user config dir (same as the data dir) + prefs.json
+/// Per-user config dir + prefs.json
 fn prefs_path() -> Option<PathBuf> {
-    Some(data_dir()?.join("prefs.json"))
+    let dir = match std::env::var_os("VJC_DATA_DIR").filter(|o| !o.is_empty()) {
+        Some(o) => PathBuf::from(o),
+        None => app_dir(DirKind::Config)?,
+    };
+    Some(dir.join("prefs.json"))
 }
 
 /// Removes the recovery file (Don't Save, saved, discarded). Missing file is fine.
@@ -12077,6 +12105,8 @@ fn local_clock() -> String {
 
 #[cfg(windows)]
 fn local_clock() -> String {
+    // Win32 SYSTEMTIME: the fields we never read still have to exist for the layout.
+    #[allow(dead_code)]
     #[repr(C)]
     #[derive(Default)]
     struct SystemTime {
@@ -12614,36 +12644,51 @@ mod remap_tests {
             match k {
                 "APPDATA" => Some(r"C:\Users\v\AppData\Roaming".into()),
                 "XDG_DATA_HOME" => Some("/x/share".into()),
+                "XDG_CONFIG_HOME" => Some("/x/cfg".into()),
                 "HOME" => Some("/h".into()),
                 _ => None,
             }
         };
+        let (c, d) = (DirKind::Config, DirKind::Data);
+        let win = PathBuf::from(r"C:\Users\v\AppData\Roaming").join("VJCraft");
+        assert_eq!(platform_dir("windows", c, &env), Some(win.join("config")));
+        assert_eq!(platform_dir("windows", d, &env), Some(win.join("data")));
         assert_eq!(
-            platform_data_dir("windows", &env),
-            Some(PathBuf::from(r"C:\Users\v\AppData\Roaming").join("VJCraft"))
+            platform_dir("linux", c, &env),
+            Some("/x/cfg/vjcraft".into())
         );
         assert_eq!(
-            platform_data_dir("linux", &env),
-            Some(PathBuf::from("/x/share/vjcraft"))
+            platform_dir("linux", d, &env),
+            Some("/x/share/vjcraft".into())
         );
-        let no_xdg = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
+        let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
         assert_eq!(
-            platform_data_dir("linux", &no_xdg),
-            Some(PathBuf::from("/h/.local/share/vjcraft"))
+            platform_dir("linux", c, &home),
+            Some("/h/.config/vjcraft".into())
         );
         assert_eq!(
-            platform_data_dir("macos", &env),
-            Some(PathBuf::from("/h/Library/Application Support/VJCraft"))
+            platform_dir("linux", d, &home),
+            Some("/h/.local/share/vjcraft".into())
         );
-        let empty_xdg = |k: &str| match k {
-            "XDG_DATA_HOME" => Some(OsString::new()),
+        let rel = |k: &str| match k {
+            "XDG_DATA_HOME" | "XDG_CONFIG_HOME" => Some(OsString::from("rel/dir")),
             "HOME" => Some(OsString::from("/h")),
             _ => None,
         };
         assert_eq!(
-            platform_data_dir("linux", &empty_xdg),
-            Some(PathBuf::from("/h/.local/share/vjcraft"))
+            platform_dir("linux", c, &rel),
+            Some("/h/.config/vjcraft".into())
         );
+        assert_eq!(
+            platform_dir("linux", d, &rel),
+            Some("/h/.local/share/vjcraft".into())
+        );
+        for k in [c, d] {
+            assert_eq!(
+                platform_dir("macos", k, &env),
+                Some("/h/Library/Application Support/VJCraft".into())
+            );
+        }
     }
 
     #[test]

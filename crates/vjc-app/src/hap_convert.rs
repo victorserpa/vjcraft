@@ -73,6 +73,10 @@ pub fn free_space(path: &Path) -> Option<Space> {
     while !p.exists() {
         p = p.parent()?;
     }
+    // GetDiskFreeSpaceExW wants a directory: for a file use its parent.
+    if cfg!(windows) && p.is_file() {
+        p = p.parent()?;
+    }
     volume_space(p)
 }
 
@@ -883,5 +887,15 @@ mod tests {
         assert!(a.total > 0 && a.free <= a.total);
         let b = free_space(&d.join("not").join("yet")).expect("walks up to the parent");
         assert_eq!(a.total, b.total);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn free_space_of_a_file_uses_its_parent() {
+        let d = tmp("space_file");
+        let f = d.join("a.bin");
+        std::fs::write(&f, b"x").unwrap();
+        let a = free_space(&f).expect("file volume");
+        assert_eq!(a.total, free_space(&d).unwrap().total);
     }
 }
