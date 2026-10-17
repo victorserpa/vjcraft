@@ -218,17 +218,30 @@ pub fn ffmpeg_args(src: &Path, part: &Path, v: Variant) -> Vec<std::ffi::OsStrin
     a
 }
 
-/// The ffmpeg CLI to run: the one bundled with the app first (`Contents/Resources/ffmpeg`
-/// next to `Contents/MacOS/<exe>`, or `ffmpeg` beside the exe), then `ffmpeg` on PATH.
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// The ffmpeg CLI to run: the first candidate that is an executable file with the HAP
+/// encoder. Candidates: the bundle (`Contents/Resources/ffmpeg` next to `Contents/MacOS/<exe>`),
+/// `ffmpeg` beside the exe, `<repo>/target/ffmpeg/bin/ffmpeg` for a dev exe in
+/// `target/{debug,release}`. Falls back to `ffmpeg` on PATH.
 pub fn resolve_ffmpeg(exe: &Path) -> PathBuf {
     let Some(dir) = exe.parent() else {
         return PathBuf::from("ffmpeg");
     };
     let bundled = dir.parent().map(|c| c.join("Resources/ffmpeg"));
+    let dev = dir
+        .file_name()
+        .is_some_and(|n| n == "debug" || n == "release")
+        .then(|| dir.parent().map(|t| t.join("ffmpeg/bin/ffmpeg")))
+        .flatten();
     bundled
         .into_iter()
         .chain([dir.join("ffmpeg")])
-        .find(|p| p.is_file())
+        .chain(dev)
+        .find(|p| is_executable_file(p) && ffmpeg_has_hap_at(p))
         .unwrap_or_else(|| PathBuf::from("ffmpeg"))
 }
 
@@ -891,15 +904,40 @@ mod tests {
         let d2 = tmp("beside");
         fake_ffmpeg(&d2.join("ffmpeg"), "beside");
         assert_eq!(resolve_ffmpeg(&d2.join("vjcraft")), d2.join("ffmpeg"));
-        // Control: a bundled binary that cannot write HAP is reported as such, not
-        // silently replaced by PATH.
+        // Control: a bundled binary that cannot write HAP is skipped (falls to PATH).
         let d3 = tmp("nohap");
         std::fs::create_dir_all(d3.join("Contents/MacOS")).unwrap();
         let p = d3.join("Contents/Resources/ffmpeg");
         fake_ffmpeg(&p, "x");
         std::fs::write(&p, "#!/bin/sh\n").unwrap();
-        assert!(!ffmpeg_has_hap_at(&resolve_ffmpeg(
-            &d3.join("Contents/MacOS/vjcraft")
-        )));
+        assert_eq!(
+            resolve_ffmpeg(&d3.join("Contents/MacOS/vjcraft")),
+            PathBuf::from("ffmpeg")
+        );
+    }
+
+    #[test]
+    fn resolve_skips_non_executable_and_non_hap_then_next_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("skip");
+        let (macos, res) = (d.join("Contents/MacOS"), d.join("Contents/Resources"));
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("vjcraft");
+        // Bundled: not executable. Beside exe: executable but no HAP. Neither is picked.
+        fake_ffmpeg(&res.join("ffmpeg"), "bundled");
+        std::fs::set_permissions(res.join("ffmpeg"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        fake_ffmpeg(&macos.join("ffmpeg"), "x");
+        std::fs::write(macos.join("ffmpeg"), "#!/bin/sh\n").unwrap();
+        assert_eq!(resolve_ffmpeg(&exe), PathBuf::from("ffmpeg"));
+        // A good later candidate wins over the bad earlier ones.
+        let t = tmp("dev");
+        let dbg = t.join("target/debug");
+        std::fs::create_dir_all(&dbg).unwrap();
+        fake_ffmpeg(&t.join("target/ffmpeg/bin/ffmpeg"), "dev");
+        assert_eq!(
+            resolve_ffmpeg(&dbg.join("vjcraft")),
+            t.join("target/ffmpeg/bin/ffmpeg")
+        );
     }
 }

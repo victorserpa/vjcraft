@@ -93,24 +93,20 @@ cmake --install "$SRC/snappy-build" >/dev/null
 rm -rf "$SRC/ffmpeg-build" "$OUT"
 mkdir -p "$SRC/ffmpeg-build"
 START=$(date +%s)
-# Minimal on purpose: conversion needs a few decoders, the HAP encoder, PCM, the mov muxer.
+# Inputs: every native demuxer, decoder, parser and bsf (so common sources convert); only the
+# file/pipe protocols. Outputs stay minimal: HAP, PCM and AAC encoders, the mov muxer.
 # No --enable-gpl, --enable-version3 or --enable-nonfree: the build stays LGPL-2.1+.
 (
   cd "$SRC/ffmpeg-build"
   "$SRC/ffmpeg/configure" \
     --prefix="$OUT" \
-    --disable-everything --disable-autodetect --disable-doc --disable-debug \
+    --disable-autodetect --disable-doc --disable-debug \
     --disable-network --disable-ffplay --disable-ffprobe \
     --enable-ffmpeg --enable-zlib --enable-libsnappy \
     --enable-swscale --enable-swresample \
-    --enable-protocol=file,pipe \
-    --enable-demuxer=mov,matroska,avi,rawvideo,image2,wav \
-    --enable-muxer=mov \
-    --enable-decoder=h264,hevc,prores,mjpeg,png,rawvideo,mpeg4,vp8,vp9,hap,aac,mp3,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8 \
-    --enable-encoder=hap,pcm_s16le \
-    --enable-parser=h264,hevc,aac,mpegaudio,mjpeg,png,mpeg4video,vp8,vp9 \
-    --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
-    --enable-filter=scale,format,aformat,aresample,null,anull \
+    --disable-protocols --enable-protocol=file,pipe \
+    --disable-encoders --enable-encoder=hap,pcm_s16le,aac \
+    --disable-muxers --enable-muxer=mov \
     --extra-cflags="-I$DEPS/include -mmacosx-version-min=$MIN_MACOS" \
     --extra-ldflags="-L$DEPS/lib -mmacosx-version-min=$MIN_MACOS" \
     --extra-libs="-lc++"

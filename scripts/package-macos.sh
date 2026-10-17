@@ -35,8 +35,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/vjcraft "$APP/Contents/MacOS/vjcraft"
 
 # HAP-capable ffmpeg CLI for "Convert to HAP" (LGPL, static; built from pinned sources).
-scripts/build-ffmpeg.sh
-cp target/ffmpeg/bin/ffmpeg "$APP/Contents/Resources/ffmpeg"
+# Reuse target/ffmpeg/bin/ffmpeg; build only when missing. A failed build is not fatal.
+if [ ! -x target/ffmpeg/bin/ffmpeg ]; then
+  scripts/build-ffmpeg.sh || echo "WARNING: FFmpeg build failed; packaging without Convert to HAP support" >&2
+fi
+if [ -x target/ffmpeg/bin/ffmpeg ]; then
+  cp target/ffmpeg/bin/ffmpeg "$APP/Contents/Resources/ffmpeg"
+else
+  echo "WARNING: no target/ffmpeg/bin/ffmpeg; app has no bundled ffmpeg" >&2
+fi
 
 # Icon: use assets/icon/VJCraft.icns if present, else a violet placeholder.
 if [ -f assets/icon/VJCraft.icns ]; then
@@ -97,9 +104,12 @@ if [ "$SIGN_ID" = "-" ]; then
 else
   SIGN_OPTS=(--force --timestamp --options runtime -s "$SIGN_ID")
 fi
-for lib in "$APP"/Contents/Frameworks/*.dylib "$APP/Contents/Resources/ffmpeg"; do
+for lib in "$APP"/Contents/Frameworks/*.dylib; do
   codesign "${SIGN_OPTS[@]}" "$lib"
 done
+if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
+  codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP/Contents/Resources/ffmpeg"
+fi
 codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP"
 codesign --verify --deep --strict "$APP"
 

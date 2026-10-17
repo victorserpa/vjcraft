@@ -216,3 +216,85 @@ fn built_ffmpeg_writes_hap_variants_the_native_path_reads_like_ffmpeg() {
         assert!(diff < 2.5, "{name}: native vs FFmpeg mean diff {diff}");
     }
 }
+
+/// Common non-mov sources must convert (all native demuxers/decoders are built in). The
+/// sources are made with the system ffmpeg (the built one only has mov/aac/pcm/hap output).
+#[test]
+fn built_ffmpeg_converts_mpegts_aac_and_mp3_sources() {
+    let Some(bin) = built_ffmpeg() else { return };
+    let mk = |args: &[&str]| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-v", "error", "-y"])
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let d = tmp("sources");
+    let ts = d.join("a.ts");
+    let mp3 = d.join("a.avi");
+    let (ts_s, mp3_s) = (ts.to_str().unwrap(), mp3.to_str().unwrap());
+    let ok = mk(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=1",
+        "-c:v",
+        "mpeg2video",
+        "-c:a",
+        "aac",
+        "-f",
+        "mpegts",
+        ts_s,
+    ]) && mk(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=1",
+        "-c:v",
+        "mpeg4",
+        "-c:a",
+        "libmp3lame",
+        "-f",
+        "avi",
+        mp3_s,
+    ]);
+    if !ok {
+        assert!(
+            std::env::var_os("VJC_REQUIRE_HAP_FFMPEG").is_none(),
+            "system ffmpeg cannot generate the sources"
+        );
+        eprintln!("skipped: system ffmpeg cannot generate mpegts/mp3 sources");
+        return;
+    }
+    for (src, name) in [(&ts, "ts"), (&mp3, "mp3")] {
+        let out = d.join(format!("{name}.mov"));
+        let st = Command::new(&bin)
+            .args(["-hide_banner", "-nostdin", "-v", "error", "-y", "-i"])
+            .arg(src)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "hap",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .args(["-f", "mov"])
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(st.success(), "{name} source failed to convert");
+        assert!(out.metadata().unwrap().len() > 0);
+    }
+}
