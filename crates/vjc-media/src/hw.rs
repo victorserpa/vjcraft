@@ -122,6 +122,50 @@ pub(crate) fn cap() -> usize {
     CAP.load(Ordering::Relaxed)
 }
 
+/// One 64x64 H.264 intra frame (Annex B), decoded once to start the VideoToolbox session.
+const WARM_CLIP: &[u8] = include_bytes!("../assets/warm.h264");
+
+/// Creating the device alone is cheap; the ~1.3 s goes into the first decode session, so
+/// decode a tiny frame through a real hardware decoder.
+fn warm_session() {
+    let Some(codec) = ff::decoder::find(ff::codec::Id::H264) else {
+        return;
+    };
+    let mut ctx = ff::codec::context::Context::new_with_codec(codec);
+    if !attach(&mut ctx, Hw::On) {
+        return;
+    }
+    let Ok(mut dec) = ctx.decoder().video() else {
+        return;
+    };
+    let pkt = ff::Packet::copy(WARM_CLIP);
+    if dec.send_packet(&pkt).is_ok() {
+        let _ = dec.send_eof();
+        let mut f = ff::frame::Video::empty();
+        let _ = dec.receive_frame(&mut f);
+    }
+}
+
+/// Pays the one-time cost of the first hardware session (about 1.3 s with VideoToolbox) in
+/// a background thread, so the first clip of a show is not late. Does nothing when the
+/// preference is Off. Runs once per process; the handle is returned only to the call that
+/// started it (tests join it).
+pub fn warm_up() -> Option<std::thread::JoinHandle<()>> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    DEVICE?;
+    if preferred() != Hw::On {
+        return None;
+    }
+    let mut handle = None;
+    ONCE.call_once(|| {
+        handle = std::thread::Builder::new()
+            .name("vjc-hw-warm".into())
+            .spawn(warm_session)
+            .ok();
+    });
+    handle
+}
+
 /// Picks the hardware surface format when the decoder offers it; otherwise the first
 /// software format (that clip decodes in software).
 unsafe extern "C" fn get_format(

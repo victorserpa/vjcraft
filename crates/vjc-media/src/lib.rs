@@ -32,7 +32,7 @@ pub mod snapshot;
 #[cfg(test)]
 use hw::HwSlots;
 use hw::{Hw, HwSlot};
-pub use hw::{active_sessions, configure as configure_hw_decode};
+pub use hw::{active_sessions, configure as configure_hw_decode, warm_up as warm_up_hw_decode};
 
 /// A decoded RGBA8 frame (tightly packed, `width * 4` bytes per row).
 #[derive(Clone)]

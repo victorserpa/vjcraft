@@ -1942,6 +1942,7 @@ impl State {
 
     fn build(prefs: Prefs, live: bool) -> Self {
         apply_hw_decode(&prefs);
+        vjc_media::warm_up_hw_decode();
         let project = fresh_project(&prefs);
         State {
             tex_cap: 16384,
