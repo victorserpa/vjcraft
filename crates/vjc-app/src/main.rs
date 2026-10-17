@@ -18,6 +18,7 @@ mod frame_stats;
 mod fx;
 mod fx_thumbs;
 mod grid_ui;
+mod hap_convert;
 mod hap_gpu;
 mod help;
 mod hold;
@@ -192,6 +193,10 @@ struct State {
     heads: HashMap<LayerId, Playhead>,
     /// Codec / size / fps of file clips, probed on demand.
     src_info: source_info::SourceInfos,
+    /// Convert to HAP: queue, the question being asked, and the swap offer after a finish.
+    hap: hap_convert::Converter,
+    hap_ask: Option<HapAsk>,
+    hap_swap: Option<(hap_convert::Request, PathBuf)>,
     last_head_tick: std::time::Instant,
     /// Runtime-only playback flow per layer (transitions, loop counts, beat loops).
     flow: Flow,
@@ -435,6 +440,15 @@ enum CellAct {
     Copy,
     Paste,
     Clear,
+    ConvertHap,
+}
+
+/// A "Convert to HAP" question waiting for the user.
+struct HapAsk {
+    src: PathBuf,
+    cell: Option<(DeckId, LayerId, u32)>,
+    /// Chosen variant; `None` = the default for the source.
+    variant: Option<hap_convert::Variant>,
 }
 
 /// What the Preview monitor shows.
@@ -1949,6 +1963,9 @@ impl State {
             clip_start: HashMap::new(),
             heads: HashMap::new(),
             src_info: Default::default(),
+            hap: Default::default(),
+            hap_ask: None,
+            hap_swap: None,
             flow: Flow::default(),
             last_head_tick: std::time::Instant::now(),
             comp: None,
@@ -2671,6 +2688,167 @@ impl State {
             }
             if self.preview_target == PreviewTarget::Layer(layer) {
                 self.preview_target = PreviewTarget::Composition;
+            }
+        }
+    }
+
+    /// Convert to HAP: the confirm dialog, the running job's status and the swap offer.
+    fn hap_windows(&mut self, ctx: &egui::Context) {
+        use hap_convert::{Finished, Request, Variant};
+        if self.hap.registry.is_none()
+            && let Some(dir) = prefs_path().and_then(|p| p.parent().map(PathBuf::from))
+        {
+            let reg = dir.join("hap-parts.txt");
+            hap_convert::Registry(reg.clone()).clean_stale();
+            self.hap.registry = Some(reg);
+        }
+        if let Some(src) = self.browser.convert_req.take() {
+            self.hap_ask = Some(HapAsk {
+                src,
+                cell: None,
+                variant: None,
+            });
+        }
+        match self.hap.poll() {
+            Some(Finished::Done { req, out }) => {
+                self.status = format!("HAP ready: {}", out.display());
+                if req.cell.is_some() {
+                    self.hap_swap = Some((req, out));
+                }
+            }
+            Some(Finished::Failed(msg)) => self.status = format!("Convert to HAP: {msg}"),
+            Some(Finished::Cancelled) => self.status = "Convert to HAP cancelled".into(),
+            None => {}
+        }
+        if self.hap.busy()
+            && let Some((name, p, queued)) = self.hap.status()
+        {
+            let more = if queued > 0 {
+                format!(" (+{queued} waiting)")
+            } else {
+                String::new()
+            };
+            self.status = format!("Converting {name} to HAP: {:.0}%{more}", p * 100.0);
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            let mut stop = false;
+            egui::Window::new("Convert to HAP")
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -40.0])
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(&name);
+                    ui.add(egui::ProgressBar::new(p).show_percentage());
+                    stop = widgets::btn(ui, "Cancel", widgets::Kind::Secondary).clicked();
+                });
+            if stop {
+                self.hap.cancel_current();
+            }
+        }
+        if let Some(ask) = &mut self.hap_ask {
+            let info = self.src_info.get(&ask.src).map(|i| i.cloned());
+            let general = &self.prefs.general;
+            let dir = general
+                .hap_folder
+                .clone()
+                .or_else(|| ask.src.parent().map(PathBuf::from))
+                .unwrap_or_default();
+            let space = hap_convert::free_space(&dir);
+            let (mut go, mut no) = (false, false);
+            let name = ask
+                .src
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let esc = widgets::dialog(ctx, "Convert to HAP", true, |ui| {
+                ui.label(format!(
+                    "{name}\nWrites a .hap.mov file; the original is kept."
+                ));
+                match &info {
+                    None => {
+                        ui.weak("Reading the file...");
+                        no = widgets::btn(ui, "Cancel", widgets::Kind::Secondary).clicked();
+                    }
+                    Some(None) => {
+                        ui.colored_label(theme::ERROR_TEXT, "Cannot read this file.");
+                        no = widgets::btn(ui, "Close", widgets::Kind::Secondary).clicked();
+                    }
+                    Some(Some(i)) => {
+                        let v = ask.variant.unwrap_or(if i.alpha {
+                            Variant::HapAlpha
+                        } else {
+                            Variant::Hap
+                        });
+                        ask.variant = Some(v);
+                        ui.horizontal(|ui| {
+                            for o in Variant::ALL {
+                                if ui.selectable_label(v == o, o.label()).clicked() {
+                                    ask.variant = Some(o);
+                                }
+                            }
+                        });
+                        let est = hap_convert::estimate_bytes(
+                            i.width,
+                            i.height,
+                            i.fps,
+                            i.duration,
+                            ask.variant.unwrap_or(v),
+                        );
+                        let free = space.map_or_else(
+                            || "free space unknown".to_string(),
+                            |s| format!("{} free", hap_convert::human(s.free)),
+                        );
+                        ui.label(format!("~{}, {free}", hap_convert::human(est)));
+                        if !i.alpha && ask.variant == Some(Variant::HapAlpha) {
+                            ui.weak("The source has no alpha channel.");
+                        }
+                        ui.horizontal(|ui| {
+                            go = widgets::btn(ui, "Convert", widgets::Kind::Primary).clicked();
+                            no = widgets::btn(ui, "Cancel", widgets::Kind::Secondary).clicked();
+                        });
+                    }
+                }
+            });
+            if go && let Some(Some(i)) = info {
+                let req = Request {
+                    src: ask.src.clone(),
+                    variant: ask.variant.unwrap_or(Variant::Hap),
+                    cell: ask.cell,
+                    out_dir: general.hap_folder.clone(),
+                    reserve_gb: general.hap_reserve_gb,
+                    width: i.width,
+                    height: i.height,
+                    fps: i.fps,
+                    duration: i.duration,
+                };
+                self.hap_ask = None;
+                match self.hap.submit(req) {
+                    Ok(()) => self.status = "Convert to HAP queued".into(),
+                    Err(e) => self.status = e,
+                }
+            } else if no || esc {
+                self.hap_ask = None;
+            }
+        }
+        if let Some((req, out)) = self.hap_swap.clone() {
+            let (mut yes, mut no) = (false, false);
+            let esc = widgets::dialog(ctx, "HAP file ready", true, |ui| {
+                ui.label(format!(
+                    "{}\nUse it in this clip instead of the original? You can undo this.",
+                    out.display()
+                ));
+                ui.horizontal(|ui| {
+                    yes = widgets::btn(ui, "Swap clip", widgets::Kind::Primary).clicked();
+                    no = widgets::btn(ui, "Keep original", widgets::Kind::Secondary).clicked();
+                });
+            });
+            if yes {
+                if let Some((deck, layer, column)) = req.cell {
+                    self.exec(Command::SetMediaPaths {
+                        changes: vec![(deck, layer, column, out)],
+                    });
+                }
+                self.hap_swap = None;
+            } else if no || esc {
+                self.hap_swap = None;
             }
         }
     }
@@ -3954,6 +4132,15 @@ impl State {
                 self.preview_target = PreviewTarget::Clip(deck, layer, column);
             }
             (CellAct::Copy, Some(k)) => self.clip_clipboard = Some(k),
+            (CellAct::ConvertHap, Some(k)) => {
+                if let vjc_model::Source::File { path } = &k.source {
+                    self.hap_ask = Some(HapAsk {
+                        src: path.clone(),
+                        cell: Some((deck, layer, column)),
+                        variant: None,
+                    });
+                }
+            }
             (CellAct::Cut, Some(k)) => {
                 self.clip_clipboard = Some(k);
                 cmds.push(Command::ClearCell {
@@ -7491,6 +7678,7 @@ impl State {
         self.save_layout_window(&ctx);
         self.overwrite_layout_window(&ctx);
         self.remove_layer_modal(&ctx);
+        self.hap_windows(&ctx);
         self.output_setup_window(&ctx);
         self.display_info_window(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -8520,6 +8708,17 @@ impl State {
                                         .clicked()
                                         {
                                             acts.push((lid, ci, CellAct::Clear));
+                                            ui.close();
+                                        }
+                                        if matches!(k.source, vjc_model::Source::File { .. })
+                                            && crate::widgets::btn(
+                                                ui,
+                                                "Convert to HAP...",
+                                                crate::widgets::Kind::Secondary,
+                                            )
+                                            .clicked()
+                                        {
+                                            acts.push((lid, ci, CellAct::ConvertHap));
                                             ui.close();
                                         }
                                         ui.menu_button("Rename...", |ui| {

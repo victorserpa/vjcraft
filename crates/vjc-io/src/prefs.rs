@@ -29,6 +29,11 @@ pub struct General {
     pub record_folder: Option<PathBuf>,
     /// Folder snapshot PNGs are saved into; `None` = ask on the first snapshot.
     pub snapshot_folder: Option<PathBuf>,
+    /// Folder "Convert to HAP" writes into; `None` = next to the source file.
+    pub hap_folder: Option<PathBuf>,
+    /// Free space (GB) a conversion must leave on the volume; `None` = the larger of 10 GB
+    /// and 10% of the volume.
+    pub hap_reserve_gb: Option<u32>,
     /// Ask before quitting even when the project has no unsaved changes.
     pub confirm_quit: bool,
     /// Blend mode of layers added from the toolbar.
@@ -103,6 +108,8 @@ impl Default for General {
             browser_grid: false,
             record_folder: None,
             snapshot_folder: None,
+            hap_folder: None,
+            hap_reserve_gb: None,
             confirm_quit: false,
             default_blend: vjc_model::BlendMode::Normal,
             clip_start_offset_ms: 0,

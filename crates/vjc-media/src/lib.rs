@@ -489,6 +489,8 @@ pub struct SourceInfo {
     pub fps: f64,
     /// Length of the file in seconds; 0 when unknown.
     pub duration: f64,
+    /// The pixel format carries an alpha channel (or the decoder could not be opened: false).
+    pub alpha: bool,
 }
 
 /// Reads codec, size, frame rate and length of a video file. Blocks on file I/O: call it
@@ -505,10 +507,13 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
     };
     let params = st.parameters();
     let codec = params.id().name().to_string();
-    let (width, height) = ff::codec::context::Context::from_parameters(params)
+    let (width, height, alpha) = ff::codec::context::Context::from_parameters(params)
         .ok()
         .and_then(|c| c.decoder().video().ok())
-        .map_or((0, 0), |d| (d.width(), d.height()));
+        .map_or((0, 0, false), |d| {
+            let comps = d.format().descriptor().map_or(0, |x| x.nb_components());
+            (d.width(), d.height(), comps == 2 || comps == 4)
+        });
     let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
     Some(SourceInfo {
         codec,
@@ -516,6 +521,7 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
         height,
         fps,
         duration,
+        alpha,
     })
 }
 

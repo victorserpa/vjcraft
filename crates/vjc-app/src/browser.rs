@@ -513,6 +513,8 @@ pub struct Browser {
     rec_active: Option<PathBuf>,
     rec_at: Option<std::time::Instant>,
     checks: PathChecks,
+    /// Video file the user asked to convert to HAP (right click); taken by the app.
+    pub convert_req: Option<PathBuf>,
 }
 
 impl Browser {
@@ -533,6 +535,7 @@ impl Browser {
             rec_active: None,
             rec_at: None,
             checks: PathChecks::default(),
+            convert_req: None,
         }
     }
 
@@ -827,6 +830,7 @@ impl Browser {
                             changed = true;
                         }
                     }
+                    Ev::Convert(i) => self.convert_req = rows[i].path.clone(),
                     Ev::Click(_) => {}
                 }
             }
@@ -1131,6 +1135,16 @@ impl Browser {
                 return;
             }
         }
+        if row.kind == RowKind::Video && row.path.is_some() {
+            r.context_menu(|ui| {
+                if crate::widgets::btn(ui, "Convert to HAP...", crate::widgets::Kind::Secondary)
+                    .clicked()
+                {
+                    evs.push(Ev::Convert(i));
+                    ui.close();
+                }
+            });
+        }
         if r.double_clicked() {
             evs.push(Ev::Double(i));
         } else if r.clicked() {
@@ -1147,6 +1161,7 @@ enum Ev {
     Double(usize),
     Drag(usize),
     Fav(usize),
+    Convert(usize),
 }
 
 #[cfg(test)]

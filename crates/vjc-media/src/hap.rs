@@ -105,8 +105,10 @@ fn section(b: &[u8]) -> Result<(usize, usize, u8), String> {
 }
 
 fn u32s(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 

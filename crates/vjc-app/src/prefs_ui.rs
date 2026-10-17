@@ -185,6 +185,37 @@ impl State {
                             }
                         });
                         help(ui, "Empty = ask on the first snapshot.");
+                        ui.horizontal(|ui| {
+                            ui.label("HAP output folder");
+                            let mut t = p
+                                .general
+                                .hap_folder
+                                .as_ref()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default();
+                            if field_text(ui, &mut t, Width::Lg, None).changed() {
+                                p.general.hap_folder =
+                                    (!t.trim().is_empty()).then(|| t.trim().into());
+                            }
+                            if btn(ui, "Choose...", Kind::Secondary).clicked()
+                                && let Some(d) = rfd::FileDialog::new().pick_folder()
+                            {
+                                p.general.hap_folder = Some(d);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("HAP free-space reserve (GB, 0 = automatic)");
+                            let mut gb = p.general.hap_reserve_gb.unwrap_or(0);
+                            if field_int(ui, &mut gb, 0..=100_000, "", "").changed() {
+                                p.general.hap_reserve_gb = (gb > 0).then_some(gb);
+                            }
+                        });
+                        help(
+                            ui,
+                            "Convert to HAP writes next to the source unless a folder is set (point it \
+                             at an external drive). It refuses, or stops, when free space would fall \
+                             below the reserve. Automatic = the larger of 10 GB and 10% of the volume.",
+                        );
                     }
                     PrefsTab::Defaults => {
                         help(ui, "Applied to clips and layers created from now on.");
