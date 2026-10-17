@@ -1586,7 +1586,9 @@ mod tests {
             return;
         }
         assert_eq!(decode_n(&out, 100).unwrap().len(), 20);
-        let mut pl = Player::open_scrub(&out);
+        // Software: the first VideoToolbox session of a process takes over a second to start,
+        // which this 30 ms-step timing test is not about.
+        let mut pl = Player::open_scrub_hw(&out, Hw::Off);
         pl.set_sequential(true);
         let mut last = 0;
         for i in 0..=10 {
