@@ -46,6 +46,7 @@ mod output_ui;
 mod palette;
 mod params;
 mod persist;
+mod output_blit;
 mod pool;
 mod prefs_ui;
 mod preload;
