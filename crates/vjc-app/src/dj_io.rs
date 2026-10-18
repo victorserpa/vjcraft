@@ -107,16 +107,20 @@ pub struct Filter {
 impl Filter {
     pub const ANY: Filter = Filter { net: 0, mask: 0 };
 
-    /// `listen` of 0.0.0.0 accepts all; otherwise the subnet of that local address (its
-    /// own netmask when the interface is found, else only that exact address).
+    /// `listen` of 0.0.0.0 accepts all; otherwise the subnet of that local address. When
+    /// the address is not a current interface (Windows, DHCP change, typed address), the
+    /// subnet is unknown, so nothing is filtered rather than dropping every player.
     pub fn for_listen(listen: Ipv4Addr, ifaces: &[Iface]) -> Filter {
         if listen.is_unspecified() {
             return Filter::ANY;
         }
-        let mask = ifaces
+        let Some(mask) = ifaces
             .iter()
             .find(|i| i.ip == listen)
-            .map_or(u32::MAX, |i| u32::from(i.mask));
+            .map(|i| u32::from(i.mask))
+        else {
+            return Filter::ANY;
+        };
         Filter {
             net: u32::from(listen) & mask,
             mask,
@@ -425,6 +429,12 @@ mod tests {
             retry,
             turns: Arc::default(),
         }
+    }
+
+    #[test]
+    fn unknown_listen_address_does_not_drop_players() {
+        let f = Filter::for_listen(Ipv4Addr::new(192, 168, 1, 20), &[]);
+        assert!(f.accepts(Ipv4Addr::new(192, 168, 1, 30)));
     }
 
     fn pump(sock: &UdpSocket, filter: &Filter) -> usize {
