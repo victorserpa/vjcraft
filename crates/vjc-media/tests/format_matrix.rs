@@ -226,51 +226,37 @@ fn format_matrix() {
     assert_eq!(failed, 0, "{failed} sample(s) failed");
 }
 
-/// Load test: `VJC_HEAVY_FILE` played by 4 players at once in real time for
-/// `VJC_HEAVY_SECS` (default 120). Prints fps per player and process CPU. No pass/fail
-/// threshold beyond "every player delivered frames and none errored".
-#[test]
-#[ignore = "needs VJC_HEAVY_FILE"]
+/// Plays `file` on `n` players in real time for `secs`, layers offset by a quarter of the
+/// clip. Returns delivered fps per layer, process CPU (% of one core), decode status of
+/// layer 0 and the clip duration.
 #[cfg(unix)]
-fn four_layers_heavy() {
-    let Some(file) = std::env::var_os("VJC_HEAVY_FILE").map(PathBuf::from) else {
-        eprintln!("VJC_HEAVY_FILE not set: skipped");
-        return;
-    };
-    let secs: u64 = std::env::var("VJC_HEAVY_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(120);
+fn run_layers(file: &Path, n: usize, secs: u64) -> (Vec<f64>, f64, Option<&'static str>, f64) {
     let cpu = || {
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
         unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
         let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 / 1e6;
         t(ru.ru_utime) + t(ru.ru_stime)
     };
-    configure_hw_decode(
-        std::env::var("VJC_FORMAT_HW").unwrap_or_default() != "off",
-        8,
-    );
-    let mut players: Vec<Player> = (0..4).map(|_| Player::open_scrub(&file)).collect();
+    let mut players: Vec<Player> = (0..n).map(|_| Player::open_scrub(file)).collect();
     for p in &players {
         p.set_sequential(true);
     }
     let t0 = Instant::now();
     while players.iter().any(|p| p.duration().is_none()) {
         assert!(
-            t0.elapsed() < Duration::from_secs(30),
-            "players did not open"
+            t0.elapsed() < Duration::from_secs(60),
+            "players did not open: {:?}",
+            players[0].error()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
     let dur = players[0].duration().unwrap();
     let (c0, w0) = (cpu(), Instant::now());
-    let mut seen = [0u64; 4];
-    let mut last = [0u64; 4];
+    let mut seen = vec![0u64; n];
+    let mut last = vec![0u64; n];
     while w0.elapsed() < Duration::from_secs(secs) {
         let pos = (w0.elapsed().as_secs_f64() % dur) / dur;
         for (i, p) in players.iter().enumerate() {
-            // Offset the layers so they do not decode the same frame.
             p.set_position((pos + i as f64 * 0.25) % 1.0);
             if let Some(f) = p.latest_frame()
                 && f.seq != last[i]
@@ -280,20 +266,111 @@ fn four_layers_heavy() {
             }
             assert!(p.error().is_none(), "{:?}", p.error());
         }
-        std::thread::sleep(Duration::from_millis(4));
+        std::thread::sleep(Duration::from_millis(2));
     }
     let wall = w0.elapsed().as_secs_f64();
-    let cores = cpu() - c0;
-    eprintln!(
-        "HEAVY {}: {} s, fps per layer {:?}, process CPU {:.0}% of one core ({:.0}% of this machine)",
-        file.display(),
-        secs,
-        seen.map(|n| (n as f64 / wall * 10.0).round() / 10.0),
-        cores / wall * 100.0,
-        cores / wall * 100.0 / std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64),
-    );
+    let pct = (cpu() - c0) / wall * 100.0;
+    let status = players[0].decode_status();
     for p in &mut players {
         p.stop();
     }
-    assert!(seen.iter().all(|&n| n > 0), "a layer got no frames");
+    (
+        seen.iter()
+            .map(|&k| (k as f64 / wall * 10.0).round() / 10.0)
+            .collect(),
+        pct,
+        status,
+        dur,
+    )
+}
+
+/// Real user files (`VJC_REAL_FILES`, ';' separated, read in place): duration agrees with
+/// the container, first frame, seek/loop latency, decode path, delivered fps with 1 and
+/// `VJC_REAL_LAYERS` (4) layers. `VJC_REAL_SECS` per run (default 20).
+#[test]
+#[ignore = "needs VJC_REAL_FILES"]
+#[cfg(unix)]
+fn real_files() {
+    let Some(list) = std::env::var("VJC_REAL_FILES").ok() else {
+        return;
+    };
+    let secs: u64 = std::env::var("VJC_REAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let layers: usize = std::env::var("VJC_REAL_LAYERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    for (mode, on) in [("auto", true), ("off", false)] {
+        if !std::env::var("VJC_FORMAT_HW")
+            .unwrap_or_default()
+            .is_empty()
+            && std::env::var("VJC_FORMAT_HW").unwrap() != mode
+        {
+            continue;
+        }
+        configure_hw_decode(on, 8);
+        for f in list.split(';').filter(|f| !f.is_empty()) {
+            let path = PathBuf::from(f);
+            let info = probe(&path);
+            let t = Instant::now();
+            let mut pl = Player::open_scrub(&path);
+            let first = wait_frame(&pl, 0, 30);
+            let t_first = t.elapsed().as_millis();
+            let dur = pl.duration();
+            let mut lat = Vec::new();
+            for p in [0.5, 0.99, 0.0, 0.25] {
+                let seq = pl.latest_frame().map_or(0, |f| f.seq);
+                let t = Instant::now();
+                pl.set_position(p);
+                let r = wait_frame(&pl, seq, 10);
+                lat.push(format!(
+                    "{p}->{}",
+                    r.map_or_else(|e| e, |_| format!("{} ms", t.elapsed().as_millis()))
+                ));
+            }
+            eprintln!(
+                "REAL [{mode}] {f}\n   probe {:?}\n   first frame {} ms ({}), player duration {:?}, decode {:?}\n   seek {}",
+                info,
+                t_first,
+                first.map_or_else(|e| e, |f| format!("{}x{}", f.width, f.height)),
+                dur,
+                pl.decode_status(),
+                lat.join(", ")
+            );
+            pl.stop();
+            for n in [1, layers] {
+                let (fps, cpu, st, d) = run_layers(&path, n, secs);
+                eprintln!(
+                    "   {n} layer(s) {secs}s: fps {fps:?}, CPU {cpu:.0}% of a core, decode {st:?}, duration {d:.2}"
+                );
+            }
+        }
+    }
+}
+
+/// Load test: `VJC_HEAVY_FILE` played by 4 players at once in real time for
+/// `VJC_HEAVY_SECS` (default 120). Prints fps per player and process CPU.
+#[test]
+#[ignore = "needs VJC_HEAVY_FILE"]
+#[cfg(unix)]
+fn four_layers_heavy() {
+    let Some(file) = std::env::var_os("VJC_HEAVY_FILE").map(PathBuf::from) else {
+        return;
+    };
+    let secs: u64 = std::env::var("VJC_HEAVY_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    configure_hw_decode(
+        std::env::var("VJC_FORMAT_HW").unwrap_or_default() != "off",
+        8,
+    );
+    let (fps, cpu, st, _) = run_layers(&file, 4, secs);
+    eprintln!(
+        "HEAVY {}: {secs} s, fps per layer {fps:?}, process CPU {cpu:.0}% of one core, decode {st:?}",
+        file.display()
+    );
+    assert!(fps.iter().all(|&f| f > 0.0), "a layer got no frames");
 }
