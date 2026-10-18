@@ -147,6 +147,23 @@ fn create(lib: &Lib, id: &str) -> Result<(*const Plugin, *const ParamsExt), Stri
     }
 }
 
+/// True when the plugin has a stereo input port and a stereo output port (the layout the host
+/// feeds). A plugin without the audio-ports extension has no ports to feed.
+fn has_stereo_ports(p: *const Plugin) -> bool {
+    unsafe {
+        let ext = ((*p).get_extension)(p, AUDIO_PORTS_EXT_ID.as_ptr()) as *const AudioPortsExt;
+        if ext.is_null() {
+            return false;
+        }
+        [true, false].into_iter().all(|input| {
+            (0..((*ext).count)(p, input).min(64)).any(|i| {
+                let mut info: AudioPortInfo = std::mem::zeroed();
+                ((*ext).get)(p, i, input, &mut info) && info.channel_count == 2
+            })
+        })
+    }
+}
+
 fn info(path: &str) -> Result<Vec<PluginInfo>, String> {
     let lib = Lib::open(path)?;
     let mut out = Vec::new();
@@ -159,8 +176,14 @@ fn info(path: &str) -> Result<Vec<PluginInfo>, String> {
             let (id, name) = (text((*d).id), text((*d).name));
             let (p, ext) = create(&lib, &id)?;
             let params = param_infos(p, ext);
+            let stereo = has_stereo_ports(p);
             ((*p).destroy)(p);
-            out.push(PluginInfo { id, name, params });
+            out.push(PluginInfo {
+                id,
+                name,
+                params,
+                stereo,
+            });
         }
     }
     Ok(out)
@@ -182,6 +205,9 @@ fn load(path: &str, id: &str, rate: u32, max_frames: u32) -> Result<Instance, St
         steady: 0,
         _lib: lib,
     };
+    if !has_stereo_ports(plugin) {
+        return Err("plugin has no stereo audio port (mono or surround only); it cannot be used here".into());
+    }
     unsafe {
         if !((*plugin).activate)(plugin, rate as f64, 1, max_frames) {
             return Err("activate failed".into());

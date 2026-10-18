@@ -4,7 +4,10 @@
 //! Not for the audio callback itself: `process` blocks up to the budget. Call it from a
 //! worker that feeds the callback, and let the callback play dry audio when a block is late.
 pub mod abi;
+pub mod lane;
 pub mod proto;
+
+pub use lane::{ClapLane, ClapShared, LaneStatus};
 
 use memmap2::MmapMut;
 use proto::{Request, Response};
@@ -183,6 +186,29 @@ pub struct Entry {
     pub id: String,
     pub name: String,
     pub params: Vec<ParamInfo>,
+    /// Has stereo ports; a mono-only plugin is listed but cannot be used.
+    #[serde(default = "yes")]
+    pub stereo: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// `.clap` files under `dir`, folders searched recursively (a `.clap` bundle folder is a
+/// plugin, not searched). Symlinked folders are not followed.
+fn find_plugins(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("clap") {
+            out.push(p);
+        } else if depth < 8 && e.file_type().is_ok_and(|t| t.is_dir()) {
+            find_plugins(&p, depth + 1, out);
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -202,7 +228,7 @@ fn mtime(p: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Scan `dirs` (not recursive) for `.clap` files. Results are cached in `cache_file` by path +
+/// Scan `dirs` (recursively) for `.clap` files. Results are cached in `cache_file` by path +
 /// mtime; a file that crashes or hangs while being read is skipped and not retried until it
 /// changes. Meant for a background thread. Returns the entries and the number of files loaded.
 pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entry>, usize) {
@@ -216,14 +242,8 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
     let mut next = BTreeMap::new();
     let mut next_failed = BTreeMap::new();
     for d in dirs {
-        let Ok(rd) = std::fs::read_dir(d) else {
-            continue;
-        };
-        let mut files: Vec<PathBuf> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("clap"))
-            .collect();
+        let mut files = Vec::new();
+        find_plugins(d, 0, &mut files);
         files.sort();
         for f in files {
             let key = f.to_string_lossy().to_string();
@@ -256,6 +276,7 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
                             id: p.id,
                             name: p.name,
                             params: p.params,
+                            stereo: p.stereo,
                         })
                         .collect();
                     found.extend(es.iter().cloned());

@@ -28,6 +28,7 @@ pub struct Entry {
 
 pub const FACTORY_ID: &std::ffi::CStr = c"clap.plugin-factory";
 pub const PARAMS_EXT_ID: &std::ffi::CStr = c"clap.params";
+pub const AUDIO_PORTS_EXT_ID: &std::ffi::CStr = c"clap.audio-ports";
 
 #[repr(C)]
 pub struct Factory {
@@ -161,4 +162,20 @@ pub struct ParamInfoRaw {
     pub min_value: f64,
     pub max_value: f64,
     pub default_value: f64,
+}
+
+#[repr(C)]
+pub struct AudioPortInfo {
+    pub id: u32,
+    pub name: [u8; 256],
+    pub flags: u32,
+    pub channel_count: u32,
+    pub port_type: *const c_char,
+    pub in_place_pair: u32,
+}
+
+#[repr(C)]
+pub struct AudioPortsExt {
+    pub count: unsafe extern "C" fn(*const Plugin, bool) -> u32,
+    pub get: unsafe extern "C" fn(*const Plugin, u32, bool, *mut AudioPortInfo) -> bool,
 }

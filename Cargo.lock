@@ -4684,6 +4684,7 @@ dependencies = [
  "tungstenite",
  "uuid",
  "vjc-avc",
+ "vjc-clap",
  "vjc-core",
  "vjc-fx",
  "vjc-io",
@@ -4767,6 +4768,7 @@ dependencies = [
  "libc",
  "rustfft",
  "snap",
+ "vjc-clap",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 cpal = { version = "0.18.2", default-features = false }
 rustfft = "6.4"
 snap = "1"
+vjc-clap = { path = "../vjc-clap" }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

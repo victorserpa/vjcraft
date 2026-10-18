@@ -42,11 +42,18 @@ pub struct ParamInfo {
     pub default: f64,
 }
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub id: String,
     pub name: String,
     pub params: Vec<ParamInfo>,
+    /// Has a stereo input and a stereo output port.
+    #[serde(default = "yes")]
+    pub stereo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -263,7 +263,7 @@ fn plugin_without_a_stereo_port_is_rejected_with_a_clear_message() {
         }
         s => panic!("expected a rejection, got {s:?}"),
     }
-    let dir = tmp("mono");
+    let dir = tmp("monoscan");
     std::fs::copy(mono_plugin(), dir.join("mono.clap")).unwrap();
     std::fs::copy(plugin(), dir.join("gain.clap")).unwrap();
     let (found, _) = scan(
