@@ -112,6 +112,8 @@ pub(crate) struct Shared {
     latest: Mutex<Option<Frame>>,
     stop: AtomicBool,
     error: Mutex<Option<String>>,
+    /// The error is "no decoder" for a non-empty file: a re-encode could play it.
+    convertible: AtomicBool,
     /// File duration in seconds (f64 bits); 0 = unknown.
     duration: AtomicU64,
     /// Wanted position 0..1 (f64 bits).
@@ -128,6 +130,7 @@ impl Shared {
             latest: Mutex::new(None),
             stop: AtomicBool::new(false),
             error: Mutex::new(None),
+            convertible: AtomicBool::new(false),
             duration: AtomicU64::new(0),
             position: AtomicU64::new(0.0f64.to_bits()),
             sequential: AtomicBool::new(true),
@@ -237,7 +240,10 @@ impl Player {
                         hw::WARM.wait(hw::WARM_WAIT);
                     }
                     if let Err(e) = run_scrub(&p, &s, hw) {
-                        *lock(&s.error) = Some(e.to_string());
+                        let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+                        s.convertible
+                            .store(is_convertible(&e, size), Ordering::Relaxed);
+                        *lock(&s.error) = Some(open_error_text(&e));
                     }
                 })
             })
@@ -370,6 +376,12 @@ impl Player {
         lock(&self.shared.error).clone()
     }
 
+    /// The error says no decoder exists for a non-empty file, so converting it (to HAP)
+    /// can help. Decided once when the error is set, cheap to call every frame.
+    pub fn can_convert(&self) -> bool {
+        self.shared.convertible.load(Ordering::Relaxed)
+    }
+
     /// Duration of the file in seconds, once known (None for images/unknown).
     pub fn duration(&self) -> Option<f64> {
         let d = f64::from_bits(self.shared.duration.load(Ordering::Relaxed));
@@ -468,6 +480,24 @@ fn load_image(path: &Path) -> Result<Frame, String> {
     })
 }
 
+/// What the user reads when a file cannot be opened.
+/// A re-encode helps only when FFmpeg has no decoder for the codec (not for a damaged,
+/// empty or non-video file).
+fn is_convertible(e: &ff::Error, file_len: u64) -> bool {
+    matches!(e, ff::Error::DecoderNotFound) && file_len > 0
+}
+
+fn open_error_text(e: &ff::Error) -> String {
+    match e {
+        ff::Error::DecoderNotFound => {
+            "No decoder for this video codec. Convert it to HAP to play it.".into()
+        }
+        ff::Error::StreamNotFound => "No playable video in this file.".into(),
+        ff::Error::InvalidData => "The file is damaged or not a video.".into(),
+        other => format!("Cannot open this file ({other})."),
+    }
+}
+
 /// Converts a decoded frame to a tightly packed RGBA `Frame`, creating the scaler on first use.
 pub(crate) fn frame_to_rgba(
     scaler: &mut Option<ff::software::scaling::Context>,
@@ -519,6 +549,165 @@ pub struct SourceInfo {
     pub alpha: bool,
 }
 
+/// How a stream is turned for display: degrees counter-clockwise (0, 90, 180 or 270), after
+/// an optional horizontal mirror of the stored pixels. Phone and camera clips store
+/// portrait video as landscape pixels plus a display matrix; front cameras add a mirror.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Orient {
+    deg: u32,
+    flip: bool,
+}
+
+impl Orient {
+    /// The displayed size of a `w` x `h` stored picture.
+    fn size(self, w: u32, h: u32) -> (u32, u32) {
+        if matches!(self.deg, 90 | 270) {
+            (h, w)
+        } else {
+            (w, h)
+        }
+    }
+}
+
+fn stream_orient(st: &ff::format::stream::Stream) -> Orient {
+    for sd in st.side_data() {
+        if sd.kind() == ff::codec::packet::side_data::Type::DisplayMatrix && sd.data().len() >= 36 {
+            let m = |i: usize| i32::from_le_bytes(sd.data()[i * 4..i * 4 + 4].try_into().unwrap());
+            return orient_from_matrix(m(0), m(1), m(3), m(4));
+        }
+    }
+    Orient::default()
+}
+
+/// Orientation for the upper-left 2x2 `(a, b; c, d)` of a display matrix (16.16 fixed
+/// point). A negative determinant means the picture is mirrored.
+fn orient_from_matrix(a: i32, b: i32, c: i32, d: i32) -> Orient {
+    let det = i64::from(a) * i64::from(d) - i64::from(b) * i64::from(c);
+    if det < 0 {
+        // Undo the mirror (negate the first column) to read the rotation underneath.
+        // The mirror is of the displayed picture (after the turn), like FFmpeg's autorotate;
+        // `rotate_frame` mirrors the stored pixels first, which for a quarter turn is the
+        // opposite turn.
+        let deg = rotation_from_matrix(a.saturating_neg(), b);
+        Orient {
+            deg: if matches!(deg, 90 | 270) {
+                360 - deg
+            } else {
+                deg
+            },
+            flip: true,
+        }
+    } else {
+        Orient {
+            deg: rotation_from_matrix(a, b),
+            flip: false,
+        }
+    }
+}
+
+/// Counter-clockwise quarter turns (in degrees) for the first row `(a, b)` of a display matrix.
+fn rotation_from_matrix(a: i32, b: i32) -> u32 {
+    if a == 0 && b == 0 {
+        return 0;
+    }
+    let deg = -(f64::from(b)).atan2(f64::from(a)).to_degrees();
+    (((deg / 90.0).round() as i32).rem_euclid(4) * 90) as u32
+}
+
+/// Tile edge (pixels) of the blocked copy: 64x64 RGBA is 16 KiB per side.
+const TILE: usize = 64;
+
+/// Mirrors (`flip`, left to right) a tightly packed RGBA frame and then turns it `deg`
+/// degrees counter-clockwise (multiple of 90). Copies in tiles so both the reads and the
+/// writes stay in cache. Block-compressed (HAP) frames are returned as they are.
+fn rotate_frame(f: Frame, deg: u32, flip: bool) -> Frame {
+    if (deg.is_multiple_of(360) && !flip) || f.hap.is_some() {
+        return f;
+    }
+    let (w, h) = (f.width as usize, f.height as usize);
+    let (nw, nh) = if deg == 180 || deg.is_multiple_of(360) {
+        (w, h)
+    } else {
+        (h, w)
+    };
+    let src = &f.data;
+    let mut out = vec![0u8; src.len()];
+    // The source pixel of destination (x, y) is (sx0 + ax*x + ay*y, sy0 + bx*x + by*y);
+    // flattened to one linear index: base + x*dx + y*dy (in pixels).
+    let (wi, hi) = (w as isize, h as isize);
+    let (sx0, ax, ay, sy0, bx, by) = match deg {
+        90 => (wi - 1, 0, -1, 0, 1, 0),
+        180 => (wi - 1, -1, 0, hi - 1, 0, -1),
+        270 => (0, 0, 1, hi - 1, -1, 0),
+        _ => (0, 1, 0, 0, 0, 1),
+    };
+    let (sx0, ax, ay) = if flip {
+        (wi - 1 - sx0, -ax, -ay)
+    } else {
+        (sx0, ax, ay)
+    };
+    let base = sy0 * wi + sx0;
+    let (dx, dy) = (bx * wi + ax, by * wi + ay);
+    for ty in (0..nh).step_by(TILE) {
+        for tx in (0..nw).step_by(TILE) {
+            let xs = tx..(tx + TILE).min(nw);
+            for y in ty..(ty + TILE).min(nh) {
+                let row = base + y as isize * dy;
+                let dst = &mut out[(y * nw + xs.start) * 4..(y * nw + xs.end) * 4];
+                let (px, _) = dst.as_chunks_mut::<4>();
+                for (x, d) in xs.clone().zip(px) {
+                    let si = (row + x as isize * dx) as usize * 4;
+                    d.copy_from_slice(&src[si..si + 4]);
+                }
+            }
+        }
+    }
+    Frame {
+        width: nw as u32,
+        height: nh as u32,
+        data: Arc::new(out),
+        ..f
+    }
+}
+
+/// VP8/VP9 in WebM store alpha as a side channel the native decoders ignore; only libvpx
+/// decodes it. Returns that decoder when the stream is flagged and libvpx is built in.
+fn vpx_alpha_codec(st: &ff::format::stream::Stream) -> Option<ff::Codec> {
+    vpx_pick(
+        st.parameters().id(),
+        st.metadata().get("alpha_mode") == Some("1"),
+        ff::decoder::find_by_name,
+    )
+}
+
+/// `vpx_alpha_codec` with the codec lookup injected. The bundled FFmpeg is built without
+/// libvpx (scripts/build-ffmpeg.sh), so None is the normal answer there: the native VP8/VP9
+/// decoder then opens the file and the alpha channel is dropped, with no error.
+fn vpx_pick(
+    id: ff::codec::Id,
+    alpha: bool,
+    find: impl Fn(&str) -> Option<ff::Codec>,
+) -> Option<ff::Codec> {
+    let name = match id {
+        ff::codec::Id::VP8 => "libvpx",
+        ff::codec::Id::VP9 => "libvpx-vp9",
+        _ => return None,
+    };
+    alpha.then(|| find(name)).flatten()
+}
+
+/// Software decoder for `params`, with an explicit codec when one is given.
+fn open_sw(
+    params: ff::codec::Parameters,
+    codec: Option<ff::Codec>,
+) -> Result<ff::decoder::Video, ff::Error> {
+    let ctx = ff::codec::context::Context::from_parameters(params)?;
+    match codec {
+        Some(c) => ctx.decoder().open_as(c)?.video(),
+        None => ctx.decoder().video(),
+    }
+}
+
 /// Reads codec, size, frame rate and length of a video file. Blocks on file I/O: call it
 /// off the UI thread. None when the file cannot be opened or has no video stream.
 pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
@@ -533,13 +722,20 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
     };
     let params = st.parameters();
     let codec = params.id().name().to_string();
-    let (width, height, alpha) = ff::codec::context::Context::from_parameters(params)
-        .ok()
-        .and_then(|c| c.decoder().video().ok())
-        .map_or((0, 0, false), |d| {
-            let comps = d.format().descriptor().map_or(0, |x| x.nb_components());
-            (d.width(), d.height(), comps == 2 || comps == 4)
-        });
+    // Block-compressed HAP frames stay unrotated (see `rotate_frame`), so the size reported
+    // for them is the stored one; everything else is reported as displayed.
+    let orient = if hap::gpu_supported() && hap_probe(path.as_ref()) {
+        Orient::default()
+    } else {
+        stream_orient(&st)
+    };
+    let vpx = vpx_alpha_codec(&st);
+    let vpx_alpha = vpx.is_some();
+    let (width, height, alpha) = open_sw(params, vpx).ok().map_or((0, 0, false), |d| {
+        let comps = d.format().descriptor().map_or(0, |x| x.nb_components());
+        let (w, h) = orient.size(d.width(), d.height());
+        (w, h, comps == 2 || comps == 4 || vpx_alpha)
+    });
     let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
     Some(SourceInfo {
         codec,
@@ -633,6 +829,10 @@ struct Scrubber {
     holder: Arc<hw::Holder>,
     /// Hardware was wanted at open but no session was free.
     slot_denied: bool,
+    /// Display rotation and mirror applied to every decoded RGBA frame.
+    orient: Orient,
+    /// Decoder chosen at open (libvpx for alpha WebM), kept across `swap_decoder`.
+    vpx: Option<ff::Codec>,
 }
 
 impl Scrubber {
@@ -650,7 +850,7 @@ impl Scrubber {
     fn open_with_hw(path: &Path, hap: bool, hw: Hw) -> Result<Scrubber, ff::Error> {
         ff::init()?;
         let ictx = ff::format::input(&path)?;
-        let (stream_idx, tb, fps, params) = {
+        let (stream_idx, tb, fps, params, orient, vpx) = {
             let st = ictx
                 .streams()
                 .best(ff::media::Type::Video)
@@ -661,15 +861,27 @@ impl Scrubber {
             } else {
                 30.0
             };
-            (st.index(), f64::from(st.time_base()), fps, st.parameters())
+            (
+                st.index(),
+                f64::from(st.time_base()),
+                fps,
+                st.parameters(),
+                stream_orient(&st),
+                vpx_alpha_codec(&st),
+            )
         };
+        // Alpha WebM needs libvpx, which runs in software.
+        let hw = if vpx.is_some() { Hw::Off } else { hw };
         let slot = if hw == Hw::Off {
             None
         } else {
             hw::SLOTS.try_acquire(hw::cap())
         };
         let slot_denied = hw != Hw::Off && slot.is_none();
-        let (decoder, slot) = open_decoder(params, hw, slot)?;
+        let (decoder, slot) = match vpx {
+            Some(c) => (open_sw(params, Some(c))?, None),
+            None => open_decoder(params, hw, slot)?,
+        };
         let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
         Ok(Scrubber {
             ictx,
@@ -691,6 +903,8 @@ impl Scrubber {
             status: None,
             holder: hw::Holder::new(),
             slot_denied,
+            orient,
+            vpx,
         })
     }
 
@@ -721,7 +935,13 @@ impl Scrubber {
     /// from the keyframe. If the new decoder cannot be opened, the old decoder and its slot
     /// stay untouched (the given slot is released).
     fn swap_decoder(&mut self, slot: Option<HwSlot<'static>>) -> Result<(), ff::Error> {
-        self.swap_decoder_with(slot, open_decoder)
+        match self.vpx {
+            // The alpha decoder only exists in software: keep it, whatever was asked.
+            Some(c) => {
+                self.swap_decoder_with(None, move |p, _, _| Ok((open_sw(p, Some(c))?, None)))
+            }
+            None => self.swap_decoder_with(slot, open_decoder),
+        }
     }
 
     fn swap_decoder_with(
@@ -778,6 +998,7 @@ impl Scrubber {
     fn convert(&mut self, decoded: &ff::frame::Video) -> Result<Frame, ff::Error> {
         self.count += 1;
         frame_to_rgba(&mut self.scaler, decoded, self.count)
+            .map(|f| rotate_frame(f, self.orient.deg, self.orient.flip))
     }
 
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
@@ -1756,5 +1977,301 @@ mod tests {
         assert!(!pl.thread.as_ref().unwrap().is_finished());
         pl.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a 1 s h264 clip with the ffmpeg CLI; false when it cannot (test then skips).
+    fn make_test_clip(out: &Path) -> bool {
+        std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x240:rate=25:duration=1")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Decode throughput of 4 parallel layers over one clip (VJC_BENCH_CLIP), software
+    /// decoder, 5 s each. Run with --ignored --nocapture; compare a rotated and a plain clip.
+    #[test]
+    #[ignore = "benchmark: set VJC_BENCH_CLIP"]
+    fn bench_four_layers() {
+        let Ok(clip) = std::env::var("VJC_BENCH_CLIP") else {
+            return;
+        };
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let clip = clip.clone();
+                std::thread::spawn(move || {
+                    let mut sc = Scrubber::open(Path::new(&clip)).unwrap();
+                    let t = std::time::Instant::now();
+                    let mut n = 0u32;
+                    let mut dims = (0, 0);
+                    while t.elapsed() < Duration::from_secs(5) {
+                        match sc.next() {
+                            Some((_, f)) => {
+                                n += 1;
+                                dims = (f.width, f.height);
+                            }
+                            None => sc.seek(0.0).unwrap(),
+                        }
+                    }
+                    (f64::from(n) / t.elapsed().as_secs_f64(), dims)
+                })
+            })
+            .collect();
+        let r: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let total: f64 = r.iter().map(|x| x.0).sum();
+        eprintln!(
+            "BENCH {clip}: per-layer fps {:?} total {total:.1} dims {:?}",
+            r.iter().map(|x| x.0.round()).collect::<Vec<_>>(),
+            r[0].1
+        );
+    }
+
+    #[test]
+    #[ignore = "dump: set VJC_DUMP_CLIP and VJC_DUMP_OUT"]
+    fn dump_first_frame() {
+        let (Ok(c), Ok(o)) = (
+            std::env::var("VJC_DUMP_CLIP"),
+            std::env::var("VJC_DUMP_OUT"),
+        ) else {
+            return;
+        };
+        let mut sc = Scrubber::open(Path::new(&c)).unwrap();
+        std::fs::write(o, sc.next().unwrap().1.data.as_slice()).unwrap();
+    }
+
+    /// Frames of mirrored / rotated clips equal what the ffmpeg CLI (autorotate) produces.
+    #[test]
+    fn orientation_matches_ffmpeg_autorotate() {
+        let dir = std::env::temp_dir().join(format!("vjc-orient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.mp4");
+        if !make_test_clip(&base) {
+            return;
+        }
+        let ff_run = |args: &[&str]| {
+            std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        for (name, tag) in [
+            ("flip", &["-display_hflip"][..]),
+            ("r90", &["-display_rotation", "90"]),
+            ("r90f", &["-display_rotation", "90", "-display_hflip"]),
+            ("r270f", &["-display_rotation", "270", "-display_hflip"]),
+        ] {
+            let clip = dir.join(format!("{name}.mp4"));
+            let raw = dir.join(format!("{name}.rgba"));
+            let made = ff_run(
+                &[
+                    tag,
+                    &[
+                        "-i",
+                        base.to_str().unwrap(),
+                        "-c",
+                        "copy",
+                        clip.to_str().unwrap(),
+                    ],
+                ]
+                .concat(),
+            );
+            let want = made
+                && ff_run(&[
+                    "-i",
+                    clip.to_str().unwrap(),
+                    "-frames:v",
+                    "1",
+                    "-pix_fmt",
+                    "rgba",
+                    "-f",
+                    "rawvideo",
+                    raw.to_str().unwrap(),
+                ]);
+            if !want {
+                eprintln!("skip {name}: ffmpeg lacks display flags");
+                continue;
+            }
+            let mut sc = Scrubber::open(&clip).unwrap();
+            let got = sc.next().unwrap().1;
+            assert!(*got.data == std::fs::read(&raw).unwrap(), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alpha_webm_without_libvpx_falls_back_to_native() {
+        let none = |_: &str| None;
+        assert!(vpx_pick(ff::codec::Id::VP9, true, none).is_none());
+        assert!(vpx_pick(ff::codec::Id::VP8, true, none).is_none());
+        // With libvpx present it is used, but only for flagged VP8/VP9.
+        let any =
+            |n: &str| ff::decoder::find_by_name(if n.contains("vp9") { "vp9" } else { "vp8" });
+        assert!(vpx_pick(ff::codec::Id::VP9, true, any).is_some());
+        assert!(vpx_pick(ff::codec::Id::VP9, false, any).is_none());
+        assert!(vpx_pick(ff::codec::Id::H264, true, any).is_none());
+        // The file itself opens and plays with the native decoder.
+        let dir = std::env::temp_dir().join(format!("vjc-novpx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a.webm");
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=1",
+            ])
+            .args(["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p"])
+            .arg(&out)
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            let mut sc = Scrubber::open(&out).unwrap();
+            assert!(sc.vpx.is_none());
+            assert!(sc.next().is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn convertible_only_for_missing_decoder() {
+        assert!(is_convertible(&ff::Error::DecoderNotFound, 10));
+        assert!(!is_convertible(&ff::Error::DecoderNotFound, 0));
+        assert!(!is_convertible(&ff::Error::InvalidData, 10));
+        assert!(!is_convertible(&ff::Error::StreamNotFound, 10));
+    }
+
+    #[test]
+    fn mirrored_matrix_sets_flip() {
+        let o = |a, b, c, d| orient_from_matrix(a, b, c, d);
+        let one = 65536;
+        assert_eq!(
+            o(one, 0, 0, one),
+            Orient {
+                deg: 0,
+                flip: false
+            }
+        );
+        assert_eq!(o(-one, 0, 0, one), Orient { deg: 0, flip: true });
+        // Mirrored quarter turns, as written by `-display_rotation N -display_hflip`.
+        assert_eq!(
+            o(0, -one, -one, 0),
+            Orient {
+                deg: 270,
+                flip: true
+            }
+        );
+        assert_eq!(
+            o(0, one, one, 0),
+            Orient {
+                deg: 90,
+                flip: true
+            }
+        );
+        assert!(!o(0, -one, one, 0).flip);
+        assert_eq!(o(0, -one, one, 0).deg, 90);
+    }
+
+    #[test]
+    fn rotate_frame_flip_mirrors_before_turning() {
+        let px = |v: u8| [v, v, v, 255];
+        let data: Vec<u8> = [1u8, 2, 3, 4, 5, 6].iter().flat_map(|&v| px(v)).collect();
+        let f = Frame {
+            width: 3,
+            height: 2,
+            data: Arc::new(data),
+            seq: 1,
+            hap: None,
+        };
+        let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
+        let m = rotate_frame(f.clone(), 0, true);
+        assert_eq!((m.width, m.height), (3, 2));
+        assert_eq!(first(&m), [3, 2, 1, 6, 5, 4]);
+        // Mirrored: 3 2 1 / 6 5 4, then 90 ccw.
+        assert_eq!(first(&rotate_frame(f, 90, true)), [1, 4, 2, 5, 3, 6]);
+    }
+
+    #[test]
+    fn rotate_frame_tiles_match_naive_on_odd_size() {
+        let (w, h) = (70usize, 45usize);
+        let data: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let f = Frame {
+            width: w as u32,
+            height: h as u32,
+            data: Arc::new(data.clone()),
+            seq: 1,
+            hap: None,
+        };
+        let r = rotate_frame(f, 90, false);
+        assert_eq!((r.width as usize, r.height as usize), (h, w));
+        for y in 0..w {
+            for x in 0..h {
+                let (sx, sy) = (w - 1 - y, x);
+                assert_eq!(
+                    r.data[(y * h + x) * 4..][..4],
+                    data[(sy * w + sx) * 4..][..4]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swap_decoder_keeps_the_chosen_decoder() {
+        let dir = std::env::temp_dir().join(format!("vjc-vpxkeep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a.mp4");
+        if !make_test_clip(&out) {
+            return;
+        }
+        let mut sc = Scrubber::open(&out).unwrap();
+        sc.vpx = ff::decoder::find_by_name("h264");
+        assert!(sc.vpx.is_some());
+        sc.hw_mode = Hw::On;
+        // A hardware slot offered while the chosen decoder is software-only is not used.
+        let slot = hw::SLOTS.try_acquire(hw::cap());
+        sc.swap_decoder(slot).unwrap();
+        assert!(!sc.is_hw());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_matrix_maps_to_quarter_turns() {
+        // av_display_rotation_set: (cos, -sin) in 16.16 fixed point.
+        assert_eq!(rotation_from_matrix(65536, 0), 0);
+        assert_eq!(rotation_from_matrix(0, -65536), 90);
+        assert_eq!(rotation_from_matrix(-65536, 0), 180);
+        assert_eq!(rotation_from_matrix(0, 65536), 270);
+        assert_eq!(rotation_from_matrix(0, 0), 0);
+    }
+
+    #[test]
+    fn rotate_frame_turns_pixels_counter_clockwise() {
+        // 3x2: top row A B C, bottom row D E F (one distinct byte per pixel).
+        let px = |v: u8| [v, v, v, 255];
+        let data: Vec<u8> = [1u8, 2, 3, 4, 5, 6].iter().flat_map(|&v| px(v)).collect();
+        let f = Frame {
+            width: 3,
+            height: 2,
+            data: Arc::new(data),
+            seq: 1,
+            hap: None,
+        };
+        let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
+        let r90 = rotate_frame(f.clone(), 90, false);
+        assert_eq!((r90.width, r90.height), (2, 3));
+        assert_eq!(first(&r90), [3, 6, 2, 5, 1, 4]);
+        let r270 = rotate_frame(f.clone(), 270, false);
+        assert_eq!((r270.width, r270.height), (2, 3));
+        assert_eq!(first(&r270), [4, 1, 5, 2, 6, 3]);
+        let r180 = rotate_frame(f.clone(), 180, false);
+        assert_eq!((r180.width, r180.height), (3, 2));
+        assert_eq!(first(&r180), [6, 5, 4, 3, 2, 1]);
+        assert_eq!(first(&rotate_frame(f, 0, false)), [1, 2, 3, 4, 5, 6]);
     }
 }
