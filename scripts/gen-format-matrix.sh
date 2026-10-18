@@ -32,7 +32,7 @@ pick() { # encoder -> prints a binary that has it
 gen() {
   local name="$1" size="$2" alpha="$3" enc="$4"; shift 4
   local bin; bin="$(pick "$enc")" || { SKIPPED+=("$name (no encoder $enc)"); return; }
-  local src="testsrc2=size=$size:rate=${RATE:-25}:duration=3,format=${SRCFMT:-yuv420p}"
+  local src="testsrc2=size=${SRCSIZE:-$size}:rate=${RATE:-25}:duration=3,format=${SRCFMT:-yuv420p}"
   if [ "$alpha" = alpha ]; then
     src="testsrc2=size=$size:rate=${RATE:-25}:duration=3,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,W/2),255,0)'"
   fi
@@ -69,8 +69,8 @@ if b="$(pick libx264)" && "$b" -v error -y -f lavfi -i "testsrc2=size=$S:rate=25
 else SKIPPED+=("rotate90.mov"); fi
 rm -f "$OUT/rot_src.mp4"
 RATE=25 gen vfr.mov $S opaque libx264 -vf "setpts='PTS+if(mod(N,5),0,0.05/TB)'" -fps_mode vfr -c:v libx264 -pix_fmt yuv420p
-gen odd_1919x1079.mov 1919x1079 opaque libx264 -c:v libx264 -pix_fmt yuv444p
-gen odd_1919x1079_prores.mov 1919x1079 opaque prores_ks -c:v prores_ks -pix_fmt yuv422p10le
+SRCFMT=yuv444p SRCSIZE=1920x1080 gen odd_1919x1079.mov 1919x1079 opaque libx264 -vf crop=1919:1079 -c:v libx264 -pix_fmt yuv444p
+SRCFMT=yuv444p SRCSIZE=1920x1080 gen odd_1919x1079_prores.mov 1919x1079 opaque prores_ks -vf crop=1919:1079 -c:v prores_ks -pix_fmt yuv444p10le
 gen timecode.mov $S opaque libx264 -c:v libx264 -pix_fmt yuv420p -timecode 01:00:00:00
 AUDIO=" " gen audio_pcm24_2tracks.mov $S opaque libx264 -f lavfi -i "sine=frequency=440:duration=3" -f lavfi -i "sine=frequency=880:duration=3" -map 0:v -map 1:a -map 2:a -c:v libx264 -pix_fmt yuv420p -c:a pcm_s24le
 gen no_audio.mov $S opaque libx264 -an -c:v libx264 -pix_fmt yuv420p
