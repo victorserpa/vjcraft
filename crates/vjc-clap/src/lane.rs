@@ -158,7 +158,7 @@ impl ClapShared {
     /// whether it was set.
     fn set_state(&self, epoch: Option<u32>, state: u8) -> bool {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
                 if epoch.is_some_and(|g| (w >> 8) as u32 != g) {
                     None
                 } else {
@@ -191,7 +191,7 @@ impl ClapShared {
     pub fn restart(&self) {
         let _ = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
                 Some((((w >> 8) + 1) << 8) | STARTING as u64)
             });
     }
