@@ -66,7 +66,8 @@ impl ClapHost {
 
     /// Scans in a background thread (nothing happens while a scan runs). The cache file keeps
     /// the plugin info by path and mtime, so only new or changed files are loaded.
-    pub fn rescan(&self, extra_dirs: &[String], cache: Option<PathBuf>) {
+    /// `force` (the Rescan button) also retries the files remembered as failed.
+    pub fn rescan(&self, extra_dirs: &[String], cache: Option<PathBuf>, force: bool) {
         {
             let Ok(mut c) = self.catalog.lock() else {
                 return;
@@ -83,7 +84,12 @@ impl ClapHost {
             move || {
                 let cache =
                     cache.unwrap_or_else(|| std::env::temp_dir().join("vjc-clap-cache.json"));
-                let (found, _) = vjc_clap::scan(&dirs, &cache, &vjc_clap::helper_path());
+                let helper = vjc_clap::helper_path();
+                let (found, _) = if force {
+                    vjc_clap::scan_forced(&dirs, &cache, &helper)
+                } else {
+                    vjc_clap::scan(&dirs, &cache, &helper)
+                };
                 if let Ok(mut c) = cat.lock() {
                     c.entries = found;
                     c.scanning = false;

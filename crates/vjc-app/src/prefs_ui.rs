@@ -337,7 +337,7 @@ impl State {
                             let busy = self.clap.scanning();
                             if crate::widgets::btn_if(ui, !busy, "Rescan", Kind::Secondary).clicked() {
                                 let cache = crate::data_dir().map(|d| d.join("clap-cache.json"));
-                                self.clap.rescan(&p.audio.clap_dirs, cache);
+                                self.clap.rescan(&p.audio.clap_dirs, cache, true);
                             }
                             let n = self.clap.entries().len();
                             ui.label(if busy {

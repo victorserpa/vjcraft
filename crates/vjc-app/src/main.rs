@@ -1929,7 +1929,11 @@ fn fresh_project(prefs: &Prefs) -> Project {
 
 impl State {
     fn new(prefs: Prefs) -> Self {
-        Self::build(prefs, true)
+        let s = Self::build(prefs, true);
+        // the plugin catalog is ready before the first audio effect is added, whether or not
+        // the audio engine has opened yet
+        s.start_clap_scan();
+        s
     }
 
     /// State for UI tests: no MIDI/OSC threads, no monitors, no audio, and nothing written
@@ -2165,7 +2169,7 @@ impl State {
     /// Starts the background scan for CLAP plugins (cached by file mtime in the data folder).
     fn start_clap_scan(&self) {
         let cache = data_dir().map(|d| d.join("clap-cache.json"));
-        self.clap.rescan(&self.prefs.audio.clap_dirs, cache);
+        self.clap.rescan(&self.prefs.audio.clap_dirs, cache, false);
     }
 
     /// Audio output, opened lazily; a failure is reported once in the status line.
@@ -2174,7 +2178,6 @@ impl State {
             match AudioEngine::start_with(self.audio_cfg.clone()) {
                 Ok(e) => {
                     self.audio = Some(e);
-                    self.start_clap_scan();
                 }
                 Err(e) => {
                     self.audio_failed = true;
