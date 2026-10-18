@@ -52,6 +52,8 @@ pub enum FxKind {
     Compressor,
     Limiter,
     Bitcrusher,
+    /// A CLAP plugin (docs/specs/audio-plugins.md); not in `ALL`, the plugin comes with the spec.
+    Clap,
 }
 
 impl FxKind {
@@ -81,10 +83,15 @@ impl FxKind {
             FxKind::Compressor => "audio.compressor",
             FxKind::Limiter => "audio.limiter",
             FxKind::Bitcrusher => "audio.bitcrusher",
+            FxKind::Clap => "clap",
         }
     }
 
     pub fn from_id(id: &str) -> Option<FxKind> {
+        // CLAP effects are stored as `clap:<id>|<path>`
+        if id.starts_with("clap:") {
+            return Some(FxKind::Clap);
+        }
         FxKind::ALL.into_iter().find(|k| k.id() == id)
     }
 
@@ -100,6 +107,7 @@ impl FxKind {
             FxKind::Compressor => "Compressor",
             FxKind::Limiter => "Limiter",
             FxKind::Bitcrusher => "Bitcrusher",
+            FxKind::Clap => "CLAP plugin",
         }
     }
 
@@ -150,6 +158,7 @@ impl FxKind {
             FxKind::Compressor => &COMP,
             FxKind::Limiter => &LIMIT,
             FxKind::Bitcrusher => &CRUSH,
+            FxKind::Clap => &[],
         }
     }
 
@@ -164,9 +173,11 @@ impl FxKind {
 }
 
 /// What the control side wants from one effect of a chain.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct FxSpec {
     pub kind: FxKind,
+    /// The plugin of a `FxKind::Clap` effect (its params live there, not in `params`).
+    pub clap: Option<std::sync::Arc<vjc_clap::ClapShared>>,
     pub bypass: bool,
     /// Dry/wet, 0..=1.
     pub mix: f32,
@@ -431,7 +442,12 @@ enum Fx {
         hold: [f32; 2],
         n: u32,
     },
+    /// None: the spec had no plugin; the audio passes.
+    Clap(Option<vjc_clap::ClapLane>),
 }
+
+/// Longest a plugin block may take before the effect is bypassed.
+const CLAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(40);
 
 fn db_to_lin(db: f32) -> f32 {
     10f32.powf(db / 20.0)
@@ -452,8 +468,16 @@ pub fn equal_power_pan(pan: f32) -> (f32, f32) {
 }
 
 impl Fx {
-    fn new(kind: FxKind, rate: f32) -> Fx {
+    fn new(kind: FxKind, rate: f32, clap: Option<&std::sync::Arc<vjc_clap::ClapShared>>) -> Fx {
         match kind {
+            FxKind::Clap => Fx::Clap(clap.map(|c| {
+                vjc_clap::ClapLane::spawn(
+                    c.clone(),
+                    &vjc_clap::helper_path(),
+                    CLAP_BUDGET,
+                    rate as u32,
+                )
+            })),
             FxKind::Gain => Fx::Gain { prev: 1.0 },
             FxKind::Pan => Fx::Pan,
             FxKind::Eq3 => Fx::Eq3 {
@@ -547,6 +571,11 @@ impl Fx {
                 }
             }
             Fx::Reverb(r) => r.process(buf, p[0], p[1]),
+            Fx::Clap(lane) => {
+                if let Some(l) = lane {
+                    l.process(buf);
+                }
+            }
             Fx::Comp { env } => {
                 let coef = |ms: f32| (-1.0 / (ms.max(0.01) * 0.001 * rate)).exp();
                 let (att, rel) = (coef(p[2]), coef(p[3]));
@@ -620,7 +649,7 @@ pub struct FxChain {
     /// One state per processing path (master has two: speakers and recording tap).
     states: Vec<Mutex<ChainState>>,
     /// Kinds the states were built for (control thread only).
-    built: Mutex<Vec<FxKind>>,
+    built: Mutex<Vec<(FxKind, usize)>>,
 }
 
 impl FxChain {
@@ -649,7 +678,18 @@ impl FxChain {
     /// ignored). Allocates only when the list of kinds changed.
     pub fn set(&self, specs: &[FxSpec], rate: u32, bpm: f32) {
         let specs = &specs[..specs.len().min(MAX_FX)];
-        let kinds: Vec<FxKind> = specs.iter().map(|s| s.kind).collect();
+        // a CLAP slot is identified by its plugin instance too
+        let kinds: Vec<(FxKind, usize)> = specs
+            .iter()
+            .map(|s| {
+                (
+                    s.kind,
+                    s.clap
+                        .as_ref()
+                        .map_or(0, |c| std::sync::Arc::as_ptr(c) as usize),
+                )
+            })
+            .collect();
         let mut built = self.built.lock().unwrap();
         if *built != kinds {
             // Bypass the whole chain while states and params change, so the callback never
@@ -660,7 +700,10 @@ impl FxChain {
                 let mut fresh: Vec<Option<Fx>> = kinds
                     .iter()
                     .enumerate()
-                    .map(|(i, k)| (built.get(i) != Some(k)).then(|| Fx::new(*k, rate)))
+                    .map(|(i, k)| {
+                        (built.get(i) != Some(k))
+                            .then(|| Fx::new(k.0, rate, specs[i].clap.as_ref()))
+                    })
                     .collect();
                 let dry = if kinds.is_empty() {
                     Vec::new()
@@ -673,8 +716,10 @@ impl FxChain {
                     let mut st = m.lock().unwrap();
                     for (i, k) in kinds.iter().enumerate() {
                         match (fresh[i].take(), st.fx.get_mut(i)) {
-                            (Some(f), Some(slot)) => garbage.push(std::mem::replace(slot, (*k, f))),
-                            (Some(f), None) => st.fx.push((*k, f)),
+                            (Some(f), Some(slot)) => {
+                                garbage.push(std::mem::replace(slot, (k.0, f)))
+                            }
+                            (Some(f), None) => st.fx.push((k.0, f)),
                             (None, _) => {}
                         }
                     }
@@ -730,6 +775,13 @@ impl FxChain {
                 std::array::from_fn(|i| f32::from_bits(slot.params[i].load(Ordering::Relaxed)));
             let chunk = st.dry.len().max(2);
             for part in buf.chunks_mut(chunk) {
+                if let Fx::Clap(lane) = fx {
+                    // the lane mixes against the dry block its wet audio came from
+                    if let Some(l) = lane {
+                        l.process_mix(part, mix);
+                    }
+                    continue;
+                }
                 if mix >= 1.0 || st.dry.len() < part.len() {
                     fx.process(&p, part, &cx);
                 } else {
@@ -798,6 +850,7 @@ mod tests {
             bypass: false,
             mix: 1.0,
             params,
+            clap: None,
         }
     }
 
@@ -1020,8 +1073,8 @@ mod tests {
     fn reorder_and_removal_rebuild_state() {
         let c = FxChain::new(1);
         let (g, d) = (spec(FxKind::Gain, &[0.0]), spec(FxKind::Delay, &[]));
-        c.set(&[g, d], R, 120.0);
-        c.set(&[d, g], R, 120.0);
+        c.set(&[g.clone(), d.clone()], R, 120.0);
+        c.set(&[d, g.clone()], R, 120.0);
         c.set(&[g], R, 120.0);
         let mut b = vec![0.5f32; 64];
         c.process(&mut b, 0, R);
@@ -1055,5 +1108,37 @@ mod tests {
             assert_eq!(ALLOCS.with(Cell::get), p0, "audio callback allocated");
         }
         assert!(ALLOCS.with(Cell::get) > before, "the counter works");
+    }
+
+    #[test]
+    fn clap_slot_keeps_its_place_and_passes_dry_when_the_plugin_is_gone() {
+        use vjc_clap::ClapShared;
+        let shared = ClapShared::new("/nonexistent/x.clap", "x.y", &[]);
+        let mut clap = spec(FxKind::Clap, &[]);
+        clap.clap = Some(shared.clone());
+        let gain = spec(FxKind::Gain, &[-20.0]); // x0.1
+        let c = FxChain::new(2);
+        c.set(&[gain.clone(), clap.clone()], R, 120.0);
+        let mut buf = vec![0.4f32; 1024];
+        let mut tap = vec![0.4f32; 1024];
+        // let the worker notice the missing plugin; the chain never waits for it
+        for _ in 0..50 {
+            buf.fill(0.4);
+            let p0 = ALLOCS.with(Cell::get);
+            c.process(&mut buf, 0, R);
+            c.process(&mut tap, 1, R);
+            assert_eq!(ALLOCS.with(Cell::get), p0, "audio callback allocated");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            buf.iter().all(|v| (v - 0.04).abs() < 1e-4),
+            "gain ran, clap passed dry"
+        );
+        assert!(matches!(
+            shared.status(),
+            vjc_clap::LaneStatus::Bypassed(_) | vjc_clap::LaneStatus::Starting
+        ));
+        // same Arc again: nothing is rebuilt
+        c.set(&[gain, clap], R, 120.0);
     }
 }

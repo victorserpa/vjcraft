@@ -301,6 +301,56 @@ impl State {
                              The input feeds audio-reactive animation and spectrum generators; it opens only \
                              while the project uses them.",
                         );
+                        ui.separator();
+                        ui.label("CLAP plugin folders");
+                        let mut remove = None;
+                        for (i, d) in p.audio.clap_dirs.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(d);
+                                if btn(ui, "Remove", Kind::Secondary).clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(i) = remove {
+                            p.audio.clap_dirs.remove(i);
+                        }
+                        ui.horizontal(|ui| {
+                            let id = ui.id().with("clap-dir-input");
+                            let mut t: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+                            field_text(ui, &mut t, Width::Lg, None);
+                            if btn(ui, "Choose...", Kind::Secondary).clicked()
+                                && let Some(d) = rfd::FileDialog::new().pick_folder()
+                            {
+                                t = d.display().to_string();
+                            }
+                            if crate::widgets::btn_if(ui, !t.trim().is_empty(), "Add folder", Kind::Secondary).clicked() {
+                                let d = t.trim().to_string();
+                                if !p.audio.clap_dirs.contains(&d) {
+                                    p.audio.clap_dirs.push(d);
+                                }
+                                t.clear();
+                            }
+                            ui.data_mut(|d| d.insert_temp(id, t));
+                        });
+                        ui.horizontal(|ui| {
+                            let busy = self.clap.scanning();
+                            if crate::widgets::btn_if(ui, !busy, "Rescan", Kind::Secondary).clicked() {
+                                let cache = crate::data_dir().map(|d| d.join("clap-cache.json"));
+                                self.clap.rescan(&p.audio.clap_dirs, cache, true);
+                            }
+                            let n = self.clap.entries().len();
+                            ui.label(if busy {
+                                "Scanning...".to_string()
+                            } else {
+                                format!("{n} plugin(s) found")
+                            });
+                        });
+                        help(
+                            ui,
+                            "Searched with the standard folders, including subfolders. Plugins are loaded in \
+                             a separate process, so a crashing plugin is bypassed instead of stopping the show.",
+                        );
                     }
                     PrefsTab::Video => {
                         ui.label("New composition");

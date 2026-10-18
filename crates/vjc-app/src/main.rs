@@ -9,6 +9,7 @@ mod audio_react;
 mod autopilot_ui;
 mod browser;
 mod capture;
+mod clap_host;
 mod clip_thumbs;
 mod col_ops;
 mod color_depth;
@@ -160,6 +161,8 @@ struct State {
     players: HashMap<LayerId, (DeckId, u32, Player)>,
     /// Audio output, opened on the first clip start (None until then or when unavailable).
     audio: Option<AudioEngine>,
+    /// CLAP plugin catalog and per-effect plugin state.
+    clap: clap_host::ClapHost,
     /// Click output, created the first time a beat lands with Metronome on.
     metro: Option<vjc_media::audio::Metronome>,
     audio_failed: bool,
@@ -1926,7 +1929,11 @@ fn fresh_project(prefs: &Prefs) -> Project {
 
 impl State {
     fn new(prefs: Prefs) -> Self {
-        Self::build(prefs, true)
+        let s = Self::build(prefs, true);
+        // the plugin catalog is ready before the first audio effect is added, whether or not
+        // the audio engine has opened yet
+        s.start_clap_scan();
+        s
     }
 
     /// State for UI tests: no MIDI/OSC threads, no monitors, no audio, and nothing written
@@ -1972,6 +1979,7 @@ impl State {
             frames: 0,
             players: HashMap::new(),
             audio: None,
+            clap: Default::default(),
             metro: None,
             gens: HashMap::new(),
             clip_start: HashMap::new(),
@@ -2158,11 +2166,19 @@ impl State {
         }
     }
 
+    /// Starts the background scan for CLAP plugins (cached by file mtime in the data folder).
+    fn start_clap_scan(&self) {
+        let cache = data_dir().map(|d| d.join("clap-cache.json"));
+        self.clap.rescan(&self.prefs.audio.clap_dirs, cache, false);
+    }
+
     /// Audio output, opened lazily; a failure is reported once in the status line.
     fn audio_engine(&mut self) -> Option<AudioEngine> {
         if self.audio.is_none() && !self.audio_failed {
             match AudioEngine::start_with(self.audio_cfg.clone()) {
-                Ok(e) => self.audio = Some(e),
+                Ok(e) => {
+                    self.audio = Some(e);
+                }
                 Err(e) => {
                     self.audio_failed = true;
                     self.audio_error = true;

@@ -4684,6 +4684,7 @@ dependencies = [
  "tungstenite",
  "uuid",
  "vjc-avc",
+ "vjc-clap",
  "vjc-core",
  "vjc-fx",
  "vjc-io",
@@ -4702,6 +4703,16 @@ dependencies = [
  "uuid",
  "vjc-fx",
  "vjc-model",
+]
+
+[[package]]
+name = "vjc-clap"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "memmap2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4757,6 +4768,7 @@ dependencies = [
  "libc",
  "rustfft",
  "snap",
+ "vjc-clap",
 ]
 
 [[package]]

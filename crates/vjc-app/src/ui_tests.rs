@@ -8733,3 +8733,99 @@ fn undo_and_redo_clear_the_output_mask_point_selection() {
     h.state_mut().redo();
     assert_eq!(h.state().poly.sel_omask, None);
 }
+
+fn clap_entry(name: &str, stereo: bool) -> vjc_clap::Entry {
+    vjc_clap::Entry {
+        path: format!("/plugins/{name}.clap"),
+        mtime: 1,
+        id: format!("org.test.{name}"),
+        name: name.into(),
+        params: vec![vjc_clap::ParamInfo {
+            id: 7,
+            name: "Gain".into(),
+            min: 0.0,
+            max: 4.0,
+            default: 1.0,
+        }],
+        stereo,
+    }
+}
+
+#[test]
+fn clap_plugins_are_listed_in_their_own_group_of_the_audio_effect_menu() {
+    let mut h = app();
+    h.state_mut().clap.set_entries(vec![
+        clap_entry("Warmth", true),
+        clap_entry("MonoOnly", false),
+    ]);
+    click(&mut h, "Composition");
+    click_far(&mut h, "Add audio effect");
+    assert!(exists(&h, "CLAP plugins"), "own group");
+    assert!(exists(&h, "Warmth"));
+    assert!(
+        has_text(&h, "MonoOnly") || exists(&h, "MonoOnly (no stereo port)"),
+        "mono plugin is listed with the reason"
+    );
+    assert!(
+        exists(&h, "Gain") || exists(&h, "Pan"),
+        "built-ins still there"
+    );
+    click(&mut h, "Warmth");
+    let chain = &h.state().project.composition.master.audio_effects;
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].kind, "clap:org.test.Warmth|/plugins/Warmth.clap");
+    assert_eq!(chain[0].params.len(), 1, "one prop row per plugin param");
+}
+
+#[test]
+fn bypassed_clap_effect_shows_a_badge_and_restart_works() {
+    use vjc_core::EffectTarget;
+    let mut h = app();
+    let e = crate::audio_fx_ui::new_clap_effect(&clap_entry("Warmth", true));
+    h.state_mut().exec(Command::AddEffect {
+        target: EffectTarget::MasterAudio,
+        effect: e.clone(),
+        index: usize::MAX,
+    });
+    click(&mut h, "Composition");
+    let shared = h
+        .state()
+        .clap
+        .shared(&e)
+        .expect("shared state for the effect");
+    assert!(!exists(&h, "Bypassed") && !exists(&h, "Restart"));
+    shared.mark_bypassed("plugin crashed");
+    settle(&mut h);
+    assert!(exists(&h, "Bypassed"), "badge");
+    assert!(exists(&h, "Gain"), "param row still there");
+    let gen_before = shared.restart_gen();
+    click_far(&mut h, "Restart");
+    assert_eq!(shared.restart_gen(), gen_before + 1);
+    assert!(!exists(&h, "Bypassed"), "badge gone while restarting");
+}
+
+#[test]
+fn clap_param_edits_reach_the_plugin_and_are_mappable_like_other_params() {
+    use vjc_core::EffectTarget;
+    let mut h = app();
+    let e = crate::audio_fx_ui::new_clap_effect(&clap_entry("Warmth", true));
+    h.state_mut().exec(Command::AddEffect {
+        target: EffectTarget::MasterAudio,
+        effect: e.clone(),
+        index: usize::MAX,
+    });
+    h.state_mut().exec(Command::SetEffectParam {
+        target: EffectTarget::MasterAudio,
+        effect: e.id,
+        param: 0,
+        value: vjc_model::Value::Number(2.5),
+    });
+    let shared = h.state().clap.shared(&e).unwrap();
+    let chain = h.state().project.composition.master.audio_effects.clone();
+    let dials = h.state().dials_for(None);
+    let ctx = h.state().anim_ctx(&dials);
+    let specs = crate::audio_fx_ui::specs_with(&chain, &ctx, Some(&h.state().clap));
+    assert_eq!(specs.len(), 1);
+    assert!(specs[0].clap.is_some());
+    assert_eq!(shared.param(0), 2.5, "effective value copied to the plugin");
+}
