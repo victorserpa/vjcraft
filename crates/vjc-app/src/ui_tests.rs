@@ -8754,19 +8754,22 @@ fn clap_entry(name: &str, stereo: bool) -> vjc_clap::Entry {
 #[test]
 fn clap_plugins_are_listed_in_their_own_group_of_the_audio_effect_menu() {
     let mut h = app();
-    h.state_mut()
-        .clap
-        .set_entries(vec![clap_entry("Warmth", true), clap_entry("MonoOnly", false)]);
-    playing_generator(&mut h);
+    h.state_mut().clap.set_entries(vec![
+        clap_entry("Warmth", true),
+        clap_entry("MonoOnly", false),
+    ]);
     click(&mut h, "Composition");
-    click(&mut h, "Add audio effect");
+    click_far(&mut h, "Add audio effect");
     assert!(exists(&h, "CLAP plugins"), "own group");
     assert!(exists(&h, "Warmth"));
     assert!(
         has_text(&h, "MonoOnly") || exists(&h, "MonoOnly (no stereo port)"),
         "mono plugin is listed with the reason"
     );
-    assert!(exists(&h, "Gain") || exists(&h, "Pan"), "built-ins still there");
+    assert!(
+        exists(&h, "Gain") || exists(&h, "Pan"),
+        "built-ins still there"
+    );
     click(&mut h, "Warmth");
     let chain = &h.state().project.composition.master.audio_effects;
     assert_eq!(chain.len(), 1);
@@ -8785,14 +8788,18 @@ fn bypassed_clap_effect_shows_a_badge_and_restart_works() {
         index: usize::MAX,
     });
     click(&mut h, "Composition");
-    let shared = h.state().clap.shared(&e).expect("shared state for the effect");
+    let shared = h
+        .state()
+        .clap
+        .shared(&e)
+        .expect("shared state for the effect");
     assert!(!exists(&h, "Bypassed") && !exists(&h, "Restart"));
     shared.mark_bypassed("plugin crashed");
     settle(&mut h);
     assert!(exists(&h, "Bypassed"), "badge");
     assert!(exists(&h, "Gain"), "param row still there");
     let gen_before = shared.restart_gen();
-    click(&mut h, "Restart");
+    click_far(&mut h, "Restart");
     assert_eq!(shared.restart_gen(), gen_before + 1);
     assert!(!exists(&h, "Bypassed"), "badge gone while restarting");
 }
@@ -8815,7 +8822,8 @@ fn clap_param_edits_reach_the_plugin_and_are_mappable_like_other_params() {
     });
     let shared = h.state().clap.shared(&e).unwrap();
     let chain = h.state().project.composition.master.audio_effects.clone();
-    let ctx = h.state().anim_ctx(&h.state().dials_for(None));
+    let dials = h.state().dials_for(None);
+    let ctx = h.state().anim_ctx(&dials);
     let specs = crate::audio_fx_ui::specs_with(&chain, &ctx, Some(&h.state().clap));
     assert_eq!(specs.len(), 1);
     assert!(specs[0].clap.is_some());

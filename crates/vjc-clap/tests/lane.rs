@@ -71,7 +71,10 @@ fn lane_applies_the_plugin_gain_without_blocking() {
     assert!(feed(&mut l, 10, |b| is_wet(b, 0.5)), "wet audio arrives");
     assert_eq!(shared.status(), LaneStatus::Running);
     shared.set_param(0, 2.0);
-    assert!(feed(&mut l, 10, |b| is_wet(b, 2.0)), "new value reaches the plugin");
+    assert!(
+        feed(&mut l, 10, |b| is_wet(b, 2.0)),
+        "new value reaches the plugin"
+    );
 }
 
 #[test]
@@ -79,7 +82,9 @@ fn crash_passes_dry_audio_and_flags_bypass() {
     let (shared, mut l) = lane(2000);
     assert!(feed(&mut l, 10, |b| is_wet(b, 1.0)) || shared.status() == LaneStatus::Running);
     shared.set_param(1, 1.0); // plugin aborts while processing
-    let ok = feed(&mut l, 10, |_| matches!(shared.status(), LaneStatus::Bypassed(_)));
+    let ok = feed(&mut l, 10, |_| {
+        matches!(shared.status(), LaneStatus::Bypassed(_))
+    });
     assert!(ok, "crash flagged");
     // keeps going: every later block is the dry input
     for _ in 0..20 {
@@ -95,7 +100,10 @@ fn budget_miss_passes_dry_audio_and_flags_bypass() {
     let (shared, mut l) = lane(50);
     assert!(feed(&mut l, 10, |_| shared.status() == LaneStatus::Running));
     shared.set_param(2, 1.0); // plugin sleeps 30 s
-    assert!(feed(&mut l, 10, |_| matches!(shared.status(), LaneStatus::Bypassed(_))));
+    assert!(feed(&mut l, 10, |_| matches!(
+        shared.status(),
+        LaneStatus::Bypassed(_)
+    )));
     let (b, _) = block(&mut l);
     assert!(is_wet(&b, 1.0));
 }
@@ -104,19 +112,33 @@ fn budget_miss_passes_dry_audio_and_flags_bypass() {
 fn restart_brings_a_bypassed_plugin_back() {
     let (shared, mut l) = lane(2000);
     shared.set_param(1, 1.0);
-    assert!(feed(&mut l, 10, |_| matches!(shared.status(), LaneStatus::Bypassed(_))));
+    assert!(feed(&mut l, 10, |_| matches!(
+        shared.status(),
+        LaneStatus::Bypassed(_)
+    )));
     shared.set_param(1, 0.0);
     shared.set_param(0, 0.5);
     shared.restart();
-    assert!(feed(&mut l, 10, |b| is_wet(b, 0.5)), "wet again after restart");
+    assert!(
+        feed(&mut l, 10, |b| is_wet(b, 0.5)),
+        "wet again after restart"
+    );
     assert_eq!(shared.status(), LaneStatus::Running);
 }
 
 #[test]
 fn missing_plugin_is_bypassed_from_the_start() {
     let shared = ClapShared::new("/nonexistent/x.clap", ID, &[]);
-    let mut l = ClapLane::spawn(shared.clone(), Path::new(HELPER), Duration::from_millis(100), RATE);
-    assert!(feed(&mut l, 10, |_| matches!(shared.status(), LaneStatus::Bypassed(_))));
+    let mut l = ClapLane::spawn(
+        shared.clone(),
+        Path::new(HELPER),
+        Duration::from_millis(100),
+        RATE,
+    );
+    assert!(feed(&mut l, 10, |_| matches!(
+        shared.status(),
+        LaneStatus::Bypassed(_)
+    )));
     let (b, _) = block(&mut l);
     assert!(is_wet(&b, 1.0));
 }

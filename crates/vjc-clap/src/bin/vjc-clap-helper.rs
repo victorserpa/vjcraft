@@ -206,7 +206,10 @@ fn load(path: &str, id: &str, rate: u32, max_frames: u32) -> Result<Instance, St
         _lib: lib,
     };
     if !has_stereo_ports(plugin) {
-        return Err("plugin has no stereo audio port (mono or surround only); it cannot be used here".into());
+        return Err(
+            "plugin has no stereo audio port (mono or surround only); it cannot be used here"
+                .into(),
+        );
     }
     unsafe {
         if !((*plugin).activate)(plugin, rate as f64, 1, max_frames) {

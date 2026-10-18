@@ -8,8 +8,20 @@ fn entry() -> Entry {
         id: "org.x.y".into(),
         name: "Y".into(),
         params: vec![
-            ParamInfo { id: 3, name: "Gain".into(), min: -1.0, max: 4.0, default: 1.0 },
-            ParamInfo { id: 9, name: "Mix".into(), min: 0.0, max: 1.0, default: 0.5 },
+            ParamInfo {
+                id: 3,
+                name: "Gain".into(),
+                min: -1.0,
+                max: 4.0,
+                default: 1.0,
+            },
+            ParamInfo {
+                id: 9,
+                name: "Mix".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.5,
+            },
         ],
         stereo: true,
     }
@@ -49,7 +61,10 @@ fn rack_keeps_one_shared_state_per_effect_and_drops_removed_ones() {
     let a = host.shared(&e).unwrap();
     let b = host.shared(&e).unwrap();
     assert!(std::sync::Arc::ptr_eq(&a, &b));
-    let plain = vjc_model::Effect { kind: "gain".into(), ..e.clone() };
+    let plain = vjc_model::Effect {
+        kind: "gain".into(),
+        ..e.clone()
+    };
     assert!(host.shared(&plain).is_none());
     host.retain(&[]);
     let c = host.shared(&e).unwrap();
@@ -59,7 +74,12 @@ fn rack_keeps_one_shared_state_per_effect_and_drops_removed_ones() {
 #[test]
 fn default_folders_plus_prefs_folders_are_scanned_without_duplicates() {
     let mut dirs = scan_dirs(&["/extra".to_string(), "/extra".to_string()]);
-    assert_eq!(dirs.iter().filter(|d| d.as_path() == std::path::Path::new("/extra")).count(), 1);
+    assert_eq!(
+        dirs.iter()
+            .filter(|d| d.as_path() == std::path::Path::new("/extra"))
+            .count(),
+        1
+    );
     assert!(dirs.len() > 1, "platform defaults included");
     dirs.dedup();
 }

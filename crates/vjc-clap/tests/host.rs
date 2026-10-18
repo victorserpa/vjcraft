@@ -34,7 +34,16 @@ fn mono_plugin() -> &'static str {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gain_plugin.rs");
         let out = dir.join("mono.clap");
         let st = std::process::Command::new("rustc")
-            .args(["--edition", "2024", "--crate-type", "cdylib", "--cfg", "mono", "-O", "-o"])
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "cdylib",
+                "--cfg",
+                "mono",
+                "-O",
+                "-o",
+            ])
             .arg(&out)
             .arg(src)
             .status()

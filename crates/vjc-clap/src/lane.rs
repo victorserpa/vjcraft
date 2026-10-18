@@ -50,7 +50,8 @@ impl Ring {
         for (i, v) in out.iter_mut().enumerate() {
             *v = f32::from_bits(self.buf[t.wrapping_add(i) & (RING - 1)].load(Ordering::Relaxed));
         }
-        self.tail.store(t.wrapping_add(out.len()), Ordering::Release);
+        self.tail
+            .store(t.wrapping_add(out.len()), Ordering::Release);
         true
     }
     fn skip(&self, n: usize) {
@@ -99,7 +100,10 @@ impl ClapShared {
         Arc::new(ClapShared {
             path: path.into(),
             id: id.into(),
-            params: defaults.iter().map(|v| AtomicU64::new(v.to_bits())).collect(),
+            params: defaults
+                .iter()
+                .map(|v| AtomicU64::new(v.to_bits()))
+                .collect(),
             status: AtomicU8::new(STARTING),
             reason: Mutex::new(String::new()),
             epoch: AtomicU32::new(0),
@@ -122,7 +126,9 @@ impl ClapShared {
     pub fn status(&self) -> LaneStatus {
         match self.status.load(Ordering::Acquire) {
             RUNNING => LaneStatus::Running,
-            BYPASSED => LaneStatus::Bypassed(self.reason.lock().map(|r| r.clone()).unwrap_or_default()),
+            BYPASSED => {
+                LaneStatus::Bypassed(self.reason.lock().map(|r| r.clone()).unwrap_or_default())
+            }
             _ => LaneStatus::Starting,
         }
     }
@@ -166,7 +172,12 @@ pub struct ClapLane {
 }
 
 impl ClapLane {
-    pub fn spawn(shared: Arc<ClapShared>, helper_bin: &Path, budget: Duration, rate: u32) -> ClapLane {
+    pub fn spawn(
+        shared: Arc<ClapShared>,
+        helper_bin: &Path,
+        budget: Duration,
+        rate: u32,
+    ) -> ClapLane {
         let lane = ClapLane {
             input: Arc::new(Ring::new()),
             output: Arc::new(Ring::new()),
@@ -180,7 +191,8 @@ impl ClapLane {
             .name("clap-lane".into())
             .spawn(move || work(shared, input, output, stop, helper, budget, rate));
         if spawned.is_err() {
-            lane.shared.mark_bypassed("could not start the plugin thread");
+            lane.shared
+                .mark_bypassed("could not start the plugin thread");
         }
         lane
     }

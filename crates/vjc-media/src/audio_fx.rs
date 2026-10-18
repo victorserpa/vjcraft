@@ -471,7 +471,12 @@ impl Fx {
     fn new(kind: FxKind, rate: f32, clap: Option<&std::sync::Arc<vjc_clap::ClapShared>>) -> Fx {
         match kind {
             FxKind::Clap => Fx::Clap(clap.map(|c| {
-                vjc_clap::ClapLane::spawn(c.clone(), &vjc_clap::helper_path(), CLAP_BUDGET, rate as u32)
+                vjc_clap::ClapLane::spawn(
+                    c.clone(),
+                    &vjc_clap::helper_path(),
+                    CLAP_BUDGET,
+                    rate as u32,
+                )
             })),
             FxKind::Gain => Fx::Gain { prev: 1.0 },
             FxKind::Pan => Fx::Pan,
@@ -676,7 +681,14 @@ impl FxChain {
         // a CLAP slot is identified by its plugin instance too
         let kinds: Vec<(FxKind, usize)> = specs
             .iter()
-            .map(|s| (s.kind, s.clap.as_ref().map_or(0, |c| std::sync::Arc::as_ptr(c) as usize)))
+            .map(|s| {
+                (
+                    s.kind,
+                    s.clap
+                        .as_ref()
+                        .map_or(0, |c| std::sync::Arc::as_ptr(c) as usize),
+                )
+            })
             .collect();
         let mut built = self.built.lock().unwrap();
         if *built != kinds {
@@ -688,7 +700,10 @@ impl FxChain {
                 let mut fresh: Vec<Option<Fx>> = kinds
                     .iter()
                     .enumerate()
-                    .map(|(i, k)| (built.get(i) != Some(k)).then(|| Fx::new(k.0, rate, specs[i].clap.as_ref())))
+                    .map(|(i, k)| {
+                        (built.get(i) != Some(k))
+                            .then(|| Fx::new(k.0, rate, specs[i].clap.as_ref()))
+                    })
                     .collect();
                 let dry = if kinds.is_empty() {
                     Vec::new()
@@ -701,7 +716,9 @@ impl FxChain {
                     let mut st = m.lock().unwrap();
                     for (i, k) in kinds.iter().enumerate() {
                         match (fresh[i].take(), st.fx.get_mut(i)) {
-                            (Some(f), Some(slot)) => garbage.push(std::mem::replace(slot, (k.0, f))),
+                            (Some(f), Some(slot)) => {
+                                garbage.push(std::mem::replace(slot, (k.0, f)))
+                            }
                             (Some(f), None) => st.fx.push((k.0, f)),
                             (None, _) => {}
                         }
@@ -1106,8 +1123,14 @@ mod tests {
             assert_eq!(ALLOCS.with(Cell::get), p0, "audio callback allocated");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert!(buf.iter().all(|v| (v - 0.04).abs() < 1e-4), "gain ran, clap passed dry");
-        assert!(matches!(shared.status(), vjc_clap::LaneStatus::Bypassed(_) | vjc_clap::LaneStatus::Starting));
+        assert!(
+            buf.iter().all(|v| (v - 0.04).abs() < 1e-4),
+            "gain ran, clap passed dry"
+        );
+        assert!(matches!(
+            shared.status(),
+            vjc_clap::LaneStatus::Bypassed(_) | vjc_clap::LaneStatus::Starting
+        ));
         // same Arc again: nothing is rebuilt
         c.set(&[gain, clap], R, 120.0);
     }
