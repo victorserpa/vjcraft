@@ -390,8 +390,8 @@ fn rescan_forces_a_retry_of_files_remembered_as_failed() {
     );
     assert_eq!(
         f.len(),
-        0,
-        "force clears failed, but a first try is quick again"
+        1,
+        "a forced rescan gives a slow plugin the long deadline"
     );
     let (f, _) = scan_with(
         std::slice::from_ref(&dir),

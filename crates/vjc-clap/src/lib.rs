@@ -252,7 +252,8 @@ pub fn scan_forced(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (V
 }
 
 /// [`scan`] with explicit info deadlines: `quick` for a first try, `long` for a retry of a file
-/// that timed out. `force` clears the failed and slow memory.
+/// that timed out. `force` clears the failed and slow memory and gives every
+/// uncached file the long deadline, so Rescan can load a slow plugin.
 pub fn scan_with(
     dirs: &[PathBuf],
     cache_file: &Path,
@@ -301,7 +302,7 @@ pub fn scan_with(
                 next_failed.insert(key, mt);
                 continue;
             }
-            let retry = cache.slow.get(&key) == Some(&mt);
+            let retry = force || cache.slow.get(&key) == Some(&mt);
             loads += 1;
             if helper.is_none() {
                 helper = Helper::spawn(helper_bin).ok();
