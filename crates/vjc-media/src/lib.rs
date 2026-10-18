@@ -519,6 +519,81 @@ pub struct SourceInfo {
     pub alpha: bool,
 }
 
+/// Display rotation of a stream in degrees counter-clockwise
+/// (0, 90, 180 or 270), from its display matrix (phone and camera clips store portrait video
+/// as landscape pixels plus this tag). Other angles round to the nearest quarter turn.
+fn stream_rotation(st: &ff::format::stream::Stream) -> u32 {
+    for sd in st.side_data() {
+        if sd.kind() == ff::codec::packet::side_data::Type::DisplayMatrix && sd.data().len() >= 36 {
+            let m = |i: usize| i32::from_le_bytes(sd.data()[i * 4..i * 4 + 4].try_into().unwrap());
+            return rotation_from_matrix(m(0), m(1));
+        }
+    }
+    0
+}
+
+/// Counter-clockwise quarter turns (in degrees) for the first row `(a, b)` of a display matrix.
+fn rotation_from_matrix(a: i32, b: i32) -> u32 {
+    if a == 0 && b == 0 {
+        return 0;
+    }
+    let deg = -(f64::from(b)).atan2(f64::from(a)).to_degrees();
+    (((deg / 90.0).round() as i32).rem_euclid(4) * 90) as u32
+}
+
+/// Rotates a tightly packed RGBA frame `deg` degrees counter-clockwise (multiple of 90).
+fn rotate_frame(f: Frame, deg: u32) -> Frame {
+    if deg % 360 == 0 || f.hap.is_some() {
+        return f;
+    }
+    let (w, h) = (f.width as usize, f.height as usize);
+    let (nw, nh) = if deg == 180 { (w, h) } else { (h, w) };
+    let src = &f.data;
+    let mut out = vec![0u8; src.len()];
+    for y in 0..nh {
+        for x in 0..nw {
+            let (sx, sy) = match deg {
+                90 => (w - 1 - y, x),
+                180 => (w - 1 - x, h - 1 - y),
+                _ => (y, h - 1 - x),
+            };
+            let (si, di) = ((sy * w + sx) * 4, (y * nw + x) * 4);
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    Frame {
+        width: nw as u32,
+        height: nh as u32,
+        data: Arc::new(out),
+        ..f
+    }
+}
+
+/// VP8/VP9 in WebM store alpha as a side channel the native decoders ignore; only libvpx
+/// decodes it. Returns that decoder when the stream is flagged and libvpx is built in.
+fn vpx_alpha_codec(st: &ff::format::stream::Stream) -> Option<ff::Codec> {
+    let name = match st.parameters().id() {
+        ff::codec::Id::VP8 => "libvpx",
+        ff::codec::Id::VP9 => "libvpx-vp9",
+        _ => return None,
+    };
+    (st.metadata().get("alpha_mode") == Some("1"))
+        .then(|| ff::decoder::find_by_name(name))
+        .flatten()
+}
+
+/// Software decoder for `params`, with an explicit codec when one is given.
+fn open_sw(
+    params: ff::codec::Parameters,
+    codec: Option<ff::Codec>,
+) -> Result<ff::decoder::Video, ff::Error> {
+    let ctx = ff::codec::context::Context::from_parameters(params)?;
+    match codec {
+        Some(c) => ctx.decoder().open_as(c)?.video(),
+        None => ctx.decoder().video(),
+    }
+}
+
 /// Reads codec, size, frame rate and length of a video file. Blocks on file I/O: call it
 /// off the UI thread. None when the file cannot be opened or has no video stream.
 pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
@@ -533,13 +608,18 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
     };
     let params = st.parameters();
     let codec = params.id().name().to_string();
-    let (width, height, alpha) = ff::codec::context::Context::from_parameters(params)
-        .ok()
-        .and_then(|c| c.decoder().video().ok())
-        .map_or((0, 0, false), |d| {
-            let comps = d.format().descriptor().map_or(0, |x| x.nb_components());
-            (d.width(), d.height(), comps == 2 || comps == 4)
-        });
+    let turned = matches!(stream_rotation(&st), 90 | 270);
+    let vpx = vpx_alpha_codec(&st);
+    let vpx_alpha = vpx.is_some();
+    let (width, height, alpha) = open_sw(params, vpx).ok().map_or((0, 0, false), |d| {
+        let comps = d.format().descriptor().map_or(0, |x| x.nb_components());
+        let (w, h) = if turned {
+            (d.height(), d.width())
+        } else {
+            (d.width(), d.height())
+        };
+        (w, h, comps == 2 || comps == 4 || vpx_alpha)
+    });
     let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
     Some(SourceInfo {
         codec,
@@ -633,6 +713,8 @@ struct Scrubber {
     holder: Arc<hw::Holder>,
     /// Hardware was wanted at open but no session was free.
     slot_denied: bool,
+    /// Display rotation (degrees counter-clockwise) applied to every frame.
+    rotation: u32,
 }
 
 impl Scrubber {
@@ -650,7 +732,7 @@ impl Scrubber {
     fn open_with_hw(path: &Path, hap: bool, hw: Hw) -> Result<Scrubber, ff::Error> {
         ff::init()?;
         let ictx = ff::format::input(&path)?;
-        let (stream_idx, tb, fps, params) = {
+        let (stream_idx, tb, fps, params, rotation, vpx) = {
             let st = ictx
                 .streams()
                 .best(ff::media::Type::Video)
@@ -661,15 +743,27 @@ impl Scrubber {
             } else {
                 30.0
             };
-            (st.index(), f64::from(st.time_base()), fps, st.parameters())
+            (
+                st.index(),
+                f64::from(st.time_base()),
+                fps,
+                st.parameters(),
+                stream_rotation(&st),
+                vpx_alpha_codec(&st),
+            )
         };
+        // Alpha WebM needs libvpx, which runs in software.
+        let hw = if vpx.is_some() { Hw::Off } else { hw };
         let slot = if hw == Hw::Off {
             None
         } else {
             hw::SLOTS.try_acquire(hw::cap())
         };
         let slot_denied = hw != Hw::Off && slot.is_none();
-        let (decoder, slot) = open_decoder(params, hw, slot)?;
+        let (decoder, slot) = match vpx {
+            Some(c) => (open_sw(params, Some(c))?, None),
+            None => open_decoder(params, hw, slot)?,
+        };
         let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
         Ok(Scrubber {
             ictx,
@@ -691,6 +785,7 @@ impl Scrubber {
             status: None,
             holder: hw::Holder::new(),
             slot_denied,
+            rotation,
         })
     }
 
@@ -777,7 +872,7 @@ impl Scrubber {
     /// Converts a decoded frame to RGBA.
     fn convert(&mut self, decoded: &ff::frame::Video) -> Result<Frame, ff::Error> {
         self.count += 1;
-        frame_to_rgba(&mut self.scaler, decoded, self.count)
+        frame_to_rgba(&mut self.scaler, decoded, self.count).map(|f| rotate_frame(f, self.rotation))
     }
 
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
@@ -1756,5 +1851,40 @@ mod tests {
         assert!(!pl.thread.as_ref().unwrap().is_finished());
         pl.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_matrix_maps_to_quarter_turns() {
+        // av_display_rotation_set: (cos, -sin) in 16.16 fixed point.
+        assert_eq!(rotation_from_matrix(65536, 0), 0);
+        assert_eq!(rotation_from_matrix(0, -65536), 90);
+        assert_eq!(rotation_from_matrix(-65536, 0), 180);
+        assert_eq!(rotation_from_matrix(0, 65536), 270);
+        assert_eq!(rotation_from_matrix(0, 0), 0);
+    }
+
+    #[test]
+    fn rotate_frame_turns_pixels_counter_clockwise() {
+        // 3x2: top row A B C, bottom row D E F (one distinct byte per pixel).
+        let px = |v: u8| [v, v, v, 255];
+        let data: Vec<u8> = [1u8, 2, 3, 4, 5, 6].iter().flat_map(|&v| px(v)).collect();
+        let f = Frame {
+            width: 3,
+            height: 2,
+            data: Arc::new(data),
+            seq: 1,
+            hap: None,
+        };
+        let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
+        let r90 = rotate_frame(f.clone(), 90);
+        assert_eq!((r90.width, r90.height), (2, 3));
+        assert_eq!(first(&r90), [3, 6, 2, 5, 1, 4]);
+        let r270 = rotate_frame(f.clone(), 270);
+        assert_eq!((r270.width, r270.height), (2, 3));
+        assert_eq!(first(&r270), [4, 1, 5, 2, 6, 3]);
+        let r180 = rotate_frame(f.clone(), 180);
+        assert_eq!((r180.width, r180.height), (3, 2));
+        assert_eq!(first(&r180), [6, 5, 4, 3, 2, 1]);
+        assert_eq!(first(&rotate_frame(f, 0)), [1, 2, 3, 4, 5, 6]);
     }
 }

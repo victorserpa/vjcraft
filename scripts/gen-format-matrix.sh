@@ -108,6 +108,11 @@ if [ -f "$OUT/h264.mp4" ]; then
   cp "$OUT/h264.mp4" "$OUT/wrong_ext.avi"; echo "$(cat "$OUT/h264.mp4.expect")" >"$OUT/wrong_ext.avi.expect"
   DONE+=(truncated.mp4 corrupt.mp4 wrong_ext.mov wrong_ext.avi)
 fi
+if [ -f "$OUT/h264_8bit.mov" ]; then
+  # Codec nobody decodes: the sample entry fourcc is rewritten (same length).
+  LC_ALL=C sed 's/avc1/zzzz/' "$OUT/h264_8bit.mov" >"$OUT/unknown_codec.mov"
+  echo "0x0 opaque error" >"$OUT/unknown_codec.mov.expect"; DONE+=(unknown_codec.mov)
+fi
 : >"$OUT/zero_byte.mov"; echo "0x0 opaque error" >"$OUT/zero_byte.mov.expect"
 head -c 4096 /dev/urandom >"$OUT/garbage.mov"; echo "0x0 opaque error" >"$OUT/garbage.mov.expect"
 DONE+=(zero_byte.mov garbage.mov)
