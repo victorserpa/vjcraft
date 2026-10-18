@@ -7822,8 +7822,9 @@ impl State {
             if let Some(e) = p.error() {
                 ui.horizontal(|ui| {
                     ui.colored_label(theme::ERROR_TEXT, format!("{}: {e}", p.path.display()));
-                    // A file FFmpeg cannot decode: offer a re-encode instead of a dead clip.
-                    if std::fs::metadata(&p.path).is_ok_and(|m| m.is_file() && m.len() > 0)
+                    // No decoder for the codec: offer a re-encode instead of a dead clip. A
+                    // damaged or non-video file gets none (decided once, not per frame).
+                    if p.can_convert()
                         && crate::widgets::btn(
                             ui,
                             "Convert to HAP...",

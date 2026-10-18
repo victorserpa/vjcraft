@@ -241,7 +241,8 @@ impl Player {
                     }
                     if let Err(e) = run_scrub(&p, &s, hw) {
                         let size = std::fs::metadata(&p).map_or(0, |m| m.len());
-                        s.convertible.store(is_convertible(&e, size), Ordering::Relaxed);
+                        s.convertible
+                            .store(is_convertible(&e, size), Ordering::Relaxed);
                         *lock(&s.error) = Some(open_error_text(&e));
                     }
                 })
@@ -584,8 +585,16 @@ fn orient_from_matrix(a: i32, b: i32, c: i32, d: i32) -> Orient {
     let det = i64::from(a) * i64::from(d) - i64::from(b) * i64::from(c);
     if det < 0 {
         // Undo the mirror (negate the first column) to read the rotation underneath.
+        // The mirror is of the displayed picture (after the turn), like FFmpeg's autorotate;
+        // `rotate_frame` mirrors the stored pixels first, which for a quarter turn is the
+        // opposite turn.
+        let deg = rotation_from_matrix(a.saturating_neg(), b);
         Orient {
-            deg: rotation_from_matrix(a.saturating_neg(), b),
+            deg: if matches!(deg, 90 | 270) {
+                360 - deg
+            } else {
+                deg
+            },
             flip: true,
         }
     } else {
@@ -605,8 +614,8 @@ fn rotation_from_matrix(a: i32, b: i32) -> u32 {
     (((deg / 90.0).round() as i32).rem_euclid(4) * 90) as u32
 }
 
-/// Tile edge (pixels) of the blocked copy: 32x32 RGBA is 4 KiB per side, inside L1.
-const TILE: usize = 32;
+/// Tile edge (pixels) of the blocked copy: 64x64 RGBA is 16 KiB per side.
+const TILE: usize = 64;
 
 /// Mirrors (`flip`, left to right) a tightly packed RGBA frame and then turns it `deg`
 /// degrees counter-clockwise (multiple of 90). Copies in tiles so both the reads and the
@@ -623,19 +632,31 @@ fn rotate_frame(f: Frame, deg: u32, flip: bool) -> Frame {
     };
     let src = &f.data;
     let mut out = vec![0u8; src.len()];
+    // The source pixel of destination (x, y) is (sx0 + ax*x + ay*y, sy0 + bx*x + by*y);
+    // flattened to one linear index: base + x*dx + y*dy (in pixels).
+    let (wi, hi) = (w as isize, h as isize);
+    let (sx0, ax, ay, sy0, bx, by) = match deg {
+        90 => (wi - 1, 0, -1, 0, 1, 0),
+        180 => (wi - 1, -1, 0, hi - 1, 0, -1),
+        270 => (0, 0, 1, hi - 1, -1, 0),
+        _ => (0, 1, 0, 0, 0, 1),
+    };
+    let (sx0, ax, ay) = if flip {
+        (wi - 1 - sx0, -ax, -ay)
+    } else {
+        (sx0, ax, ay)
+    };
+    let base = sy0 * wi + sx0;
+    let (dx, dy) = (bx * wi + ax, by * wi + ay);
     for ty in (0..nh).step_by(TILE) {
         for tx in (0..nw).step_by(TILE) {
+            let xs = tx..(tx + TILE).min(nw);
             for y in ty..(ty + TILE).min(nh) {
-                for x in tx..(tx + TILE).min(nw) {
-                    let (sx, sy) = match deg {
-                        90 => (w - 1 - y, x),
-                        180 => (w - 1 - x, h - 1 - y),
-                        270 => (y, h - 1 - x),
-                        _ => (x, y),
-                    };
-                    let sx = if flip { w - 1 - sx } else { sx };
-                    let (si, di) = ((sy * w + sx) * 4, (y * nw + x) * 4);
-                    out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                let row = base + y as isize * dy;
+                let dst = &mut out[(y * nw + xs.start) * 4..(y * nw + xs.end) * 4];
+                for (x, d) in xs.clone().zip(dst.chunks_exact_mut(4)) {
+                    let si = (row + x as isize * dx) as usize * 4;
+                    d.copy_from_slice(&src[si..si + 4]);
                 }
             }
         }
@@ -902,7 +923,9 @@ impl Scrubber {
     fn swap_decoder(&mut self, slot: Option<HwSlot<'static>>) -> Result<(), ff::Error> {
         match self.vpx {
             // The alpha decoder only exists in software: keep it, whatever was asked.
-            Some(c) => self.swap_decoder_with(None, move |p, _, _| Ok((open_sw(p, Some(c))?, None))),
+            Some(c) => {
+                self.swap_decoder_with(None, move |p, _, _| Ok((open_sw(p, Some(c))?, None)))
+            }
             None => self.swap_decoder_with(slot, open_decoder),
         }
     }
@@ -960,7 +983,8 @@ impl Scrubber {
     /// Converts a decoded frame to RGBA.
     fn convert(&mut self, decoded: &ff::frame::Video) -> Result<Frame, ff::Error> {
         self.count += 1;
-        frame_to_rgba(&mut self.scaler, decoded, self.count).map(|f| rotate_frame(f, self.orient.deg, self.orient.flip))
+        frame_to_rgba(&mut self.scaler, decoded, self.count)
+            .map(|f| rotate_frame(f, self.orient.deg, self.orient.flip))
     }
 
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
@@ -1953,6 +1977,117 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Decode throughput of 4 parallel layers over one clip (VJC_BENCH_CLIP), software
+    /// decoder, 5 s each. Run with --ignored --nocapture; compare a rotated and a plain clip.
+    #[test]
+    #[ignore = "benchmark: set VJC_BENCH_CLIP"]
+    fn bench_four_layers() {
+        let Ok(clip) = std::env::var("VJC_BENCH_CLIP") else {
+            return;
+        };
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let clip = clip.clone();
+                std::thread::spawn(move || {
+                    let mut sc = Scrubber::open(Path::new(&clip)).unwrap();
+                    let t = std::time::Instant::now();
+                    let mut n = 0u32;
+                    let mut dims = (0, 0);
+                    while t.elapsed() < Duration::from_secs(5) {
+                        match sc.next() {
+                            Some((_, f)) => {
+                                n += 1;
+                                dims = (f.width, f.height);
+                            }
+                            None => sc.seek(0.0).unwrap(),
+                        }
+                    }
+                    (f64::from(n) / t.elapsed().as_secs_f64(), dims)
+                })
+            })
+            .collect();
+        let r: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let total: f64 = r.iter().map(|x| x.0).sum();
+        eprintln!(
+            "BENCH {clip}: per-layer fps {:?} total {total:.1} dims {:?}",
+            r.iter().map(|x| x.0.round()).collect::<Vec<_>>(),
+            r[0].1
+        );
+    }
+
+    #[test]
+    #[ignore = "dump: set VJC_DUMP_CLIP and VJC_DUMP_OUT"]
+    fn dump_first_frame() {
+        let (Ok(c), Ok(o)) = (
+            std::env::var("VJC_DUMP_CLIP"),
+            std::env::var("VJC_DUMP_OUT"),
+        ) else {
+            return;
+        };
+        let mut sc = Scrubber::open(Path::new(&c)).unwrap();
+        std::fs::write(o, sc.next().unwrap().1.data.as_slice()).unwrap();
+    }
+
+    /// Frames of mirrored / rotated clips equal what the ffmpeg CLI (autorotate) produces.
+    #[test]
+    fn orientation_matches_ffmpeg_autorotate() {
+        let dir = std::env::temp_dir().join(format!("vjc-orient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.mp4");
+        if !make_test_clip(&base) {
+            return;
+        }
+        let ff_run = |args: &[&str]| {
+            std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        for (name, tag) in [
+            ("flip", &["-display_hflip"][..]),
+            ("r90", &["-display_rotation", "90"]),
+            ("r90f", &["-display_rotation", "90", "-display_hflip"]),
+            ("r270f", &["-display_rotation", "270", "-display_hflip"]),
+        ] {
+            let clip = dir.join(format!("{name}.mp4"));
+            let raw = dir.join(format!("{name}.rgba"));
+            let made = ff_run(
+                &[
+                    tag,
+                    &[
+                        "-i",
+                        base.to_str().unwrap(),
+                        "-c",
+                        "copy",
+                        clip.to_str().unwrap(),
+                    ],
+                ]
+                .concat(),
+            );
+            let want = made
+                && ff_run(&[
+                    "-i",
+                    clip.to_str().unwrap(),
+                    "-frames:v",
+                    "1",
+                    "-pix_fmt",
+                    "rgba",
+                    "-f",
+                    "rawvideo",
+                    raw.to_str().unwrap(),
+                ]);
+            if !want {
+                eprintln!("skip {name}: ffmpeg lacks display flags");
+                continue;
+            }
+            let mut sc = Scrubber::open(&clip).unwrap();
+            let got = sc.next().unwrap().1;
+            assert!(*got.data == std::fs::read(&raw).unwrap(), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn convertible_only_for_missing_decoder() {
         assert!(is_convertible(&ff::Error::DecoderNotFound, 10));
@@ -1965,9 +2100,29 @@ mod tests {
     fn mirrored_matrix_sets_flip() {
         let o = |a, b, c, d| orient_from_matrix(a, b, c, d);
         let one = 65536;
-        assert_eq!(o(one, 0, 0, one), Orient { deg: 0, flip: false });
+        assert_eq!(
+            o(one, 0, 0, one),
+            Orient {
+                deg: 0,
+                flip: false
+            }
+        );
         assert_eq!(o(-one, 0, 0, one), Orient { deg: 0, flip: true });
-        assert!(o(0, -one, -one, 0).flip);
+        // Mirrored quarter turns, as written by `-display_rotation N -display_hflip`.
+        assert_eq!(
+            o(0, -one, -one, 0),
+            Orient {
+                deg: 270,
+                flip: true
+            }
+        );
+        assert_eq!(
+            o(0, one, one, 0),
+            Orient {
+                deg: 90,
+                flip: true
+            }
+        );
         assert!(!o(0, -one, one, 0).flip);
         assert_eq!(o(0, -one, one, 0).deg, 90);
     }
