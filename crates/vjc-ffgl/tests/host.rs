@@ -257,10 +257,13 @@ fn macos_bundle_is_resolved_to_its_executable() {
     )
     .unwrap();
     let cache = d.join("cache.json");
-    let (e, loads) = scan(&[d.clone()], &cache, Path::new(HELPER));
+    let (e, loads) = scan(std::slice::from_ref(&d), &cache, Path::new(HELPER));
     assert_eq!((e.len(), loads), (1, 1));
     assert_eq!(e[0].info.name, "VJC Test Gain");
-    assert_eq!(scan(&[d.clone()], &cache, Path::new(HELPER)).1, 0);
+    assert_eq!(
+        scan(std::slice::from_ref(&d), &cache, Path::new(HELPER)).1,
+        0
+    );
     // the cache follows the executable's mtime, not the directory's
     let f = std::fs::OpenOptions::new()
         .write(true)
@@ -268,7 +271,10 @@ fn macos_bundle_is_resolved_to_its_executable() {
         .unwrap();
     f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
         .unwrap();
-    assert_eq!(scan(&[d.clone()], &cache, Path::new(HELPER)).1, 1);
+    assert_eq!(
+        scan(std::slice::from_ref(&d), &cache, Path::new(HELPER)).1,
+        1
+    );
     // and the effect loads the bundle too
     let mut fx = FfglEffect::new(&e[0].path, Path::new(HELPER), Duration::from_secs(5));
     assert_eq!(fx.status, Status::Running);
@@ -284,9 +290,12 @@ fn failed_plugins_are_cached_by_mtime() {
     let junk = d.join("junk.dylib");
     std::fs::write(&junk, b"not a library").unwrap();
     let cache = d.join("cache.json");
-    assert_eq!(scan(&[d.clone()], &cache, Path::new(HELPER)).1, 1);
     assert_eq!(
-        scan(&[d.clone()], &cache, Path::new(HELPER)).1,
+        scan(std::slice::from_ref(&d), &cache, Path::new(HELPER)).1,
+        1
+    );
+    assert_eq!(
+        scan(std::slice::from_ref(&d), &cache, Path::new(HELPER)).1,
         0,
         "not reloaded"
     );
@@ -294,7 +303,7 @@ fn failed_plugins_are_cached_by_mtime() {
     f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
         .unwrap();
     assert_eq!(
-        scan(&[d.clone()], &cache, Path::new(HELPER)).1,
+        scan(std::slice::from_ref(&d), &cache, Path::new(HELPER)).1,
         1,
         "changed file is retried"
     );
