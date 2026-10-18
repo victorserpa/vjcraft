@@ -23,6 +23,8 @@ pub const FF_GETPARAMETERNAME: u32 = 5;
 pub const FF_GETPARAMETERDEFAULT: u32 = 6;
 pub const FF_SETPARAMETER: u32 = 8;
 pub const FF_GETPARAMETER: u32 = 9;
+pub const FF_INSTANTIATE: u32 = 11;
+pub const FF_DEINSTANTIATE: u32 = 12;
 pub const FF_GETPARAMETERTYPE: u32 = 15;
 /// VJCraft stage-1 extension (not part of FFGL): process an RGBA8 frame on the CPU.
 /// Lets the helper be tested without an OpenGL context; real plugins answer FF_FAIL.
@@ -52,6 +54,15 @@ pub struct SetParameterStruct {
 pub struct CpuFrameStruct {
     pub input: *const u8,
     pub output: *mut u8,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Documented viewport passed to INSTANTIATE.
+#[repr(C)]
+pub struct ViewportStruct {
+    pub x: u32,
+    pub y: u32,
     pub width: u32,
     pub height: u32,
 }

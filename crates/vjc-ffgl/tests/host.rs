@@ -169,3 +169,133 @@ fn scan_skips_a_file_that_is_not_a_plugin() {
     );
     assert!(e.is_empty());
 }
+
+#[test]
+fn out_of_range_index_and_non_finite_values_are_rejected_locally() {
+    let mut e = effect(5000);
+    e.set_param(7, 0.5); // fixture would crash on an index it does not have
+    e.set_param(usize::MAX, 0.5);
+    assert_eq!(e.status, Status::Running);
+    assert_eq!(e.get_param(7), None);
+    assert_eq!(e.status, Status::Running);
+    e.set_param(0, f32::NAN);
+    e.set_param(0, f32::INFINITY);
+    assert_eq!(e.get_param(0), Some(0.5), "plugin never saw the bad values");
+}
+
+#[test]
+fn enable_stays_stopped_when_restoring_a_parameter_fails() {
+    let mut e = effect(5000);
+    e.set_param(1, 0.75); // fixture aborts while setting this value
+    assert!(matches!(e.status, Status::Stopped(_)));
+    e.enable(); // restore replays the same Set, which crashes again
+    assert!(matches!(e.status, Status::Stopped(_)), "{:?}", e.status);
+    let f = frame(80);
+    assert_eq!(e.process(&f).rgba, f.rgba, "pass-through");
+    e.set_param(1, 0.0);
+    e.enable();
+    assert_eq!(e.status, Status::Running);
+}
+
+#[test]
+fn lifecycle_follows_the_ffgl_order() {
+    let dir = std::env::temp_dir().join(format!("vjc-ffgl-life-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join(Path::new(&plugin()).file_name().unwrap());
+    std::fs::copy(plugin(), &lib).unwrap();
+    let log = dir.join(format!(
+        "{}.log",
+        lib.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&log, "").unwrap();
+    let path = lib.to_string_lossy().to_string();
+    let mut h = Helper::spawn(Path::new(HELPER)).unwrap();
+    let t = Duration::from_secs(5);
+    let load = Request::Load { path: path.clone() };
+    assert!(matches!(h.request(&load, t), Ok(Response::Info { .. })));
+    // per-instance calls carry the instance id: the fixture fails them otherwise
+    assert_eq!(
+        h.request(
+            &Request::Set {
+                index: 0,
+                value: 0.25
+            },
+            t
+        ),
+        Ok(Response::Done)
+    );
+    assert_eq!(
+        h.request(&Request::Get { index: 0 }, t),
+        Ok(Response::Value { value: 0.25 })
+    );
+    assert!(matches!(h.request(&load, t), Ok(Response::Info { .. }))); // replace
+    let _ = h.request(&Request::Quit, t);
+    let codes: Vec<u32> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| l.parse().unwrap())
+        .collect();
+    let seq: Vec<u32> = codes
+        .into_iter()
+        .filter(|c| matches!(c, 1 | 2 | 11 | 12))
+        .collect();
+    // INITIALISE, INSTANTIATE, then DEINSTANTIATE + DEINITIALISE on replace and on quit
+    assert_eq!(seq, [1, 11, 12, 2, 1, 11, 12, 2]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_bundle_is_resolved_to_its_executable() {
+    let d = std::env::temp_dir().join(format!("vjc-ffgl-bundle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let macos = d.join("Gain.bundle/Contents/MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    std::fs::copy(plugin(), macos.join("GainExe")).unwrap();
+    std::fs::write(
+        d.join("Gain.bundle/Contents/Info.plist"),
+        "<plist><dict><key>CFBundleExecutable</key><string>GainExe</string></dict></plist>",
+    )
+    .unwrap();
+    let cache = d.join("cache.json");
+    let (e, loads) = scan(&[d.clone()], &cache, Path::new(HELPER));
+    assert_eq!((e.len(), loads), (1, 1));
+    assert_eq!(e[0].info.name, "VJC Test Gain");
+    assert_eq!(scan(&[d.clone()], &cache, Path::new(HELPER)).1, 0);
+    // the cache follows the executable's mtime, not the directory's
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(macos.join("GainExe"))
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(scan(&[d.clone()], &cache, Path::new(HELPER)).1, 1);
+    // and the effect loads the bundle too
+    let mut fx = FfglEffect::new(&e[0].path, Path::new(HELPER), Duration::from_secs(5));
+    assert_eq!(fx.status, Status::Running);
+    fx.set_param(0, 1.0);
+    assert_eq!(fx.process(&frame(100)).rgba[0], 200);
+}
+
+#[test]
+fn failed_plugins_are_cached_by_mtime() {
+    let d = std::env::temp_dir().join(format!("vjc-ffgl-failcache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let junk = d.join("junk.dylib");
+    std::fs::write(&junk, b"not a library").unwrap();
+    let cache = d.join("cache.json");
+    assert_eq!(scan(&[d.clone()], &cache, Path::new(HELPER)).1, 1);
+    assert_eq!(
+        scan(&[d.clone()], &cache, Path::new(HELPER)).1,
+        0,
+        "not reloaded"
+    );
+    let f = std::fs::OpenOptions::new().write(true).open(&junk).unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        scan(&[d.clone()], &cache, Path::new(HELPER)).1,
+        1,
+        "changed file is retried"
+    );
+}

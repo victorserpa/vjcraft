@@ -122,10 +122,48 @@ pub struct Entry {
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Cache {
     entries: BTreeMap<String, Entry>,
+    /// Plugins that failed, crashed or hung, by path -> mtime; not retried until the file changes.
+    #[serde(default)]
+    failed: BTreeMap<String, u64>,
+}
+
+/// The file that is actually loaded. A macOS `.bundle` is a directory: the executable lives in
+/// `Contents/MacOS/` (named by `CFBundleExecutable` in Info.plist, else the only file there).
+pub fn resolve_binary(p: &Path) -> PathBuf {
+    if !p.is_dir() {
+        return p.to_path_buf();
+    }
+    let macos = p.join("Contents/MacOS");
+    if let Some(name) = std::fs::read_to_string(p.join("Contents/Info.plist"))
+        .ok()
+        .and_then(|t| {
+            let rest = t.split("<key>CFBundleExecutable</key>").nth(1)?;
+            let rest = rest.split("<string>").nth(1)?;
+            Some(rest.split("</string>").next()?.trim().to_string())
+        })
+        .filter(|n| !n.is_empty() && !n.contains(['/', '\\']) && n != "..")
+    {
+        let f = macos.join(name);
+        if f.is_file() {
+            return f;
+        }
+    }
+    let files: Vec<PathBuf> = std::fs::read_dir(&macos)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+    if files.len() == 1 {
+        return files.into_iter().next().unwrap();
+    }
+    p.to_path_buf()
 }
 
 fn mtime(p: &Path) -> u64 {
-    std::fs::metadata(p)
+    std::fs::metadata(resolve_binary(p))
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -145,6 +183,7 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
     let mut loads = 0;
     let mut helper: Option<Helper> = None;
     let mut next = BTreeMap::new();
+    let mut next_failed = BTreeMap::new();
     for d in dirs {
         let Ok(rd) = std::fs::read_dir(d) else {
             continue;
@@ -167,6 +206,10 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
                 found.push(e);
                 continue;
             }
+            if cache.failed.get(&key) == Some(&mt) {
+                next_failed.insert(key, mt);
+                continue;
+            }
             loads += 1;
             if helper.is_none() {
                 helper = Helper::spawn(helper_bin).ok();
@@ -183,8 +226,14 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
                     next.insert(key, e.clone());
                     found.push(e);
                 }
-                Err(HostError::Plugin(_)) => {}
-                _ => helper = None, // crashed or hung: drop it, next plugin gets a fresh one
+                Err(HostError::Plugin(_)) => {
+                    next_failed.insert(key, mt);
+                }
+                _ => {
+                    // crashed or hung: drop it, next plugin gets a fresh one
+                    helper = None;
+                    next_failed.insert(key, mt);
+                }
             }
         }
     }
@@ -193,7 +242,11 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
     }
     let _ = std::fs::write(
         cache_file,
-        serde_json::to_vec(&Cache { entries: next }).unwrap(),
+        serde_json::to_vec(&Cache {
+            entries: next,
+            failed: next_failed,
+        })
+        .unwrap(),
     );
     (found, loads)
 }
@@ -292,13 +345,14 @@ impl FfglEffect {
                     self.params = info.params.iter().map(|p| p.default).collect();
                 }
                 for (i, v) in self.params.iter().enumerate() {
-                    let _ = h.request(
-                        &Request::Set {
-                            index: i as u32,
-                            value: *v,
-                        },
-                        self.timeout,
-                    );
+                    let set = Request::Set {
+                        index: i as u32,
+                        value: *v,
+                    };
+                    if let Err(e) = h.request(&set, self.timeout) {
+                        self.status = Status::Stopped(e);
+                        return; // helper stays None: pass-through
+                    }
                 }
                 self.helper = Some(h);
                 self.status = Status::Running;
@@ -308,19 +362,25 @@ impl FfglEffect {
         }
     }
 
-    /// Set a parameter (kept locally so it survives a restart).
-    pub fn set_param(&mut self, index: usize, value: f32) {
-        if index < self.params.len() {
-            self.params[index] = value;
+    /// Set a parameter (kept locally so it survives a restart). Returns false and sends nothing
+    /// if the index is out of range or the value is not finite.
+    pub fn set_param(&mut self, index: usize, value: f32) -> bool {
+        if index >= self.params.len() || !value.is_finite() {
+            return false;
         }
+        self.params[index] = value;
         self.call(Request::Set {
             index: index as u32,
             value,
         });
+        true
     }
 
     /// Read a parameter back from the plugin.
     pub fn get_param(&mut self, index: usize) -> Option<f32> {
+        if index >= self.params.len() {
+            return None;
+        }
         match self.call(Request::Get {
             index: index as u32,
         }) {

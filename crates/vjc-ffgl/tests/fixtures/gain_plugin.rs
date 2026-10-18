@@ -1,6 +1,6 @@
 // Minimal FFGL 2.x style test plugin written from the documented ABI. Built by the tests
 // with rustc --crate-type cdylib. Params: 0 Gain (default 0.5, output = input * 2 * gain),
-// 1 Crash (>0.5: abort while processing), 2 Hang (>0.5: never return while processing).
+// 1 Crash (>0.5: abort while processing; exactly 0.75: abort while setting), 2 Hang (>0.5: never return while processing).
 use std::ffi::c_void;
 
 #[repr(C)]
@@ -34,10 +34,49 @@ static INFO: Info = Info { major: 2, minor: 0, id: *b"TSTG", name: *b"VJC Test G
 static NAMES: [[u8; 16]; 3] = [*b"Gain\0\0\0\0\0\0\0\0\0\0\0\0", *b"Crash\0\0\0\0\0\0\0\0\0\0\0", *b"Hang\0\0\0\0\0\0\0\0\0\0\0\0"];
 static mut VALS: [f32; 3] = [0.5, 0.0, 0.0];
 
+static TOKEN: u8 = 0;
+
+#[repr(C)]
+struct DlInfo {
+    fname: *const std::ffi::c_char,
+    fbase: *mut c_void,
+    sname: *const std::ffi::c_char,
+    saddr: *mut c_void,
+}
+unsafe extern "C" {
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+}
+
+/// Lifecycle log: appends the function code to `<this library>.log`, only if that file exists.
+fn log(code: u32) {
+    unsafe {
+        let mut i = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+        if dladdr(plugMain as *const c_void, &mut i) == 0 || i.fname.is_null() {
+            return;
+        }
+        let mut p = std::ffi::CStr::from_ptr(i.fname).to_string_lossy().to_string();
+        p.push_str(".log");
+        if std::path::Path::new(&p).exists() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&p) {
+                let _ = writeln!(f, "{code}");
+            }
+        }
+    }
+}
+
+// Needs an instance id (the one INSTANTIATE returned) for everything per-instance, like FFGL 2.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, _inst: *mut c_void) -> FFMixed {
+pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> FFMixed {
+    log(code);
+    let has_inst = inst as *const u8 == &TOKEN as *const u8;
+    if matches!(code, 8 | 9 | 12 | 0x7F00) && !has_inst {
+        return FFMixed { u: 0xFFFF_FFFF };
+    }
     unsafe {
         match code {
+            11 => FFMixed { p: &TOKEN as *const u8 as *mut c_void },
+            12 | 2 => FFMixed { u: 0 },
             0 => FFMixed { p: &INFO as *const Info as *mut c_void },
             1 => FFMixed { u: 0 },
             4 => FFMixed { u: 3 },
@@ -46,6 +85,9 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, _inst: *mut c_void) -> 
             15 => FFMixed { u: if v.u == 0 { 10 } else { 0 } },
             8 => {
                 let s = &*(v.p as *const SetP);
+                if s.index == 1 && f32::from_bits(s.value.u) == 0.75 {
+                    std::process::abort(); // crash while setting
+                }
                 VALS[s.index as usize] = f32::from_bits(s.value.u);
                 FFMixed { u: 0 }
             }
