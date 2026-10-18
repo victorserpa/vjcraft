@@ -138,6 +138,8 @@ pub struct Video {
     pub hw_decode: HwDecode,
     /// Most clips decoding on the GPU media engine at once; the rest decode in software.
     pub hw_sessions: u32,
+    /// Folders scanned for FFGL plugins (docs/specs/ffgl-host.md).
+    pub ffgl_dirs: Vec<String>,
 }
 
 /// Video > "Hardware decoding".
@@ -161,6 +163,7 @@ impl Default for Video {
             output_10bit: false,
             hw_decode: HwDecode::Auto,
             hw_sessions: 8,
+            ffgl_dirs: Vec::new(),
         }
     }
 }

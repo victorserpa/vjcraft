@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vjc-net", "crates/vjc-model", "crates/vjc-core", "crates/vjc-io", "crates/vjc-avc", "crates/vjc-media", "crates/vjc-fx", "crates/vjc-ml", "crates/vjc-app"]
+members = ["crates/vjc-net", "crates/vjc-model", "crates/vjc-core", "crates/vjc-io", "crates/vjc-avc", "crates/vjc-media", "crates/vjc-fx", "crates/vjc-ml", "crates/vjc-ffgl", "crates/vjc-app"]
 
 [workspace.package]
 edition = "2024"
