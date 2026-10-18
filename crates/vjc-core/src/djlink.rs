@@ -199,8 +199,8 @@ mod tests {
 
     #[test]
     fn pitch_scales_tempo() {
-        let up = NORMAL_PITCH + NORMAL_PITCH * 10 / 100;
-        assert!((effective_bpm(100.0, up) - 110.0).abs() < 1e-9);
+        let up = NORMAL_PITCH + NORMAL_PITCH / 16;
+        assert!((effective_bpm(100.0, up) - 106.25).abs() < 1e-9);
         assert!((effective_bpm(100.0, NORMAL_PITCH) - 100.0).abs() < 1e-9);
     }
 
@@ -276,10 +276,10 @@ mod tests {
 
     #[test]
     fn clock_follows_pitch_and_midbar_start() {
-        let up = NORMAL_PITCH + NORMAL_PITCH * 6 / 100;
+        let up = NORMAL_PITCH + NORMAL_PITCH / 16;
         let (err, bpm) = run(120.0, up, 3, 12.0);
         assert!(err < 5.0, "phase error {err} ms");
-        assert!((bpm - 127.2).abs() < 0.01, "{bpm}");
+        assert!((bpm - 127.5).abs() < 0.01, "{bpm}");
     }
 
     #[test]
