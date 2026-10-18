@@ -296,8 +296,44 @@ static PARAMS: ParamsExt = ParamsExt {
     from_text: x_from_text,
     flush: x_flush,
 };
+// clap.audio-ports: one input and one output port; stereo, or mono when built with --cfg mono.
+#[repr(C)]
+struct PortInfo {
+    id: u32,
+    name: [u8; 256],
+    flags: u32,
+    channel_count: u32,
+    port_type: *const c_char,
+    in_place_pair: u32,
+}
+#[repr(C)]
+struct PortsExt {
+    count: unsafe extern "C" fn(*const Plugin, bool) -> u32,
+    get: unsafe extern "C" fn(*const Plugin, u32, bool, *mut PortInfo) -> bool,
+}
+unsafe extern "C" fn pt_count(_: *const Plugin, _: bool) -> u32 {
+    1
+}
+unsafe extern "C" fn pt_get(_: *const Plugin, i: u32, _: bool, out: *mut PortInfo) -> bool {
+    if i != 0 {
+        return false;
+    }
+    unsafe {
+        (*out).id = 0;
+        (*out).name = [0; 256];
+        (*out).flags = 1;
+        (*out).channel_count = if cfg!(mono) { 1 } else { 2 };
+        (*out).port_type = if cfg!(mono) { c"mono".as_ptr() } else { c"stereo".as_ptr() };
+        (*out).in_place_pair = u32::MAX;
+    }
+    true
+}
+static PORTS: PortsExt = PortsExt { count: pt_count, get: pt_get };
 unsafe extern "C" fn p_ext(_: *const Plugin, id: *const c_char) -> *const c_void {
-    if unsafe { std::ffi::CStr::from_ptr(id) } == c"clap.params" {
+    let id = unsafe { std::ffi::CStr::from_ptr(id) };
+    if id == c"clap.audio-ports" {
+        &PORTS as *const PortsExt as *const c_void
+    } else if id == c"clap.params" {
         &PARAMS as *const ParamsExt as *const c_void
     } else {
         std::ptr::null()

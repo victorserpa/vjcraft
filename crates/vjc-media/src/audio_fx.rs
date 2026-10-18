@@ -798,6 +798,7 @@ mod tests {
             bypass: false,
             mix: 1.0,
             params,
+            clap: None,
         }
     }
 
@@ -1055,5 +1056,31 @@ mod tests {
             assert_eq!(ALLOCS.with(Cell::get), p0, "audio callback allocated");
         }
         assert!(ALLOCS.with(Cell::get) > before, "the counter works");
+    }
+
+    #[test]
+    fn clap_slot_keeps_its_place_and_passes_dry_when_the_plugin_is_gone() {
+        use vjc_clap::ClapShared;
+        let shared = ClapShared::new("/nonexistent/x.clap", "x.y", &[]);
+        let mut clap = spec(FxKind::Clap, &[]);
+        clap.clap = Some(shared.clone());
+        let mut gain = spec(FxKind::Gain, &[0.5]);
+        gain.params[0] = 0.5;
+        let c = FxChain::new(2);
+        c.set(&[gain.clone(), clap.clone()], R, 120.0);
+        let mut buf = vec![0.4f32; 1024];
+        // let the worker notice the missing plugin; the chain never waits for it
+        for _ in 0..50 {
+            buf.fill(0.4);
+            let p0 = ALLOCS.with(Cell::get);
+            c.process(&mut buf, 0, R);
+            c.process(&mut buf.clone(), 1, R);
+            assert_eq!(ALLOCS.with(Cell::get), p0, "audio callback allocated");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(buf.iter().all(|v| (v - 0.2).abs() < 1e-5), "gain ran, clap passed dry");
+        assert!(matches!(shared.status(), vjc_clap::LaneStatus::Bypassed(_) | vjc_clap::LaneStatus::Starting));
+        // same Arc again: nothing is rebuilt
+        c.set(&[gain, clap], R, 120.0);
     }
 }

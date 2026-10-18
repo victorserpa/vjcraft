@@ -25,6 +25,25 @@ fn plugin() -> &'static str {
     })
 }
 
+/// Same plugin built with a mono-only port.
+fn mono_plugin() -> &'static str {
+    static P: OnceLock<String> = OnceLock::new();
+    P.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("vjc-clap-mono-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gain_plugin.rs");
+        let out = dir.join("mono.clap");
+        let st = std::process::Command::new("rustc")
+            .args(["--edition", "2024", "--crate-type", "cdylib", "--cfg", "mono", "-O", "-o"])
+            .arg(&out)
+            .arg(src)
+            .status()
+            .unwrap();
+        assert!(st.success(), "mono fixture build failed");
+        out.to_string_lossy().to_string()
+    })
+}
+
 const ID: &str = "org.vjcraft.test.gain";
 
 fn effect(budget_ms: u64) -> ClapEffect {
@@ -227,4 +246,46 @@ fn macos_bundle_is_resolved_to_its_executable() {
     let f = dir.join("plain.clap");
     std::fs::write(&f, "").unwrap();
     assert_eq!(resolve_binary(&f), f);
+}
+
+#[test]
+fn plugin_without_a_stereo_port_is_rejected_with_a_clear_message() {
+    let e = ClapEffect::new(
+        mono_plugin(),
+        ID,
+        Path::new(HELPER),
+        Duration::from_millis(500),
+        RATE,
+    );
+    match &e.status {
+        Status::Stopped(HostError::Plugin(m)) => {
+            assert!(m.contains("stereo"), "message names the problem: {m}")
+        }
+        s => panic!("expected a rejection, got {s:?}"),
+    }
+    let dir = tmp("mono");
+    std::fs::copy(mono_plugin(), dir.join("mono.clap")).unwrap();
+    std::fs::copy(plugin(), dir.join("gain.clap")).unwrap();
+    let (found, _) = scan(
+        std::slice::from_ref(&dir),
+        &dir.join("c.json"),
+        Path::new(HELPER),
+    );
+    assert_eq!(found.len(), 2);
+    let stereo: Vec<bool> = found.iter().map(|f| f.stereo).collect();
+    assert_eq!(stereo, vec![true, false], "sorted by file name: gain, mono");
+}
+
+#[test]
+fn scan_descends_into_subfolders() {
+    let dir = tmp("deep");
+    let sub = dir.join("Vendor").join("Pack");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::copy(plugin(), sub.join("gain.clap")).unwrap();
+    let (found, _) = scan(
+        std::slice::from_ref(&dir),
+        &dir.join("c.json"),
+        Path::new(HELPER),
+    );
+    assert_eq!(found.len(), 1);
 }
