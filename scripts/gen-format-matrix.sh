@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$(mktemp -d "${TMPDIR:-/tmp}/vjc-formats.XXXXXX")}"
 mkdir -p "$OUT"
 BUNDLED="${VJC_FFMPEG:-$ROOT/target/ffmpeg/bin/ffmpeg}"
-[ -x "$BUNDLED" ] || BUNDLED="$HOME/Developer/vjcraft-public/target/ffmpeg/bin/ffmpeg"
+# Another build location (a sibling worktree, say): VJC_FFMPEG=/path/to/ffmpeg.
 SYSTEM="$(command -v ffmpeg || true)"
 BINS=()
 [ -x "$BUNDLED" ] && BINS+=("$BUNDLED")

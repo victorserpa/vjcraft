@@ -672,14 +672,27 @@ fn rotate_frame(f: Frame, deg: u32, flip: bool) -> Frame {
 /// VP8/VP9 in WebM store alpha as a side channel the native decoders ignore; only libvpx
 /// decodes it. Returns that decoder when the stream is flagged and libvpx is built in.
 fn vpx_alpha_codec(st: &ff::format::stream::Stream) -> Option<ff::Codec> {
-    let name = match st.parameters().id() {
+    vpx_pick(
+        st.parameters().id(),
+        st.metadata().get("alpha_mode") == Some("1"),
+        ff::decoder::find_by_name,
+    )
+}
+
+/// `vpx_alpha_codec` with the codec lookup injected. The bundled FFmpeg is built without
+/// libvpx (scripts/build-ffmpeg.sh), so None is the normal answer there: the native VP8/VP9
+/// decoder then opens the file and the alpha channel is dropped, with no error.
+fn vpx_pick(
+    id: ff::codec::Id,
+    alpha: bool,
+    find: impl Fn(&str) -> Option<ff::Codec>,
+) -> Option<ff::Codec> {
+    let name = match id {
         ff::codec::Id::VP8 => "libvpx",
         ff::codec::Id::VP9 => "libvpx-vp9",
         _ => return None,
     };
-    (st.metadata().get("alpha_mode") == Some("1"))
-        .then(|| ff::decoder::find_by_name(name))
-        .flatten()
+    alpha.then(|| find(name)).flatten()
 }
 
 /// Software decoder for `params`, with an explicit codec when one is given.
@@ -2084,6 +2097,43 @@ mod tests {
             let mut sc = Scrubber::open(&clip).unwrap();
             let got = sc.next().unwrap().1;
             assert!(*got.data == std::fs::read(&raw).unwrap(), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alpha_webm_without_libvpx_falls_back_to_native() {
+        let none = |_: &str| None;
+        assert!(vpx_pick(ff::codec::Id::VP9, true, none).is_none());
+        assert!(vpx_pick(ff::codec::Id::VP8, true, none).is_none());
+        // With libvpx present it is used, but only for flagged VP8/VP9.
+        let any =
+            |n: &str| ff::decoder::find_by_name(if n.contains("vp9") { "vp9" } else { "vp8" });
+        assert!(vpx_pick(ff::codec::Id::VP9, true, any).is_some());
+        assert!(vpx_pick(ff::codec::Id::VP9, false, any).is_none());
+        assert!(vpx_pick(ff::codec::Id::H264, true, any).is_none());
+        // The file itself opens and plays with the native decoder.
+        let dir = std::env::temp_dir().join(format!("vjc-novpx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a.webm");
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=1",
+            ])
+            .args(["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p"])
+            .arg(&out)
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            let mut sc = Scrubber::open(&out).unwrap();
+            assert!(sc.vpx.is_none());
+            assert!(sc.next().is_some());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
