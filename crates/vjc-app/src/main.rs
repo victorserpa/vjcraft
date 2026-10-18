@@ -305,6 +305,8 @@ struct State {
     /// DJ player listener, what it heard and the follower steering the clock.
     dj: dj_io::Dj,
     dj_cfg: Option<dj_io::Cfg>,
+    /// Interface text being typed in Preferences > DJ sync (applied on commit only).
+    dj_iface_buf: Option<String>,
     dj_tracker: vjc_core::djlink::Tracker,
     dj_follow: vjc_core::djlink::Follower,
     dmx: dmx_io::Dmx,
@@ -2084,6 +2086,7 @@ impl State {
                 dj_io::Dj::idle()
             },
             dj_cfg: None,
+            dj_iface_buf: None,
             dj_tracker: Default::default(),
             dj_follow: Default::default(),
             dmx: if live {
@@ -6577,13 +6580,23 @@ impl State {
         while let Ok((p, at)) = self.dj.rx.try_recv() {
             self.dj_tracker.feed(p, at);
         }
+        let stopped = self.project.composition.tempo.play_state == vjc_model::PlayState::Stop;
         self.dj_follow.update(
             &self.dj_tracker,
             self.prefs.dj.enabled && allowed,
             self.prefs.dj.follow_player,
+            stopped,
             &mut self.clock,
             now,
         );
+        let locked = !stopped
+            && matches!(
+                self.dj_follow.state,
+                vjc_core::djlink::SyncState::Locked { .. }
+            );
+        if dj_io::mirror_bpm(&mut self.project, self.clock.bpm(), locked) {
+            self.dirty = true;
+        }
     }
 
     /// Art-Net input, once per frame and never blocking: changed channels learn (first one

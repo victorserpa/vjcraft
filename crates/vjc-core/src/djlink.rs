@@ -275,8 +275,17 @@ impl Default for Follower {
 impl Follower {
     /// Once per frame. While a player is heard, tempo is taken from it and the phase is
     /// steered so the bar position matches its beats. When it goes silent the clock
-    /// keeps its last tempo and runs free.
-    pub fn update(&mut self, t: &Tracker, on: bool, follow: u8, c: &mut Clock, now: Instant) {
+    /// keeps its last tempo and runs free. While the transport is stopped (`stopped`) the
+    /// state still reports the player but the clock is left alone.
+    pub fn update(
+        &mut self,
+        t: &Tracker,
+        on: bool,
+        follow: u8,
+        stopped: bool,
+        c: &mut Clock,
+        now: Instant,
+    ) {
         if !on {
             self.state = SyncState::Off;
             return;
@@ -286,6 +295,13 @@ impl Follower {
             return;
         };
         let bpm = l.bpm.clamp(crate::clock::MIN_BPM, crate::clock::MAX_BPM);
+        if stopped {
+            self.state = SyncState::Locked {
+                player: l.player,
+                bpm,
+            };
+            return;
+        }
         if (c.bpm() - bpm).abs() > 1e-6 {
             c.set_bpm(bpm, now);
         }
@@ -427,7 +443,7 @@ mod tests {
                 t.feed(Packet::Beat(beat(1, bpm_track, pitch, b)), at);
                 next += 1;
             }
-            f.update(&t, true, 0, &mut clock, now);
+            f.update(&t, true, 0, false, &mut clock, now);
             if now_s > 3.0 {
                 // truth: beat index since start, offset by start_beat
                 let truth = now_s / period + f64::from(start_beat - 1);
@@ -468,15 +484,30 @@ mod tests {
         let mut t = Tracker::default();
         let mut f = Follower::default();
         t.feed(Packet::Beat(beat(1, 140.0, NORMAL_PITCH, 1)), t0);
-        f.update(&t, false, 0, &mut clock, t0);
+        f.update(&t, false, 0, false, &mut clock, t0);
         assert_eq!(clock.bpm(), 100.0);
         assert_eq!(f.state, SyncState::Off);
-        f.update(&t, true, 0, &mut clock, t0);
+        f.update(&t, true, 0, false, &mut clock, t0);
         assert_eq!(clock.bpm(), 140.0);
         assert!(matches!(f.state, SyncState::Locked { player: 1, .. }));
         // player vanishes: tempo stays, state says waiting
-        f.update(&t, true, 0, &mut clock, ms(t0, 3000));
+        f.update(&t, true, 0, false, &mut clock, ms(t0, 3000));
         assert_eq!(clock.bpm(), 140.0);
         assert_eq!(f.state, SyncState::Waiting);
+    }
+
+    #[test]
+    fn stopped_transport_is_not_steered() {
+        let t0 = Instant::now();
+        let mut clock = Clock::new(100.0, t0);
+        let mut t = Tracker::default();
+        let mut f = Follower::default();
+        t.feed(Packet::Beat(beat(1, 140.0, NORMAL_PITCH, 3)), t0);
+        f.update(&t, true, 0, true, &mut clock, t0);
+        assert_eq!(clock.bpm(), 100.0, "tempo untouched while stopped");
+        assert_eq!(clock.phase(t0), 0.0, "phase untouched while stopped");
+        assert!(matches!(f.state, SyncState::Locked { player: 1, .. }));
+        f.update(&t, true, 0, false, &mut clock, t0);
+        assert_eq!(clock.bpm(), 140.0);
     }
 }

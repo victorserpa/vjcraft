@@ -490,8 +490,46 @@ impl State {
                         toggle(ui, &mut d.enabled, "Follow DJ players");
                         ui.add_enabled_ui(d.enabled, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label("Interface IP");
-                                field_text(ui, &mut d.interface, Width::Md, None);
+                                ui.label("Network");
+                                let ifaces = crate::dj_io::local_ifaces();
+                                if ifaces.is_empty() {
+                                    // Cannot list interfaces here: typed address, applied
+                                    // on Enter or when the field loses focus.
+                                    let buf = self
+                                        .dj_iface_buf
+                                        .get_or_insert_with(|| d.interface.clone());
+                                    let r = field_text(ui, buf, Width::Md, None);
+                                    if r.lost_focus() {
+                                        d.interface = buf.trim().to_owned();
+                                        self.dj_iface_buf = None;
+                                    }
+                                } else {
+                                    let label = |ip: &str| -> String {
+                                        if ip == "0.0.0.0" {
+                                            return "Any".into();
+                                        }
+                                        match ifaces.iter().find(|i| i.ip.to_string() == ip) {
+                                            Some(i) => format!("{} ({})", i.ip, i.name),
+                                            None => ip.to_owned(),
+                                        }
+                                    };
+                                    egui::ComboBox::from_id_salt("dj-iface")
+                                        .selected_text(label(&d.interface))
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut d.interface,
+                                                "0.0.0.0".to_owned(),
+                                                "Any",
+                                            );
+                                            for i in &ifaces {
+                                                ui.selectable_value(
+                                                    &mut d.interface,
+                                                    i.ip.to_string(),
+                                                    format!("{} ({})", i.ip, i.name),
+                                                );
+                                            }
+                                        });
+                                }
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Follow player");
@@ -515,7 +553,7 @@ impl State {
                                 }
                             }
                         }
-                        help(ui, "Listens only: it never sends anything or appears as a device on the network. Pick the address of the interface the players are on (127.0.0.1 = this computer only, 0.0.0.0 = every interface). Tempo and bar position follow the chosen player. Link, when on, takes priority.");
+                        help(ui, "Listens only: it never sends anything or appears as a device on the network. Pick the network the players are on (127.0.0.1 = this computer only, Any = every network); only packets from that network are used. Tempo and bar position follow the chosen player. Link, when on, takes priority.");
                     }
                     PrefsTab::Dmx => {
                         let d = &mut p.dmx;
