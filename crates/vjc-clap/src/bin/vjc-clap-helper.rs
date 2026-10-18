@@ -167,6 +167,7 @@ fn has_stereo_ports(p: *const Plugin) -> bool {
 fn info(path: &str) -> Result<Vec<PluginInfo>, String> {
     let lib = Lib::open(path)?;
     let mut out = Vec::new();
+    let mut failed: Option<String> = None;
     unsafe {
         for i in 0..((*lib.factory).count)(lib.factory).min(256) {
             let d = ((*lib.factory).descriptor)(lib.factory, i);
@@ -174,7 +175,11 @@ fn info(path: &str) -> Result<Vec<PluginInfo>, String> {
                 continue;
             }
             let (id, name) = (text((*d).id), text((*d).name));
-            let (p, ext) = create(&lib, &id)?;
+            // one descriptor that will not create must not hide the others in the file
+            let Ok((p, ext)) = create(&lib, &id) else {
+                failed = Some(id);
+                continue;
+            };
             let params = param_infos(p, ext);
             let stereo = has_stereo_ports(p);
             ((*p).destroy)(p);
@@ -186,7 +191,10 @@ fn info(path: &str) -> Result<Vec<PluginInfo>, String> {
             });
         }
     }
-    Ok(out)
+    match (out.is_empty(), failed) {
+        (true, Some(id)) => Err(format!("could not create plugin {id}")),
+        _ => Ok(out),
+    }
 }
 
 fn load(path: &str, id: &str, rate: u32, max_frames: u32) -> Result<Instance, String> {
@@ -387,11 +395,18 @@ fn handle(req: Request, cur: &mut Option<Instance>) -> Response {
             }
             None => err("no plugin loaded"),
         },
-        Request::Process { shm, frames } => match cur {
-            Some(i) => match i.process(&shm, frames) {
-                Ok(()) => Response::Done,
-                Err(m) => err(m),
-            },
+        Request::Process { shm, frames, sets } => match cur {
+            Some(i) => {
+                for (index, value) in sets {
+                    if let Some(p) = i.infos.get(index as usize) {
+                        i.pending.insert(p.id, value);
+                    }
+                }
+                match i.process(&shm, frames) {
+                    Ok(()) => Response::Done,
+                    Err(m) => err(m),
+                }
+            }
             None => err("no plugin loaded"),
         },
         Request::Quit => {

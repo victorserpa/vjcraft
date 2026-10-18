@@ -25,6 +25,12 @@ pub use proto::ParamInfo;
 pub const MAX_FRAMES: usize = 4096;
 /// Deadline for control calls (load, scan info, parameter get/set), not for audio blocks.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Deadline for loading + activating a plugin: heavy plugins take many seconds. Runs on the
+/// lane's worker, never on the audio thread; the lane shows "starting" meanwhile.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Info timeout of a first scan, and of the retry for a file that was too slow the first time.
+const SCAN_QUICK: Duration = Duration::from_secs(5);
+const SCAN_LONG: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostError {
@@ -217,6 +223,10 @@ struct Cache {
     /// Files that failed, crashed or hung, by path -> mtime; not retried until the file changes.
     #[serde(default)]
     failed: BTreeMap<String, u64>,
+    /// Files whose info took longer than the quick timeout; retried with the long one, and
+    /// only if that also times out do they move to `failed`.
+    #[serde(default)]
+    slow: BTreeMap<String, u64>,
 }
 
 fn mtime(p: &Path) -> u64 {
@@ -229,23 +239,53 @@ fn mtime(p: &Path) -> u64 {
 }
 
 /// Scan `dirs` (recursively) for `.clap` files. Results are cached in `cache_file` by path +
-/// mtime; a file that crashes or hangs while being read is skipped and not retried until it
-/// changes. Meant for a background thread. Returns the entries and the number of files loaded.
+/// mtime; a file that crashes or is invalid is skipped and not retried until it changes. A file
+/// that is merely slow (no answer within 5 s) is retried on the next scan with a 30 s deadline.
+/// Meant for a background thread. Returns the entries and the number of files loaded.
 pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entry>, usize) {
+    scan_with(dirs, cache_file, helper_bin, false, SCAN_QUICK, SCAN_LONG)
+}
+
+/// Like [`scan`], but forgets the files remembered as failed or slow first (the Rescan button).
+pub fn scan_forced(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entry>, usize) {
+    scan_with(dirs, cache_file, helper_bin, true, SCAN_QUICK, SCAN_LONG)
+}
+
+/// [`scan`] with explicit info deadlines: `quick` for a first try, `long` for a retry of a file
+/// that timed out. `force` clears the failed and slow memory.
+pub fn scan_with(
+    dirs: &[PathBuf],
+    cache_file: &Path,
+    helper_bin: &Path,
+    force: bool,
+    quick: Duration,
+    long: Duration,
+) -> (Vec<Entry>, usize) {
     let mut cache: Cache = std::fs::read(cache_file)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
+    if force {
+        cache.failed.clear();
+        cache.slow.clear();
+    }
     let mut found = Vec::new();
     let mut loads = 0;
     let mut helper: Option<Helper> = None;
     let mut next = BTreeMap::new();
     let mut next_failed = BTreeMap::new();
+    let mut next_slow = BTreeMap::new();
+    let mut seen_files = std::collections::HashSet::new();
     for d in dirs {
         let mut files = Vec::new();
         find_plugins(d, 0, &mut files);
         files.sort();
         for f in files {
+            // the same file reached through nested or overlapping folders counts once
+            let canon = std::fs::canonicalize(&f).unwrap_or_else(|_| f.clone());
+            if !seen_files.insert(canon) {
+                continue;
+            }
             let key = f.to_string_lossy().to_string();
             let mt = mtime(&f);
             if let Some(es) = cache
@@ -261,12 +301,14 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
                 next_failed.insert(key, mt);
                 continue;
             }
+            let retry = cache.slow.get(&key) == Some(&mt);
             loads += 1;
             if helper.is_none() {
                 helper = Helper::spawn(helper_bin).ok();
             }
             let Some(h) = helper.as_mut() else { continue };
-            match h.request(&Request::Info { path: key.clone() }, CONTROL_TIMEOUT) {
+            let deadline = if retry { long } else { quick };
+            match h.request(&Request::Info { path: key.clone() }, deadline) {
                 Ok(Response::Info { plugins }) => {
                     let es: Vec<Entry> = plugins
                         .into_iter()
@@ -285,8 +327,16 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
                 Err(HostError::Plugin(_)) => {
                     next_failed.insert(key, mt);
                 }
+                Err(HostError::Timeout) => {
+                    helper = None; // killed by the timeout
+                    if retry {
+                        next_failed.insert(key, mt);
+                    } else {
+                        next_slow.insert(key, mt);
+                    }
+                }
                 _ => {
-                    // crashed or hung: drop it, the next file gets a fresh helper
+                    // crashed: drop it, the next file gets a fresh helper
                     helper = None;
                     next_failed.insert(key, mt);
                 }
@@ -301,6 +351,7 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
         serde_json::to_vec(&Cache {
             entries: next,
             failed: next_failed,
+            slow: next_slow,
         })
         .unwrap(),
     );
@@ -331,6 +382,8 @@ pub struct ClapEffect {
     pub status: Status,
     params: Vec<ParamInfo>,
     values: Vec<f64>,
+    /// Changes not yet sent: they travel with the next process request.
+    pending: BTreeMap<usize, f64>,
     shm_path: PathBuf,
     map: Option<MmapMut>,
 }
@@ -354,6 +407,7 @@ impl ClapEffect {
             status: Status::Stopped(HostError::Died),
             params: Vec::new(),
             values: Vec::new(),
+            pending: BTreeMap::new(),
             shm_path: std::env::temp_dir()
                 .join(format!("vjc-clap-{}-{n}-{t}.shm", std::process::id())),
             map: None,
@@ -373,26 +427,18 @@ impl ClapEffect {
                     rate: self.rate,
                     max_frames: MAX_FRAMES as u32,
                 },
-                CONTROL_TIMEOUT,
+                LOAD_TIMEOUT,
             )?;
             Ok((h, r))
         });
         match r {
-            Ok((mut h, Response::Loaded { params })) => {
+            Ok((h, Response::Loaded { params })) => {
                 if self.values.len() != params.len() {
                     self.values = params.iter().map(|p| p.default).collect();
                 }
                 self.params = params;
-                for (i, v) in self.values.iter().enumerate() {
-                    let set = Request::Set {
-                        index: i as u32,
-                        value: *v,
-                    };
-                    if let Err(e) = h.request(&set, CONTROL_TIMEOUT) {
-                        self.status = Status::Stopped(e);
-                        return; // helper stays None: bypass
-                    }
-                }
+                // every value goes with the first block, in the same message
+                self.pending = self.values.iter().copied().enumerate().collect();
                 self.helper = Some(h);
                 self.status = Status::Running;
             }
@@ -419,13 +465,9 @@ impl ClapEffect {
             self.values.resize(index + 1, 0.0);
         }
         self.values[index] = value;
-        self.call(
-            Request::Set {
-                index: index as u32,
-                value,
-            },
-            CONTROL_TIMEOUT,
-        );
+        if self.helper.is_some() {
+            self.pending.insert(index, value); // no round trip: sent with the next block
+        }
         true
     }
 
@@ -434,7 +476,7 @@ impl ClapEffect {
         if index >= self.params.len() {
             return None;
         }
-        if self.helper.is_none() {
+        if self.helper.is_none() || self.pending.contains_key(&index) {
             return self.values.get(index).copied();
         }
         match self.call(
@@ -495,6 +537,10 @@ impl ClapEffect {
             let req = Request::Process {
                 shm: shm.clone(),
                 frames: frames as u32,
+                sets: std::mem::take(&mut self.pending)
+                    .into_iter()
+                    .map(|(i, v)| (i as u32, v))
+                    .collect(),
             };
             if !matches!(self.call(req, self.budget), Some(Response::Done)) {
                 return false;

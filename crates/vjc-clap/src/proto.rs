@@ -25,10 +25,13 @@ pub enum Request {
     Get {
         index: u32,
     },
-    /// Process `frames` stereo frames from the mapping at `shm`.
+    /// Process `frames` stereo frames from the mapping at `shm`. `sets` are parameter changes
+    /// (index, value) applied before the block: fire-and-forget, no separate reply.
     Process {
         shm: String,
         frames: u32,
+        #[serde(default)]
+        sets: Vec<(u32, f64)>,
     },
     Quit,
 }

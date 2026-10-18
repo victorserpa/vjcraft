@@ -137,6 +137,19 @@ struct State {
     vals: [f64; 3],
 }
 
+static BROKEN: Desc = Desc {
+    version: V,
+    id: c"org.vjcraft.test.broken".as_ptr(),
+    name: c"VJC Test Broken".as_ptr(),
+    vendor: c"test".as_ptr(),
+    url: c"".as_ptr(),
+    manual: c"".as_ptr(),
+    support: c"".as_ptr(),
+    plugin_version: c"1".as_ptr(),
+    description: c"".as_ptr(),
+    features: NO_FEATURES.as_ptr() as *const *const c_char,
+};
+
 static NO_FEATURES: [usize; 1] = [0];
 
 static DESC: Desc = Desc {
@@ -163,11 +176,20 @@ unsafe extern "C" fn e_factory(id: *const c_char) -> *const c_void {
         std::ptr::null()
     }
 }
+// --cfg slow: listing the plugins takes 2 s. --cfg two: a second descriptor first in the
+// list whose create fails.
 unsafe extern "C" fn f_count(_: *const Factory) -> u32 {
-    1
+    if cfg!(slow) {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    if cfg!(two) { 2 } else { 1 }
 }
 unsafe extern "C" fn f_desc(_: *const Factory, i: u32) -> *const Desc {
-    if i == 0 { &DESC } else { std::ptr::null() }
+    match (cfg!(two), i) {
+        (true, 0) => &BROKEN,
+        (true, 1) | (false, 0) => &DESC,
+        _ => std::ptr::null(),
+    }
 }
 unsafe extern "C" fn f_create(_: *const Factory, _: *const c_void, id: *const c_char) -> *const Plugin {
     if unsafe { std::ffi::CStr::from_ptr(id) } != c"org.vjcraft.test.gain" {
@@ -203,7 +225,11 @@ unsafe extern "C" fn p_destroy(p: *const Plugin) {
         drop(Box::from_raw(b.data as *mut State));
     }
 }
+// --cfg slowload: activating takes 6 s (longer than a control call may take).
 unsafe extern "C" fn p_activate(_: *const Plugin, _: f64, _: u32, _: u32) -> bool {
+    if cfg!(slowload) {
+        std::thread::sleep(std::time::Duration::from_secs(6));
+    }
     true
 }
 unsafe extern "C" fn p_start(_: *const Plugin) -> bool {

@@ -298,3 +298,203 @@ fn scan_descends_into_subfolders() {
     );
     assert_eq!(found.len(), 1);
 }
+
+/// The fixture built with extra `--cfg` flags, once per name.
+fn plugin_cfg(name: &str, cfgs: &[&str]) -> String {
+    let dir = std::env::temp_dir().join(format!("vjc-clap-cfg-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join(format!("{name}.clap"));
+    if out.exists() {
+        return out.to_string_lossy().to_string();
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gain_plugin.rs");
+    let mut cmd = std::process::Command::new("rustc");
+    cmd.args(["--edition", "2024", "--crate-type", "cdylib", "-O"]);
+    for c in cfgs {
+        cmd.args(["--cfg", c]);
+    }
+    assert!(cmd.arg("-o").arg(&out).arg(src).status().unwrap().success());
+    out.to_string_lossy().to_string()
+}
+
+const MS: fn(u64) -> Duration = Duration::from_millis;
+
+#[test]
+fn a_slow_plugin_is_retried_with_a_longer_deadline_not_cached_as_failed() {
+    let dir = tmp("slow");
+    std::fs::copy(plugin_cfg("slow", &["slow"]), dir.join("slow.clap")).unwrap();
+    let cache = dir.join("c.json");
+    let h = Path::new(HELPER);
+    let (found, _) = scan_with(
+        std::slice::from_ref(&dir),
+        &cache,
+        h,
+        false,
+        MS(500),
+        MS(10_000),
+    );
+    assert!(found.is_empty(), "too slow for the quick deadline");
+    let (found, loads) = scan_with(
+        std::slice::from_ref(&dir),
+        &cache,
+        h,
+        false,
+        MS(500),
+        MS(10_000),
+    );
+    assert_eq!(
+        (found.len(), loads),
+        (1, 1),
+        "the next scan retries it and it loads"
+    );
+}
+
+#[test]
+fn rescan_forces_a_retry_of_files_remembered_as_failed() {
+    let dir = tmp("force");
+    std::fs::copy(plugin_cfg("slow", &["slow"]), dir.join("slow.clap")).unwrap();
+    let cache = dir.join("c.json");
+    let h = Path::new(HELPER);
+    // both deadlines too short: it ends up in the failed list
+    for _ in 0..2 {
+        let (f, _) = scan_with(
+            std::slice::from_ref(&dir),
+            &cache,
+            h,
+            false,
+            MS(300),
+            MS(300),
+        );
+        assert!(f.is_empty());
+    }
+    let (f, loads) = scan_with(
+        std::slice::from_ref(&dir),
+        &cache,
+        h,
+        false,
+        MS(300),
+        MS(10_000),
+    );
+    assert_eq!(
+        (f.len(), loads),
+        (0, 0),
+        "failed files are not retried by a plain scan"
+    );
+    let (f, _) = scan_with(
+        std::slice::from_ref(&dir),
+        &cache,
+        h,
+        true,
+        MS(300),
+        MS(10_000),
+    );
+    assert_eq!(
+        f.len(),
+        0,
+        "force clears failed, but a first try is quick again"
+    );
+    let (f, _) = scan_with(
+        std::slice::from_ref(&dir),
+        &cache,
+        h,
+        false,
+        MS(300),
+        MS(10_000),
+    );
+    assert_eq!(
+        f.len(),
+        1,
+        "and the retry after that gets the long deadline"
+    );
+}
+
+#[test]
+fn one_descriptor_failing_to_create_does_not_drop_the_others() {
+    let dir = tmp("two");
+    std::fs::copy(plugin_cfg("two", &["two"]), dir.join("two.clap")).unwrap();
+    let (found, _) = scan(
+        std::slice::from_ref(&dir),
+        &dir.join("c.json"),
+        Path::new(HELPER),
+    );
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, ID);
+}
+
+#[test]
+fn the_same_file_through_nested_folders_is_listed_once() {
+    let dir = tmp("nested");
+    let sub = dir.join("Vendor");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::copy(plugin(), sub.join("gain.clap")).unwrap();
+    let (found, loads) = scan(
+        &[dir.clone(), sub.clone(), dir.join("Vendor/../Vendor")],
+        &dir.join("c.json"),
+        Path::new(HELPER),
+    );
+    assert_eq!((found.len(), loads), (1, 1));
+}
+
+#[test]
+fn loading_a_heavy_plugin_may_take_longer_than_a_control_call() {
+    let e = ClapEffect::new(
+        &plugin_cfg("slowload", &["slowload"]),
+        ID,
+        Path::new(HELPER),
+        MS(2000),
+        RATE,
+    );
+    assert_eq!(
+        e.status,
+        Status::Running,
+        "6 s activate fits the load deadline"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parameter_changes_ride_with_the_process_request_without_round_trips() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp("fakehelper");
+    let log = dir.join("log.txt");
+    let script = dir.join("helper.sh");
+    // a helper that answers every set slowly: a per-change round trip would show
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\nwhile IFS= read -r line; do\n echo \"$line\" >> '{}'\n case \"$line\" in\n \
+             *'\"op\":\"load\"'*) echo '{{\"re\":\"loaded\",\"params\":[{{\"id\":7,\"name\":\"G\",\"min\":0.0,\"max\":4.0,\"default\":1.0}}]}}';;\n \
+             *'\"op\":\"set\"'*) sleep 1; echo '{{\"re\":\"done\"}}';;\n \
+             *'\"op\":\"process\"'*) echo '{{\"re\":\"done\"}}';;\n esac\ndone\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut e = ClapEffect::new("/x.clap", "x", &script, MS(2000), RATE);
+    assert_eq!(e.status, Status::Running);
+    let t = Instant::now();
+    assert!(e.set_param(0, 2.5));
+    assert!(e.set_param(0, 3.0));
+    assert!(
+        t.elapsed() < MS(300),
+        "set_param waited for the helper: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(e.get_param(0), Some(3.0));
+    let mut buf = vec![0.1f32; 64];
+    assert!(e.process(&mut buf));
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !text.contains("\"op\":\"set\""),
+        "no separate set messages: {text}"
+    );
+    let p = text
+        .lines()
+        .find(|l| l.contains("\"op\":\"process\""))
+        .unwrap();
+    assert!(
+        p.contains("\"sets\":[[0,3.0]]"),
+        "the last value travels with the block: {p}"
+    );
+}
