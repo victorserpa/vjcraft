@@ -8,6 +8,7 @@ pub mod clock;
 pub mod columns;
 pub mod comp_autopilot;
 pub mod crossfader;
+pub mod djlink;
 pub mod dmx;
 pub mod effects;
 pub mod groups;
