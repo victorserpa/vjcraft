@@ -84,6 +84,15 @@ pub struct ClapShared {
     epoch: AtomicU32,
 }
 
+impl std::fmt::Debug for ClapShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClapShared")
+            .field("id", &self.id)
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
 impl ClapShared {
     /// `defaults` are the starting values of the plugin parameters, in plugin order.
     pub fn new(path: &str, id: &str, defaults: &[f64]) -> Arc<ClapShared> {
