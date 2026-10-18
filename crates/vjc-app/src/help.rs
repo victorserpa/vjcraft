@@ -140,6 +140,9 @@ pub fn text(key: &str) -> Option<&'static str> {
         "prefs-control" => "Keyboard shortcut presets and MIDI input.",
         "prefs-osc" => "Open Sound Control: receive port and where feedback is sent.",
         "prefs-dmx" => "Art-Net input and output, universes and fixtures.",
+        "prefs-dj" => {
+            "Follow the tempo and bar position of DJ players on the network (listen only)."
+        }
         "prefs-api" => "Optional local HTTP and WebSocket remote control.",
         "prefs-timecode" => {
             "Follow an external timecode source and choose what happens when the signal is lost."

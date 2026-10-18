@@ -429,6 +429,29 @@ impl Default for Dmx {
     }
 }
 
+/// DJ player sync (off by default). Passive and read-only: only listens, on the one
+/// interface named here, and never announces a device on the network.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DjSync {
+    pub enabled: bool,
+    /// Local IPv4 to listen on: 127.0.0.1 (this computer only), 0.0.0.0 (all interfaces),
+    /// or the address of one network interface.
+    pub interface: String,
+    /// Player number to follow; 0 = the master player.
+    pub follow_player: u8,
+}
+
+impl Default for DjSync {
+    fn default() -> Self {
+        DjSync {
+            enabled: false,
+            interface: "127.0.0.1".into(),
+            follow_player: 0,
+        }
+    }
+}
+
 /// Remote HTTP/WebSocket API (no authentication: loopback unless the user exposes it).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -664,6 +687,7 @@ pub struct Prefs {
     pub midi: Midi,
     pub osc: Osc,
     pub dmx: Dmx,
+    pub dj: DjSync,
     pub api: Api,
     pub timecode: Timecode,
     pub layouts: Layouts,
@@ -684,6 +708,7 @@ impl Default for Prefs {
             midi: Midi::default(),
             osc: Osc::default(),
             dmx: Dmx::default(),
+            dj: DjSync::default(),
             api: Api::default(),
             timecode: Timecode::default(),
             layouts: Layouts::default(),

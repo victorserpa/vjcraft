@@ -33,11 +33,12 @@ impl State {
                         (PrefsTab::Midi, "MIDI"),
                         (PrefsTab::Osc, "OSC"),
                         (PrefsTab::Dmx, "DMX"),
+                        (PrefsTab::DjSync, "DJ sync"),
                         (PrefsTab::Api, "Remote API"),
                         (PrefsTab::Timecode, "Timecode"),
                     ] {
                         let r = ui.selectable_value(&mut self.prefs_tab, t, l);
- let key = match t { PrefsTab::General => "prefs-general", PrefsTab::Audio => "prefs-audio", PrefsTab::Recording => "prefs-recording", PrefsTab::Defaults => "prefs-defaults", PrefsTab::Video => "prefs-video", PrefsTab::Control => "prefs-control", PrefsTab::Osc => "prefs-osc", PrefsTab::Dmx => "prefs-dmx", PrefsTab::Api => "prefs-api", PrefsTab::Timecode => "prefs-timecode", PrefsTab::Midi => "prefs-midi" };
+ let key = match t { PrefsTab::General => "prefs-general", PrefsTab::Audio => "prefs-audio", PrefsTab::Recording => "prefs-recording", PrefsTab::Defaults => "prefs-defaults", PrefsTab::Video => "prefs-video", PrefsTab::Control => "prefs-control", PrefsTab::Osc => "prefs-osc", PrefsTab::Dmx => "prefs-dmx", PrefsTab::DjSync => "prefs-dj", PrefsTab::Api => "prefs-api", PrefsTab::Timecode => "prefs-timecode", PrefsTab::Midi => "prefs-midi" };
  crate::help::help(r, key);
                     }
                 });
@@ -483,6 +484,38 @@ impl State {
                         if btn(ui, "OSC monitor...", Kind::Secondary).clicked() {
                             self.osc_monitor_open = true;
                         }
+                    }
+                    PrefsTab::DjSync => {
+                        let d = &mut p.dj;
+                        toggle(ui, &mut d.enabled, "Follow DJ players");
+                        ui.add_enabled_ui(d.enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Interface IP");
+                                field_text(ui, &mut d.interface, Width::Md, None);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Follow player");
+                                let mut n = u32::from(d.follow_player);
+                                if field_int(ui, &mut n, 0..=6, "", "").changed() {
+                                    d.follow_player = n as u8;
+                                }
+                                help(ui, "0 = the master player");
+                            });
+                        });
+                        if d.enabled {
+                            match self.dj.status() {
+                                crate::dj_io::Status::Listening(ip) => {
+                                    help(ui, &format!("Listening on {ip}"));
+                                }
+                                crate::dj_io::Status::Failed(e) => {
+                                    ui.colored_label(ui.visuals().error_fg_color, e);
+                                }
+                                crate::dj_io::Status::Off => {
+                                    help(ui, "Starting...");
+                                }
+                            }
+                        }
+                        help(ui, "Listens only: it never sends anything or appears as a device on the network. Pick the address of the interface the players are on (127.0.0.1 = this computer only, 0.0.0.0 = every interface). Tempo and bar position follow the chosen player. Link, when on, takes priority.");
                     }
                     PrefsTab::Dmx => {
                         let d = &mut p.dmx;
