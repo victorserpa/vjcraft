@@ -14,6 +14,7 @@ mod clip_thumbs;
 mod col_ops;
 mod color_depth;
 mod compositor;
+mod dj_io;
 mod dmx_io;
 mod frame_stats;
 mod fx;
@@ -301,6 +302,13 @@ struct State {
     osc_prev: HashMap<String, f64>,
     osc_limit: vjc_core::osc::RateLimit,
     /// Art-Net input thread and the config last sent to it.
+    /// DJ player listener, what it heard and the follower steering the clock.
+    dj: dj_io::Dj,
+    dj_cfg: Option<dj_io::Cfg>,
+    /// Interface text being typed in Preferences > DJ sync (applied on commit only).
+    dj_iface_buf: Option<String>,
+    dj_tracker: vjc_core::djlink::Tracker,
+    dj_follow: vjc_core::djlink::Follower,
     dmx: dmx_io::Dmx,
     dmx_cfg: Option<dmx_io::Cfg>,
     api: api_io::Api,
@@ -694,6 +702,7 @@ enum PrefsTab {
     Control,
     Osc,
     Dmx,
+    DjSync,
     Api,
     Timecode,
     Midi,
@@ -2071,6 +2080,15 @@ impl State {
             osc_cfg: None,
             osc_prev: HashMap::new(),
             osc_limit: Default::default(),
+            dj: if live {
+                dj_io::Dj::spawn()
+            } else {
+                dj_io::Dj::idle()
+            },
+            dj_cfg: None,
+            dj_iface_buf: None,
+            dj_tracker: Default::default(),
+            dj_follow: Default::default(),
             dmx: if live {
                 dmx_io::Dmx::spawn()
             } else {
@@ -4639,6 +4657,8 @@ impl State {
             &mut self.clock,
             now,
         );
+        // DJ players (Preferences > DJ sync) steer tempo and bar phase; Link wins if on.
+        self.dj_pump(now, !on);
         // Transport of the tempo clock follows the saved play state.
         match self.project.composition.tempo.play_state {
             vjc_model::PlayState::Play => self.clock.play(now),
@@ -6549,6 +6569,36 @@ impl State {
         }
     }
 
+    /// DJ player packets, once per frame and never blocking: feeds the tracker and lets the
+    /// follower steer the clock (not while Link is on).
+    fn dj_pump(&mut self, now: std::time::Instant, allowed: bool) {
+        let cfg = dj_io::Cfg::from_prefs(&self.prefs.dj);
+        if self.dj_cfg.as_ref() != Some(&cfg) {
+            self.dj.configure(cfg.clone());
+            self.dj_cfg = Some(cfg);
+        }
+        while let Ok((p, at)) = self.dj.rx.try_recv() {
+            self.dj_tracker.feed(p, at);
+        }
+        let stopped = self.project.composition.tempo.play_state == vjc_model::PlayState::Stop;
+        self.dj_follow.update(
+            &self.dj_tracker,
+            self.prefs.dj.enabled && allowed,
+            self.prefs.dj.follow_player,
+            stopped,
+            &mut self.clock,
+            now,
+        );
+        let locked = !stopped
+            && matches!(
+                self.dj_follow.state,
+                vjc_core::djlink::SyncState::Locked { .. }
+            );
+        if dj_io::mirror_bpm(&mut self.project, self.clock.bpm(), locked) {
+            self.dirty = true;
+        }
+    }
+
     /// Art-Net input, once per frame and never blocking: changed channels learn (first one
     /// only) or fire their shortcuts.
     fn dmx_pump(&mut self) {
@@ -6896,6 +6946,27 @@ impl State {
         }
     }
 
+    /// Short DJ sync status for the clock area, and a longer hover text.
+    fn dj_status_text(&self, link_on: bool) -> (String, String) {
+        use vjc_core::djlink::SyncState;
+        if link_on {
+            return (
+                "DJ paused".into(),
+                "Link is on and wins over DJ players".into(),
+            );
+        }
+        if let dj_io::Status::Failed(e) = self.dj.status() {
+            return ("DJ error".into(), e);
+        }
+        match self.dj_follow.state {
+            SyncState::Locked { player, bpm } => (
+                format!("DJ P{player} {bpm:.1}"),
+                format!("Following player {player} at {bpm:.2} BPM"),
+            ),
+            _ => ("DJ waiting".into(), "No player heard yet".into()),
+        }
+    }
+
     /// Tempo row: BPM, tap, nudge (hold), resync, half/double, beat lights, metronome.
     fn time_bar(&mut self, ui: &mut egui::Ui) {
         let now = std::time::Instant::now();
@@ -6922,6 +6993,11 @@ impl State {
                 if help(lr, "link").clicked() {
                     link = !link;
                     cmds.push(Command::SetLink { enabled: link });
+                }
+                if self.prefs.dj.enabled {
+                    let (text, tip) = self.dj_status_text(link);
+                    ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED))
+                        .on_hover_text(tip);
                 }
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, false])
