@@ -282,6 +282,8 @@ pub struct Audio {
     pub channels: Option<u16>,
     /// Samples per FFT block of the input analysis; one of `FFT_SIZES`.
     pub fft_size: usize,
+    /// Extra folders scanned for CLAP audio plugins (docs/specs/audio-plugins.md), besides the standard ones.
+    pub clap_dirs: Vec<String>,
 }
 
 impl Default for Audio {
@@ -294,6 +296,7 @@ impl Default for Audio {
             buffer_size: None,
             channels: None,
             fft_size: 1024,
+            clap_dirs: Vec::new(),
         }
     }
 }
@@ -305,6 +308,7 @@ impl Audio {
         self.buffer_size = self.buffer_size.filter(|b| (16..=16_384).contains(b));
         self.channels = self.channels.filter(|c| (1..=32).contains(c));
         self.input_channel = self.input_channel.min(63);
+        self.clap_dirs.retain(|d| !d.trim().is_empty());
         if !FFT_SIZES.contains(&self.fft_size) {
             self.fft_size = Audio::default().fft_size;
         }
@@ -960,6 +964,7 @@ mod tests {
             buffer_size: Some(256),
             channels: Some(2),
             fft_size: 2048,
+            clap_dirs: vec!["/x/clap".into()],
         };
         q.record = Record {
             codec: "prores".into(),
@@ -981,6 +986,7 @@ mod tests {
             (None, None, None)
         );
         assert_eq!((p.audio.fft_size, p.audio.input_device), (1024, None));
+        assert!(p.audio.clap_dirs.is_empty());
         assert_eq!(p.record.quality, 1);
     }
 

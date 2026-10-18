@@ -133,16 +133,32 @@ fn bad_input_is_rejected_locally() {
     let mut odd = vec![0.25f32; 7]; // not whole stereo frames
     assert!(!e.process(&mut odd));
     assert_eq!(odd, vec![0.25f32; 7]);
-    assert_eq!(e.status, Status::Running, "bad input is not the plugin's fault");
+    assert_eq!(
+        e.status,
+        Status::Running,
+        "bad input is not the plugin's fault"
+    );
 }
 
 #[test]
 fn missing_plugin_or_id_stays_stopped_and_passes_through() {
-    let mut e = ClapEffect::new("/no/such.clap", ID, Path::new(HELPER), Duration::from_secs(2), RATE);
+    let mut e = ClapEffect::new(
+        "/no/such.clap",
+        ID,
+        Path::new(HELPER),
+        Duration::from_secs(2),
+        RATE,
+    );
     assert!(matches!(e.status, Status::Stopped(_)));
     let mut b = sine();
     assert!(!e.process(&mut b));
-    let e = ClapEffect::new(plugin(), "no.such.id", Path::new(HELPER), Duration::from_secs(2), RATE);
+    let e = ClapEffect::new(
+        plugin(),
+        "no.such.id",
+        Path::new(HELPER),
+        Duration::from_secs(2),
+        RATE,
+    );
     assert!(matches!(e.status, Status::Stopped(HostError::Plugin(_))));
 }
 
@@ -159,7 +175,7 @@ fn scan_lists_the_plugin_and_caches_by_mtime() {
     std::fs::copy(plugin(), dir.join("gain.clap")).unwrap();
     std::fs::write(dir.join("notes.txt"), "x").unwrap();
     let cache = dir.join("cache.json");
-    let (found, loads) = scan(&[dir.clone()], &cache, Path::new(HELPER));
+    let (found, loads) = scan(std::slice::from_ref(&dir), &cache, Path::new(HELPER));
     assert_eq!((found.len(), loads), (1, 1));
     assert_eq!(found[0].id, ID);
     assert_eq!(found[0].name, "VJC Test Gain");
@@ -173,7 +189,11 @@ fn scan_skips_a_file_that_is_not_a_plugin() {
     let dir = tmp("junk");
     std::fs::write(dir.join("junk.clap"), "not a library").unwrap();
     std::fs::copy(plugin(), dir.join("gain.clap")).unwrap();
-    let (found, _) = scan(&[dir.clone()], &dir.join("c.json"), Path::new(HELPER));
+    let (found, _) = scan(
+        std::slice::from_ref(&dir),
+        &dir.join("c.json"),
+        Path::new(HELPER),
+    );
     assert_eq!(found.len(), 1);
 }
 
@@ -187,7 +207,10 @@ fn default_scan_dirs_follow_the_platform() {
         assert!(d.iter().any(|p| p.ends_with("Library/Audio/Plug-Ins/CLAP")));
         assert!(d.contains(&"/Library/Audio/Plug-Ins/CLAP".to_string()));
     } else if cfg!(windows) {
-        assert!(d.iter().any(|p| p.ends_with("/CLAP") || p.ends_with("CLAP")));
+        assert!(
+            d.iter()
+                .any(|p| p.ends_with("/CLAP") || p.ends_with("CLAP"))
+        );
     } else {
         assert!(d.iter().any(|p| p.ends_with("/.clap")));
         assert!(d.contains(&"/usr/lib/clap".to_string()));
