@@ -654,7 +654,8 @@ fn rotate_frame(f: Frame, deg: u32, flip: bool) -> Frame {
             for y in ty..(ty + TILE).min(nh) {
                 let row = base + y as isize * dy;
                 let dst = &mut out[(y * nw + xs.start) * 4..(y * nw + xs.end) * 4];
-                for (x, d) in xs.clone().zip(dst.chunks_exact_mut(4)) {
+                let (px, _) = dst.as_chunks_mut::<4>();
+                for (x, d) in xs.clone().zip(px) {
                     let si = (row + x as isize * dx) as usize * 4;
                     d.copy_from_slice(&src[si..si + 4]);
                 }
