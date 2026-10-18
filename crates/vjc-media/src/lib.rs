@@ -237,7 +237,7 @@ impl Player {
                         hw::WARM.wait(hw::WARM_WAIT);
                     }
                     if let Err(e) = run_scrub(&p, &s, hw) {
-                        *lock(&s.error) = Some(e.to_string());
+                        *lock(&s.error) = Some(open_error_text(&e));
                     }
                 })
             })
@@ -466,6 +466,18 @@ fn load_image(path: &Path) -> Result<Frame, String> {
         seq: 1,
         hap: None,
     })
+}
+
+/// What the user reads when a file cannot be opened.
+fn open_error_text(e: &ff::Error) -> String {
+    match e {
+        ff::Error::DecoderNotFound => {
+            "No decoder for this video codec. Convert it to HAP to play it.".into()
+        }
+        ff::Error::StreamNotFound => "No playable video in this file.".into(),
+        ff::Error::InvalidData => "The file is damaged or not a video.".into(),
+        other => format!("Cannot open this file ({other})."),
+    }
 }
 
 /// Converts a decoded frame to a tightly packed RGBA `Frame`, creating the scaler on first use.

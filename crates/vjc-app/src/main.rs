@@ -7817,10 +7817,33 @@ impl State {
                 }
             });
         }
-        for (_, _, p) in self.players.values() {
+        let mut convert: Option<(PathBuf, DeckId, LayerId, u32)> = None;
+        for (lid, (deck, col, p)) in &self.players {
             if let Some(e) = p.error() {
-                ui.colored_label(theme::ERROR_TEXT, format!("{}: {e}", p.path.display()));
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::ERROR_TEXT, format!("{}: {e}", p.path.display()));
+                    // A file FFmpeg cannot decode: offer a re-encode instead of a dead clip.
+                    if std::fs::metadata(&p.path).is_ok_and(|m| m.is_file() && m.len() > 0)
+                        && crate::widgets::btn(
+                            ui,
+                            "Convert to HAP...",
+                            crate::widgets::Kind::Secondary,
+                        )
+                        .clicked()
+                    {
+                        convert = Some((p.path.clone(), *deck, *lid, *col));
+                    }
+                });
             }
+        }
+        if let Some((src, deck, layer, column)) = convert {
+            let clip = vjc_core::clip_in(&self.project, deck, layer, column).map(|k| k.id);
+            self.hap_ask = Some(HapAsk {
+                src,
+                cell: Some((deck, layer, column)),
+                clip,
+                variant: None,
+            });
         }
         let dials = self.dials();
         let cf_pos = {

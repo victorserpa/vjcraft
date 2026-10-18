@@ -105,6 +105,9 @@ fn check(path: &Path, x: &Expect) -> Result<(), String> {
         Ok(f) => f,
         Err(e) => {
             pl.stop();
+            if x.result == "error" {
+                eprintln!("    message for {}: {e}", path.display());
+            }
             return match x.result.as_str() {
                 "error" if e.starts_with("error:") && !e.contains("panic") => Ok(()),
                 "any" if e.starts_with("error:") && !e.contains("panic") => Ok(()),
