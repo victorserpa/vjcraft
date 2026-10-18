@@ -142,3 +142,79 @@ fn missing_plugin_is_bypassed_from_the_start() {
     let (b, _) = block(&mut l);
     assert!(is_wet(&b, 1.0));
 }
+
+#[test]
+fn dry_wet_mix_uses_the_dry_block_the_wet_audio_came_from() {
+    // gain 1: the wet block equals its own dry block, so a correct mix returns exactly an
+    // earlier input value. Mixing against the current block would land between two values.
+    let (shared, mut l) = lane(2000);
+    assert!(feed(&mut l, 10, |_| shared.status() == LaneStatus::Running));
+    let mut wet_blocks = 0;
+    for k in 1..400 {
+        let v = k as f32 * 0.01;
+        let mut b = vec![v; 512];
+        l.process_mix(&mut b, 0.25);
+        let r = (b[0] / 0.01).round();
+        assert!(
+            (b[0] - r * 0.01).abs() < 1e-4 && b.iter().all(|x| (x - b[0]).abs() < 1e-6),
+            "block {k} came out as a blend of different blocks: {}",
+            b[0]
+        );
+        if r < k as f32 {
+            wet_blocks += 1;
+        }
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    assert!(wet_blocks > 5, "wet audio did arrive ({wet_blocks})");
+}
+
+#[test]
+fn a_stale_report_does_not_overwrite_a_newer_restart() {
+    let shared = ClapShared::new("/x.clap", ID, &[]);
+    let g = shared.restart_gen();
+    shared.restart(); // asked for while the worker was still loading
+    shared.mark_running_at(g);
+    assert_eq!(shared.status(), LaneStatus::Starting);
+    shared.mark_bypassed_at(Some(g), "old failure");
+    assert_eq!(shared.status(), LaneStatus::Starting);
+    shared.mark_running_at(shared.restart_gen());
+    assert_eq!(shared.status(), LaneStatus::Running);
+}
+
+#[test]
+fn a_heavy_plugin_shows_starting_while_it_loads_and_never_blocks_the_callback() {
+    let shared = ClapShared::new(&slow_load_plugin(), ID, &[1.0, 0.0, 0.0]);
+    let mut l = ClapLane::spawn(
+        shared.clone(),
+        Path::new(HELPER),
+        Duration::from_secs(2),
+        RATE,
+    );
+    feed(&mut l, 1, |_| false);
+    assert_eq!(shared.status(), LaneStatus::Starting);
+    assert!(feed(&mut l, 20, |_| shared.status() == LaneStatus::Running));
+}
+
+fn slow_load_plugin() -> String {
+    let dir = std::env::temp_dir().join(format!("vjc-clap-lane-slowload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gain_plugin.rs");
+    let out = dir.join("slow.clap");
+    let st = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            "2024",
+            "--crate-type",
+            "cdylib",
+            "--cfg",
+            "slowload",
+            "-O",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(src)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    out.to_string_lossy().to_string()
+}

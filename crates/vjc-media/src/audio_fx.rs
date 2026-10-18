@@ -775,6 +775,13 @@ impl FxChain {
                 std::array::from_fn(|i| f32::from_bits(slot.params[i].load(Ordering::Relaxed)));
             let chunk = st.dry.len().max(2);
             for part in buf.chunks_mut(chunk) {
+                if let Fx::Clap(lane) = fx {
+                    // the lane mixes against the dry block its wet audio came from
+                    if let Some(l) = lane {
+                        l.process_mix(part, mix);
+                    }
+                    continue;
+                }
                 if mix >= 1.0 || st.dry.len() < part.len() {
                     fx.process(&p, part, &cx);
                 } else {

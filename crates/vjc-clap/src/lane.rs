@@ -4,7 +4,7 @@
 //! its time budget, the callback keeps the dry audio. The wet signal is one callback late.
 use crate::{ClapEffect, HostError, MAX_FRAMES, Status};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,6 +54,25 @@ impl Ring {
             .store(t.wrapping_add(out.len()), Ordering::Release);
         true
     }
+    fn free(&self) -> usize {
+        RING - self.len()
+    }
+    /// Pops `buf.len()` samples and mixes them into `buf` as the dry part: `buf` holds the wet
+    /// signal on entry. All-or-nothing, no allocation.
+    fn pop_dry_mix(&self, buf: &mut [f32], mix: f32) -> bool {
+        let t = self.tail.load(Ordering::Relaxed);
+        if self.head.load(Ordering::Acquire).wrapping_sub(t) < buf.len() {
+            return false;
+        }
+        for (i, v) in buf.iter_mut().enumerate() {
+            let d =
+                f32::from_bits(self.buf[t.wrapping_add(i) & (RING - 1)].load(Ordering::Relaxed));
+            *v = d * (1.0 - mix) + *v * mix;
+        }
+        self.tail
+            .store(t.wrapping_add(buf.len()), Ordering::Release);
+        true
+    }
     fn skip(&self, n: usize) {
         let t = self.tail.load(Ordering::Relaxed);
         let n = n.min(self.len());
@@ -70,6 +89,8 @@ pub enum LaneStatus {
     Bypassed(String),
 }
 
+// The status and the restart count live in one word, `(restarts << 8) | state`, so the worker
+// can report a result only if no restart was asked for since it began (see `report_at`).
 const STARTING: u8 = 0;
 const RUNNING: u8 = 1;
 const BYPASSED: u8 = 2;
@@ -80,9 +101,8 @@ pub struct ClapShared {
     pub path: String,
     pub id: String,
     params: Vec<AtomicU64>,
-    status: AtomicU8,
+    state: AtomicU64,
     reason: Mutex<String>,
-    epoch: AtomicU32,
 }
 
 impl std::fmt::Debug for ClapShared {
@@ -104,9 +124,8 @@ impl ClapShared {
                 .iter()
                 .map(|v| AtomicU64::new(v.to_bits()))
                 .collect(),
-            status: AtomicU8::new(STARTING),
+            state: AtomicU64::new(STARTING as u64),
             reason: Mutex::new(String::new()),
-            epoch: AtomicU32::new(0),
         })
     }
     pub fn param_count(&self) -> usize {
@@ -123,8 +142,11 @@ impl ClapShared {
             .get(index)
             .map_or(0.0, |p| f64::from_bits(p.load(Ordering::Relaxed)))
     }
+    fn raw(&self) -> u8 {
+        (self.state.load(Ordering::Acquire) & 0xff) as u8
+    }
     pub fn status(&self) -> LaneStatus {
-        match self.status.load(Ordering::Acquire) {
+        match self.raw() {
             RUNNING => LaneStatus::Running,
             BYPASSED => {
                 LaneStatus::Bypassed(self.reason.lock().map(|r| r.clone()).unwrap_or_default())
@@ -132,23 +154,50 @@ impl ClapShared {
             _ => LaneStatus::Starting,
         }
     }
+    /// Sets the state unless a restart newer than `epoch` was asked for (None: always). Returns
+    /// whether it was set.
+    fn set_state(&self, epoch: Option<u32>, state: u8) -> bool {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+                if epoch.is_some_and(|g| (w >> 8) as u32 != g) {
+                    None
+                } else {
+                    Some((w & !0xff) | state as u64)
+                }
+            })
+            .is_ok()
+    }
     pub fn mark_bypassed(&self, why: &str) {
+        self.mark_bypassed_at(None, why);
+    }
+    /// Worker side: bypassed, unless a restart came after generation `epoch` (the report is stale).
+    pub fn mark_bypassed_at(&self, epoch: Option<u32>, why: &str) {
+        if epoch.is_some_and(|g| g != self.restart_gen()) {
+            return;
+        }
         if let Ok(mut r) = self.reason.lock() {
             *r = why.into();
         }
-        self.status.store(BYPASSED, Ordering::Release);
+        self.set_state(epoch, BYPASSED);
     }
     pub fn mark_running(&self) {
-        self.status.store(RUNNING, Ordering::Release);
+        self.set_state(None, RUNNING);
+    }
+    /// Worker side: running, unless a restart came after generation `epoch`.
+    pub fn mark_running_at(&self, epoch: u32) {
+        self.set_state(Some(epoch), RUNNING);
     }
     /// Asks the lane to start the plugin again (after a bypass).
     pub fn restart(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.status.store(STARTING, Ordering::Release);
+        let _ = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+                Some((((w >> 8) + 1) << 8) | STARTING as u64)
+            });
     }
     /// Counts the restarts asked for.
     pub fn restart_gen(&self) -> u32 {
-        self.epoch.load(Ordering::Acquire)
+        (self.state.load(Ordering::Acquire) >> 8) as u32
     }
 }
 
@@ -167,6 +216,9 @@ pub struct ClapLane {
     shared: Arc<ClapShared>,
     input: Arc<Ring>,
     output: Arc<Ring>,
+    /// The dry audio of the blocks in flight, in step with `input` and `output`: the wet block
+    /// that comes back one callback late is mixed with the dry block it was made from.
+    dry: Ring,
     stop: Arc<AtomicBool>,
     seen_gen: u32,
 }
@@ -181,6 +233,7 @@ impl ClapLane {
         let lane = ClapLane {
             input: Arc::new(Ring::new()),
             output: Arc::new(Ring::new()),
+            dry: Ring::new(),
             stop: Arc::new(AtomicBool::new(false)),
             seen_gen: shared.restart_gen(),
             shared: shared.clone(),
@@ -201,20 +254,34 @@ impl ClapLane {
     /// handed to the worker; if its earlier wet output is ready it replaces the block, else the
     /// block stays dry.
     pub fn process(&mut self, buf: &mut [f32]) {
+        self.process_mix(buf, 1.0);
+    }
+
+    /// Like [`ClapLane::process`] with a dry/wet `mix` (0..=1). The wet audio is one callback
+    /// late, so it is mixed with the dry audio of the same earlier block, not the current one.
+    pub fn process_mix(&mut self, buf: &mut [f32], mix: f32) {
         let g = self.shared.restart_gen();
         if g != self.seen_gen {
             self.seen_gen = g;
             self.output.skip(usize::MAX); // audio of the previous run
+            self.dry.skip(usize::MAX);
         }
-        if self.shared.status.load(Ordering::Acquire) != RUNNING || buf.is_empty() {
+        if self.shared.raw() != RUNNING || buf.is_empty() {
             return;
         }
-        self.input.push(buf);
+        // both rings take the block or neither does, so they stay in step
+        if self.input.free() >= buf.len() && self.dry.free() >= buf.len() {
+            self.input.push(buf);
+            self.dry.push(buf);
+        }
         // stay close to real time: drop wet audio that piled up while the callback was away
         while self.output.len() >= 2 * buf.len() {
             self.output.skip(buf.len());
+            self.dry.skip(buf.len());
         }
-        self.output.pop(buf);
+        if self.output.pop(buf) {
+            self.dry.pop_dry_mix(buf, mix.clamp(0.0, 1.0));
+        }
     }
 }
 
@@ -247,12 +314,13 @@ fn work(
             }
         }
     };
-    let report = |fx: &ClapEffect| match &fx.status {
-        Status::Running => shared.mark_running(),
-        Status::Stopped(e) => shared.mark_bypassed(&why(e)),
+    // a result from before a newer restart request must not overwrite its "starting"
+    let report = |fx: &ClapEffect, epoch: u32| match &fx.status {
+        Status::Running => shared.mark_running_at(epoch),
+        Status::Stopped(e) => shared.mark_bypassed_at(Some(epoch), &why(e)),
     };
     sync(&mut fx, &mut last);
-    report(&fx);
+    report(&fx, seen);
     while !stop.load(Ordering::Acquire) {
         let g = shared.restart_gen();
         if g != seen {
@@ -261,11 +329,11 @@ fn work(
             fx.enable();
             let k = input.len();
             input.skip(k);
-            report(&fx);
+            report(&fx, seen);
             continue;
         }
         if fx.status != Status::Running {
-            report(&fx);
+            report(&fx, seen);
             std::thread::sleep(Duration::from_millis(5));
             continue;
         }
@@ -281,7 +349,7 @@ fn work(
         fx.process(block); // on a failure the block stays dry
         output.push(block);
         if fx.status != Status::Running {
-            report(&fx);
+            report(&fx, seen);
         }
     }
 }
