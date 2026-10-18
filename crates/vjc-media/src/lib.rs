@@ -112,6 +112,8 @@ pub(crate) struct Shared {
     latest: Mutex<Option<Frame>>,
     stop: AtomicBool,
     error: Mutex<Option<String>>,
+    /// The error is "no decoder" for a non-empty file: a re-encode could play it.
+    convertible: AtomicBool,
     /// File duration in seconds (f64 bits); 0 = unknown.
     duration: AtomicU64,
     /// Wanted position 0..1 (f64 bits).
@@ -128,6 +130,7 @@ impl Shared {
             latest: Mutex::new(None),
             stop: AtomicBool::new(false),
             error: Mutex::new(None),
+            convertible: AtomicBool::new(false),
             duration: AtomicU64::new(0),
             position: AtomicU64::new(0.0f64.to_bits()),
             sequential: AtomicBool::new(true),
@@ -237,6 +240,8 @@ impl Player {
                         hw::WARM.wait(hw::WARM_WAIT);
                     }
                     if let Err(e) = run_scrub(&p, &s, hw) {
+                        let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+                        s.convertible.store(is_convertible(&e, size), Ordering::Relaxed);
                         *lock(&s.error) = Some(open_error_text(&e));
                     }
                 })
@@ -370,6 +375,12 @@ impl Player {
         lock(&self.shared.error).clone()
     }
 
+    /// The error says no decoder exists for a non-empty file, so converting it (to HAP)
+    /// can help. Decided once when the error is set, cheap to call every frame.
+    pub fn can_convert(&self) -> bool {
+        self.shared.convertible.load(Ordering::Relaxed)
+    }
+
     /// Duration of the file in seconds, once known (None for images/unknown).
     pub fn duration(&self) -> Option<f64> {
         let d = f64::from_bits(self.shared.duration.load(Ordering::Relaxed));
@@ -469,6 +480,12 @@ fn load_image(path: &Path) -> Result<Frame, String> {
 }
 
 /// What the user reads when a file cannot be opened.
+/// A re-encode helps only when FFmpeg has no decoder for the codec (not for a damaged,
+/// empty or non-video file).
+fn is_convertible(e: &ff::Error, file_len: u64) -> bool {
+    matches!(e, ff::Error::DecoderNotFound) && file_len > 0
+}
+
 fn open_error_text(e: &ff::Error) -> String {
     match e {
         ff::Error::DecoderNotFound => {
@@ -531,17 +548,52 @@ pub struct SourceInfo {
     pub alpha: bool,
 }
 
-/// Display rotation of a stream in degrees counter-clockwise
-/// (0, 90, 180 or 270), from its display matrix (phone and camera clips store portrait video
-/// as landscape pixels plus this tag). Other angles round to the nearest quarter turn.
-fn stream_rotation(st: &ff::format::stream::Stream) -> u32 {
+/// How a stream is turned for display: degrees counter-clockwise (0, 90, 180 or 270), after
+/// an optional horizontal mirror of the stored pixels. Phone and camera clips store
+/// portrait video as landscape pixels plus a display matrix; front cameras add a mirror.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Orient {
+    deg: u32,
+    flip: bool,
+}
+
+impl Orient {
+    /// The displayed size of a `w` x `h` stored picture.
+    fn size(self, w: u32, h: u32) -> (u32, u32) {
+        if matches!(self.deg, 90 | 270) {
+            (h, w)
+        } else {
+            (w, h)
+        }
+    }
+}
+
+fn stream_orient(st: &ff::format::stream::Stream) -> Orient {
     for sd in st.side_data() {
         if sd.kind() == ff::codec::packet::side_data::Type::DisplayMatrix && sd.data().len() >= 36 {
             let m = |i: usize| i32::from_le_bytes(sd.data()[i * 4..i * 4 + 4].try_into().unwrap());
-            return rotation_from_matrix(m(0), m(1));
+            return orient_from_matrix(m(0), m(1), m(3), m(4));
         }
     }
-    0
+    Orient::default()
+}
+
+/// Orientation for the upper-left 2x2 `(a, b; c, d)` of a display matrix (16.16 fixed
+/// point). A negative determinant means the picture is mirrored.
+fn orient_from_matrix(a: i32, b: i32, c: i32, d: i32) -> Orient {
+    let det = i64::from(a) * i64::from(d) - i64::from(b) * i64::from(c);
+    if det < 0 {
+        // Undo the mirror (negate the first column) to read the rotation underneath.
+        Orient {
+            deg: rotation_from_matrix(a.saturating_neg(), b),
+            flip: true,
+        }
+    } else {
+        Orient {
+            deg: rotation_from_matrix(a, b),
+            flip: false,
+        }
+    }
 }
 
 /// Counter-clockwise quarter turns (in degrees) for the first row `(a, b)` of a display matrix.
@@ -553,24 +605,39 @@ fn rotation_from_matrix(a: i32, b: i32) -> u32 {
     (((deg / 90.0).round() as i32).rem_euclid(4) * 90) as u32
 }
 
-/// Rotates a tightly packed RGBA frame `deg` degrees counter-clockwise (multiple of 90).
-fn rotate_frame(f: Frame, deg: u32) -> Frame {
-    if deg.is_multiple_of(360) || f.hap.is_some() {
+/// Tile edge (pixels) of the blocked copy: 32x32 RGBA is 4 KiB per side, inside L1.
+const TILE: usize = 32;
+
+/// Mirrors (`flip`, left to right) a tightly packed RGBA frame and then turns it `deg`
+/// degrees counter-clockwise (multiple of 90). Copies in tiles so both the reads and the
+/// writes stay in cache. Block-compressed (HAP) frames are returned as they are.
+fn rotate_frame(f: Frame, deg: u32, flip: bool) -> Frame {
+    if (deg.is_multiple_of(360) && !flip) || f.hap.is_some() {
         return f;
     }
     let (w, h) = (f.width as usize, f.height as usize);
-    let (nw, nh) = if deg == 180 { (w, h) } else { (h, w) };
+    let (nw, nh) = if deg == 180 || deg.is_multiple_of(360) {
+        (w, h)
+    } else {
+        (h, w)
+    };
     let src = &f.data;
     let mut out = vec![0u8; src.len()];
-    for y in 0..nh {
-        for x in 0..nw {
-            let (sx, sy) = match deg {
-                90 => (w - 1 - y, x),
-                180 => (w - 1 - x, h - 1 - y),
-                _ => (y, h - 1 - x),
-            };
-            let (si, di) = ((sy * w + sx) * 4, (y * nw + x) * 4);
-            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+    for ty in (0..nh).step_by(TILE) {
+        for tx in (0..nw).step_by(TILE) {
+            for y in ty..(ty + TILE).min(nh) {
+                for x in tx..(tx + TILE).min(nw) {
+                    let (sx, sy) = match deg {
+                        90 => (w - 1 - y, x),
+                        180 => (w - 1 - x, h - 1 - y),
+                        270 => (y, h - 1 - x),
+                        _ => (x, y),
+                    };
+                    let sx = if flip { w - 1 - sx } else { sx };
+                    let (si, di) = ((sy * w + sx) * 4, (y * nw + x) * 4);
+                    out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                }
+            }
         }
     }
     Frame {
@@ -620,16 +687,18 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
     };
     let params = st.parameters();
     let codec = params.id().name().to_string();
-    let turned = matches!(stream_rotation(&st), 90 | 270);
+    // Block-compressed HAP frames stay unrotated (see `rotate_frame`), so the size reported
+    // for them is the stored one; everything else is reported as displayed.
+    let orient = if hap::gpu_supported() && hap_probe(path.as_ref()) {
+        Orient::default()
+    } else {
+        stream_orient(&st)
+    };
     let vpx = vpx_alpha_codec(&st);
     let vpx_alpha = vpx.is_some();
     let (width, height, alpha) = open_sw(params, vpx).ok().map_or((0, 0, false), |d| {
         let comps = d.format().descriptor().map_or(0, |x| x.nb_components());
-        let (w, h) = if turned {
-            (d.height(), d.width())
-        } else {
-            (d.width(), d.height())
-        };
+        let (w, h) = orient.size(d.width(), d.height());
         (w, h, comps == 2 || comps == 4 || vpx_alpha)
     });
     let duration = ictx.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE);
@@ -725,8 +794,10 @@ struct Scrubber {
     holder: Arc<hw::Holder>,
     /// Hardware was wanted at open but no session was free.
     slot_denied: bool,
-    /// Display rotation (degrees counter-clockwise) applied to every frame.
-    rotation: u32,
+    /// Display rotation and mirror applied to every decoded RGBA frame.
+    orient: Orient,
+    /// Decoder chosen at open (libvpx for alpha WebM), kept across `swap_decoder`.
+    vpx: Option<ff::Codec>,
 }
 
 impl Scrubber {
@@ -744,7 +815,7 @@ impl Scrubber {
     fn open_with_hw(path: &Path, hap: bool, hw: Hw) -> Result<Scrubber, ff::Error> {
         ff::init()?;
         let ictx = ff::format::input(&path)?;
-        let (stream_idx, tb, fps, params, rotation, vpx) = {
+        let (stream_idx, tb, fps, params, orient, vpx) = {
             let st = ictx
                 .streams()
                 .best(ff::media::Type::Video)
@@ -760,7 +831,7 @@ impl Scrubber {
                 f64::from(st.time_base()),
                 fps,
                 st.parameters(),
-                stream_rotation(&st),
+                stream_orient(&st),
                 vpx_alpha_codec(&st),
             )
         };
@@ -797,7 +868,8 @@ impl Scrubber {
             status: None,
             holder: hw::Holder::new(),
             slot_denied,
-            rotation,
+            orient,
+            vpx,
         })
     }
 
@@ -828,7 +900,11 @@ impl Scrubber {
     /// from the keyframe. If the new decoder cannot be opened, the old decoder and its slot
     /// stay untouched (the given slot is released).
     fn swap_decoder(&mut self, slot: Option<HwSlot<'static>>) -> Result<(), ff::Error> {
-        self.swap_decoder_with(slot, open_decoder)
+        match self.vpx {
+            // The alpha decoder only exists in software: keep it, whatever was asked.
+            Some(c) => self.swap_decoder_with(None, move |p, _, _| Ok((open_sw(p, Some(c))?, None))),
+            None => self.swap_decoder_with(slot, open_decoder),
+        }
     }
 
     fn swap_decoder_with(
@@ -884,7 +960,7 @@ impl Scrubber {
     /// Converts a decoded frame to RGBA.
     fn convert(&mut self, decoded: &ff::frame::Video) -> Result<Frame, ff::Error> {
         self.count += 1;
-        frame_to_rgba(&mut self.scaler, decoded, self.count).map(|f| rotate_frame(f, self.rotation))
+        frame_to_rgba(&mut self.scaler, decoded, self.count).map(|f| rotate_frame(f, self.orient.deg, self.orient.flip))
     }
 
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
@@ -1865,6 +1941,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Writes a 1 s h264 clip with the ffmpeg CLI; false when it cannot (test then skips).
+    fn make_test_clip(out: &Path) -> bool {
+        std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x240:rate=25:duration=1")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn convertible_only_for_missing_decoder() {
+        assert!(is_convertible(&ff::Error::DecoderNotFound, 10));
+        assert!(!is_convertible(&ff::Error::DecoderNotFound, 0));
+        assert!(!is_convertible(&ff::Error::InvalidData, 10));
+        assert!(!is_convertible(&ff::Error::StreamNotFound, 10));
+    }
+
+    #[test]
+    fn mirrored_matrix_sets_flip() {
+        let o = |a, b, c, d| orient_from_matrix(a, b, c, d);
+        let one = 65536;
+        assert_eq!(o(one, 0, 0, one), Orient { deg: 0, flip: false });
+        assert_eq!(o(-one, 0, 0, one), Orient { deg: 0, flip: true });
+        assert!(o(0, -one, -one, 0).flip);
+        assert!(!o(0, -one, one, 0).flip);
+        assert_eq!(o(0, -one, one, 0).deg, 90);
+    }
+
+    #[test]
+    fn rotate_frame_flip_mirrors_before_turning() {
+        let px = |v: u8| [v, v, v, 255];
+        let data: Vec<u8> = [1u8, 2, 3, 4, 5, 6].iter().flat_map(|&v| px(v)).collect();
+        let f = Frame {
+            width: 3,
+            height: 2,
+            data: Arc::new(data),
+            seq: 1,
+            hap: None,
+        };
+        let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
+        let m = rotate_frame(f.clone(), 0, true);
+        assert_eq!((m.width, m.height), (3, 2));
+        assert_eq!(first(&m), [3, 2, 1, 6, 5, 4]);
+        // Mirrored: 3 2 1 / 6 5 4, then 90 ccw.
+        assert_eq!(first(&rotate_frame(f, 90, true)), [1, 4, 2, 5, 3, 6]);
+    }
+
+    #[test]
+    fn rotate_frame_tiles_match_naive_on_odd_size() {
+        let (w, h) = (70usize, 45usize);
+        let data: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let f = Frame {
+            width: w as u32,
+            height: h as u32,
+            data: Arc::new(data.clone()),
+            seq: 1,
+            hap: None,
+        };
+        let r = rotate_frame(f, 90, false);
+        assert_eq!((r.width as usize, r.height as usize), (h, w));
+        for y in 0..w {
+            for x in 0..h {
+                let (sx, sy) = (w - 1 - y, x);
+                assert_eq!(
+                    r.data[(y * h + x) * 4..][..4],
+                    data[(sy * w + sx) * 4..][..4]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swap_decoder_keeps_the_chosen_decoder() {
+        let dir = std::env::temp_dir().join(format!("vjc-vpxkeep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a.mp4");
+        if !make_test_clip(&out) {
+            return;
+        }
+        let mut sc = Scrubber::open(&out).unwrap();
+        sc.vpx = ff::decoder::find_by_name("h264");
+        assert!(sc.vpx.is_some());
+        sc.hw_mode = Hw::On;
+        // A hardware slot offered while the chosen decoder is software-only is not used.
+        let slot = hw::SLOTS.try_acquire(hw::cap());
+        sc.swap_decoder(slot).unwrap();
+        assert!(!sc.is_hw());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn display_matrix_maps_to_quarter_turns() {
         // av_display_rotation_set: (cos, -sin) in 16.16 fixed point.
@@ -1888,15 +2057,15 @@ mod tests {
             hap: None,
         };
         let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
-        let r90 = rotate_frame(f.clone(), 90);
+        let r90 = rotate_frame(f.clone(), 90, false);
         assert_eq!((r90.width, r90.height), (2, 3));
         assert_eq!(first(&r90), [3, 6, 2, 5, 1, 4]);
-        let r270 = rotate_frame(f.clone(), 270);
+        let r270 = rotate_frame(f.clone(), 270, false);
         assert_eq!((r270.width, r270.height), (2, 3));
         assert_eq!(first(&r270), [4, 1, 5, 2, 6, 3]);
-        let r180 = rotate_frame(f.clone(), 180);
+        let r180 = rotate_frame(f.clone(), 180, false);
         assert_eq!((r180.width, r180.height), (3, 2));
         assert_eq!(first(&r180), [6, 5, 4, 3, 2, 1]);
-        assert_eq!(first(&rotate_frame(f, 0)), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(first(&rotate_frame(f, 0, false)), [1, 2, 3, 4, 5, 6]);
     }
 }
