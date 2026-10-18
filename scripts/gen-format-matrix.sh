@@ -117,6 +117,13 @@ fi
 head -c 4096 /dev/urandom >"$OUT/garbage.mov"; echo "0x0 opaque error" >"$OUT/garbage.mov.expect"
 DONE+=(zero_byte.mov garbage.mov)
 
+# Optional heavy sample for the multi-layer load test (HEAVY=1): 1080p25 ProRes 4444 + alpha, 10 s.
+if [ "${HEAVY:-0}" = 1 ] && b="$(pick prores_ks)"; then
+  "$b" -v error -y -f lavfi -i "testsrc2=size=1920x1080:rate=25:duration=10,format=yuva444p10le" \
+    -c:v prores_ks -profile:v 4 -pix_fmt yuva444p10le "$OUT/heavy_prores4444_1080p.mov" </dev/null \
+    && echo "heavy sample: $OUT/heavy_prores4444_1080p.mov"
+fi
+
 echo "generated ${#DONE[@]} in $OUT"
 for s in "${SKIPPED[@]:-}"; do [ -n "$s" ] && echo "SKIPPED: $s"; done
 echo "$OUT"
