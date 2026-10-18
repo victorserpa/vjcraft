@@ -555,7 +555,7 @@ fn rotation_from_matrix(a: i32, b: i32) -> u32 {
 
 /// Rotates a tightly packed RGBA frame `deg` degrees counter-clockwise (multiple of 90).
 fn rotate_frame(f: Frame, deg: u32) -> Frame {
-    if deg % 360 == 0 || f.hap.is_some() {
+    if deg.is_multiple_of(360) || f.hap.is_some() {
         return f;
     }
     let (w, h) = (f.width as usize, f.height as usize);

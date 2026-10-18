@@ -60,7 +60,7 @@ fn samples(dir: &Path) -> Vec<(String, PathBuf, Expect)> {
 }
 
 fn has_alpha(f: &Frame) -> bool {
-    f.data.chunks_exact(4).any(|p| p[3] < 250)
+    f.data.as_chunks::<4>().0.iter().any(|p| p[3] < 250)
 }
 
 /// Waits for a frame newer than `after`; Err on error text or timeout.
