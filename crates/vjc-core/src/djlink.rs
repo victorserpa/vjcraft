@@ -341,6 +341,8 @@ mod tests {
         assert_eq!(u16::from_be_bytes([raw[0x5a], raw[0x5b]]), 12750);
         assert_eq!(raw[0x5c], 3);
         assert_eq!(decode(&raw), Some(Packet::Beat(b)));
+        let p = beat(1, 90.0, NORMAL_PITCH + 12345, 4);
+        assert_eq!(decode(&encode_beat(&p)), Some(Packet::Beat(p)));
     }
 
     #[test]
@@ -446,7 +448,7 @@ mod tests {
 
     #[test]
     fn clock_follows_synthetic_stream_within_5ms() {
-        let (err, bpm) = run(128.0, NORMAL_PITCH, 1, 12.0);
+        let (err, bpm) = run(128.0, NORMAL_PITCH, 2, 12.0);
         assert!(err < 5.0, "phase error {err} ms");
         assert!((bpm - 128.0).abs() < 0.01);
     }
