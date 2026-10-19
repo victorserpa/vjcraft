@@ -143,6 +143,8 @@ TP="$APP/Contents/Resources/ThirdParty"
 mkdir -p "$TP"
 : > "$TP/dylibs.tsv"
 while IFS=$'\t' read -r name orig; do
+  # /opt/homebrew/opt/<pkg> is a symlink into the Cellar; resolve directories fully.
+  orig="$(cd -P "$(dirname "$orig")" && pwd)/$(basename "$orig")"
   case "$orig" in
     */Cellar/*) rest="${orig#*/Cellar/}"; pkg="${rest%%/*}"; rest="${rest#*/}"; ver="${rest%%/*}"
       root="${orig%%/Cellar/*}/Cellar/$pkg/$ver" ;;
@@ -156,7 +158,15 @@ while IFS=$'\t' read -r name orig; do
     [ -e "$dest" ] || { cp -L "$lf" "$dest"; n=$((n+1)); }
   done < <(find "$root" -maxdepth 4 -type f \( -iname 'LICEN[SC]E*' -o -iname 'COPYING*' -o -iname 'COPYRIGHT*' -o -iname 'NOTICE*' -o -iname 'UNLICENSE*' \) \
              -not -path '*/include/*' -not -path '*/lib/python*' 2>/dev/null | sort)
-  [ -n "$(ls "$TP/$pkg")" ] || die "no license file found for $pkg $ver (needed by $name) under $root"
+  if [ -z "$(ls "$TP/$pkg")" ]; then
+    # Bottle ships no license file: record the SPDX id and upstream URL from the formula.
+    . "$(dirname "$0")/third-party-lib.sh"
+    j="$("$BREW" info --json=v2 "$pkg")" || die "no license file for $pkg $ver and brew info failed"
+    IFS=$'\t' read -r lic home < <(formula_meta "$pkg" "$ver" "$j") || die "no license id for $pkg"
+    printf '%s\n%s\nHomebrew bottle %s %s ships no license file; this is the license id declared by its formula.\n' \
+      "$lic" "$home" "$pkg" "$ver" > "$TP/$pkg/LICENSE-SPDX.txt"
+    echo "bundle-dylibs: $pkg $ver ships no license file, wrote LICENSE-SPDX.txt ($lic)"
+  fi
   printf '%s\t%s\t%s\n' "$name" "$pkg" "$ver" >> "$TP/dylibs.tsv"
 done < "$MAP"
 echo "licenses for $(cut -f2 "$TP/dylibs.tsv" | sort -u | wc -l | tr -d ' ') formulae in $TP"

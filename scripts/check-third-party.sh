@@ -20,5 +20,7 @@ for f in "$APP"/Contents/Frameworks/*.dylib; do
 done
 [ "$n" -gt 0 ] || fail "no dylibs in Frameworks"
 [ ! -f "$APP/Contents/Resources/ffmpeg" ] || grep -q '^| FFmpeg ' "$TP/NOTICE.md" || fail "NOTICE.md lacks the FFmpeg CLI entry"
+[ -s "$TP/Syphon/License.txt" ] || fail "ThirdParty/Syphon/License.txt missing"
+[ -n "$(ls "$TP/crates" 2>/dev/null)" ] || fail "ThirdParty/crates empty"
 [ "$bad" -eq 0 ] || exit 1
 echo "check-third-party: ok ($n dylibs)"
