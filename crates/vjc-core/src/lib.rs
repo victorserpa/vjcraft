@@ -1415,19 +1415,29 @@ fn apply_inner_meshes(
         }
     }
     let mut prev = vec![];
+    let mut shapes = vec![];
     let dims = (scr.width, scr.height);
     for (id, m) in meshes {
         let sl = scr.slices.iter_mut().find(|s| s.id == id).unwrap();
-        slice_adv::follow_outline(sl, &m, dims);
+        if let Some(poly) = slice_adv::follow_outline(sl, &m, dims) {
+            shapes.push(Command::SetSliceShape {
+                screen,
+                slice: id,
+                shape: vjc_model::SliceShape::Polygon(poly),
+            });
+        }
         prev.push((id, std::mem::replace(&mut sl.output_mesh, m)));
     }
-    undoable(
-        Command::SetSliceMeshes {
-            screen,
-            meshes: prev,
-        },
-        vec![],
-    )
+    let mut inverse = Command::SetSliceMeshes {
+        screen,
+        meshes: prev,
+    };
+    if !shapes.is_empty() {
+        // Exact outlines, not the inverse transform of them.
+        shapes.insert(0, inverse);
+        inverse = Command::Batch { commands: shapes };
+    }
+    undoable(inverse, vec![])
 }
 
 fn has_duplicates(ids: impl Iterator<Item = Uuid>) -> bool {
@@ -3085,18 +3095,46 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 .iter()
                 .position(|x| x.id == slice)
                 .ok_or(Error::NoSlice)?;
-            let sl = src.slices.remove(i);
+            let mut sl = src.slices.remove(i);
+            let (fw, fh) = (src.width.max(1) as f32, src.height.max(1) as f32);
             let dst = screen_mut(p, to)?;
+            // The outline is normalised to its screen: keep its pixels on a different size.
+            let mut prev_outline = None;
+            if let vjc_model::SliceShape::Polygon(poly) = &mut sl.shape {
+                let (tw, th) = (dst.width.max(1) as f32, dst.height.max(1) as f32);
+                if (fw, fh) != (tw, th) {
+                    let scaled: Vec<_> = poly
+                        .iter()
+                        .map(|q| {
+                            (
+                                (q.0 * fw / tw).clamp(0.0, 1.0),
+                                (q.1 * fh / th).clamp(0.0, 1.0),
+                            )
+                        })
+                        .collect();
+                    prev_outline = Some(std::mem::replace(poly, scaled));
+                }
+            }
             dst.slices.insert(index.min(dst.slices.len()), sl);
-            undoable(
-                Command::MoveSlice {
-                    from: to,
-                    to: from,
-                    slice,
-                    index: i,
-                },
-                vec![],
-            )
+            let mut inverse = Command::MoveSlice {
+                from: to,
+                to: from,
+                slice,
+                index: i,
+            };
+            if let Some(poly) = prev_outline {
+                inverse = Command::Batch {
+                    commands: vec![
+                        inverse,
+                        Command::SetSliceShape {
+                            screen: from,
+                            slice,
+                            shape: vjc_model::SliceShape::Polygon(poly),
+                        },
+                    ],
+                };
+            }
+            undoable(inverse, vec![])
         }
         Command::ReorderSlice {
             screen,
@@ -3291,9 +3329,11 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 (scr.width, scr.height)
             };
             let s = slice_mut(p, screen, slice)?;
-            if cols == s.mesh_cols {
-                slice_adv::follow_outline(s, &mesh, (w, h));
-            }
+            let prev_outline = if cols == s.mesh_cols {
+                slice_adv::follow_outline(s, &mesh, (w, h))
+            } else {
+                None
+            };
             let stale = !s.mesh_tangents.is_empty() && s.mesh_tangents.len() != mesh.len();
             let old_tangents = stale.then(|| std::mem::take(&mut s.mesh_tangents));
             let mut inverse = Command::SetSliceMesh {
@@ -3315,6 +3355,18 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 };
             }
             s.mesh_cols = cols;
+            if let Some(poly) = prev_outline {
+                inverse = Command::Batch {
+                    commands: vec![
+                        inverse,
+                        Command::SetSliceShape {
+                            screen,
+                            slice,
+                            shape: vjc_model::SliceShape::Polygon(poly),
+                        },
+                    ],
+                };
+            }
             undoable(inverse, vec![])
         }
         Command::RestoreSliceTangents {
@@ -3426,6 +3478,8 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             }
             let scr = screen_mut(p, screen)?;
             let mut old = vec![];
+            let mut bounds = vec![];
+            let (sw, sh) = (scr.width as f32, scr.height as f32);
             for id in &slices {
                 let sl = scr
                     .slices
@@ -3433,8 +3487,14 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     .find(|s| s.id == *id)
                     .ok_or(Error::NoSlice)?;
                 old.push(sl.output_mesh.clone());
+                match &sl.shape {
+                    vjc_model::SliceShape::Polygon(poly) if poly.len() >= 3 => {
+                        bounds.extend(poly.iter().map(|q| (q.0 * sw, q.1 * sh)));
+                    }
+                    _ => bounds.extend(sl.output_mesh.iter().copied()),
+                }
             }
-            let new = slice_adv::resize_group(&old, slice_geom::Rect { x, y, w, h });
+            let new = slice_adv::resize_group(&old, &bounds, slice_geom::Rect { x, y, w, h });
             let meshes: Vec<_> = slices.into_iter().zip(new).collect();
             apply_inner_meshes(scr, screen, meshes)
         }
@@ -3453,8 +3513,12 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 return Err(Error::InvalidValue);
             }
             let new = mapping::resample_mesh(&s.output_mesh, s.mesh_cols, cols, rows);
-            // Handles are indexed by grid position, so a new grid starts with zero handles.
-            let old_tangents = std::mem::take(&mut s.mesh_tangents);
+            // Handles are indexed by grid position: they follow their (row, col).
+            let old_cols = s.mesh_cols;
+            let old_rows = (s.output_mesh.len() as u32) / old_cols.max(1);
+            let remapped =
+                slice_adv::remap_tangents(&s.mesh_tangents, old_cols, old_rows, cols, rows);
+            let old_tangents = std::mem::replace(&mut s.mesh_tangents, remapped);
             let mut inverse = Command::SetSliceMesh {
                 screen,
                 slice,

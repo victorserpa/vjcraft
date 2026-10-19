@@ -231,3 +231,38 @@ fn a_clip_that_gave_its_session_away_gets_one_back_when_the_taker_closes() {
     }
     assert_eq!(a.decode_status(), Some("hw"), "A got a free session back");
 }
+
+/// Drives A (a preview scrub, moving) and B (moving) for `ms`.
+fn scrub_pair(a: &Player, b: &Player, ms: u64) {
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(ms) {
+        a.set_position((t.elapsed().as_millis() as f64 / 3000.0).fract());
+        b.set_position((t.elapsed().as_millis() as f64 / 4000.0).fract());
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+#[test]
+fn a_stale_on_air_player_scrubbed_by_preview_is_not_busy() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(path) = clip("stale-busy") else {
+        return;
+    };
+    setup(1);
+    let a = open_with_frame(&path);
+    a.set_on_air(true);
+    assert_eq!(a.decode_status(), Some("hw"));
+    let b = open_with_frame(&path);
+    b.set_on_air(true);
+    // Control: A still told on air and moving is busy, B cannot take the session.
+    scrub_pair(&a, &b, 4000);
+    assert_eq!(a.decode_status(), Some("hw"), "control: busy A keeps it");
+    // The app marks A off air when it leaves the layer; the preview scrub is not busy.
+    a.set_on_air(false);
+    scrub_pair(&a, &b, 6000);
+    assert_eq!(
+        b.decode_status(),
+        Some("hw"),
+        "B takes the stale player's session"
+    );
+}

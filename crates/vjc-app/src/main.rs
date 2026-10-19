@@ -3933,6 +3933,8 @@ impl State {
                             .preload
                             .take(deck, src, column, &path)
                             .unwrap_or_else(|| Player::open_scrub(&path));
+                        // A warmed player was opened off air; it is on air from here.
+                        player.set_on_air(true);
                         if let Some(engine) = self.audio_engine() {
                             player.attach_audio(&engine);
                         }
@@ -4401,6 +4403,11 @@ impl State {
                     seed,
                 )
             });
+        // A clip that fades out stays on air (and keeps its hw session) until the fade
+        // ends and it is dropped; a clip cut straight away is off air now.
+        if state == vjc_core::transition::State::Idle {
+            old.set_on_air(false);
+        }
         if state != vjc_core::transition::State::Idle {
             self.flow.outgoing.insert(
                 layer,

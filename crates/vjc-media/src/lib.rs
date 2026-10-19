@@ -405,6 +405,15 @@ impl Player {
             .store(if on_air { 1 } else { 2 }, Ordering::Relaxed);
     }
 
+    /// What the last `set_on_air` told: `None` when never called.
+    pub fn told_on_air(&self) -> Option<bool> {
+        match self.shared.on_air.load(Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
+    }
+
     /// Access hint: true when the position only advances (streaming, no cache), false when
     /// it jumps around (cache if the global budget admits it, else keyframe seeks).
     /// May change at any time; the decode thread switches without blocking the caller.
@@ -1573,7 +1582,6 @@ fn scrub_loop(
             continue;
         }
         shown = pos;
-        idle_since = Instant::now();
         yielded = false;
         let first = std::mem::replace(&mut preloaded, true);
         let on_air = match told {
@@ -1582,7 +1590,10 @@ fn scrub_loop(
             _ => first,
         };
         if on_air {
+            // Only moves on air count as activity; a preview scrub of an off-air
+            // player must not make it look busy to eviction.
             sc.holder.touch();
+            idle_since = Instant::now();
         }
         if on_air && want_hw && cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
             want_hw = !sc.acquire_hw();
