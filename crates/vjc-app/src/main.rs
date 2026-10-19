@@ -4401,6 +4401,8 @@ impl State {
                     seed,
                 )
             });
+        // The replaced clip is off air whether it fades out or is dropped.
+        old.set_on_air(false);
         if state != vjc_core::transition::State::Idle {
             self.flow.outgoing.insert(
                 layer,

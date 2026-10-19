@@ -97,6 +97,8 @@ impl Preload {
             let key = (deck, l, c);
             if let std::collections::hash_map::Entry::Vacant(e) = self.players.entry(key) {
                 let player = open(&path);
+                // Preloaded, not on air: it must never evict an idle on-air holder.
+                player.set_on_air(false);
                 e.insert((path, player));
             }
         }
@@ -166,6 +168,18 @@ mod tests {
 
     fn open(p: &Path) -> Player {
         Player::open_scrub(p)
+    }
+
+    #[test]
+    fn preloaded_players_are_marked_off_air() {
+        let (_p, deck, ids) = project(1, 1);
+        let path = std::path::PathBuf::from("/nope/0-0.mp4");
+        let mut pre = Preload::default();
+        pre.warm(deck, vec![(ids[0], 0, path.clone())], open);
+        let pl = pre.take(deck, ids[0], 0, &path).unwrap();
+        assert_eq!(pl.told_on_air(), Some(false));
+        // Control: a freshly opened player was never told.
+        assert_eq!(open(&path).told_on_air(), None);
     }
 
     #[test]
