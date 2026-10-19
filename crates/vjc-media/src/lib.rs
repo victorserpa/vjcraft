@@ -2131,6 +2131,24 @@ mod tests {
             }
             let mut sc = Scrubber::open(&clip).unwrap();
             let got = sc.next().unwrap().1;
+            // Playback keeps the stored pixels and the orientation; baked, they match ffmpeg.
+            let turned = matches!(got.orient.deg, 90 | 270);
+            assert_eq!(
+                got.display_size(),
+                if turned {
+                    (got.height, got.width)
+                } else {
+                    (got.width, got.height)
+                },
+                "{name}"
+            );
+            let info = probe(&clip).unwrap();
+            assert_eq!(
+                (info.width, info.height),
+                got.display_size(),
+                "{name} probe"
+            );
+            let got = got.oriented();
             assert!(*got.data == std::fs::read(&raw).unwrap(), "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);

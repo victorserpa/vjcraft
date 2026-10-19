@@ -1540,10 +1540,124 @@ struct GroupBuf {
 struct Slot {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Turned (displayed) size: the size of `tex`, which everything downstream sees.
     size: (u32, u32),
+    /// Stored size of the uploaded picture and how it turns into `tex`.
+    stored: (u32, u32),
+    orient: vjc_media::Orient,
+    /// Stored-orientation picture and the pass that turns it into `tex`; only when the
+    /// orientation is not the identity.
+    turn: Option<Turn>,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
     seq: u64,
+}
+
+/// Staging texture and bind group of a layer whose picture is turned on the GPU.
+struct Turn {
+    raw: wgpu::Texture,
+    raw_view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+}
+
+/// Turns a stored-orientation texture into the displayed one (quarter turns and mirror),
+/// by pixel: the same table as `vjc_media::Frame::oriented`.
+struct Turner {
+    pipe: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+}
+
+const TURN_SHADER: &str = r#"
+struct U { code: u32, w: u32, h: u32, _p: u32 }
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let w = i32(u.w);
+    let h = i32(u.h);
+    var s = p;
+    switch (u.code & 3u) {
+        case 1u: { s = vec2<i32>(w - 1 - p.y, p.x); }
+        case 2u: { s = vec2<i32>(w - 1 - p.x, h - 1 - p.y); }
+        case 3u: { s = vec2<i32>(p.y, h - 1 - p.x); }
+        default: {}
+    }
+    if ((u.code & 4u) != 0u) { s.x = w - 1 - s.x; }
+    return textureLoad(src, s, 0);
+}
+"#;
+
+impl Turner {
+    fn new(device: &wgpu::Device) -> Turner {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("turn"),
+            source: wgpu::ShaderSource::Wgsl(TURN_SHADER.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("turn_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("turn_pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("turn"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        Turner { pipe, bgl }
+    }
 }
 
 pub struct Compositor {
@@ -1578,6 +1692,7 @@ pub struct Compositor {
     /// The matching `LayerDraw.frame` carries the size and seq with an empty pixel slice.
     pub hap_in: HashMap<LayerId, std::sync::Arc<vjc_media::hap::HapFrame>>,
     hap: Option<crate::hap_gpu::HapGpu>,
+    turner: Turner,
     group: Option<GroupBuf>,
     /// Layers / groups rendered on their own because a slice routes them (only the ones
     /// in use are kept).
@@ -1989,6 +2104,7 @@ impl Compositor {
             slots: HashMap::new(),
             hap_in: HashMap::new(),
             hap: crate::hap_gpu::HapGpu::new(device),
+            turner: Turner::new(device),
             group: None,
             routed: HashMap::new(),
             preview: None,
@@ -2638,28 +2754,72 @@ impl Compositor {
             h.retain(&hap_live);
         }
         for l in all_layers {
-            let (w, h, data, seq) = match (&l.frame, &l.generator) {
+            let (sw, sh, data, seq) = match (&l.frame, &l.generator) {
                 (Some((w, h, data, seq)), _) => (*w, *h, Some(*data), *seq),
                 (None, Some(_)) => (self.size.0.max(1), self.size.1.max(1), None, u64::MAX),
                 (None, None) => continue,
             };
-            let recreate = self.slots.get(&l.id).is_none_or(|s| s.size != (w, h));
+            // Generators have no stored picture: nothing to turn.
+            let orient = if l.frame.is_some() {
+                l.orient
+            } else {
+                Default::default()
+            };
+            // `w` x `h` is the displayed size: the layer texture and all downstream work.
+            let (w, h) = orient.size(sw, sh);
+            let recreate = self
+                .slots
+                .get(&l.id)
+                .is_none_or(|s| s.size != (w, h) || s.stored != (sw, sh) || s.orient != orient);
             if recreate {
-                let tex = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("layer"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
+                let make_tex = |label, (tw, th)| {
+                    device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: tw,
+                            height: th,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: FORMAT,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    })
+                };
+                let tex = make_tex("layer", (w, h));
+                let turn = (orient != Default::default()).then(|| {
+                    let raw = make_tex("layer_raw", (sw, sh));
+                    let raw_view = raw.create_view(&Default::default());
+                    let u = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("turn_u"),
+                        size: 16,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    queue.write_buffer(&u, 0, bytemuck::cast_slice(&[orient.code(), sw, sh, 0u32]));
+                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("turn_bg"),
+                        layout: &self.turner.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: u.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&raw_view),
+                            },
+                        ],
+                    });
+                    Turn {
+                        raw,
+                        raw_view,
+                        bind,
+                    }
                 });
                 let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("layer_u"),
@@ -2692,6 +2852,9 @@ impl Compositor {
                         view,
                         tex,
                         size: (w, h),
+                        stored: (sw, sh),
+                        orient,
+                        turn,
                         uniform,
                         bind,
                         seq: u64::MAX,
@@ -2699,12 +2862,19 @@ impl Compositor {
                 );
             }
             let slot = self.slots.get_mut(&l.id).unwrap();
+            // The picture lands in the stored-orientation texture when it has to be turned.
+            let (up_tex, up_view) = match &slot.turn {
+                Some(t) => (&t.raw, &t.raw_view),
+                None => (&slot.tex, &slot.view),
+            };
+            let mut uploaded = false;
             if let Some(hf) = self.hap_in.get(&l.id) {
                 if slot.seq != seq
                     && let Some(g) = &mut self.hap
                 {
-                    g.decode(device, queue, l.id, hf, &slot.view);
+                    g.decode(device, queue, l.id, hf, up_view);
                     slot.seq = seq;
+                    uploaded = true;
                 }
             } else if let Some(data) = data
                 && !data.is_empty()
@@ -2712,7 +2882,7 @@ impl Compositor {
             {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &slot.tex,
+                        texture: up_tex,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -2720,16 +2890,44 @@ impl Compositor {
                     data,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(4 * w),
-                        rows_per_image: Some(h),
+                        bytes_per_row: Some(4 * sw),
+                        rows_per_image: Some(sh),
                     },
                     wgpu::Extent3d {
-                        width: w,
-                        height: h,
+                        width: sw,
+                        height: sh,
                         depth_or_array_layers: 1,
                     },
                 );
                 slot.seq = seq;
+                uploaded = true;
+            }
+            if uploaded && let Some(t) = &slot.turn {
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("turn"),
+                });
+                {
+                    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("turn"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &slot.view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.turner.pipe);
+                    pass.set_bind_group(0, &t.bind, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                queue.submit(Some(enc.finish()));
             }
             let (sx, sy) = fit_scale((w, h), self.size, l.fit);
             queue.write_buffer(
