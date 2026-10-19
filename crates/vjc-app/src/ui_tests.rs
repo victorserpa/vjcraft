@@ -6796,6 +6796,9 @@ fn transport_pause_and_play_leave_no_undo_entry_for_the_clip_directions() {
     click(&mut h, "Pause tempo clock");
     assert_eq!(dir(&h), Some(vjc_model::Direction::Pause));
     assert!(!h.state().history.can_undo(), "pause records no undo entry");
+    click(&mut h, "Play tempo clock");
+    assert_eq!(dir(&h), Some(vjc_model::Direction::Forward));
+    assert!(!h.state().history.can_undo(), "play records no undo entry");
 }
 
 #[test]

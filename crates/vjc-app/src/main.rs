@@ -572,8 +572,6 @@ fn scale_to_apply(applied: &mut Option<f32>, pref: f32, dragging: bool) -> Optio
     Some(pref)
 }
 
-/// Rewrites the column of a queued command after columns moved; false when its column was
-/// removed (the command is dropped).
 /// Whether the palette may take arrows and Enter: nothing is focused or its own field is.
 fn palette_owns_keys(focused: Option<egui::Id>, query: egui::Id) -> bool {
     focused.is_none_or(|f| f == query)
@@ -587,6 +585,8 @@ fn every_loops_edit(a: &vjc_model::Autopilot, n: f32) -> vjc_model::Autopilot {
     }
 }
 
+/// Rewrites the column of a queued command after columns moved; false when its column was
+/// removed (the command is dropped).
 fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
     match cmd {
         Command::ImportMedia { column, .. }
