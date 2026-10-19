@@ -488,6 +488,7 @@ mod tests {
                 transform: crate::compositor::Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
@@ -501,6 +502,63 @@ mod tests {
                 .max()
                 .unwrap();
             assert!(max <= 16, "{fmt:?}: pixels differ by {max}");
+        }
+    }
+
+    /// A HAP layer with an orientation plays turned: the compressed frame is decoded on the
+    /// GPU and turned in the compositor, like any other picture.
+    #[test]
+    fn hap_frame_is_turned_on_the_gpu() {
+        use crate::compositor::{Compositor, LayerDraw};
+        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((device, queue)) = device(true) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("vjc-hapgpu-turn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("turn.mov");
+        write_clip(&path, Kind::Hap, (62, 34), 3, 2).unwrap();
+        let reference = vjc_media::decode_n(&path, 1).unwrap().remove(0);
+        let hap = first_hap_frame(&path)
+            .hap
+            .clone()
+            .expect("compressed frame");
+        let id = LayerId::from_u128(1);
+        for code in 1..8 {
+            let orient = vjc_media::Orient::from_code(code);
+            let want = vjc_media::Frame {
+                orient,
+                ..reference.clone()
+            };
+            let (lw, lh) = want.display_size();
+            let want = want.oriented();
+            let mut comp = Compositor::new(&device, lw, lh);
+            comp.hap_in.insert(id, hap.clone());
+            let blank = vec![0u8; 62 * 34 * 4];
+            let layer = [LayerDraw {
+                id,
+                opacity: 1.0,
+                blend: Default::default(),
+                fit: vjc_model::FitMode::Stretch,
+                effects: vec![],
+                frame: Some((62, 34, &blank, 1)),
+                generator: None,
+                transition: None,
+                transform: crate::compositor::Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+                orient,
+            }];
+            comp.render(&device, &queue, &layer, &[], 1.0);
+            let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
+            assert_eq!((w, h), (lw, lh), "orientation {code}");
+            let max = got
+                .iter()
+                .zip(want.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(max <= 16, "orientation {code}: pixels differ by {max}");
         }
     }
 

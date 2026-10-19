@@ -4427,6 +4427,7 @@ impl State {
             h.seek(vjc_core::playback::to_local(pos, reg));
         }
         if let Some((_, _, p)) = self.players.get(&layer) {
+            p.set_on_air(true);
             p.set_position(pos);
         }
         self.flow.pos.insert(layer, pos);
@@ -4795,6 +4796,7 @@ impl State {
                     head.seek(vjc_core::playback::to_local(np, reg));
                     position = np;
                 }
+                player.set_on_air(true);
                 player.set_position(position);
                 // Audio only at forward 1x; any other speed, direction or pause is muted.
                 let audible = rate.is_finite()
@@ -5275,7 +5277,13 @@ impl State {
             return;
         }
         let player = match source {
-            vjc_model::Source::File { path } if path.exists() => Some(Player::open_scrub(path)),
+            vjc_model::Source::File { path } if path.exists() => {
+                let p = Player::open_scrub(path);
+                // Looped on its own clock for the preview: never claims a hardware session
+                // from a clip that is on a layer.
+                p.set_on_air(false);
+                Some(p)
+            }
             _ => None,
         };
         self.clip_prev = Some(ClipPreview {
@@ -5300,7 +5308,10 @@ impl State {
             .filter(|(d, c, _)| *d == deck && *c == column)
             .and_then(|(_, _, p)| p.latest_frame());
         let shot = match playing {
-            Some(f) if f.hap.is_none() => Some((f.width, f.height, f.data.to_vec())),
+            Some(f) if f.hap.is_none() => {
+                let f = f.oriented();
+                Some((f.width, f.height, f.data.to_vec()))
+            }
             Some(_) => frame
                 .wgpu_render_state()
                 .zip(self.comp.as_ref())
@@ -5489,7 +5500,7 @@ impl State {
                 continue;
             }
             // Clip chain first, then the layer chain.
-            let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
+            let size = f.as_ref().map_or((w, h), |f| f.display_size());
             let clip = active_of(players, gens, l.id)
                 .and_then(|(d, col)| clip_for(&self.project, origin, l.id, d, col));
             // Strip video: this clip's picture is not drawn (its audio keeps playing).
@@ -5590,7 +5601,7 @@ impl State {
                     None,
                     &l.track.effects,
                     time,
-                    (of.width, of.height),
+                    of.display_size(),
                     &lctx,
                 );
                 draw_groups.push(l.group);
@@ -5607,14 +5618,15 @@ impl State {
                     transition: Some((kind.shader_id(), prog, true)),
                     transform: compositor::area_affine(
                         &l.extras,
-                        (of.width, of.height),
+                        of.display_size(),
                         (w, h),
                         l.extras.auto_size.fit().unwrap_or(o.fit),
                     )
                     .map_or(layer_xf, |a| layer_xf.through(&a)),
                     channels: channels_of(o.clip.as_ref()),
                     mask: l.mask_mode,
-                    frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
+                    frame: compositor::frame_input(Some(of)).0,
+                    orient: compositor::frame_input(Some(of)).1,
                 });
             }
             draw_groups.push(l.group);
@@ -5632,9 +5644,8 @@ impl State {
                 transform: xf,
                 channels: channels_of(clip),
                 mask: l.mask_mode,
-                frame: f
-                    .as_ref()
-                    .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
+                frame: compositor::frame_input(f.as_ref()).0,
+                orient: compositor::frame_input(f.as_ref()).1,
             });
         }
         // The previewed clip, drawn alone with its own effects: last in the list, so the
@@ -5657,7 +5668,7 @@ impl State {
                 .clip_prev
                 .as_ref()
                 .map_or(0.0, |p| p.since.elapsed().as_secs_f32());
-            let size = prev_frame.as_ref().map_or((w, h), |f| (f.width, f.height));
+            let size = prev_frame.as_ref().map_or((w, h), |f| f.display_size());
             let generator = match &k.source {
                 vjc_model::Source::Generator { kind, params } => {
                     self.fx.request(kind);
@@ -5690,9 +5701,7 @@ impl State {
                 size,
                 &pctx,
             );
-            let frame = prev_frame
-                .as_ref()
-                .map(|f| (f.width, f.height, f.data.as_slice(), f.seq));
+            let (frame, prev_orient) = compositor::frame_input(prev_frame.as_ref());
             if let Some(h) = prev_frame.as_ref().and_then(|f| f.hap.clone()) {
                 hap_in.insert(compositor::PREVIEW_CLIP_ID, h);
             }
@@ -5710,6 +5719,7 @@ impl State {
                     channels: k.channels,
                     mask: Default::default(),
                     frame,
+                    orient: prev_orient,
                 });
             }
         }

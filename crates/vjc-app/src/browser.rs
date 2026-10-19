@@ -1196,6 +1196,7 @@ mod tests {
             data: Arc::new(vec![0; bytes]),
             seq: 1,
             hap: None,
+            orient: Default::default(),
         })
     }
 

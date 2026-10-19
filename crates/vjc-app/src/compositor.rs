@@ -1380,7 +1380,23 @@ pub struct LayerDraw<'a> {
     /// What this layer masks. A layer with a mask mode is not drawn: its luminance (drawn on
     /// black with its own fit, effects and opacity) multiplies the layer(s) below it.
     pub mask: vjc_model::MaskMode,
+    /// How the stored pixels of `frame` turn for display. `frame`'s width and height are the
+    /// stored ones; the layer texture has the turned size.
+    pub orient: vjc_media::Orient,
 }
+
+/// What a decoded frame hands to `LayerDraw`: the stored picture and the turn the GPU
+/// applies. Every consumer of a player's frame goes through here so none can show a
+/// rotated clip unturned.
+pub fn frame_input(f: Option<&vjc_media::Frame>) -> (Option<FrameRef<'_>>, vjc_media::Orient) {
+    (
+        f.map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
+        f.map(|f| f.orient).unwrap_or_default(),
+    )
+}
+
+/// `(width, height, rgba, seq)` of a stored picture.
+pub type FrameRef<'a> = (u32, u32, &'a [u8], u64);
 
 /// Where `draw_layer` puts its pass.
 #[derive(Clone, Copy, PartialEq)]
@@ -1537,10 +1553,124 @@ struct GroupBuf {
 struct Slot {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Turned (displayed) size: the size of `tex`, which everything downstream sees.
     size: (u32, u32),
+    /// Stored size of the uploaded picture and how it turns into `tex`.
+    stored: (u32, u32),
+    orient: vjc_media::Orient,
+    /// Stored-orientation picture and the pass that turns it into `tex`; only when the
+    /// orientation is not the identity.
+    turn: Option<Turn>,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
     seq: u64,
+}
+
+/// Staging texture and bind group of a layer whose picture is turned on the GPU.
+struct Turn {
+    raw: wgpu::Texture,
+    raw_view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+}
+
+/// Turns a stored-orientation texture into the displayed one (quarter turns and mirror),
+/// by pixel: the same table as `vjc_media::Frame::oriented`.
+struct Turner {
+    pipe: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+}
+
+const TURN_SHADER: &str = r#"
+struct U { code: u32, w: u32, h: u32, _p: u32 }
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let w = i32(u.w);
+    let h = i32(u.h);
+    var s = p;
+    switch (u.code & 3u) {
+        case 1u: { s = vec2<i32>(w - 1 - p.y, p.x); }
+        case 2u: { s = vec2<i32>(w - 1 - p.x, h - 1 - p.y); }
+        case 3u: { s = vec2<i32>(p.y, h - 1 - p.x); }
+        default: {}
+    }
+    if ((u.code & 4u) != 0u) { s.x = w - 1 - s.x; }
+    return textureLoad(src, s, 0);
+}
+"#;
+
+impl Turner {
+    fn new(device: &wgpu::Device) -> Turner {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("turn"),
+            source: wgpu::ShaderSource::Wgsl(TURN_SHADER.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("turn_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("turn_pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("turn"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        Turner { pipe, bgl }
+    }
 }
 
 pub struct Compositor {
@@ -1575,6 +1705,7 @@ pub struct Compositor {
     /// The matching `LayerDraw.frame` carries the size and seq with an empty pixel slice.
     pub hap_in: HashMap<LayerId, std::sync::Arc<vjc_media::hap::HapFrame>>,
     hap: Option<crate::hap_gpu::HapGpu>,
+    turner: Turner,
     group: Option<GroupBuf>,
     /// Layers / groups rendered on their own because a slice routes them (only the ones
     /// in use are kept).
@@ -1986,6 +2117,7 @@ impl Compositor {
             slots: HashMap::new(),
             hap_in: HashMap::new(),
             hap: crate::hap_gpu::HapGpu::new(device),
+            turner: Turner::new(device),
             group: None,
             routed: HashMap::new(),
             preview: None,
@@ -2009,7 +2141,11 @@ impl Compositor {
         fixed += self.routed.values().map(|r| b(&r.0)).sum::<u64>();
         crate::vram::Usage {
             fixed,
-            players: self.slots.values().map(|s| b(&s.tex)).sum(),
+            players: self
+                .slots
+                .values()
+                .map(|s| b(&s.tex) + s.turn.as_ref().map_or(0, |t| b(&t.raw)))
+                .sum(),
             pool: self
                 .fx
                 .scratch
@@ -2084,7 +2220,25 @@ impl Compositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Option<(u32, u32, Vec<u8>)> {
-        let tex = self.readable();
+        Self::read_texture(device, queue, self.readable())
+    }
+
+    /// Blocking readback of what a routed source (e.g. the Preview) drew last.
+    #[cfg(test)]
+    pub fn read_routed(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: SliceSource,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        Self::read_texture(device, queue, &self.routed.get(&source)?.0)
+    }
+
+    fn read_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+    ) -> Option<(u32, u32, Vec<u8>)> {
         let (w, h) = (tex.width(), tex.height());
         let row = (w * 4).div_ceil(256) * 256;
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2635,28 +2789,72 @@ impl Compositor {
             h.retain(&hap_live);
         }
         for l in all_layers {
-            let (w, h, data, seq) = match (&l.frame, &l.generator) {
+            let (sw, sh, data, seq) = match (&l.frame, &l.generator) {
                 (Some((w, h, data, seq)), _) => (*w, *h, Some(*data), *seq),
                 (None, Some(_)) => (self.size.0.max(1), self.size.1.max(1), None, u64::MAX),
                 (None, None) => continue,
             };
-            let recreate = self.slots.get(&l.id).is_none_or(|s| s.size != (w, h));
+            // Generators have no stored picture: nothing to turn.
+            let orient = if l.frame.is_some() {
+                l.orient
+            } else {
+                Default::default()
+            };
+            // `w` x `h` is the displayed size: the layer texture and all downstream work.
+            let (w, h) = orient.size(sw, sh);
+            let recreate = self
+                .slots
+                .get(&l.id)
+                .is_none_or(|s| s.size != (w, h) || s.stored != (sw, sh) || s.orient != orient);
             if recreate {
-                let tex = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("layer"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
+                let make_tex = |label, (tw, th)| {
+                    device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: tw,
+                            height: th,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: FORMAT,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    })
+                };
+                let tex = make_tex("layer", (w, h));
+                let turn = (orient != Default::default()).then(|| {
+                    let raw = make_tex("layer_raw", (sw, sh));
+                    let raw_view = raw.create_view(&Default::default());
+                    let u = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("turn_u"),
+                        size: 16,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    queue.write_buffer(&u, 0, bytemuck::cast_slice(&[orient.code(), sw, sh, 0u32]));
+                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("turn_bg"),
+                        layout: &self.turner.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: u.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&raw_view),
+                            },
+                        ],
+                    });
+                    Turn {
+                        raw,
+                        raw_view,
+                        bind,
+                    }
                 });
                 let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("layer_u"),
@@ -2689,6 +2887,9 @@ impl Compositor {
                         view,
                         tex,
                         size: (w, h),
+                        stored: (sw, sh),
+                        orient,
+                        turn,
                         uniform,
                         bind,
                         seq: u64::MAX,
@@ -2696,12 +2897,19 @@ impl Compositor {
                 );
             }
             let slot = self.slots.get_mut(&l.id).unwrap();
+            // The picture lands in the stored-orientation texture when it has to be turned.
+            let (up_tex, up_view) = match &slot.turn {
+                Some(t) => (&t.raw, &t.raw_view),
+                None => (&slot.tex, &slot.view),
+            };
+            let mut uploaded = false;
             if let Some(hf) = self.hap_in.get(&l.id) {
                 if slot.seq != seq
                     && let Some(g) = &mut self.hap
                 {
-                    g.decode(device, queue, l.id, hf, &slot.view);
+                    g.decode(device, queue, l.id, hf, up_view);
                     slot.seq = seq;
+                    uploaded = true;
                 }
             } else if let Some(data) = data
                 && !data.is_empty()
@@ -2709,7 +2917,7 @@ impl Compositor {
             {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &slot.tex,
+                        texture: up_tex,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -2717,16 +2925,44 @@ impl Compositor {
                     data,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(4 * w),
-                        rows_per_image: Some(h),
+                        bytes_per_row: Some(4 * sw),
+                        rows_per_image: Some(sh),
                     },
                     wgpu::Extent3d {
-                        width: w,
-                        height: h,
+                        width: sw,
+                        height: sh,
                         depth_or_array_layers: 1,
                     },
                 );
                 slot.seq = seq;
+                uploaded = true;
+            }
+            if uploaded && let Some(t) = &slot.turn {
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("turn"),
+                });
+                {
+                    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("turn"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &slot.view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.turner.pipe);
+                    pass.set_bind_group(0, &t.bind, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                queue.submit(Some(enc.finish()));
             }
             let (sx, sy) = fit_scale((w, h), self.size, l.fit);
             queue.write_buffer(
@@ -3196,6 +3432,65 @@ mod tests {
         assert!((w - 400.0).abs() > 1.0 && (h - 300.0).abs() > 1.0);
     }
 
+    /// A 3x2 picture with six distinct pixels, rendered in each of the eight orientations,
+    /// equals the CPU-oriented copy (the reference, checked against ffmpeg in vjc-media).
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_orientation_matches_cpu_reference() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let stored: Vec<u8> = (0..6u8)
+            .flat_map(|i| [40 * i + 10, 255 - 30 * i, 17 * i, 255])
+            .collect();
+        for code in 0..8 {
+            let orient = vjc_media::Orient::from_code(code);
+            let frame = vjc_media::Frame {
+                width: 3,
+                height: 2,
+                data: std::sync::Arc::new(stored.clone()),
+                seq: 1,
+                hap: None,
+                orient,
+            };
+            let (lw, lh) = frame.display_size();
+            let want = frame.clone().oriented();
+            let mut comp = Compositor::new(&device, lw, lh);
+            let layers = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![],
+                frame: Some((3, 2, &stored, 1)),
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+                orient,
+            }];
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            let (w, h, got) = comp.read_rgba(&device, &queue).expect("read");
+            assert_eq!((w, h), (lw, lh), "orientation {code}");
+            for (g, e) in got.iter().zip(want.data.iter()) {
+                assert!(
+                    g.abs_diff(*e) <= 2,
+                    "orientation {code}: {got:?} vs {:?}",
+                    want.data
+                );
+            }
+        }
+    }
+
     /// Renders every composition mode on the GPU and compares one pixel to the Rust reference.
     /// Skipped when there is no adapter.
     #[test]
@@ -3232,6 +3527,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(2),
@@ -3245,6 +3541,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -3313,6 +3610,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         };
         let layers = [
             draw(1, &[0, 0, 0, 255], true),
@@ -3381,6 +3679,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         };
         let layers = [draw(1, old, true), draw(2, new, false)];
         let mut comp = Compositor::new(&device, w, h);
@@ -3467,6 +3766,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         };
         comp.render(&device, &queue, &[layer], &[], 1.0);
         let busy = comp.vram();
@@ -3484,6 +3784,34 @@ mod tests {
         assert_eq!(after.players, busy.players);
         assert_eq!(after.persist, busy.persist);
         assert_eq!(after.fixed, busy.fixed);
+    }
+
+    /// A turned layer holds the displayed texture plus the stored-orientation staging one;
+    /// both count. Control: the same layer unturned counts one. Skipped without an adapter.
+    #[test]
+    fn gpu_vram_counts_the_turn_staging_texture() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let px = [9u8; 4 * 6 * 4];
+        let mut comp = Compositor::new(&device, 4, 6);
+        let mut players = |orient: vjc_media::Orient| {
+            let mut l = solid(5, &[0, 0, 0, 255], 1.0);
+            l.frame = Some((6, 4, &px, 1));
+            l.orient = orient;
+            comp.render(&device, &queue, &[l], &[], 1.0);
+            comp.vram().players
+        };
+        assert_eq!(
+            players(Default::default()),
+            6 * 4 * 4,
+            "unturned: one texture"
+        );
+        assert_eq!(
+            players(vjc_media::Orient::from_code(1)),
+            2 * 6 * 4 * 4,
+            "turned: displayed + staging"
+        );
     }
 
     fn px_near(px: [u8; 4], v: u8) -> bool {
@@ -3740,6 +4068,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
             comp.render(&device, &queue, &layer, &master, 1.0);
@@ -3820,6 +4149,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3894,6 +4224,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4009,6 +4340,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots");
@@ -4211,6 +4543,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 }];
                 comp.render(&device, &queue, &layer, &[], 1.0);
                 let data = read_target(&device, &queue, &comp);
@@ -4287,6 +4620,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let data = read_target(&device, &queue, &comp);
@@ -4374,6 +4708,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4435,6 +4770,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(device, queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4488,6 +4824,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
@@ -4696,6 +5033,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             comp.read_rgba(&device, &queue).unwrap().2
@@ -4791,6 +5129,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 }];
                 comp.render(&device, &queue, &layer, &[], 1.0);
                 last = read_px(&device, &queue, &comp);
@@ -4847,6 +5186,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render_routed(&device, &queue, (&layer, &[]), (&[], 1.0), &routes);
             main_px = read_px(&device, &queue, &comp);
@@ -4882,6 +5222,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }
     }
 
@@ -5530,6 +5871,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -5553,6 +5895,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layer, &[], 1.0);
@@ -5627,6 +5970,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             if round == 0 {
@@ -5708,6 +6052,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let col = read_col(&device, &queue, &comp, 4);
@@ -5949,6 +6294,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -5971,6 +6317,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -6000,6 +6347,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }
     }
 
@@ -6696,6 +7044,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 })
                 .collect();
             let t = std::time::Instant::now();
@@ -6712,5 +7061,110 @@ mod tests {
             stats.avg(),
             stats.p99()
         );
+    }
+
+    /// A real clip tagged 90 degrees, played through a `Player`: the layer output, the clip
+    /// preview output and the baked copy all come out portrait and equal. Every consumer
+    /// maps the frame through `frame_input`, so this is the one place that can go wrong.
+    /// Skipped without a GPU or ffmpeg.
+    #[test]
+    fn rotated_clip_shows_turned_in_layer_and_clip_preview() {
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("vjc-rot-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, clip) = (dir.join("base.mp4"), dir.join("r90.mp4"));
+        let ff = |args: &[&str]| {
+            std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let made = ff(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=10:duration=1",
+            "-pix_fmt",
+            "yuv420p",
+            base.to_str().unwrap(),
+        ]) && ff(&[
+            "-display_rotation",
+            "90",
+            "-i",
+            base.to_str().unwrap(),
+            "-c",
+            "copy",
+            clip.to_str().unwrap(),
+        ]);
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("ffmpeg missing or lacks -display_rotation: skipped");
+            return;
+        }
+        let mut player = vjc_media::Player::open_scrub(&clip);
+        let t = std::time::Instant::now();
+        let frame = loop {
+            if let Some(f) = player.latest_frame() {
+                break f;
+            }
+            assert!(t.elapsed().as_secs() < 10, "no frame");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        player.stop();
+        assert_eq!((frame.width, frame.height), (160, 120), "stored pixels");
+        assert_eq!(frame.display_size(), (120, 160), "displayed portrait");
+        let want = frame.clone().oriented();
+        assert_eq!((want.width, want.height), (120, 160));
+        let draw = |id: LayerId| {
+            let (f, orient) = frame_input(Some(&frame));
+            LayerDraw {
+                id,
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![],
+                frame: f,
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+                orient,
+            }
+        };
+        let close = |got: &[u8], what: &str| {
+            let max = got
+                .iter()
+                .zip(want.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(max <= 3, "{what}: pixels differ by {max}");
+        };
+        let mut comp = Compositor::new(&device, 120, 160);
+        // Layer output.
+        comp.render(&device, &queue, &[draw(uuid::Uuid::from_u128(1))], &[], 1.0);
+        let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
+        assert_eq!((w, h), (120, 160), "layer is portrait");
+        close(&got, "layer");
+        // Clip preview output: the preview-only clip, routed to the Preview.
+        comp.preview = Some(SliceSource::Layer(PREVIEW_CLIP_ID));
+        comp.render_routed(
+            &device,
+            &queue,
+            (&[draw(PREVIEW_CLIP_ID)], &[]),
+            (&[], 1.0),
+            &[],
+        );
+        let (w, h, got) = comp
+            .read_routed(&device, &queue, SliceSource::Preview)
+            .expect("preview rendered");
+        assert_eq!((w, h), (120, 160), "preview is portrait");
+        close(&got, "preview");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

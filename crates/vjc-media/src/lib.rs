@@ -47,9 +47,33 @@ pub struct Frame {
     pub seq: u64,
     /// HAP frame still block-compressed (`data` is empty then); the GPU decodes it.
     pub hap: Option<Arc<hap::HapFrame>>,
+    /// How the stored pixels turn for display. `width` / `height` and `data` stay as
+    /// decoded; the renderer applies this on the GPU (no CPU copy).
+    pub orient: Orient,
 }
 
 impl Frame {
+    /// Displayed size in px (after the quarter turn).
+    pub fn display_size(&self) -> (u32, u32) {
+        self.orient.size(self.width, self.height)
+    }
+
+    /// The frame with its orientation baked into the pixels (CPU copy). For thumbnails,
+    /// snapshots and tests; playback never calls it. Block-compressed frames are returned
+    /// as they are, orientation included.
+    pub fn oriented(self) -> Frame {
+        if self.hap.is_some() {
+            // The GPU turns block-compressed frames; keep the tag so display_size stays right.
+            return self;
+        }
+        let o = self.orient;
+        let f = rotate_frame(self, o.deg, o.flip);
+        Frame {
+            orient: Orient::default(),
+            ..f
+        }
+    }
+
     /// Bytes this frame holds in memory (cache accounting).
     pub fn bytes(&self) -> usize {
         self.hap.as_ref().map_or(self.data.len(), |h| h.bytes())
@@ -118,6 +142,12 @@ pub(crate) struct Shared {
     duration: AtomicU64,
     /// Wanted position 0..1 (f64 bits).
     position: AtomicU64,
+    /// Counts `set_position` calls: a clip driven by the app is on air even when its
+    /// position does not change (a trigger at the preload position, a paused clip).
+    drives: AtomicU64,
+    /// Whether the app says this clip is the layer's active clip: 0 = not told (inferred
+    /// from `drives`), 1 = on air, 2 = not on air (preloaded, previewed).
+    on_air: AtomicU8,
     /// True while playback only moves forward (streaming is enough).
     sequential: AtomicBool,
     /// Decoder in use: see `hw::ST_*` (0 = not known yet).
@@ -133,6 +163,8 @@ impl Shared {
             convertible: AtomicBool::new(false),
             duration: AtomicU64::new(0),
             position: AtomicU64::new(0.0f64.to_bits()),
+            drives: AtomicU64::new(0),
+            on_air: AtomicU8::new(0),
             sequential: AtomicBool::new(true),
             hw: Arc::new(AtomicU8::new(0)),
         }
@@ -309,6 +341,7 @@ impl Player {
                             data: Arc::new(data),
                             seq,
                             hap: None,
+                            orient: Orient::default(),
                         });
                         true
                     };
@@ -359,6 +392,17 @@ impl Player {
             0.0
         };
         self.shared.position.store(p.to_bits(), Ordering::Relaxed);
+        self.shared.drives.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Tells the player whether it is the active clip of a layer. Only an on-air clip asks
+    /// for a hardware session it lacks; a preloaded or previewed one (also driven by
+    /// `set_position`) never evicts a paused on-air clip. Without a call the player infers
+    /// it from `set_position`.
+    pub fn set_on_air(&self, on_air: bool) {
+        self.shared
+            .on_air
+            .store(if on_air { 1 } else { 2 }, Ordering::Relaxed);
     }
 
     /// Access hint: true when the position only advances (streaming, no cache), false when
@@ -477,6 +521,7 @@ fn load_image(path: &Path) -> Result<Frame, String> {
         data: Arc::new(img.into_raw()),
         seq: 1,
         hap: None,
+        orient: Orient::default(),
     })
 }
 
@@ -530,6 +575,7 @@ pub(crate) fn frame_to_rgba(
         data: Arc::new(data),
         seq,
         hap: None,
+        orient: Orient::default(),
     })
 }
 
@@ -553,14 +599,26 @@ pub struct SourceInfo {
 /// an optional horizontal mirror of the stored pixels. Phone and camera clips store
 /// portrait video as landscape pixels plus a display matrix; front cameras add a mirror.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Orient {
-    deg: u32,
-    flip: bool,
+pub struct Orient {
+    pub deg: u32,
+    pub flip: bool,
 }
 
 impl Orient {
+    /// Shader code: quarter turns (0..3) plus 4 when mirrored.
+    pub fn code(self) -> u32 {
+        (self.deg / 90) % 4 + if self.flip { 4 } else { 0 }
+    }
+
+    pub fn from_code(c: u32) -> Orient {
+        Orient {
+            deg: (c % 4) * 90,
+            flip: c >= 4,
+        }
+    }
+
     /// The displayed size of a `w` x `h` stored picture.
-    fn size(self, w: u32, h: u32) -> (u32, u32) {
+    pub fn size(self, w: u32, h: u32) -> (u32, u32) {
         if matches!(self.deg, 90 | 270) {
             (h, w)
         } else {
@@ -722,13 +780,7 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
     };
     let params = st.parameters();
     let codec = params.id().name().to_string();
-    // Block-compressed HAP frames stay unrotated (see `rotate_frame`), so the size reported
-    // for them is the stored one; everything else is reported as displayed.
-    let orient = if hap::gpu_supported() && hap_probe(path.as_ref()) {
-        Orient::default()
-    } else {
-        stream_orient(&st)
-    };
+    let orient = stream_orient(&st);
     let vpx = vpx_alpha_codec(&st);
     let vpx_alpha = vpx.is_some();
     let (width, height, alpha) = open_sw(params, vpx).ok().map_or((0, 0, false), |d| {
@@ -997,8 +1049,10 @@ impl Scrubber {
     /// Converts a decoded frame to RGBA.
     fn convert(&mut self, decoded: &ff::frame::Video) -> Result<Frame, ff::Error> {
         self.count += 1;
-        frame_to_rgba(&mut self.scaler, decoded, self.count)
-            .map(|f| rotate_frame(f, self.orient.deg, self.orient.flip))
+        frame_to_rgba(&mut self.scaler, decoded, self.count).map(|f| Frame {
+            orient: self.orient,
+            ..f
+        })
     }
 
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
@@ -1151,6 +1205,7 @@ impl Scrubber {
                     data: Arc::new(Vec::new()),
                     seq: self.count,
                     hap: Some(Arc::new(h)),
+                    orient: self.orient,
                 };
                 self.last_t = t;
                 self.last = Some(f.clone());
@@ -1438,6 +1493,13 @@ fn scrub_loop(
     let mut asked = false;
     // The first frame of a clip is only its preload: not yet a sign it is on air.
     let mut preloaded = false;
+    // On air also means the app keeps setting the position; and a request for a session
+    // is repeated while the clip lacks one, since the holder may have been busy (it drops
+    // a request when it moved) or may become idle later.
+    let (mut seen_drives, mut driven_at) = (0u64, None::<Instant>);
+    let mut last_ask = Instant::now();
+    // Gave its session away: does not ask for one back until its position moves again.
+    let mut yielded = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let r = f64::from_bits(refined.load(Ordering::Relaxed));
         if r.is_finite() && r > 0.0 && r != sc.duration {
@@ -1477,18 +1539,48 @@ fn scrub_loop(
             sc.release_hw();
             want_hw = sc.hw_mode == Hw::On && !sc.hap;
             asked = false;
+            yielded = true;
         }
+        let drives = shared.drives.load(Ordering::Relaxed);
+        if drives != seen_drives {
+            seen_drives = drives;
+            driven_at = Some(Instant::now());
+        }
+        let told = shared.on_air.load(Ordering::Relaxed);
+        let driven = match told {
+            1 => true,
+            2 => false,
+            _ => driven_at.is_some_and(|t| t.elapsed() < HW_IDLE),
+        };
         let pos = f64::from_bits(shared.position.load(Ordering::Relaxed));
         if pos == shown {
-            if want_hw && asked && cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
-                want_hw = !sc.acquire_hw();
+            if want_hw && cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
+                if asked {
+                    want_hw = !sc.acquire_hw();
+                }
+                if want_hw && driven && last_ask.elapsed() >= HW_IDLE {
+                    // Still on air without a session: a free one is taken (the clip that
+                    // took ours may have closed); else ask again, unless we just gave ours
+                    // away (two paused clips would trade it forever).
+                    want_hw = !sc.acquire_hw();
+                    if want_hw && !yielded {
+                        asked = hw::evict_idle_holder(&sc.holder, HW_IDLE);
+                    }
+                    last_ask = Instant::now();
+                }
             }
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
         shown = pos;
         idle_since = Instant::now();
-        let on_air = std::mem::replace(&mut preloaded, true);
+        yielded = false;
+        let first = std::mem::replace(&mut preloaded, true);
+        let on_air = match told {
+            1 => true,
+            2 => false,
+            _ => first,
+        };
         if on_air {
             sc.holder.touch();
         }
@@ -1497,6 +1589,7 @@ fn scrub_loop(
             if want_hw {
                 // On air without a session: take one from the longest idle clip.
                 asked = hw::evict_idle_holder(&sc.holder, HW_IDLE);
+                last_ask = Instant::now();
             }
         }
         let target = pos_to_pts(start, sc.duration, pos);
@@ -1553,7 +1646,7 @@ fn thumbnail_inner(path: &Path, max_side: u32) -> Result<Frame, String> {
             .next()
             .ok_or("no frames")?
     };
-    Ok(downscale(&frame, max_side))
+    Ok(downscale(&frame, max_side).oriented())
 }
 
 fn downscale(f: &Frame, max_side: u32) -> Frame {
@@ -1578,6 +1671,7 @@ fn downscale(f: &Frame, max_side: u32) -> Frame {
         data: Arc::new(out),
         seq: 1,
         hap: None,
+        orient: f.orient,
     }
 }
 
@@ -1657,6 +1751,7 @@ mod tests {
                     data: Arc::new(vec![0; 4]),
                     seq: 0,
                     hap: None,
+                    orient: Orient::default(),
                 };
                 (*t, f)
             })
@@ -2097,6 +2192,24 @@ mod tests {
             }
             let mut sc = Scrubber::open(&clip).unwrap();
             let got = sc.next().unwrap().1;
+            // Playback keeps the stored pixels and the orientation; baked, they match ffmpeg.
+            let turned = matches!(got.orient.deg, 90 | 270);
+            assert_eq!(
+                got.display_size(),
+                if turned {
+                    (got.height, got.width)
+                } else {
+                    (got.width, got.height)
+                },
+                "{name}"
+            );
+            let info = probe(&clip).unwrap();
+            assert_eq!(
+                (info.width, info.height),
+                got.display_size(),
+                "{name} probe"
+            );
+            let got = got.oriented();
             assert!(*got.data == std::fs::read(&raw).unwrap(), "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -2188,6 +2301,7 @@ mod tests {
             data: Arc::new(data),
             seq: 1,
             hap: None,
+            orient: Orient::default(),
         };
         let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
         let m = rotate_frame(f.clone(), 0, true);
@@ -2207,6 +2321,7 @@ mod tests {
             data: Arc::new(data.clone()),
             seq: 1,
             hap: None,
+            orient: Orient::default(),
         };
         let r = rotate_frame(f, 90, false);
         assert_eq!((r.width as usize, r.height as usize), (h, w));
@@ -2250,6 +2365,59 @@ mod tests {
         assert_eq!(rotation_from_matrix(0, 0), 0);
     }
 
+    /// Thumbnails of a clip tagged 90 degrees are portrait and equal the turned picture.
+    #[test]
+    fn thumbnail_of_a_rotated_clip_is_turned() {
+        let dir = std::env::temp_dir().join(format!("vjc-thumb-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, clip) = (dir.join("base.mp4"), dir.join("r90.mp4"));
+        let made = make_test_clip(&base)
+            && std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-display_rotation", "90", "-i"])
+                .arg(&base)
+                .args(["-c", "copy"])
+                .arg(&clip)
+                .status()
+                .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let t = thumbnail(&clip, 10_000).unwrap();
+        assert_eq!((t.width, t.height), (240, 320), "portrait thumbnail");
+        assert_eq!(t.orient, Orient::default(), "already turned");
+        let raw = decode_n(&clip, 1).unwrap().remove(0);
+        assert_eq!((raw.width, raw.height), (320, 240), "stored pixels");
+        assert!(*t.data == *raw.oriented().data, "pixels turned");
+        let small = thumbnail(&clip, 64).unwrap();
+        assert_eq!((small.width, small.height), (48, 64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block-compressed frame keeps its orientation through `oriented`: the GPU turns it.
+    #[test]
+    fn oriented_keeps_the_turn_of_a_compressed_frame() {
+        let f = Frame {
+            width: 8,
+            height: 4,
+            data: Arc::new(vec![]),
+            seq: 1,
+            hap: Some(Arc::new(hap::HapFrame {
+                format: hap::HapFormat::Dxt1,
+                width: 8,
+                height: 4,
+                tex_w: 8,
+                tex_h: 4,
+                color: vec![0; 16],
+                alpha: None,
+            })),
+            orient: Orient::from_code(2),
+        };
+        let o = f.clone().oriented();
+        assert_eq!(o.orient, f.orient);
+        assert_eq!(o.display_size(), f.display_size());
+    }
+
     #[test]
     fn rotate_frame_turns_pixels_counter_clockwise() {
         // 3x2: top row A B C, bottom row D E F (one distinct byte per pixel).
@@ -2261,6 +2429,7 @@ mod tests {
             data: Arc::new(data),
             seq: 1,
             hap: None,
+            orient: Orient::default(),
         };
         let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
         let r90 = rotate_frame(f.clone(), 90, false);

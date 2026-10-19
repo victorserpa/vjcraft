@@ -132,11 +132,9 @@ fn check(path: &Path, x: &Expect) -> Result<(), String> {
             _ => Ok(()),
         };
     }
-    if (first.width, first.height) != (x.w, x.h) {
-        problems.push(format!(
-            "frame {}x{} want {}x{}",
-            first.width, first.height, x.w, x.h
-        ));
+    if first.display_size() != (x.w, x.h) {
+        let (w, h) = first.display_size();
+        problems.push(format!("frame {w}x{h} want {}x{}", x.w, x.h));
     }
     if x.alpha && !has_alpha(&first) {
         problems.push("alpha lost (all opaque)".into());
