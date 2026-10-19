@@ -32,7 +32,7 @@ DMG="$DIST/VJCraft-$VERSION-macos.dmg"
 # The vjc-app build links these libs (ffmpeg-sys uses pkg-config), not Homebrew's GPL FFmpeg.
 scripts/build-ffmpeg.sh || { echo "FFmpeg build failed" >&2; exit 1; }
 FFMPEG_PC="$PWD/target/ffmpeg-libs/lib/pkgconfig"
-for f in dav1d libvpx; do FFMPEG_PC="$FFMPEG_PC:$(brew --prefix "$f")/lib/pkgconfig"; done
+FFMPEG_PC="$FFMPEG_PC:$PWD/target/ffmpeg-src/prefix/lib/pkgconfig"  # our dav1d + libvpx
 # Clean the ffmpeg-sys artifacts so a build against Homebrew's FFmpeg is never reused.
 cargo clean --release -p ffmpeg-sys-next
 PKG_CONFIG_PATH="$FFMPEG_PC" cargo build --release -p vjc-app
@@ -100,6 +100,19 @@ cat > "$APP/Contents/Info.plist" <<PL
 PL
 
 scripts/bundle-dylibs.sh "$APP"
+
+# Every Mach-O in the bundle must run on macOS 12.0 (minos <= 12.0).
+min_ok=1
+while IFS= read -r f; do
+  file -b "$f" | grep -q 'Mach-O' || continue
+  mv_list=$(vtool -show-build "$f" | awk '$1=="minos"{print $2}')
+  [ -n "$mv_list" ] || { echo "minos check: no build version in $f" >&2; min_ok=0; continue; }
+  for mv in $mv_list; do
+    awk -v v="$mv" 'BEGIN{split(v,a,".");exit !((a[1]+0)*10000+(a[2]+0)*100+(a[3]+0) <= 120000)}' \
+      || { echo "minos check: $f has minos $mv (> 12.0)" >&2; min_ok=0; }
+  done
+done < <(find "$APP/Contents" -type f \( -perm -u+x -o -name '*.dylib' \))
+[ "$min_ok" -eq 1 ] || { echo "bundle needs a newer macOS than 12.0" >&2; exit 1; }
 
 # Link audit: the binary must use our libav* via @rpath, and no GPL/network/Homebrew-FFmpeg libs.
 EXE_LIBS=$(otool -L "$APP/Contents/MacOS/vjcraft" | tail -n +2 | awk '{print $1}')
