@@ -5617,8 +5617,8 @@ impl State {
                     .map_or(layer_xf, |a| layer_xf.through(&a)),
                     channels: channels_of(o.clip.as_ref()),
                     mask: l.mask_mode,
-                    frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
-                    orient: of.orient,
+                    frame: compositor::frame_input(Some(&of)).0,
+                    orient: compositor::frame_input(Some(&of)).1,
                 });
             }
             draw_groups.push(l.group);
@@ -5636,10 +5636,8 @@ impl State {
                 transform: xf,
                 channels: channels_of(clip),
                 mask: l.mask_mode,
-                frame: f
-                    .as_ref()
-                    .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
-                orient: f.as_ref().map(|f| f.orient).unwrap_or_default(),
+                frame: compositor::frame_input(f.as_ref()).0,
+                orient: compositor::frame_input(f.as_ref()).1,
             });
         }
         // The previewed clip, drawn alone with its own effects: last in the list, so the
@@ -5695,9 +5693,7 @@ impl State {
                 size,
                 &pctx,
             );
-            let frame = prev_frame
-                .as_ref()
-                .map(|f| (f.width, f.height, f.data.as_slice(), f.seq));
+            let (frame, prev_orient) = compositor::frame_input(prev_frame.as_ref());
             if let Some(h) = prev_frame.as_ref().and_then(|f| f.hap.clone()) {
                 hap_in.insert(compositor::PREVIEW_CLIP_ID, h);
             }
@@ -5715,7 +5711,7 @@ impl State {
                     channels: k.channels,
                     mask: Default::default(),
                     frame,
-                    orient: prev_frame.as_ref().map(|f| f.orient).unwrap_or_default(),
+                    orient: prev_orient,
                 });
             }
         }

@@ -60,8 +60,12 @@ impl Frame {
 
     /// The frame with its orientation baked into the pixels (CPU copy). For thumbnails,
     /// snapshots and tests; playback never calls it. Block-compressed frames are returned
-    /// as they are.
+    /// as they are, orientation included.
     pub fn oriented(self) -> Frame {
+        if self.hap.is_some() {
+            // The GPU turns block-compressed frames; keep the tag so display_size stays right.
+            return self;
+        }
         let o = self.orient;
         let f = rotate_frame(self, o.deg, o.flip);
         Frame {
@@ -2333,6 +2337,59 @@ mod tests {
         assert_eq!(rotation_from_matrix(-65536, 0), 180);
         assert_eq!(rotation_from_matrix(0, 65536), 270);
         assert_eq!(rotation_from_matrix(0, 0), 0);
+    }
+
+    /// Thumbnails of a clip tagged 90 degrees are portrait and equal the turned picture.
+    #[test]
+    fn thumbnail_of_a_rotated_clip_is_turned() {
+        let dir = std::env::temp_dir().join(format!("vjc-thumb-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, clip) = (dir.join("base.mp4"), dir.join("r90.mp4"));
+        let made = make_test_clip(&base)
+            && std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-display_rotation", "90", "-i"])
+                .arg(&base)
+                .args(["-c", "copy"])
+                .arg(&clip)
+                .status()
+                .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let t = thumbnail(&clip, 10_000).unwrap();
+        assert_eq!((t.width, t.height), (240, 320), "portrait thumbnail");
+        assert_eq!(t.orient, Orient::default(), "already turned");
+        let raw = decode_n(&clip, 1).unwrap().remove(0);
+        assert_eq!((raw.width, raw.height), (320, 240), "stored pixels");
+        assert!(*t.data == *raw.oriented().data, "pixels turned");
+        let small = thumbnail(&clip, 64).unwrap();
+        assert_eq!((small.width, small.height), (48, 64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block-compressed frame keeps its orientation through `oriented`: the GPU turns it.
+    #[test]
+    fn oriented_keeps_the_turn_of_a_compressed_frame() {
+        let f = Frame {
+            width: 8,
+            height: 4,
+            data: Arc::new(vec![]),
+            seq: 1,
+            hap: Some(Arc::new(hap::HapFrame {
+                format: hap::HapFormat::Dxt1,
+                width: 8,
+                height: 4,
+                tex_w: 8,
+                tex_h: 4,
+                color: vec![0; 16],
+                alpha: None,
+            })),
+            orient: Orient::from_code(2),
+        };
+        let o = f.clone().oriented();
+        assert_eq!(o.orient, f.orient);
+        assert_eq!(o.display_size(), f.display_size());
     }
 
     #[test]

@@ -1385,6 +1385,19 @@ pub struct LayerDraw<'a> {
     pub orient: vjc_media::Orient,
 }
 
+/// What a decoded frame hands to `LayerDraw`: the stored picture and the turn the GPU
+/// applies. Every consumer of a player's frame goes through here so none can show a
+/// rotated clip unturned.
+pub fn frame_input(f: Option<&vjc_media::Frame>) -> (Option<FrameRef<'_>>, vjc_media::Orient) {
+    (
+        f.map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
+        f.map(|f| f.orient).unwrap_or_default(),
+    )
+}
+
+/// `(width, height, rgba, seq)` of a stored picture.
+pub type FrameRef<'a> = (u32, u32, &'a [u8], u64);
+
 /// Where `draw_layer` puts its pass.
 #[derive(Clone, Copy, PartialEq)]
 enum Dest {
@@ -2203,7 +2216,24 @@ impl Compositor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Option<(u32, u32, Vec<u8>)> {
-        let tex = self.readable();
+        Self::read_texture(device, queue, self.readable())
+    }
+
+    /// Blocking readback of what a routed source (e.g. the Preview) drew last.
+    pub fn read_routed(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: SliceSource,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        Self::read_texture(device, queue, &self.routed.get(&source)?.0)
+    }
+
+    fn read_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+    ) -> Option<(u32, u32, Vec<u8>)> {
         let (w, h) = (tex.width(), tex.height());
         let row = (w * 4).div_ceil(256) * 256;
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -6998,5 +7028,110 @@ mod tests {
             stats.avg(),
             stats.p99()
         );
+    }
+
+    /// A real clip tagged 90 degrees, played through a `Player`: the layer output, the clip
+    /// preview output and the baked copy all come out portrait and equal. Every consumer
+    /// maps the frame through `frame_input`, so this is the one place that can go wrong.
+    /// Skipped without a GPU or ffmpeg.
+    #[test]
+    fn rotated_clip_shows_turned_in_layer_and_clip_preview() {
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("vjc-rot-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, clip) = (dir.join("base.mp4"), dir.join("r90.mp4"));
+        let ff = |args: &[&str]| {
+            std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let made = ff(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=10:duration=1",
+            "-pix_fmt",
+            "yuv420p",
+            base.to_str().unwrap(),
+        ]) && ff(&[
+            "-display_rotation",
+            "90",
+            "-i",
+            base.to_str().unwrap(),
+            "-c",
+            "copy",
+            clip.to_str().unwrap(),
+        ]);
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("ffmpeg missing or lacks -display_rotation: skipped");
+            return;
+        }
+        let mut player = vjc_media::Player::open_scrub(&clip);
+        let t = std::time::Instant::now();
+        let frame = loop {
+            if let Some(f) = player.latest_frame() {
+                break f;
+            }
+            assert!(t.elapsed().as_secs() < 10, "no frame");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        player.stop();
+        assert_eq!((frame.width, frame.height), (160, 120), "stored pixels");
+        assert_eq!(frame.display_size(), (120, 160), "displayed portrait");
+        let want = frame.clone().oriented();
+        assert_eq!((want.width, want.height), (120, 160));
+        let draw = |id: LayerId| {
+            let (f, orient) = frame_input(Some(&frame));
+            LayerDraw {
+                id,
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![],
+                frame: f,
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+                orient,
+            }
+        };
+        let close = |got: &[u8], what: &str| {
+            let max = got
+                .iter()
+                .zip(want.data.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(max <= 3, "{what}: pixels differ by {max}");
+        };
+        let mut comp = Compositor::new(&device, 120, 160);
+        // Layer output.
+        comp.render(&device, &queue, &[draw(uuid::Uuid::from_u128(1))], &[], 1.0);
+        let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
+        assert_eq!((w, h), (120, 160), "layer is portrait");
+        close(&got, "layer");
+        // Clip preview output: the preview-only clip, routed to the Preview.
+        comp.preview = Some(SliceSource::Layer(PREVIEW_CLIP_ID));
+        comp.render_routed(
+            &device,
+            &queue,
+            (&[draw(PREVIEW_CLIP_ID)], &[]),
+            (&[], 1.0),
+            &[],
+        );
+        let (w, h, got) = comp
+            .read_routed(&device, &queue, SliceSource::Preview)
+            .expect("preview rendered");
+        assert_eq!((w, h), (120, 160), "preview is portrait");
+        close(&got, "preview");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
