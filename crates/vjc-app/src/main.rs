@@ -12745,7 +12745,7 @@ mod remap_tests {
         use egui::{Event, PointerButton, Pos2, RawInput};
         let ctx = egui::Context::default();
         let mut v = 1.0f32;
-        let mut frame = |ev: Vec<Event>, draw: bool, v: &mut f32| -> bool {
+        let frame = |ev: Vec<Event>, draw: bool, v: &mut f32| -> bool {
             let raw = RawInput {
                 events: ev,
                 ..Default::default()
