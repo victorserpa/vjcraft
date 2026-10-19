@@ -6785,6 +6785,23 @@ fn global_stop_ejects_pause_and_play_follow_and_reverse_and_metronome_are_comman
 }
 
 #[test]
+fn transport_pause_and_play_leave_no_undo_entry_for_the_clip_directions() {
+    let mut h = app();
+    let lid = playing_generator(&mut h);
+    let deck = h.state().project.composition.current_deck;
+    let dir = |h: &Harness<'_, State>| {
+        vjc_core::clip_in(&h.state().project, deck, lid, 1).map(|k| k.transport.direction)
+    };
+    h.state_mut().history = vjc_core::History::new();
+    click(&mut h, "Pause tempo clock");
+    assert_eq!(dir(&h), Some(vjc_model::Direction::Pause));
+    assert!(!h.state().history.can_undo(), "pause records no undo entry");
+    click(&mut h, "Play tempo clock");
+    assert_eq!(dir(&h), Some(vjc_model::Direction::Forward));
+    assert!(!h.state().history.can_undo(), "play records no undo entry");
+}
+
+#[test]
 fn speed_sliders_can_be_hidden_from_the_view_option() {
     let mut h = app();
     let lid = playing_generator(&mut h);

@@ -4648,6 +4648,14 @@ impl History {
         Self::default()
     }
 
+    /// Ends the coalescing window of the last step: the next edit of the same target starts
+    /// a step of its own (a drag that ended, before a nudge of the same fields).
+    pub fn seal(&mut self) {
+        if let Some(e) = self.done.last_mut() {
+            e.sealed = true;
+        }
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.done.is_empty()
     }
@@ -4762,6 +4770,27 @@ impl History {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seal_keeps_the_next_edit_of_the_same_target_a_separate_step() {
+        let (mut p, _) = setup();
+        let mut h = History::default();
+        let t = Instant::now();
+        let set = |x: f64| Command::SetTransformMulti {
+            target: EffectTarget::Master,
+            values: vec![(TransformField::X, x)],
+        };
+        let x = |p: &Project| number(&p.composition.master.transform.x.value);
+        h.exec(&mut p, set(5.0), t).unwrap();
+        h.exec(&mut p, set(9.0), t).unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(x(&p), 0.0, "without seal both edits are one step");
+        h.redo(&mut p).unwrap().unwrap();
+        h.seal();
+        h.exec(&mut p, set(20.0), t).unwrap();
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(x(&p), 9.0, "after seal the edit is its own step");
+    }
+
     #[test]
     fn set_media_paths_is_one_undo_step_and_all_or_nothing() {
         let (mut p, l) = setup();

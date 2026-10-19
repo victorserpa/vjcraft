@@ -440,7 +440,8 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         s = vec4(s.rgb * select(select(0.45, 0.7, cp.x < 8u), 1.0, cp.y < 8u), s.a);
     }
     // pad bit 4: the source is premultiplied; blending wants straight colour.
-    if ((u.pad & 16u) != 0u && s.a > 0.0) { s = vec4(min(s.rgb / s.a, vec3(1.0)), s.a); }
+    // With alpha off the texel is opaque: there is nothing to divide by.
+    if ((u.pad & 16u) != 0u && (u.pad & 8u) == 0u && s.a > 0.0) { s = vec4(min(s.rgb / s.a, vec3(1.0)), s.a); }
     // pad = channel mask: bit 0..3 set = R, G, B, A off (off alpha means opaque).
     if ((u.pad & 1u) != 0u) { s.r = 0.0; }
     if ((u.pad & 2u) != 0u) { s.g = 0.0; }
@@ -6958,6 +6959,30 @@ mod tests {
         let a = show(2, [100, 50, 25, 255], false);
         let b = show(2, [100, 50, 25, 255], true);
         assert!(a[0].abs_diff(b[0]) <= 1, "{a:?} {b:?}");
+    }
+
+    /// Premultiplied with the alpha channel off: opaque, the colour is not divided by the
+    /// alpha that was switched off. Skipped when there is no adapter.
+    #[test]
+    fn gpu_premultiplied_with_alpha_off_keeps_the_colour() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let mut comp = Compositor::new(&device, 1, 1);
+        let mut show = |id: u128, premultiplied: bool| {
+            let mut layers = [solid(id, &[100, 50, 25, 128], 1.0)];
+            layers[0].channels = vjc_model::Channels {
+                a: false,
+                premultiplied,
+                ..Default::default()
+            };
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            read_px(&device, &queue, &comp)
+        };
+        let straight = show(5, false);
+        let premult = show(6, true);
+        assert!(straight[0].abs_diff(100) <= 2, "{straight:?}");
+        assert!(premult[0].abs_diff(100) <= 2, "{premult:?}");
     }
 
     #[test]
