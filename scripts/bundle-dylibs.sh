@@ -133,3 +133,30 @@ for f in "$BIN" "$FW"/*.dylib; do
 done
 [ "$bad" -eq 0 ] || die "leftover external paths"
 echo "bundled $(ls "$FW" | wc -l | tr -d ' ') dylibs into $FW"
+
+# Licenses: for every bundled dylib find its Homebrew formula (the original lives in
+# <prefix>/Cellar/<formula>/<version>/...), copy that formula's license files into
+# Contents/Resources/ThirdParty/<formula>/ and record "<dylib>\t<formula>\t<version>" in
+# ThirdParty/dylibs.tsv (read by scripts/gen-third-party.sh). A dylib without a formula or
+# without any license file aborts packaging.
+TP="$APP/Contents/Resources/ThirdParty"
+mkdir -p "$TP"
+: > "$TP/dylibs.tsv"
+while IFS=$'\t' read -r name orig; do
+  case "$orig" in
+    */Cellar/*) rest="${orig#*/Cellar/}"; pkg="${rest%%/*}"; rest="${rest#*/}"; ver="${rest%%/*}"
+      root="${orig%%/Cellar/*}/Cellar/$pkg/$ver" ;;
+    *) die "$name ($orig) is not from a Homebrew Cellar; cannot find its license" ;;
+  esac
+  mkdir -p "$TP/$pkg"
+  n=0
+  while IFS= read -r lf; do
+    [ -z "$lf" ] && continue
+    dest="$TP/$pkg/$(echo "${lf#$root/}" | tr '/' '_')"
+    [ -e "$dest" ] || { cp -L "$lf" "$dest"; n=$((n+1)); }
+  done < <(find "$root" -maxdepth 4 -type f \( -iname 'LICEN[SC]E*' -o -iname 'COPYING*' -o -iname 'COPYRIGHT*' -o -iname 'NOTICE*' -o -iname 'UNLICENSE*' \) \
+             -not -path '*/include/*' -not -path '*/lib/python*' 2>/dev/null | sort)
+  [ -n "$(ls "$TP/$pkg")" ] || die "no license file found for $pkg $ver (needed by $name) under $root"
+  printf '%s\t%s\t%s\n' "$name" "$pkg" "$ver" >> "$TP/dylibs.tsv"
+done < "$MAP"
+echo "licenses for $(cut -f2 "$TP/dylibs.tsv" | sort -u | wc -l | tr -d ' ') formulae in $TP"
