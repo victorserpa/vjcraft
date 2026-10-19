@@ -6551,6 +6551,77 @@ fn monitors_log_incoming_messages_with_middle_c_naming() {
     );
 }
 
+/// A HAP clip snapshot is taken where the app's playhead is now, not at the first position
+/// the player was given, and is decoded on a worker (not on the UI thread).
+#[test]
+fn hap_snapshot_follows_the_playhead_and_decodes_off_thread() {
+    use vjc_media::hap::testgen::{Kind, write_clip};
+    let dir = std::env::temp_dir().join(format!("vjc-ui-hapsnap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let clip = dir.join("snap.mov");
+    write_clip(&clip, Kind::Hap, (64, 32), 10, 2).unwrap();
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut().exec(Command::ImportMedia {
+        deck,
+        layer,
+        column: 0,
+        path: clip.clone(),
+    });
+    h.state_mut().exec(Command::TriggerClip {
+        deck,
+        layer,
+        column: 0,
+    });
+    for _ in 0..5 {
+        h.step();
+    }
+    assert!(h.state().players.contains_key(&layer), "HAP player exists");
+    // The app drives the playhead every frame: the player ends up at the latest position.
+    for want in [0.1, 0.5, 0.9] {
+        {
+            let st = h.state_mut();
+            st.players[&layer].2.set_position(want);
+            st.flow.pos.insert(layer, want);
+        }
+        let (_, pos) = h.state().snapshot_source(deck, layer, 0).expect("source");
+        assert!((pos - want).abs() < 1e-9, "snapshot at {pos}, playhead {want}");
+    }
+    // The player's own value can lag the playhead the app tracks: the playhead wins.
+    {
+        let st = h.state_mut();
+        st.players[&layer].2.set_position(0.0);
+        st.flow.pos.insert(layer, 0.8);
+    }
+    let (path, pos) = h.state().snapshot_source(deck, layer, 0).expect("source");
+    assert!((pos - 0.8).abs() < 1e-9);
+    // Different playhead positions give different pictures.
+    let a = vjc_media::snapshot_frame(&path, 0.0).expect("first");
+    let b = vjc_media::snapshot_frame(&path, pos).expect("current");
+    assert_ne!(a.data.to_vec(), b.data.to_vec());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn snapshot_job_is_written_only_when_the_worker_finishes() {
+    let mut h = app();
+    let dir = std::env::temp_dir().join(format!("vjc-ui-snapjob-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    h.state_mut().prefs.general.snapshot_folder = Some(dir.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.state_mut().snap_job = Some(("Job".into(), rx));
+    h.state_mut().poll_snapshot_job();
+    assert!(h.state().snap_job.is_some(), "still decoding: UI keeps going");
+    assert!(!dir.exists());
+    tx.send(Some((1, 1, vec![9, 9, 9, 255]))).unwrap();
+    h.state_mut().poll_snapshot_job();
+    assert!(h.state().snap_job.is_none());
+    assert!(h.state().status.starts_with("Snapshot saved"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn snapshot_writes_a_png_into_the_chosen_folder() {
     let mut h = app();
