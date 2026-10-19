@@ -154,9 +154,9 @@ pub fn preset_polygon(preset: ShapePreset, r: Rect) -> Vec<Pt> {
 
 /// When `new` is an affine image of the slice's current mesh (move, nudge, resize, rotate,
 /// flip), applies the same transform to a polygon outline so it keeps following the mesh.
-/// Point edits that are not affine leave the outline alone. The result is clamped to
-/// 0..1. Returns the outline as it was when it changed, so the caller can store the exact
-/// original for undo (following the inverse transform would drift, and clamping loses data).
+/// Point edits that are not affine leave the outline alone. The result may leave
+/// 0..1 (rendered clipped). Returns the outline as it was when it changed, so the caller can store the exact
+/// original for undo (following the inverse transform would drift).
 pub fn follow_outline(
     sl: &mut vjc_model::Slice,
     new: &[Pt],
@@ -216,10 +216,7 @@ pub fn follow_outline(
         .map(|p| (p.0 / w, p.1 / h))
         .collect();
     if out.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
-        let out: Vec<Pt> = out
-            .into_iter()
-            .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
-            .collect();
+        // Never clamp per vertex: that would destroy the shape across moves past the edge.
         if out == *poly {
             return None;
         }
