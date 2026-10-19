@@ -208,13 +208,18 @@ pub fn supervise(
     mut launch: impl FnMut(bool) -> ChildEnd,
     mut now: impl FnMut() -> Instant,
     mut pause: impl FnMut(),
+    stopping: impl Fn() -> bool,
 ) -> Outcome {
     let mut limit = RestartLimit::new();
     let (mut launches, mut recover) = (0, false);
     loop {
+        if stopping() {
+            return Outcome::Quit;
+        }
         launches += 1;
         let end = launch(recover);
-        if end.is_clean() {
+        // A stop request (relayed SIGTERM/SIGHUP) wins however the child ended.
+        if end.is_clean() || stopping() {
             return Outcome::Quit;
         }
         if !limit.allow(now()) {
@@ -225,6 +230,9 @@ pub fn supervise(
         }
         recover = true;
         pause();
+        if stopping() {
+            return Outcome::Quit;
+        }
     }
 }
 
@@ -264,6 +272,8 @@ pub fn run_supervisor(args: &[String]) -> Option<i32> {
         eprintln!("VJCraft: cannot find own executable; running unsupervised");
         return None;
     };
+    #[cfg(unix)]
+    install_stop_handlers();
     let started = SystemTime::now();
     let fake = args.iter().any(|a| a.starts_with("--fake-child"));
     let outcome = supervise(
@@ -289,6 +299,7 @@ pub fn run_supervisor(args: &[String]) -> Option<i32> {
         },
         Instant::now,
         || std::thread::sleep(Duration::from_millis(if fake { 50 } else { 500 })),
+        is_stopping,
     );
     Some(match outcome {
         Outcome::Quit => 0,
@@ -303,7 +314,7 @@ pub fn run_supervisor(args: &[String]) -> Option<i32> {
                  not restarting again. Crash report: {report}"
             );
             eprintln!("{msg}");
-            if !fake {
+            if !fake && !is_stopping() {
                 alert(&msg);
             }
             1
@@ -315,33 +326,98 @@ pub fn run_supervisor(args: &[String]) -> Option<i32> {
 #[cfg(unix)]
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Set by a SIGTERM/SIGHUP sent to the supervisor: the user wants out, never relaunch.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+fn is_stopping() -> bool {
+    STOPPING.load(Ordering::SeqCst)
+}
+
 #[cfg(unix)]
 extern "C" fn relay_term(sig: libc::c_int) {
-    let pid = CHILD_PID.load(Ordering::Relaxed);
+    STOPPING.store(true, Ordering::SeqCst);
+    let pid = CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: kill is async-signal-safe.
         unsafe { libc::kill(pid, sig) };
     }
 }
 
+/// Installed before the first child is spawned, so no signal falls in a gap.
+#[cfg(unix)]
+fn install_stop_handlers() {
+    // SAFETY: the handler only stores an atomic and calls an async-signal-safe function.
+    unsafe {
+        libc::signal(libc::SIGTERM, relay_term as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, relay_term as *const () as libc::sighandler_t);
+    }
+}
+
 /// Like `Command::status`, but a SIGTERM/SIGHUP sent to the supervisor (`kill`, logout) is
 /// relayed to the child, so the app can quit cleanly instead of being orphaned.
 fn spawn_and_wait(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    if is_stopping() {
+        return Ok(end_status_stopped());
+    }
     let mut child = cmd.spawn()?;
     #[cfg(unix)]
     {
-        CHILD_PID.store(child.id() as i32, Ordering::Relaxed);
-        // SAFETY: the handler only calls an async-signal-safe function.
-        unsafe {
-            libc::signal(libc::SIGTERM, relay_term as *const () as libc::sighandler_t);
-            libc::signal(libc::SIGHUP, relay_term as *const () as libc::sighandler_t);
+        CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
+        // A signal that landed before the pid was published was not relayed.
+        if is_stopping() {
+            // SAFETY: the pid is our live, un-waited child.
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
         }
     }
     let r = child.wait();
     #[cfg(unix)]
-    CHILD_PID.store(0, Ordering::Relaxed);
+    CHILD_PID.store(0, Ordering::SeqCst);
     r
 }
+
+#[cfg(unix)]
+fn end_status_stopped() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(0)
+}
+
+#[cfg(not(unix))]
+fn end_status_stopped() -> std::process::ExitStatus {
+    unreachable!("no stop handlers off unix")
+}
+
+/// Set when the supervisor (our parent) is gone.
+static PARENT_GONE: AtomicBool = AtomicBool::new(false);
+
+/// True once the supervisor died (SIGKILL, crash): the app must save and quit.
+pub fn parent_gone() -> bool {
+    PARENT_GONE.load(Ordering::SeqCst)
+}
+
+/// Child mode: watches the supervisor every 500 ms. When it dies the app would otherwise
+/// keep playing unattended forever, so this flags `parent_gone` (the UI loop then saves
+/// recovery and exits) and, if the loop does not get there in 1 s, exits the process.
+#[cfg(unix)]
+pub fn start_parent_watch() {
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
+    let _ = std::thread::Builder::new()
+        .name("vjc-parent-watch".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                // SAFETY: as above.
+                if unsafe { libc::getppid() } != parent {
+                    PARENT_GONE.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_secs(1));
+                    std::process::exit(0);
+                }
+            }
+        });
+}
+
+#[cfg(not(unix))]
+pub fn start_parent_watch() {}
 
 /// A visible message when the supervisor gives up (macOS: dialog; elsewhere stderr only).
 fn alert(msg: &str) {
@@ -378,6 +454,16 @@ pub fn fake_child(args: &[String]) {
         {
             let _ = writeln!(f, "{}", if recovered { "recover" } else { "fresh" });
         }
+    }
+    if mode == "sleep-crash-on-term" {
+        extern "C" fn die(_: libc::c_int) {
+            // SAFETY: _exit is async-signal-safe.
+            unsafe { libc::_exit(1) };
+        }
+        // SAFETY: the handler only calls _exit.
+        unsafe { libc::signal(libc::SIGTERM, die as *const () as libc::sighandler_t) };
+        std::thread::sleep(Duration::from_secs(20));
+        std::process::exit(0);
     }
     if mode == "sleep" {
         // Waits for a relayed SIGTERM (bounded, so a failing test leaks nothing for long).
@@ -562,6 +648,7 @@ mod tests {
             },
             || t0,
             || {},
+            || false,
         );
         // 1 first launch + 3 restarts, all after the first with recovery.
         assert_eq!(seen, [false, true, true, true]);
@@ -590,6 +677,7 @@ mod tests {
             },
             Instant::now,
             || {},
+            || false,
         );
         assert_eq!(out, Outcome::Quit);
         assert_eq!(seen, [false, true]);
@@ -611,10 +699,43 @@ mod tests {
                 },
                 Instant::now,
                 || {},
+                || false,
             );
             assert_eq!((out, n), (Outcome::Quit, 1));
         }
         assert!(!ChildEnd::Code(1).is_clean() && !ChildEnd::Signal(11).is_clean());
+    }
+
+    #[test]
+    fn stop_request_quits_instead_of_relaunching() {
+        use std::cell::Cell;
+        let stop = Cell::new(false);
+        let mut n = 0;
+        // The child crashes on the relayed signal: still a quit.
+        let out = supervise(
+            |_| {
+                n += 1;
+                stop.set(true);
+                ChildEnd::Code(1)
+            },
+            Instant::now,
+            || {},
+            || stop.get(),
+        );
+        assert_eq!((out, n), (Outcome::Quit, 1));
+        // A signal during the restart backoff stops before the next launch.
+        let stop = Cell::new(false);
+        let mut n = 0;
+        let out = supervise(
+            |_| {
+                n += 1;
+                ChildEnd::Code(101)
+            },
+            Instant::now,
+            || stop.set(true),
+            || stop.get(),
+        );
+        assert_eq!((out, n), (Outcome::Quit, 1));
     }
 
     #[test]

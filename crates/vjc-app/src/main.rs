@@ -3437,6 +3437,21 @@ impl State {
     }
 
     /// Every `autosave_secs` while dirty (if enabled), writes the recovery file.
+    /// The supervisor died (SIGKILL): do what a clean quit does (recovery file, prefs,
+    /// recording trailer, outputs go with the process) and exit instead of playing on.
+    fn quit_orphaned(&mut self) -> ! {
+        if self.persist {
+            let every = std::time::Duration::from_secs(self.prefs.general.autosave_secs.into());
+            let gap = every + std::time::Duration::from_secs(1);
+            self.last_autosave = std::time::Instant::now()
+                .checked_sub(gap)
+                .unwrap_or(self.last_autosave);
+            self.autosave();
+        }
+        eframe::App::on_exit(self);
+        std::process::exit(0);
+    }
+
     fn autosave(&mut self) {
         let path = self.recovery_path();
         self.autosave_to(path);
@@ -11983,6 +11998,9 @@ const BLACKOUT_KEY: (egui::Modifiers, egui::Key) = (
 impl eframe::App for State {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         reliability::beat();
+        if reliability::parent_gone() {
+            self.quit_orphaned();
+        }
         // Pace the UI: an unthrottled swapchain (vsync off, occluded window, output window
         // redrawing the parent) would otherwise run the whole UI thousands of times a second.
         let min_gap = ui_pace_gap(effective_fps(
@@ -12093,6 +12111,7 @@ fn main() -> eframe::Result {
         }
     }
     if args.iter().any(|a| a == "--child") {
+        reliability::start_parent_watch();
         reliability::fake_child(&args);
     }
     reliability::install_panic_hook();

@@ -240,7 +240,11 @@ impl Registry {
 
 /// A pid that fits `pid_t` and is positive; anything else is 0 (no live owner).
 fn parse_pid(s: &str) -> u32 {
-    s.trim().parse::<i32>().ok().filter(|p| *p > 0).map_or(0, |p| p as u32)
+    s.trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|p| *p > 0)
+        .map_or(0, |p| p as u32)
 }
 
 fn pid_alive(pid: u32) -> bool {
