@@ -792,6 +792,20 @@ mod tests {
         assert_eq!(f.data.len(), 62 * 34 * 4);
     }
 
+    #[test]
+    fn snapshot_frame_is_rgba_even_for_a_compressed_hap_player() {
+        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        let p = temp("snap.mov");
+        write_clip(&p, Kind::HapAlpha, (62, 34), 5, 2).unwrap();
+        set_gpu_supported(true);
+        let f = crate::snapshot_frame(&p, 0.5).expect("frame");
+        set_gpu_supported(false);
+        assert!(f.hap.is_none());
+        assert_eq!((f.width, f.height), (62, 34));
+        assert_eq!(f.data.len(), 62 * 34 * 4);
+        assert!(f.data.iter().any(|b| *b != 0), "picture must not be empty");
+    }
+
     /// Prints CPU time per 1080p frame: HAP parse (snappy) against FFmpeg RGBA decode.
     #[test]
     #[ignore = "benchmark; cargo test -p vjc-media hap_bench --release -- --ignored --nocapture"]

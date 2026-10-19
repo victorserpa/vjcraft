@@ -359,6 +359,7 @@ impl FrameQueue {
     }
 
     /// Queues the frame; returns false (and counts a drop) when the queue is full or closed.
+    #[cfg(test)]
     fn push(&self, pts: i64, data: Vec<u8>) -> bool {
         self.push_warm(pts, data, false)
     }

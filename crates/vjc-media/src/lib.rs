@@ -385,6 +385,11 @@ impl Player {
     }
 
     /// Sets the wanted position (0..1, clamped).
+    /// The wanted position last set (0..1).
+    pub fn position(&self) -> f64 {
+        f64::from_bits(self.shared.position.load(Ordering::Relaxed))
+    }
+
     pub fn set_position(&self, pos: f64) {
         let p = if pos.is_finite() {
             pos.clamp(0.0, 1.0)
@@ -1658,6 +1663,18 @@ fn thumbnail_inner(path: &Path, max_side: u32) -> Result<Frame, String> {
             .ok_or("no frames")?
     };
     Ok(downscale(&frame, max_side).oriented())
+}
+
+/// The clip's own picture at `pos` (0..1 of its length) as RGBA, for a snapshot. Always the
+/// CPU path, so a HAP clip gives real pixels (the player hands those out block-compressed).
+pub fn snapshot_frame(path: &Path, pos: f64) -> Option<Frame> {
+    std::panic::catch_unwind(|| {
+        let mut sc = Scrubber::open(path).ok()?;
+        let t = if pos.is_finite() { pos.clamp(0.0, 1.0) } else { 0.0 } * sc.duration;
+        sc.frame_at(t).ok().flatten().map(Frame::oriented)
+    })
+    .ok()
+    .flatten()
 }
 
 fn downscale(f: &Frame, max_side: u32) -> Frame {

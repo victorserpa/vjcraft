@@ -317,10 +317,20 @@ mod tests {
 
     static FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Reports a skipped GPU test loudly (`cargo test -- --nocapture` shows it). With
+    /// `VJC_REQUIRE_GPU=1` (CI with a GPU) a missing capability fails instead.
+    fn skipped(why: &str) {
+        assert!(
+            std::env::var_os("VJC_REQUIRE_GPU").is_none(),
+            "GPU test cannot run: {why} (VJC_REQUIRE_GPU is set)"
+        );
+        eprintln!("SKIPPED (not passed): GPU test did not run: {why}");
+    }
+
     fn device(bc: bool) -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
-            eprintln!("no wgpu adapter: skipped");
+            skipped("no wgpu adapter");
             return None;
         };
         let want = if bc {
@@ -329,7 +339,7 @@ mod tests {
             wgpu::Features::empty()
         };
         if bc && want.is_empty() {
-            eprintln!("adapter has no BC textures: skipped");
+            skipped("adapter has no BC texture support");
             return None;
         }
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {

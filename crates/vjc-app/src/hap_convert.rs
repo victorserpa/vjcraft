@@ -86,6 +86,28 @@ pub fn free_space(path: &Path) -> Option<Space> {
     })
 }
 
+/// Device id (`st_dev`) of the volume holding `path` (or its nearest existing parent).
+pub fn volume_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut p = path;
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    std::fs::metadata(p).ok().map(|m| m.dev())
+}
+
+/// True when both folders live on the same volume (so they share one free-space budget).
+/// When a volume cannot be read, falls back to comparing the paths.
+pub fn same_volume(a: &Option<PathBuf>, b: &Option<PathBuf>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => match (volume_of(x), volume_of(y)) {
+            (Some(vx), Some(vy)) => vx == vy,
+            _ => x == y,
+        },
+        _ => a == b,
+    }
+}
+
 /// Free space a conversion must leave: the pref in GB, else max(10 GB, 10% of the volume).
 pub fn reserve_bytes(total: u64, pref_gb: Option<u32>) -> u64 {
     match pref_gb {
@@ -515,7 +537,7 @@ impl Converter {
         let queued: u64 = self
             .queue
             .iter()
-            .filter(|r| Self::out_dir(r) == dir)
+            .filter(|r| same_volume(&Self::out_dir(r), &dir))
             .map(Request::estimate)
             .fold(0, u64::saturating_add);
         // The running job has already written part of its estimate: `space.free` shows that
@@ -523,7 +545,7 @@ impl Converter {
         let running = self
             .current
             .iter()
-            .filter(|r| Self::out_dir(&r.req) == dir)
+            .filter(|r| same_volume(&Self::out_dir(&r.req), &dir))
             .map(|r| (r.req.estimate() as f64 * f64::from(1.0 - r.progress.clamp(0.0, 1.0))) as u64)
             .fold(0, u64::saturating_add);
         let pending = queued.saturating_add(running);
@@ -746,10 +768,34 @@ mod tests {
         let e = c.submit_with(req(secs), space).unwrap_err();
         assert!(e.contains("Not enough disk space"), "{e}");
         assert_eq!(c.queue.len(), 2);
-        // Another folder is another budget.
+        // Another volume is another budget.
+        if volume_of(Path::new("/dev")) == volume_of(Path::new("/")) {
+            eprintln!("/dev shares the root volume here: other-volume case SKIPPED");
+            return;
+        }
         let mut other = req(secs);
-        other.out_dir = Some(PathBuf::from("/elsewhere"));
+        other.out_dir = Some(PathBuf::from("/dev"));
         assert!(c.submit_with(other, space).is_ok());
+    }
+
+    #[test]
+    fn different_folders_on_one_volume_share_the_budget() {
+        let space = Space {
+            free: 10 * GB,
+            total: 100 * GB,
+        };
+        let secs = (3.5 * GB as f64 / req(1.0).estimate() as f64).ceil();
+        let mut c = Converter::default();
+        let mut a = req(secs);
+        a.out_dir = Some(std::env::temp_dir());
+        let mut b = req(secs);
+        b.out_dir = Some(std::env::temp_dir().join("vjc-other-folder-same-volume"));
+        let mut d = req(secs);
+        d.out_dir = Some(std::env::temp_dir().join("vjc-third-folder"));
+        assert!(c.submit_with(a, space).is_ok());
+        assert!(c.submit_with(b, space).is_ok());
+        let e = c.submit_with(d, space).unwrap_err();
+        assert!(e.contains("Not enough disk space"), "{e}");
     }
 
     #[test]

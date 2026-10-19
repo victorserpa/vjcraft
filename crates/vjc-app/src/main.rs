@@ -5366,16 +5366,21 @@ impl State {
             .players
             .get(&layer)
             .filter(|(d, c, _)| *d == deck && *c == column)
-            .and_then(|(_, _, p)| p.latest_frame());
-        let shot = match playing {
-            Some(f) if f.hap.is_none() => {
+            .map(|(_, _, p)| p);
+        let shot = match playing.and_then(|p| p.latest_frame().map(|f| (p, f))) {
+            Some((_, f)) if f.hap.is_none() => {
                 let f = f.oriented();
                 Some((f.width, f.height, f.data.to_vec()))
             }
-            Some(_) => frame
-                .wgpu_render_state()
-                .zip(self.comp.as_ref())
-                .and_then(|(rs, comp)| comp.read_rgba(&rs.device, &rs.queue)),
+            // Block-compressed HAP: decode the clip itself on the CPU, not the composition.
+            Some((p, _)) => vjc_core::clip_in(&self.project, deck, layer, column)
+                .and_then(|k| match &k.source {
+                    vjc_model::Source::File { path } => {
+                        vjc_media::snapshot_frame(path, p.position())
+                    }
+                    _ => None,
+                })
+                .map(|f| (f.width, f.height, f.data.to_vec())),
             None => frame
                 .wgpu_render_state()
                 .zip(self.comp.as_ref())
