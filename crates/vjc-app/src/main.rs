@@ -574,6 +574,19 @@ fn scale_to_apply(applied: &mut Option<f32>, pref: f32, dragging: bool) -> Optio
 
 /// Rewrites the column of a queued command after columns moved; false when its column was
 /// removed (the command is dropped).
+/// Whether the palette may take arrows and Enter: nothing is focused or its own field is.
+fn palette_owns_keys(focused: Option<egui::Id>, query: egui::Id) -> bool {
+    focused.is_none_or(|f| f == query)
+}
+
+/// The autopilot after the "Every loops" field was set to `n`: the unit stays as it is.
+fn every_loops_edit(a: &vjc_model::Autopilot, n: f32) -> vjc_model::Autopilot {
+    vjc_model::Autopilot {
+        every_loops: n.round().max(1.0) as u32,
+        ..a.clone()
+    }
+}
+
 fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
     match cmd {
         Command::ImportMedia { column, .. }
@@ -738,6 +751,9 @@ struct XfDrag {
     start: xform_widget::Xf,
     p0: egui::Vec2,
     target: EffectTarget,
+    /// Shift at the start: the corner keeps its scale mode for the whole drag, so one drag
+    /// writes one set of fields (one undo step).
+    shift: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2665,11 +2681,14 @@ impl State {
         const SHOWN: usize = 12;
         let hits = palette::rank(&self.palette.entries, &self.palette.query, SHOWN);
         let none = egui::Modifiers::NONE;
+        // Arrows and Enter belong to the palette only while nothing else has the focus.
+        let query_id = egui::Id::new("quick-search-query");
+        let mine = palette_owns_keys(ctx.memory(|m| m.focused()), query_id);
         let (down, up, enter, esc) = ctx.input_mut(|i| {
             (
-                i.consume_key(none, Key::ArrowDown),
-                i.consume_key(none, Key::ArrowUp),
-                i.consume_key(none, Key::Enter),
+                mine && i.consume_key(none, Key::ArrowDown),
+                mine && i.consume_key(none, Key::ArrowUp),
+                mine && i.consume_key(none, Key::Enter),
                 i.consume_key(none, Key::Escape),
             )
         });
@@ -2699,6 +2718,7 @@ impl State {
             .show(ctx, |ui| {
                 let e = ui.add(
                     egui::TextEdit::singleline(&mut self.palette.query)
+                        .id(query_id)
                         .hint_text("Search effects, generators, layers, clips, commands")
                         .desired_width(f32::INFINITY),
                 );
@@ -3764,7 +3784,8 @@ impl State {
                         st == vjc_model::PlayState::Pause,
                     ) {
                         // Clips already in that state make this fail: nothing to do then.
-                        let _ = self.history.exec(&mut self.project, c, now);
+                        // A performance action, like the transport itself: no undo entry.
+                        let _ = vjc_core::apply(&mut self.project, c);
                     }
                 }
                 if is_set_bpm {
@@ -9410,11 +9431,14 @@ impl State {
             if let Some(o) = origin {
                 let p0 = to_frame(o);
                 if let Some(handle) = xform_widget::hit(&xf, comp, p0, 8.0 / k) {
+                    // A nudge just before must stay its own undo step.
+                    self.history.seal();
                     self.xf_drag = Some(XfDrag {
                         handle,
                         start: xf,
                         p0,
                         target,
+                        shift: ui.input(|i| i.modifiers.shift),
                     });
                 }
             }
@@ -9423,16 +9447,20 @@ impl State {
             resp.request_focus();
         }
         let mut busy = false;
+        let was_dragging = self.xf_drag.is_some();
         if let Some(d) = self.xf_drag.take()
             && resp.dragged()
             && d.target == target
             && let Some(ptr) = ui.input(|i| i.pointer.latest_pos())
         {
-            let shift = ui.input(|i| i.modifiers.shift);
-            let values = xform_widget::drag(d.handle, &d.start, comp, d.p0, to_frame(ptr), shift);
+            let values = xform_widget::drag(d.handle, &d.start, comp, d.p0, to_frame(ptr), d.shift);
             self.exec(Command::SetTransformMulti { target, values });
             self.xf_drag = Some(d);
             busy = true;
+        }
+        if was_dragging && !busy {
+            // The drag ended: a nudge right after must not merge into it.
+            self.history.seal();
         }
         if resp.has_focus() {
             ui.memory_mut(|m| {
@@ -10558,17 +10586,18 @@ impl State {
                         extras,
                     });
                 }
-                if let Some(a) = own.as_ref().filter(|a| a.mode != M::Off) {
+                // The count is in loops only for the Loops unit; editing it must not
+                // switch a Beats or Seconds autopilot to Loops.
+                if let Some(a) = own
+                    .as_ref()
+                    .filter(|a| a.mode != M::Off && a.unit == vjc_model::AutopilotUnit::Loops)
+                {
                     ui.horizontal(|ui| {
                         params::row_label(ui, "Every loops");
                         let mut n = a.every_loops as f32;
                         if widgets::field_num(ui, &mut n, 1.0..=1024.0, 1.0).changed() {
                             let mut extras = k.extras.clone();
-                            extras.autopilot = Some(vjc_model::Autopilot {
-                                every_loops: n.round().max(1.0) as u32,
-                                unit: vjc_model::AutopilotUnit::Loops,
-                                ..a.clone()
-                            });
+                            extras.autopilot = Some(every_loops_edit(a, n));
                             cmds.push(Command::SetClipExtras {
                                 deck,
                                 layer,
@@ -12684,6 +12713,25 @@ mod sequential_tests {
         // Pausing must not pull the whole clip into RAM.
         assert!(is_sequential(PlayMode::Loop, Direction::Forward, 0.0));
         assert!(is_sequential(PlayMode::Loop, Direction::Pause, 1.0));
+    }
+
+    #[test]
+    fn palette_keys_yield_to_another_focused_widget() {
+        let q = egui::Id::new("q");
+        assert!(super::palette_owns_keys(None, q));
+        assert!(super::palette_owns_keys(Some(q), q));
+        assert!(!super::palette_owns_keys(Some(egui::Id::new("other")), q));
+    }
+
+    #[test]
+    fn every_loops_edit_keeps_the_unit() {
+        let a = vjc_model::Autopilot {
+            unit: vjc_model::AutopilotUnit::Seconds,
+            ..Default::default()
+        };
+        let b = super::every_loops_edit(&a, 4.2);
+        assert_eq!(b.every_loops, 4);
+        assert_eq!(b.unit, vjc_model::AutopilotUnit::Seconds);
     }
 }
 

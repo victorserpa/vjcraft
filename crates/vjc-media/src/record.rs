@@ -1433,8 +1433,7 @@ mod tests {
     #[test]
     fn warm_up_lasts_past_the_codec_open_until_first_frames_are_encoded() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-        let r =
-            Recorder::spawn(&tmp("warm4.mp4"), 2, 2, 4, holding(Some("x"), gate_rx)).unwrap();
+        let r = Recorder::spawn(&tmp("warm4.mp4"), 2, 2, 4, holding(Some("x"), gate_rx)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!r.codec.lock().unwrap().is_empty(), "codec open");
         assert!(r.warming(), "codec open but no frame encoded yet");
