@@ -48,13 +48,16 @@ pub(crate) fn next_screen_name(screens: &[Screen]) -> String {
         .unwrap_or_default()
 }
 
-/// Square mask inset from the slice edges.
-pub(crate) fn inset_mask() -> Vec<(f32, f32)> {
+/// Rectangular mask inset from the edges of the slice's own output bounds (masks live in
+/// screen-normalized space, so a fixed 0.1..0.9 square ignored where the slice sits).
+pub(crate) fn inset_mask(sl: &Slice, scr: &Screen) -> Vec<(f32, f32)> {
+    let (x0, y0, x1, y1) = crate::output_props::slice_bbox_norm(sl, scr);
+    let (dx, dy) = ((x1 - x0) * MASK_INSET, (y1 - y0) * MASK_INSET);
     vec![
-        (MASK_INSET, MASK_INSET),
-        (1.0 - MASK_INSET, MASK_INSET),
-        (1.0 - MASK_INSET, 1.0 - MASK_INSET),
-        (MASK_INSET, 1.0 - MASK_INSET),
+        (x0 + dx, y0 + dy),
+        (x1 - dx, y0 + dy),
+        (x1 - dx, y1 - dy),
+        (x0 + dx, y1 - dy),
     ]
 }
 
@@ -263,7 +266,7 @@ impl State {
                 cmds.push(Command::SetSliceMask {
                     screen: s.id,
                     slice: sl.id,
-                    mask: Some(inset_mask()),
+                    mask: Some(inset_mask(sl, s)),
                 });
                 ui.close();
             }

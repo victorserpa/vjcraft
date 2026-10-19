@@ -841,7 +841,7 @@ impl State {
                     if widgets::btn(ui, "Create mask", Kind::Secondary).clicked() {
                         self.edit_mask = true;
                         self.sel_mask_pt = None;
-                        cmds.push(set_mask(sl.id, Some(inset_mask())));
+                        cmds.push(set_mask(sl.id, Some(inset_mask(sl, scr))));
                     }
                 } else if let Some(m) = &sl.mask {
                     toggle(ui, &mut self.edit_mask, "Edit mask points");
@@ -1048,7 +1048,7 @@ impl State {
 }
 
 /// The slice's output rectangle in 0..1 screen units (what mask shapes are fitted to).
-fn slice_bbox_norm(sl: &Slice, scr: &Screen) -> (f32, f32, f32, f32) {
+pub(crate) fn slice_bbox_norm(sl: &Slice, scr: &Screen) -> (f32, f32, f32, f32) {
     let (w, h) = (scr.width.max(1) as f32, scr.height.max(1) as f32);
     let fold = |it: &mut dyn Iterator<Item = f32>| {
         it.fold((f32::MAX, f32::MIN), |a, v| (a.0.min(v), a.1.max(v)))
@@ -1065,6 +1065,23 @@ fn slice_bbox_norm(sl: &Slice, scr: &Screen) -> (f32, f32, f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inset_mask_follows_the_slice_bounds() {
+        let mut scr = vjc_core::mapping::new_screen("s", 1000, 500);
+        let mut sl = vjc_core::mapping::new_slice(1000, 500);
+        // Right half of the screen.
+        sl.output_mesh = vec![(500.0, 0.0), (1000.0, 0.0), (500.0, 500.0), (1000.0, 500.0)];
+        sl.mesh_cols = 2;
+        scr.slices.push(sl.clone());
+        let m = crate::output_tree::inset_mask(&sl, &scr);
+        assert!(m.iter().all(|p| p.0 > 0.5), "stays inside the slice: {m:?}");
+        assert!((m[0].0 - 0.55).abs() < 1e-4 && (m[0].1 - 0.1).abs() < 1e-4);
+        // Control: a whole-screen slice keeps the 0.1..0.9 square.
+        let full = vjc_core::mapping::new_slice(1000, 500);
+        let m = crate::output_tree::inset_mask(&full, &scr);
+        assert!((m[0].0 - 0.1).abs() < 1e-4 && (m[2].0 - 0.9).abs() < 1e-4);
+    }
 
     #[test]
     fn soft_edge_on_keeps_each_slices_own_widths() {
