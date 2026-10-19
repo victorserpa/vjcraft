@@ -1340,7 +1340,10 @@ mod tests {
         })
         .unwrap();
         for i in 0..12 {
-            assert!(r.push(vec![0; 16]), "frame {i} dropped while the encoder starts");
+            assert!(
+                r.push(vec![0; 16]),
+                "frame {i} dropped while the encoder starts"
+            );
         }
         assert_eq!(r.dropped(), 0);
         gate_tx.send(()).unwrap();

@@ -1670,7 +1670,11 @@ fn thumbnail_inner(path: &Path, max_side: u32) -> Result<Frame, String> {
 pub fn snapshot_frame(path: &Path, pos: f64) -> Option<Frame> {
     std::panic::catch_unwind(|| {
         let mut sc = Scrubber::open(path).ok()?;
-        let t = if pos.is_finite() { pos.clamp(0.0, 1.0) } else { 0.0 } * sc.duration;
+        let t = if pos.is_finite() {
+            pos.clamp(0.0, 1.0)
+        } else {
+            0.0
+        } * sc.duration;
         sc.frame_at(t).ok().flatten().map(Frame::oriented)
     })
     .ok()
