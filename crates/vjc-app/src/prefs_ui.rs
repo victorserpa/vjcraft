@@ -59,11 +59,14 @@ impl State {
                         help(ui, "A triggered clip starts this far into the file (0 = at its in-point).");
                         ui.horizontal(|ui| {
                             ui.label("Interface scale");
-                            ui.add(
+                            let r = ui.add(
                                 egui::Slider::new(&mut p.general.ui_scale, 0.75..=2.0)
                                     .step_by(0.05)
                                     .fixed_decimals(2),
                             );
+                            let drag = r.dragged();
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(egui::Id::new("ui-scale-drag"), drag));
                         });
                         ui.horizontal(|ui| {
                             ui.label("Browser start folder");

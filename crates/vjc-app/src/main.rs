@@ -546,8 +546,10 @@ fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -
 /// removed (the command is dropped).
 /// The zoom to set when the `ui_scale` pref differs from the last one applied; None while
 /// it is unchanged, so a Cmd +/- zoom made meanwhile stays.
-fn scale_to_apply(applied: &mut Option<f32>, pref: f32) -> Option<f32> {
-    if applied.is_some_and(|a| (a - pref).abs() < 1e-3) {
+/// Not while the scale slider is being dragged: zooming under the pointer moves the slider
+/// itself, so the value is applied once the drag ends.
+fn scale_to_apply(applied: &mut Option<f32>, pref: f32, dragging: bool) -> Option<f32> {
+    if dragging || applied.is_some_and(|a| (a - pref).abs() < 1e-3) {
         return None;
     }
     *applied = Some(pref);
@@ -7287,8 +7289,15 @@ impl State {
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         // Only when the pref changes: egui's own Cmd +/- must keep working in between.
-        if let Some(scale) = scale_to_apply(&mut self.applied_ui_scale, self.prefs.general.ui_scale)
-        {
+        let dragging = ui
+            .ctx()
+            .data(|d| d.get_temp::<bool>(egui::Id::new("ui-scale-drag")))
+            .unwrap_or(false);
+        if let Some(scale) = scale_to_apply(
+            &mut self.applied_ui_scale,
+            self.prefs.general.ui_scale,
+            dragging,
+        ) {
             ui.ctx().set_zoom_factor(scale);
         }
         params::set_hidden(ui.ctx(), &self.prefs.layouts.current.hidden);
@@ -12721,14 +12730,21 @@ mod remap_tests {
     #[test]
     fn ui_scale_is_applied_only_when_the_pref_changes() {
         let mut applied = None;
-        assert_eq!(scale_to_apply(&mut applied, 1.0), Some(1.0), "first frame");
         assert_eq!(
-            scale_to_apply(&mut applied, 1.0),
+            scale_to_apply(&mut applied, 1.0, false),
+            Some(1.0),
+            "first frame"
+        );
+        assert_eq!(
+            scale_to_apply(&mut applied, 1.0, false),
             None,
             "unchanged: Cmd +/- survives"
         );
-        assert_eq!(scale_to_apply(&mut applied, 1.25), Some(1.25));
-        assert_eq!(scale_to_apply(&mut applied, 1.25), None);
+        // While the slider is dragged nothing is applied; the release applies the value.
+        assert_eq!(scale_to_apply(&mut applied, 1.25, true), None);
+        assert_eq!(scale_to_apply(&mut applied, 1.5, true), None);
+        assert_eq!(scale_to_apply(&mut applied, 1.5, false), Some(1.5));
+        assert_eq!(scale_to_apply(&mut applied, 1.5, false), None);
     }
 
     #[test]
