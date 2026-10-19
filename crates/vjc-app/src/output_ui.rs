@@ -317,7 +317,7 @@ impl State {
         }
     }
 
-    fn out_open(&mut self) {
+    pub(crate) fn out_open(&mut self) {
         let screens = self.project.output.screens.clone();
         self.out_win = Some(OutWin {
             orig: screens.clone(),

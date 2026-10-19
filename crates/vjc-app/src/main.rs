@@ -339,6 +339,8 @@ struct State {
     sel_slices: Vec<Uuid>,
     /// Working copy of the Output setup while its window is open.
     out_win: Option<output_ui::OutWin>,
+    /// Guide images being decoded off the UI thread.
+    guide_jobs: Vec<output_canvas::GuideJob>,
     sel_pt_in: Option<usize>,
     sel_pt_out: Option<usize>,
     snap: bool,
@@ -540,18 +542,35 @@ fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -
         .collect()
 }
 
-/// Rewrites the column of a queued command after columns moved; false when its column was
-/// removed (the command is dropped).
+/// Memory key under which the Preferences scale slider stores its widget id.
+pub(crate) fn ui_scale_slider_key() -> egui::Id {
+    egui::Id::new("ui-scale-slider")
+}
+
+/// Is the scale slider being dragged right now? Read from egui's pointer state (not a flag
+/// the slider writes), so it cannot stick when the slider stops being drawn, and it is
+/// already false on the frame the button is released.
+fn ui_scale_dragging(ctx: &egui::Context) -> bool {
+    let Some(id) = ctx.data(|d| d.get_temp::<egui::Id>(ui_scale_slider_key())) else {
+        return false;
+    };
+    ctx.is_being_dragged(id) && ctx.input(|i| i.pointer.any_down() && !i.pointer.any_released())
+}
+
 /// The zoom to set when the `ui_scale` pref differs from the last one applied; None while
 /// it is unchanged, so a Cmd +/- zoom made meanwhile stays.
-fn scale_to_apply(applied: &mut Option<f32>, pref: f32) -> Option<f32> {
-    if applied.is_some_and(|a| (a - pref).abs() < 1e-3) {
+/// Not while the scale slider is being dragged: zooming under the pointer moves the slider
+/// itself, so the value is applied once the drag ends.
+fn scale_to_apply(applied: &mut Option<f32>, pref: f32, dragging: bool) -> Option<f32> {
+    if dragging || applied.is_some_and(|a| (a - pref).abs() < 1e-3) {
         return None;
     }
     *applied = Some(pref);
     Some(pref)
 }
 
+/// Rewrites the column of a queued command after columns moved; false when its column was
+/// removed (the command is dropped).
 fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
     match cmd {
         Command::ImportMedia { column, .. }
@@ -2136,6 +2155,7 @@ impl State {
             sel_slice: None,
             sel_slices: vec![],
             out_win: None,
+            guide_jobs: vec![],
             sel_pt_in: None,
             sel_pt_out: None,
             snap: false,
@@ -7284,9 +7304,14 @@ impl State {
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         // Only when the pref changes: egui's own Cmd +/- must keep working in between.
-        if let Some(scale) = scale_to_apply(&mut self.applied_ui_scale, self.prefs.general.ui_scale)
-        {
+        let dragging = ui_scale_dragging(ui.ctx());
+        if let Some(scale) = scale_to_apply(
+            &mut self.applied_ui_scale,
+            self.prefs.general.ui_scale,
+            dragging,
+        ) {
             ui.ctx().set_zoom_factor(scale);
+            ui.ctx().request_repaint();
         }
         params::set_hidden(ui.ctx(), &self.prefs.layouts.current.hidden);
         self.prune_screen_state();
@@ -7890,6 +7915,7 @@ impl State {
                 .collect()
         });
         // Files dropped on the Output setup window are a guide image, not clips.
+        self.poll_guides(&ctx);
         let dropped = self.out_take_drops(&ctx, dropped);
         if !dropped.is_empty() {
             match resolve_drop(&self.cells, self.last_pointer, self.selected) {
@@ -12715,16 +12741,67 @@ mod remap_tests {
     use super::*;
 
     #[test]
+    fn ui_scale_drag_follows_the_pointer_and_cannot_stick() {
+        use egui::{Event, PointerButton, Pos2, RawInput};
+        let ctx = egui::Context::default();
+        let mut v = 1.0f32;
+        let frame = |ev: Vec<Event>, draw: bool, v: &mut f32| -> bool {
+            let raw = RawInput {
+                events: ev,
+                ..Default::default()
+            };
+            let mut dragging = false;
+            let mut out = ctx.run_ui(raw, |ui| {
+                if draw {
+                    let r = ui.add(egui::Slider::new(v, 0.0..=10.0));
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(ui_scale_slider_key(), r.id));
+                }
+                dragging = ui_scale_dragging(ui.ctx());
+            });
+            out.textures_delta.clear();
+            dragging
+        };
+        let at = |x: f32| Pos2::new(x, 12.0);
+        let mv = |x: f32| Event::PointerMoved(at(x));
+        let btn = |x: f32, pressed: bool| Event::PointerButton {
+            pos: at(x),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(vec![mv(40.0)], true, &mut v);
+        frame(vec![btn(40.0, true)], true, &mut v);
+        let mut during = false;
+        for x in [60.0, 80.0, 100.0] {
+            during = frame(vec![mv(x)], true, &mut v);
+        }
+        assert!(during, "dragging while the button is held on the slider");
+        // The slider stops being drawn mid-drag, then the button goes up: not stuck.
+        frame(vec![mv(110.0)], false, &mut v);
+        let released = frame(vec![btn(110.0, false)], false, &mut v);
+        assert!(!released, "false on the release frame");
+        assert!(!frame(vec![], false, &mut v), "and after it");
+    }
+
+    #[test]
     fn ui_scale_is_applied_only_when_the_pref_changes() {
         let mut applied = None;
-        assert_eq!(scale_to_apply(&mut applied, 1.0), Some(1.0), "first frame");
         assert_eq!(
-            scale_to_apply(&mut applied, 1.0),
+            scale_to_apply(&mut applied, 1.0, false),
+            Some(1.0),
+            "first frame"
+        );
+        assert_eq!(
+            scale_to_apply(&mut applied, 1.0, false),
             None,
             "unchanged: Cmd +/- survives"
         );
-        assert_eq!(scale_to_apply(&mut applied, 1.25), Some(1.25));
-        assert_eq!(scale_to_apply(&mut applied, 1.25), None);
+        // While the slider is dragged nothing is applied; the release applies the value.
+        assert_eq!(scale_to_apply(&mut applied, 1.25, true), None);
+        assert_eq!(scale_to_apply(&mut applied, 1.5, true), None);
+        assert_eq!(scale_to_apply(&mut applied, 1.5, false), Some(1.5));
+        assert_eq!(scale_to_apply(&mut applied, 1.5, false), None);
     }
 
     #[test]

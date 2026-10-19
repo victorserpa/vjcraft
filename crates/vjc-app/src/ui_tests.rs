@@ -8301,7 +8301,7 @@ fn output_setup_snapshots() {
     let id = h.state().project.output.screens[0].id;
     let ctx = h.ctx.clone();
     h.state_mut().load_guide(&ctx, id, &png);
-    settle(&mut h);
+    wait_guide(&mut h, id);
     snap(&mut h, "23-output-screen-props");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -8859,4 +8859,170 @@ fn clap_param_edits_reach_the_plugin_and_are_mappable_like_other_params() {
     assert_eq!(specs.len(), 1);
     assert!(specs[0].clap.is_some());
     assert_eq!(shared.param(0), 2.5, "effective value copied to the plugin");
+}
+
+/// Steps the app until the guide of `screen` is installed (the decode is off-thread).
+fn wait_guide(h: &mut Harness<'_, State>, screen: Uuid) {
+    for _ in 0..200 {
+        h.step();
+        if State::guide_texture(&h.ctx, screen).is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the guide image never loaded");
+}
+
+#[test]
+fn guide_image_decodes_off_the_ui_thread() {
+    let mut h = app();
+    let id = Uuid::new_v4();
+    let dir = presets_tmp("guide-async");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("g.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+        .save(&png)
+        .unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().load_guide(&ctx, id, &png);
+    // The call itself installs nothing: the job is pending.
+    assert!(State::guide_texture(&h.ctx, id).is_none());
+    assert_eq!(h.state().guide_jobs.len(), 1);
+    wait_guide(&mut h, id);
+    assert!(State::guide_texture(&h.ctx, id).is_some());
+    assert!(h.state().guide_jobs.is_empty());
+    // Control: a file that is not an image installs nothing and reports it.
+    let bad = dir.join("bad.png");
+    std::fs::write(&bad, b"nope").unwrap();
+    let other = Uuid::new_v4();
+    h.state_mut().load_guide(&ctx, other, &bad);
+    for _ in 0..200 {
+        h.step();
+        if h.state().guide_jobs.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(State::guide_texture(&h.ctx, other).is_none());
+    assert!(h.state().status.contains("Could not read"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn guide_drop_takes_only_pictures() {
+    use crate::output_canvas::is_guide_image;
+    use std::path::Path;
+    assert!(is_guide_image(Path::new("/a/b.PNG")));
+    assert!(is_guide_image(Path::new("/a/b.jpeg")));
+    // Control: a video or a folder is not a guide image.
+    assert!(!is_guide_image(Path::new("/a/b.mp4")));
+    assert!(!is_guide_image(Path::new("/a/folder")));
+}
+
+#[test]
+fn clear_guide_cancels_a_pending_decode() {
+    let mut h = app();
+    let id = Uuid::new_v4();
+    let dir = presets_tmp("guide-clear");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("g.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+        .save(&png)
+        .unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().load_guide(&ctx, id, &png);
+    h.state_mut().clear_guide(&ctx, id);
+    assert!(h.state().guide_jobs.is_empty());
+    for _ in 0..30 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        State::guide_texture(&h.ctx, id).is_none(),
+        "stale result dropped"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn guide_toggle_turns_on_only_for_the_selected_screen() {
+    let mut h = app();
+    let scr = vjc_core::mapping::new_screen("Wall", 1920, 1080);
+    let a = scr.id;
+    h.state_mut().exec(Command::AddScreen {
+        screen: scr,
+        index: 0,
+    });
+    settle(&mut h);
+    let b = Uuid::new_v4();
+    let dir = presets_tmp("guide-on");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("g.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+        .save(&png)
+        .unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().output_setup_open = true;
+    settle(&mut h);
+    h.state_mut().out_win.as_mut().unwrap().guide_on = false;
+    h.state_mut().sel_screen = Some(a);
+    h.state_mut().load_guide(&ctx, b, &png);
+    wait_guide(&mut h, b);
+    assert!(
+        !h.state().out_win.as_ref().unwrap().guide_on,
+        "other screen's job"
+    );
+    h.state_mut().load_guide(&ctx, a, &png);
+    wait_guide(&mut h, a);
+    assert!(h.state().out_win.as_ref().unwrap().guide_on);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_guide_extension_decodes() {
+    let dir = presets_tmp("guide-exts");
+    std::fs::create_dir_all(&dir).unwrap();
+    for e in crate::output_canvas::GUIDE_EXTS {
+        let p = dir.join(format!("g.{e}"));
+        image::RgbImage::from_pixel(4, 4, image::Rgb([9, 9, 9]))
+            .save(&p)
+            .unwrap();
+        assert!(crate::reliability::image_open(&p).is_ok(), "{e}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_images_dropped_on_output_setup_do_not_reach_the_grid() {
+    let mut h = app();
+    h.state_mut().output_setup_open = true;
+    settle(&mut h);
+    h.state_mut().out_win.as_mut().unwrap().rect = eframe::egui::Rect::from_min_size(
+        eframe::egui::pos2(0.0, 0.0),
+        eframe::egui::vec2(600.0, 400.0),
+    );
+    h.hover_at(eframe::egui::pos2(100.0, 100.0));
+    h.step();
+    let small = eframe::egui::Rect::from_min_size(
+        eframe::egui::pos2(0.0, 0.0),
+        eframe::egui::vec2(600.0, 400.0),
+    );
+    h.state_mut().out_win.as_mut().unwrap().rect = small;
+    let ctx = h.ctx.clone();
+    let video = std::path::PathBuf::from("/a/clip.mp4");
+    let left = h.state_mut().out_take_drops(&ctx, vec![video]);
+    assert!(left.is_empty(), "swallowed by the window");
+    assert_eq!(h.state().toasts.len(), 1, "told why");
+    // Control: outside the window the drop is untouched.
+    h.hover_at(eframe::egui::pos2(900.0, 700.0));
+    settle(&mut h);
+    assert_eq!(
+        h.ctx.input(|i| i.pointer.latest_pos()),
+        Some(eframe::egui::pos2(900.0, 700.0))
+    );
+    h.state_mut().out_win.as_mut().unwrap().rect = small;
+    let left = h
+        .state_mut()
+        .out_take_drops(&ctx, vec!["/a/clip.mp4".into()]);
+    assert_eq!(left.len(), 1);
 }

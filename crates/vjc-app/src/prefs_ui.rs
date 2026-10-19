@@ -9,6 +9,8 @@ use eframe::egui;
 use vjc_io::prefs::HwDecode;
 use vjc_model::FitMode;
 
+use crate::ui_scale_slider_key;
+
 impl State {
     pub(crate) fn prefs_window(&mut self, ctx: &egui::Context) {
         if !self.prefs_open {
@@ -59,11 +61,13 @@ impl State {
                         help(ui, "A triggered clip starts this far into the file (0 = at its in-point).");
                         ui.horizontal(|ui| {
                             ui.label("Interface scale");
-                            ui.add(
+                            let r = ui.add(
                                 egui::Slider::new(&mut p.general.ui_scale, 0.75..=2.0)
                                     .step_by(0.05)
                                     .fixed_decimals(2),
                             );
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(ui_scale_slider_key(), r.id));
                         });
                         ui.horizontal(|ui| {
                             ui.label("Browser start folder");
