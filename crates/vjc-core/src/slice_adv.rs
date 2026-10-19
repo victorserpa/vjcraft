@@ -154,23 +154,29 @@ pub fn preset_polygon(preset: ShapePreset, r: Rect) -> Vec<Pt> {
 
 /// When `new` is an affine image of the slice's current mesh (move, nudge, resize, rotate,
 /// flip), applies the same transform to a polygon outline so it keeps following the mesh.
-/// Point edits that are not affine leave the outline alone.
-pub fn follow_outline(sl: &mut vjc_model::Slice, new: &[Pt], screen: (u32, u32)) {
+/// Point edits that are not affine leave the outline alone. The result is clamped to
+/// 0..1. Returns the outline as it was when it changed, so the caller can store the exact
+/// original for undo (following the inverse transform would drift, and clamping loses data).
+pub fn follow_outline(
+    sl: &mut vjc_model::Slice,
+    new: &[Pt],
+    screen: (u32, u32),
+) -> Option<Vec<Pt>> {
     let vjc_model::SliceShape::Polygon(poly) = &mut sl.shape else {
-        return;
+        return None;
     };
     let old = &sl.output_mesh;
     let cols = sl.mesh_cols as usize;
     if cols < 2 || old.len() != new.len() || old.len() < cols * 2 || !old.len().is_multiple_of(cols)
     {
-        return;
+        return None;
     }
     let (a, b, c) = (old[0], old[cols - 1], old[old.len() - cols]);
     let (na, nb, nc) = (new[0], new[cols - 1], new[new.len() - cols]);
     let (u, v) = ((b.0 - a.0, b.1 - a.1), (c.0 - a.0, c.1 - a.1));
     let det = u.0 * v.1 - u.1 * v.0;
     if det.abs() < 1e-3 {
-        return;
+        return None;
     }
     let (nu, nv) = ((nb.0 - na.0, nb.1 - na.1), (nc.0 - na.0, nc.1 - na.1));
     // L = [nu nv] * [u v]^-1
@@ -201,7 +207,7 @@ pub fn follow_outline(sl: &mut vjc_model::Slice, new: &[Pt], screen: (u32, u32))
         (m.0 - n.0).abs() <= tol && (m.1 - n.1).abs() <= tol
     });
     if !affine {
-        return;
+        return None;
     }
     let (w, h) = (screen.0.max(1) as f32, screen.1.max(1) as f32);
     let out: Vec<Pt> = poly
@@ -210,8 +216,45 @@ pub fn follow_outline(sl: &mut vjc_model::Slice, new: &[Pt], screen: (u32, u32))
         .map(|p| (p.0 / w, p.1 / h))
         .collect();
     if out.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
-        *poly = out;
+        let out: Vec<Pt> = out
+            .into_iter()
+            .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
+            .collect();
+        if out == *poly {
+            return None;
+        }
+        return Some(std::mem::replace(poly, out));
     }
+    None
+}
+
+/// Handles of a grid carried to another grid size: each new (row, col) takes the handle of
+/// the nearest old (row, col), scaled by the change in point spacing. Empty when the old
+/// handles did not match the old grid.
+pub fn remap_tangents(
+    old: &[(Pt, Pt)],
+    cols: u32,
+    rows: u32,
+    ncols: u32,
+    nrows: u32,
+) -> Vec<(Pt, Pt)> {
+    if old.len() != (cols * rows) as usize || cols < 2 || rows < 2 || ncols < 2 || nrows < 2 {
+        return vec![];
+    }
+    let (kx, ky) = (
+        (cols - 1) as f32 / (ncols - 1) as f32,
+        (rows - 1) as f32 / (nrows - 1) as f32,
+    );
+    let mut out = Vec::with_capacity((ncols * nrows) as usize);
+    for r in 0..nrows {
+        for c in 0..ncols {
+            let oc = ((c as f32 * kx).round() as u32).min(cols - 1);
+            let or = ((r as f32 * ky).round() as u32).min(rows - 1);
+            let (h0, h1) = old[(or * cols + oc) as usize];
+            out.push(((h0.0 * kx, h0.1 * kx), (h1.0 * ky, h1.1 * ky)));
+        }
+    }
+    out
 }
 
 /// Margin kept around a preset slice, as a fraction of the screen.
@@ -356,11 +399,11 @@ pub fn tessellate_bezier(
     (out, dc as u32)
 }
 
-/// Scales every point of `meshes` from the group bounding box onto `to`. An axis where the
-/// group has no extent is only moved.
-pub fn resize_group(meshes: &[Vec<Pt>], to: Rect) -> Vec<Vec<Pt>> {
-    let all: Vec<Pt> = meshes.iter().flatten().copied().collect();
-    let Some(from) = bbox(&all) else {
+/// Scales every point of `meshes` from the group box (the bounds of `bounds`: the outline
+/// for polygon slices, the mesh otherwise) onto `to`. An axis where the group has no extent
+/// is only moved.
+pub fn resize_group(meshes: &[Vec<Pt>], bounds: &[Pt], to: Rect) -> Vec<Vec<Pt>> {
+    let Some(from) = bbox(bounds) else {
         return meshes.to_vec();
     };
     let sx = if from.w > 0.0 { to.w / from.w } else { 1.0 };

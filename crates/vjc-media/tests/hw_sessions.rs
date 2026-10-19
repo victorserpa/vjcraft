@@ -260,5 +260,9 @@ fn a_stale_on_air_player_scrubbed_by_preview_is_not_busy() {
     // The app marks A off air when it leaves the layer; the preview scrub is not busy.
     a.set_on_air(false);
     scrub_pair(&a, &b, 6000);
-    assert_eq!(b.decode_status(), Some("hw"), "B takes the stale player's session");
+    assert_eq!(
+        b.decode_status(),
+        Some("hw"),
+        "B takes the stale player's session"
+    );
 }

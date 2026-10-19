@@ -281,8 +281,10 @@ fn group_resize_scales_every_slice() {
     h.undo(&mut p).unwrap().unwrap();
     assert_eq!(p, before, "one command, one undo");
     // Only the selected slices move: resize the second alone onto a new box.
+    let one = before.output.screens[0].slices[1].output_mesh.clone();
     let r = resize_group(
-        &[before.output.screens[0].slices[1].output_mesh.clone()],
+        std::slice::from_ref(&one),
+        &one,
         Rect {
             x: 0.0,
             y: 0.0,
@@ -437,17 +439,24 @@ fn moving_a_polygon_slice_moves_its_outline_in_one_undo_step() {
     h.undo(&mut p).unwrap().unwrap();
     assert!(close(&outline(&p, id), &orig));
     // Group resize and SetSliceMeshes carry the outline too.
+    let px: Vec<Pt> = orig.iter().map(|q| (q.0 * 200.0, q.1 * 100.0)).collect();
+    let bb = crate::slice_geom::bbox(&px).unwrap();
     h.exec(
         &mut p,
         Command::ResizeSlices {
             screen: sid,
             slices: vec![id],
-            to: (0.0, 0.0, 400.0, 200.0),
+            to: (0.0, 0.0, bb.w, bb.h),
         },
         Instant::now(),
     )
     .unwrap();
-    let want: Vec<Pt> = orig.iter().map(|q| (q.0 * 2.0, q.1 * 2.0)).collect();
+    // The group box is the outline (not 0..200 x 0..100), not the full-screen mesh: the
+    // same size moved to the origin shifts the outline by its own offset.
+    let want: Vec<Pt> = orig
+        .iter()
+        .map(|q| (q.0 - bb.x / 200.0, q.1 - bb.y / 100.0))
+        .collect();
     assert!(close(&outline(&p, id), &want));
     h.undo(&mut p).unwrap().unwrap();
     assert!(close(&outline(&p, id), &orig));
@@ -504,7 +513,7 @@ fn mesh_mode_normalizes_stale_tangent_length() {
 }
 
 #[test]
-fn grid_size_change_resets_tangents_and_undo_restores_them() {
+fn grid_size_change_remaps_tangents_by_row_col_and_undo_restores_them() {
     let (mut p, sid, ids) = setup();
     let mut h = History::new();
     let now = Instant::now();
@@ -523,9 +532,102 @@ fn grid_size_change_resets_tangents_and_undo_restores_them() {
         rows: 3,
     };
     h.exec(&mut p, c, now).unwrap();
-    assert!(p.output.screens[0].slices[0].mesh_tangents.is_empty());
+    // 2x2 -> 3x3: spacing halves, so the handles halve; every new point has one.
+    let t = &p.output.screens[0].slices[0].mesh_tangents;
+    assert_eq!(t.len(), 9);
+    assert!(t.iter().all(|q| *q == ((1.5, 0.0), (0.0, 1.5))));
     h.undo(&mut p).unwrap().unwrap();
     assert_eq!(p, before);
+}
+
+#[test]
+fn tangents_follow_their_row_and_col() {
+    let old: Vec<_> = (0..4).map(|i| ((i as f32, 0.0), (0.0, i as f32))).collect();
+    let n = remap_tangents(&old, 2, 2, 3, 2);
+    // Column 1 of 3 sits halfway: nearest old column (rounds up), row kept.
+    assert_eq!(n[0].0, (0.0, 0.0));
+    assert_eq!(n[2].0.0, 0.5);
+    assert_eq!(n[3].1.1, 2.0);
+    assert!(
+        remap_tangents(&old[..3], 2, 2, 3, 3).is_empty(),
+        "stale length"
+    );
+}
+
+fn exact_outline_setup() -> (Project, Uuid, Uuid) {
+    hex_setup()
+}
+
+#[test]
+fn outline_following_a_mesh_is_clamped_and_undo_is_exact() {
+    let (mut p, sid, id) = exact_outline_setup();
+    let before = p.clone();
+    let mut h = History::new();
+    // 60 px right pushes the hexagon (to 0.9) past the screen edge.
+    let mesh: Vec<Pt> = p.output.screens[0].slices[2]
+        .output_mesh
+        .iter()
+        .map(|q| (q.0 + 60.0 + 0.123_456, q.1 + 3.3))
+        .collect();
+    h.exec(
+        &mut p,
+        Command::SetSliceMesh {
+            screen: sid,
+            slice: id,
+            mesh,
+            cols: 2,
+        },
+        Instant::now(),
+    )
+    .unwrap();
+    assert!(outline(&p, id).iter().all(|q| (0.0..=1.0).contains(&q.0)));
+    assert!(
+        outline(&p, id).iter().any(|q| q.0 == 1.0),
+        "clamped to the edge"
+    );
+    h.undo(&mut p).unwrap().unwrap();
+    assert_eq!(p, before, "bit-exact, no float drift");
+    h.redo(&mut p).unwrap().unwrap();
+    h.undo(&mut p).unwrap().unwrap();
+    assert_eq!(p, before);
+}
+
+#[test]
+fn moving_a_slice_to_a_bigger_screen_rescales_its_outline() {
+    let (mut p, from, id) = hex_setup();
+    let mut big = mapping::new_screen("big", 400, 200);
+    big.slices = vec![];
+    let to = big.id;
+    apply(
+        &mut p,
+        Command::AddScreen {
+            screen: big,
+            index: 1,
+        },
+    )
+    .unwrap();
+    let before = p.clone();
+    let orig = outline(&p, id);
+    let mut h = History::new();
+    h.exec(
+        &mut p,
+        Command::MoveSlice {
+            from,
+            to,
+            slice: id,
+            index: 0,
+        },
+        Instant::now(),
+    )
+    .unwrap();
+    let sl = &p.output.screens[1].slices[0];
+    let SliceShape::Polygon(poly) = &sl.shape else {
+        panic!()
+    };
+    let want: Vec<Pt> = orig.iter().map(|q| (q.0 * 0.5, q.1 * 0.5)).collect();
+    assert!(close(poly, &want), "same pixels on the bigger screen");
+    h.undo(&mut p).unwrap().unwrap();
+    assert_eq!(p, before, "exact undo");
 }
 
 #[test]
