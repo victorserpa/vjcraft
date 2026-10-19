@@ -145,25 +145,22 @@ fn eviction_asked_while_the_holder_moves_is_asked_again_when_it_idles() {
     setup(1);
     let a = open_with_frame(&path);
     assert_eq!(a.decode_status(), Some("hw"));
-    std::thread::sleep(Duration::from_millis(1500)); // A is idle
     let b = open_with_frame(&path);
-    assert_eq!(b.decode_status(), Some("sw"));
-    // B goes on air and stays on its frame (paused); A moves, so the request to A is not
-    // honoured and gets dropped.
+    assert_eq!(b.decode_status(), Some("sw"), "cap 1 is taken by A");
+    // A is on air and moves. B goes on air too and stays on its frame (paused): its request
+    // finds no idle holder, and A keeps its session.
     let t = Instant::now();
-    while t.elapsed() < Duration::from_millis(1500) {
-        let ms = t.elapsed().as_millis() as f64;
-        a.set_position((ms / 4000.0).fract());
-        let _ = ms;
+    while t.elapsed() < Duration::from_millis(2500) {
+        a.set_position((t.elapsed().as_millis() as f64 / 4000.0).fract());
         b.set_position(0.3);
         std::thread::sleep(Duration::from_millis(16));
     }
-    assert_eq!(b.decode_status(), Some("sw"), "A is not idle yet");
+    assert_eq!(b.decode_status(), Some("sw"), "A is not idle");
+    assert_eq!(a.decode_status(), Some("hw"));
     // A stops on its frame. B still waits on air without a session: it must ask again.
-    let a_pos = 1500.0 / 4000.0;
     let t = Instant::now();
-    while t.elapsed() < Duration::from_millis(5000) && b.decode_status() != Some("hw") {
-        a.set_position(a_pos);
+    while t.elapsed() < Duration::from_millis(6000) && b.decode_status() != Some("hw") {
+        a.set_position(0.62);
         b.set_position(0.3);
         std::thread::sleep(Duration::from_millis(16));
     }

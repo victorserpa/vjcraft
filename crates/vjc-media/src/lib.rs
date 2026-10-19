@@ -138,6 +138,9 @@ pub(crate) struct Shared {
     duration: AtomicU64,
     /// Wanted position 0..1 (f64 bits).
     position: AtomicU64,
+    /// Counts `set_position` calls: a clip driven by the app is on air even when its
+    /// position does not change (a trigger at the preload position, a paused clip).
+    drives: AtomicU64,
     /// True while playback only moves forward (streaming is enough).
     sequential: AtomicBool,
     /// Decoder in use: see `hw::ST_*` (0 = not known yet).
@@ -153,6 +156,7 @@ impl Shared {
             convertible: AtomicBool::new(false),
             duration: AtomicU64::new(0),
             position: AtomicU64::new(0.0f64.to_bits()),
+            drives: AtomicU64::new(0),
             sequential: AtomicBool::new(true),
             hw: Arc::new(AtomicU8::new(0)),
         }
@@ -380,6 +384,7 @@ impl Player {
             0.0
         };
         self.shared.position.store(p.to_bits(), Ordering::Relaxed);
+        self.shared.drives.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Access hint: true when the position only advances (streaming, no cache), false when
@@ -1470,6 +1475,13 @@ fn scrub_loop(
     let mut asked = false;
     // The first frame of a clip is only its preload: not yet a sign it is on air.
     let mut preloaded = false;
+    // On air also means the app keeps setting the position; and a request for a session
+    // is repeated while the clip lacks one, since the holder may have been busy (it drops
+    // a request when it moved) or may become idle later.
+    let (mut seen_drives, mut driven_at) = (0u64, None::<Instant>);
+    let mut last_ask = Instant::now();
+    // Gave its session away: does not ask for one back until its position moves again.
+    let mut yielded = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let r = f64::from_bits(refined.load(Ordering::Relaxed));
         if r.is_finite() && r > 0.0 && r != sc.duration {
@@ -1509,17 +1521,35 @@ fn scrub_loop(
             sc.release_hw();
             want_hw = sc.hw_mode == Hw::On && !sc.hap;
             asked = false;
+            yielded = true;
         }
+        let drives = shared.drives.load(Ordering::Relaxed);
+        if drives != seen_drives {
+            seen_drives = drives;
+            driven_at = Some(Instant::now());
+        }
+        let driven = driven_at.is_some_and(|t| t.elapsed() < HW_IDLE);
         let pos = f64::from_bits(shared.position.load(Ordering::Relaxed));
         if pos == shown {
-            if want_hw && asked && cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
-                want_hw = !sc.acquire_hw();
+            if want_hw && cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
+                if asked {
+                    want_hw = !sc.acquire_hw();
+                }
+                if want_hw && driven && !yielded && last_ask.elapsed() >= HW_IDLE {
+                    // Still on air without a session: ask again.
+                    want_hw = !sc.acquire_hw();
+                    if want_hw {
+                        asked = hw::evict_idle_holder(&sc.holder, HW_IDLE);
+                        last_ask = Instant::now();
+                    }
+                }
             }
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
         shown = pos;
         idle_since = Instant::now();
+        yielded = false;
         let on_air = std::mem::replace(&mut preloaded, true);
         if on_air {
             sc.holder.touch();
@@ -1529,6 +1559,7 @@ fn scrub_loop(
             if want_hw {
                 // On air without a session: take one from the longest idle clip.
                 asked = hw::evict_idle_holder(&sc.holder, HW_IDLE);
+                last_ask = Instant::now();
             }
         }
         let target = pos_to_pts(start, sc.duration, pos);
