@@ -8,7 +8,7 @@ use ffmpeg_next as ff;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 /// What to record with. Ids are stored in the preferences.
@@ -98,6 +98,28 @@ pub fn available() -> Vec<RecCodec> {
         return vec![];
     }
     available_with(|n| ff::encoder::find_by_name(n).is_some())
+}
+
+/// Codec probe run on its own thread: `get` never blocks the caller (the UI thread) and
+/// is empty until the probe finishes.
+#[derive(Clone, Default)]
+pub struct Probe(Arc<OnceLock<Vec<RecCodec>>>);
+
+impl Probe {
+    /// Runs `f` on a new thread.
+    pub fn start(f: impl FnOnce() -> Vec<RecCodec> + Send + 'static) -> Self {
+        let cell = Arc::new(OnceLock::new());
+        let c = cell.clone();
+        std::thread::spawn(move || {
+            let _ = c.set(f());
+        });
+        Self(cell)
+    }
+
+    /// The codecs found so far (none while still probing).
+    pub fn get(&self) -> &[RecCodec] {
+        self.0.get().map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Codec and quality of a recording.
@@ -1421,5 +1443,23 @@ mod tests {
         assert_eq!(ok, 5);
         gate_tx.send(()).unwrap();
         let _ = r.finish();
+    }
+
+    #[test]
+    fn probe_does_not_block_the_caller() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let p = Probe::start(move || {
+            let _ = rx.recv();
+            vec![RecCodec::H264]
+        });
+        assert!(p.get().is_empty(), "get must not wait for the probe");
+        tx.send(()).unwrap();
+        for _ in 0..200 {
+            if !p.get().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(p.get(), &[RecCodec::H264]);
     }
 }

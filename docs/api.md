@@ -95,14 +95,14 @@ curl -X POST -H 'Content-Type: application/json' \
 ## More routes
 
 All under `/api/v1`, JSON in and out. `POST` needs `Content-Type: application/json` and the PIN when one is
-set (see PIN); `GET` stays open. Layers are numbered from the bottom, columns, clips and effects from 1. Every
+set (see PIN); `GET` stays open except `GET /can-open`, which needs the PIN too. Layers are numbered from the bottom, columns, clips and effects from 1. Every
 change goes through the same commands as the UI (undo, dirty flag, locks); a command the app would refuse
 (for example removing a layer another layer routes) answers 422 with the reason. Unknown route 404, wrong method 405.
 
 | Route | Body / query | Does |
 | --- | --- | --- |
 | `POST /composition/load` | `{"path": "/abs/x.vjc", "force": false}` | Opens a project. 409 when there are unsaved changes unless `force` is true. |
-| `POST /composition/save` | `{"path": "/abs/x.vjc"}` (optional once the project has a file) | Saves. No extension becomes `.vjc`; any other extension, or a missing parent directory, is 422. |
+| `POST /composition/save` | `{"path": "/abs/x.vjc"}` (optional once the project has a file) | Saves. No extension becomes `.vjc`; any other extension (including a bare trailing dot, `name.`), or a missing parent directory, is 422; so is a target that is a symlink or a directory. |
 | `POST /clips/open` | `{"layer":1,"column":2,"paths":["/abs/a.mp4","/abs/dir"]}` | Like dropping files from that cell on: one per column in name order, missing columns are added, one undo step. **Never triggers a clip** unless a cell of the range is already on air (then that cell reloads). Black-out stays on. Max 128 files. |
 | `GET /can-open?path=/abs/a.mp4` or `POST /can-open {"paths":[...]}` | | `{"results":[{"path","ok","kind","codec","width","height","fps","duration","reason"}]}`; does not touch the project. Needs the PIN when one is set, GET included. |
 | `POST /clips/add` | `{"layer","column","path"}` | Puts one file in a cell without triggering it. |
