@@ -47,4 +47,4 @@ See `CONTRIBUTING.md`. Bugs and ideas go to GitHub Issues.
 
 ## License
 
-GPL-3.0, see `LICENSE`.
+GPL-3.0, see `LICENSE`. Bundled third-party licenses: `docs/dev/third-party.md`.

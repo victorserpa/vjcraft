@@ -100,6 +100,8 @@ cat > "$APP/Contents/Info.plist" <<PL
 PL
 
 scripts/bundle-dylibs.sh "$APP"
+scripts/gen-third-party.sh "$APP"
+scripts/check-third-party.sh "$APP"
 
 # Sign inside-out: each dylib, then the app (no --deep). Hardened runtime needs a secure timestamp.
 if [ "$SIGN_ID" = "-" ]; then
