@@ -161,47 +161,68 @@ pub fn part_of(out: &Path) -> PathBuf {
 pub struct Registry(pub PathBuf);
 
 impl Registry {
-    fn list(&self) -> Vec<PathBuf> {
+    /// `(owner pid, path)`; a line without a pid (older format) has no live owner.
+    fn list(&self) -> Vec<(u32, PathBuf)> {
         std::fs::read_to_string(&self.0)
             .unwrap_or_default()
             .lines()
             .filter(|l| !l.is_empty())
-            .map(PathBuf::from)
+            .map(|l| match l.split_once('\t') {
+                Some((pid, p)) => (pid.parse().unwrap_or(0), PathBuf::from(p)),
+                None => (0, PathBuf::from(l)),
+            })
             .collect()
     }
 
-    fn write(&self, v: &[PathBuf]) {
+    fn write(&self, v: &[(u32, PathBuf)]) {
         if v.is_empty() {
             let _ = std::fs::remove_file(&self.0);
         } else {
-            let text: Vec<String> = v.iter().map(|p| p.display().to_string()).collect();
+            let text: Vec<String> = v
+                .iter()
+                .map(|(pid, p)| format!("{pid}\t{}", p.display()))
+                .collect();
             let _ = std::fs::write(&self.0, text.join("\n"));
         }
     }
 
     fn add(&self, p: &Path) {
+        self.add_as(p, std::process::id());
+    }
+
+    fn add_as(&self, p: &Path, pid: u32) {
         let mut v = self.list();
-        v.push(p.to_path_buf());
+        v.push((pid, p.to_path_buf()));
         self.write(&v);
     }
 
     fn remove(&self, p: &Path) {
-        let v: Vec<PathBuf> = self.list().into_iter().filter(|x| x != p).collect();
+        let v: Vec<_> = self.list().into_iter().filter(|(_, x)| x != p).collect();
         self.write(&v);
     }
 
-    /// Deletes every listed `.part` (only ones ending in `.part`, never anything else).
+    /// Deletes the listed `.part` files of dead instances (only ones ending in `.part`,
+    /// never anything else). A part owned by another running VJCraft is left alone.
     pub fn clean_stale(&self) -> usize {
-        let v = self.list();
         let mut n = 0;
-        for p in &v {
-            if p.extension().is_some_and(|e| e == "part") && std::fs::remove_file(p).is_ok() {
+        let mut keep = vec![];
+        for (pid, p) in self.list() {
+            if pid != 0 && pid != std::process::id() && pid_alive(pid) {
+                keep.push((pid, p));
+            } else if p.extension().is_some_and(|e| e == "part") && std::fs::remove_file(&p).is_ok()
+            {
                 n += 1;
             }
         }
-        self.write(&[]);
+        self.write(&keep);
         n
     }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let ok = unsafe { libc::kill(pid as i32, 0) } == 0;
+    ok || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 pub fn ffmpeg_args(src: &Path, part: &Path, v: Variant) -> Vec<std::ffi::OsString> {
@@ -875,6 +896,26 @@ mod tests {
         assert_eq!(reg.clean_stale(), 1);
         assert!(!part.exists());
         assert!(keep.exists(), "only .part files are deleted");
+    }
+
+    #[test]
+    fn stale_clean_spares_a_part_of_a_running_instance() {
+        let d = tmp("stale-live");
+        let (live, dead) = (d.join("a.hap.mov.part"), d.join("b.hap.mov.part"));
+        std::fs::write(&live, b"x").unwrap();
+        std::fs::write(&dead, b"x").unwrap();
+        let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut gone = Command::new("true").spawn().unwrap();
+        gone.wait().unwrap();
+        let reg = Registry(d.join("parts.txt"));
+        reg.add_as(&live, other.id());
+        reg.add_as(&dead, gone.id());
+        let n = reg.clean_stale();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(n, 1);
+        assert!(live.exists(), "another instance's part survives");
+        assert!(!dead.exists(), "control: a dead owner's part is deleted");
     }
 
     fn fake_ffmpeg(path: &Path, tag: &str) {
