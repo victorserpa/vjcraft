@@ -3436,10 +3436,10 @@ impl State {
         }
     }
 
-    /// Every `autosave_secs` while dirty (if enabled), writes the recovery file.
     /// The supervisor died (SIGKILL): do what a clean quit does (recovery file, prefs,
     /// recording trailer, outputs go with the process) and exit instead of playing on.
     fn quit_orphaned(&mut self) -> ! {
+        reliability::ORPHAN_QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
         if self.persist {
             let every = std::time::Duration::from_secs(self.prefs.general.autosave_secs.into());
             let gap = every + std::time::Duration::from_secs(1);
@@ -3452,6 +3452,7 @@ impl State {
         std::process::exit(0);
     }
 
+    /// Every `autosave_secs` while dirty (if enabled), writes the recovery file.
     fn autosave(&mut self) {
         let path = self.recovery_path();
         self.autosave_to(path);

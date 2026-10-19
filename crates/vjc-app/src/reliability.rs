@@ -388,6 +388,8 @@ fn end_status_stopped() -> std::process::ExitStatus {
 
 /// Set when the supervisor (our parent) is gone.
 static PARENT_GONE: AtomicBool = AtomicBool::new(false);
+/// Set by the UI when it starts the orphan quit, so the watcher lets it finish.
+pub static ORPHAN_QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// True once the supervisor died (SIGKILL, crash): the app must save and quit.
 pub fn parent_gone() -> bool {
@@ -396,7 +398,9 @@ pub fn parent_gone() -> bool {
 
 /// Child mode: watches the supervisor every 500 ms. When it dies the app would otherwise
 /// keep playing unattended forever, so this flags `parent_gone` (the UI loop then saves
-/// recovery and exits) and, if the loop does not get there in 1 s, exits the process.
+/// recovery and exits). If the loop has not started that quit within 10 s (window hidden,
+/// UI stuck) the process exits; once the quit has started it gets up to 30 s to finish
+/// writing, so a large project's recovery file is not cut short.
 #[cfg(unix)]
 pub fn start_parent_watch() {
     // SAFETY: getppid has no preconditions.
@@ -409,7 +413,14 @@ pub fn start_parent_watch() {
                 // SAFETY: as above.
                 if unsafe { libc::getppid() } != parent {
                     PARENT_GONE.store(true, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_secs(1));
+                    let t = std::time::Instant::now();
+                    while t.elapsed() < Duration::from_secs(10) {
+                        if ORPHAN_QUITTING.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_secs(30));
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     std::process::exit(0);
                 }
             }
@@ -466,8 +477,16 @@ pub fn fake_child(args: &[String]) {
         std::process::exit(0);
     }
     if mode == "sleep" {
-        // Waits for a relayed SIGTERM (bounded, so a failing test leaks nothing for long).
-        std::thread::sleep(Duration::from_secs(20));
+        // Waits for a relayed SIGTERM (bounded, so a failing test leaks nothing for long),
+        // and quits like the UI loop does when the parent watch flags the supervisor gone.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(20) {
+            if parent_gone() {
+                ORPHAN_QUITTING.store(true, Ordering::SeqCst);
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         std::process::exit(0);
     }
     let crash = match mode {
