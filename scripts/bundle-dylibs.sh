@@ -146,6 +146,17 @@ while IFS=$'\t' read -r name orig; do
   # /opt/homebrew/opt/<pkg> is a symlink into the Cellar; resolve directories fully.
   orig="$(cd -P "$(dirname "$orig")" && pwd)/$(basename "$orig")"
   case "$orig" in
+    */target/ffmpeg-libs/lib/*)
+      # Our own LGPL FFmpeg build (scripts/build-ffmpeg.sh); license files from its source.
+      pkg=ffmpeg-vjc; ver="$(sed -n 's/^FFMPEG_VER=//p' "$(dirname "$0")/build-ffmpeg.sh" | head -1)"
+      mkdir -p "$TP/$pkg"
+      for lf in COPYING.LGPLv2.1 LICENSE.md; do
+        src_lf="${orig%%/target/ffmpeg-libs/*}/target/ffmpeg-src/ffmpeg/$lf"
+        [ -f "$src_lf" ] && cp -L "$src_lf" "$TP/$pkg/$lf"
+      done
+      [ -f "$TP/$pkg/COPYING.LGPLv2.1" ] || die "no FFmpeg license file for $name"
+      printf '%s\t%s\t%s\n' "$name" "$pkg" "$ver" >> "$TP/dylibs.tsv"
+      continue ;;
     */Cellar/*) rest="${orig#*/Cellar/}"; pkg="${rest%%/*}"; rest="${rest#*/}"; ver="${rest%%/*}"
       root="${orig%%/Cellar/*}/Cellar/$pkg/$ver" ;;
     *) die "$name ($orig) is not from a Homebrew Cellar; cannot find its license" ;;

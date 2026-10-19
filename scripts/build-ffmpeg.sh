@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Builds a small, LGPL FFmpeg CLI with the HAP encoder (needs libsnappy) into
-# target/ffmpeg/bin/ffmpeg. Used by "Convert to HAP"; playback keeps the linked libav*.
+# Builds, from one pinned FFmpeg source, two LGPL products:
+#   1. a small static FFmpeg CLI with the HAP encoder (needs libsnappy) into
+#      target/ffmpeg/bin/ffmpeg, used by "Convert to HAP";
+#   2. shared libav* libs for playback (all native decoders/demuxers/parsers, swscale,
+#      swresample, VideoToolbox hwaccel, libvpx + dav1d decoders, HAP encoder only) into
+#      target/ffmpeg-libs. Packaging points the ffmpeg-sys build at it
+#      (PKG_CONFIG_PATH=target/ffmpeg-libs/lib/pkgconfig); dev builds keep using Homebrew.
+# libvpx and dav1d are NOT downloaded: they come from Homebrew (pkg-config), are BSD-licensed,
+# and are bundled by scripts/bundle-dylibs.sh like any other Homebrew dylib.
 #
 # Network: exactly two downloads, both pinned and SHA-256 checked, nothing else.
 #   FFmpeg 9.0.2  https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz   (official release tarball)
@@ -39,10 +46,20 @@ ROOT=$PWD
 OUT_BASE="$ROOT/target"
 SRC="$OUT_BASE/ffmpeg-src"
 OUT="$OUT_BASE/ffmpeg"
+LIBS="$OUT_BASE/ffmpeg-libs"
 DEPS="$SRC/prefix"
 STAMP="$FFMPEG_VER+$SNAPPY_VER+$(shasum -a 256 "$0" | cut -c1-16)"
 
-if [ "$FORCE" -eq 0 ] && [ -x "$OUT/bin/ffmpeg" ] && [ "$(cat "$OUT/stamp" 2>/dev/null)" = "$STAMP" ]; then
+# Homebrew's dav1d and libvpx (decoders only are enabled below).
+BREW_PC=""
+for f in dav1d libvpx; do
+  p="$(brew --prefix "$f" 2>/dev/null)/lib/pkgconfig"
+  [ -d "$p" ] || { echo "missing Homebrew formula $f (brew install $f)" >&2; exit 1; }
+  BREW_PC="$BREW_PC:$p"
+done
+export PKG_CONFIG_PATH="${BREW_PC#:}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+if [ "$FORCE" -eq 0 ] && [ -x "$OUT/bin/ffmpeg" ] && [ -f "$LIBS/lib/pkgconfig/libavcodec.pc" ] && [ "$(cat "$OUT/stamp" 2>/dev/null)" = "$STAMP" ]; then
   echo "up to date: $OUT/bin/ffmpeg"
   exit 0
 fi
@@ -90,7 +107,7 @@ cmake -S "$SRC/snappy" -B "$SRC/snappy-build" -DCMAKE_BUILD_TYPE=Release \
 cmake --build "$SRC/snappy-build" -j "$JOBS" >/dev/null
 cmake --install "$SRC/snappy-build" >/dev/null
 
-rm -rf "$SRC/ffmpeg-build" "$OUT"
+rm -rf "$SRC/ffmpeg-build" "$SRC/ffmpeg-libs-build" "$OUT" "$LIBS"
 mkdir -p "$SRC/ffmpeg-build"
 START=$(date +%s)
 # Inputs: every native demuxer, decoder, parser and bsf (so common sources convert); only the
@@ -113,6 +130,29 @@ START=$(date +%s)
   make -j"$JOBS"
   make install
 )
+
+# Shared libs for playback. Encoders: only hap (Convert to HAP) and pcm_s16le; libvpx/dav1d
+# are decoders (their encoders are not enabled). Protocols: file and pipe only.
+mkdir -p "$SRC/ffmpeg-libs-build"
+(
+  cd "$SRC/ffmpeg-libs-build"
+  "$SRC/ffmpeg/configure" \
+    --prefix="$LIBS" \
+    --enable-shared --disable-static \
+    --disable-autodetect --disable-doc --disable-debug \
+    --disable-network --disable-programs \
+    --enable-zlib --enable-libsnappy \
+    --enable-libdav1d --enable-libvpx --enable-videotoolbox --enable-audiotoolbox \
+    --enable-swscale --enable-swresample \
+    --disable-protocols --enable-protocol=file,pipe \
+    --disable-encoders --enable-encoder=hap,pcm_s16le \
+    --disable-muxers --enable-muxer=mov \
+    --extra-cflags="-I$DEPS/include -mmacosx-version-min=$MIN_MACOS" \
+    --extra-ldflags="-L$DEPS/lib -mmacosx-version-min=$MIN_MACOS" \
+    --extra-libs="-lc++"
+  make -j"$JOBS"
+  make install
+)
 END=$(date +%s)
 
 BIN="$OUT/bin/ffmpeg"
@@ -126,5 +166,14 @@ fi
 if otool -L "$BIN" | tail -n +2 | grep -Ev '^\s+(/usr/lib/|/System/)' | grep -q .; then
   echo "non-system dynamic library linked:" >&2; otool -L "$BIN" >&2; exit 1
 fi
+# Shared libs: LGPL, no GPL codecs or network libs linked.
+if grep -Eq '^#define CONFIG_(GPL|VERSION3|NONFREE) 1' "$SRC/ffmpeg-libs-build/config.h"; then
+  echo "license check failed: GPL/nonfree flag in shared libs" >&2; exit 1
+fi
+for l in "$LIBS"/lib/*.dylib; do
+  if otool -L "$l" | grep -Eq 'x264|x265|ssl|crypto|vmaf|lame|SvtAv1'; then
+    echo "unwanted dependency in $l" >&2; exit 1
+  fi
+done
 echo "$STAMP" > "$OUT/stamp"
 echo "built $BIN in $((END - START)) s"

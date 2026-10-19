@@ -28,20 +28,20 @@ DIST=target/dist
 APP="$DIST/VJCraft.app"
 DMG="$DIST/VJCraft-$VERSION-macos.dmg"
 
-cargo build --release -p vjc-app
+# Our own LGPL FFmpeg (shared libs for playback + HAP CLI), built from pinned sources.
+# The vjc-app build links these libs (ffmpeg-sys uses pkg-config), not Homebrew's GPL FFmpeg.
+scripts/build-ffmpeg.sh || { echo "FFmpeg build failed" >&2; exit 1; }
+FFMPEG_PC="$PWD/target/ffmpeg-libs/lib/pkgconfig"
+for f in dav1d libvpx; do FFMPEG_PC="$FFMPEG_PC:$(brew --prefix "$f")/lib/pkgconfig"; done
+# Clean the ffmpeg-sys artifacts so a build against Homebrew's FFmpeg is never reused.
+cargo clean --release -p ffmpeg-sys-next 2>/dev/null || true
+PKG_CONFIG_PATH="$FFMPEG_PC" cargo build --release -p vjc-app
 
 rm -rf "$APP" "$DMG" "$DIST/dmg-root"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/vjcraft "$APP/Contents/MacOS/vjcraft"
+cp "${CARGO_TARGET_DIR:-target}/release/vjcraft" "$APP/Contents/MacOS/vjcraft"
 
-# HAP-capable ffmpeg CLI for "Convert to HAP" (LGPL, static; built from pinned sources).
-# build-ffmpeg.sh is a no-op when target/ffmpeg matches its stamp (version + configure), so a
-# stale binary from an older configure is rebuilt. Set REQUIRE_FFMPEG=1 for release builds.
-if ! scripts/build-ffmpeg.sh; then
-  echo "WARNING: FFmpeg build failed; packaging without Convert to HAP support" >&2
-  [ "${REQUIRE_FFMPEG:-0}" = 1 ] && exit 1
-  rm -f target/ffmpeg/bin/ffmpeg
-fi
+# HAP-capable ffmpeg CLI for "Convert to HAP" (LGPL, static), built above.
 if [ -x target/ffmpeg/bin/ffmpeg ]; then
   cp target/ffmpeg/bin/ffmpeg "$APP/Contents/Resources/ffmpeg"
 else
