@@ -320,11 +320,15 @@ struct Job {
     _pending: Pending,
 }
 
-struct Pending(Arc<AtomicUsize>);
+/// Frames the encoder must finish before the larger warm-up queue ends.
+const WARM_DONE: u64 = 3;
+
+struct Pending(Arc<AtomicUsize>, Arc<AtomicU64>);
 
 impl Drop for Pending {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+        self.1.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -337,6 +341,8 @@ pub struct FrameQueue {
     dropped: AtomicU64,
     /// Jobs queued or being encoded.
     pending: Arc<AtomicUsize>,
+    /// Jobs the encoder has finished with.
+    done: Arc<AtomicU64>,
 }
 
 impl FrameQueue {
@@ -353,6 +359,7 @@ impl FrameQueue {
                 extra,
                 dropped: AtomicU64::new(0),
                 pending: Arc::new(AtomicUsize::new(0)),
+                done: Arc::new(AtomicU64::new(0)),
             },
             rx,
         )
@@ -376,7 +383,7 @@ impl FrameQueue {
         let job = Job {
             pts,
             data,
-            _pending: Pending(self.pending.clone()),
+            _pending: Pending(self.pending.clone(), self.done.clone()),
         };
         match self.tx.try_send(job) {
             Ok(()) => true,
@@ -781,10 +788,12 @@ impl Recorder {
         self.queue.push_warm(pts, rgba, self.warming())
     }
 
-    /// True while the encoder is still opening, for at most `warm_window` from the spawn
-    /// (the codec may never be written if the open fails or hangs).
+    /// True while the encoder is opening or has not yet finished its first frames (the first
+    /// frames after the open are slow too), for at most `warm_window` from the spawn.
     fn warming(&self) -> bool {
-        self.started.elapsed() < self.warm_window && self.codec.lock().unwrap().is_empty()
+        self.started.elapsed() < self.warm_window
+            && (self.codec.lock().unwrap().is_empty()
+                || self.queue.done.load(Ordering::Relaxed) < WARM_DONE)
     }
 
     /// Counts a frame that could not even be captured. Only adds a drop: it must not move
@@ -1125,7 +1134,7 @@ mod tests {
         let job = Job {
             pts: 0,
             data: vec![0; 16 * 16 * 4],
-            _pending: Pending(Arc::new(AtomicUsize::new(1))),
+            _pending: Pending(Arc::new(AtomicUsize::new(1)), Arc::new(AtomicU64::new(0))),
         };
         e.encode(&job).unwrap();
         let r = e.finish_video(Err(ff::Error::Bug));
@@ -1384,6 +1393,18 @@ mod tests {
         r.warm_window = std::time::Duration::ZERO;
         let ok = steady_pushes(&mut r);
         assert_eq!(ok, 5, "4 queued + 1 in flight");
+        gate_tx.send(()).unwrap();
+        let _ = r.finish();
+    }
+
+    #[test]
+    fn warm_up_lasts_past_the_codec_open_until_first_frames_are_encoded() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut r =
+            Recorder::spawn(&tmp("warm4.mp4"), 2, 2, 4, holding(Some("x"), gate_rx)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!r.codec.lock().unwrap().is_empty(), "codec open");
+        assert!(r.warming(), "codec open but no frame encoded yet");
         gate_tx.send(()).unwrap();
         let _ = r.finish();
     }
