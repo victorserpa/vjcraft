@@ -168,7 +168,7 @@ impl Registry {
             .lines()
             .filter(|l| !l.is_empty())
             .map(|l| match l.split_once('\t') {
-                Some((pid, p)) => (pid.parse().unwrap_or(0), PathBuf::from(p)),
+                Some((pid, p)) => (parse_pid(pid), PathBuf::from(p)),
                 None => (0, PathBuf::from(l)),
             })
             .collect()
@@ -190,13 +190,31 @@ impl Registry {
         self.add_as(p, std::process::id());
     }
 
+    /// Exclusive lock for a read-modify-write of the file (released on drop).
+    fn lock(&self) -> Option<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        let mut name = self.0.as_os_str().to_os_string();
+        name.push(".lock");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(name)
+            .ok()?;
+        // SAFETY: flock on a descriptor we own; blocks until the other writer is done.
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        Some(f)
+    }
+
     fn add_as(&self, p: &Path, pid: u32) {
+        let _lock = self.lock();
         let mut v = self.list();
         v.push((pid, p.to_path_buf()));
         self.write(&v);
     }
 
     fn remove(&self, p: &Path) {
+        let _lock = self.lock();
         let v: Vec<_> = self.list().into_iter().filter(|(_, x)| x != p).collect();
         self.write(&v);
     }
@@ -204,6 +222,7 @@ impl Registry {
     /// Deletes the listed `.part` files of dead instances (only ones ending in `.part`,
     /// never anything else). A part owned by another running VJCraft is left alone.
     pub fn clean_stale(&self) -> usize {
+        let _lock = self.lock();
         let mut n = 0;
         let mut keep = vec![];
         for (pid, p) in self.list() {
@@ -217,6 +236,11 @@ impl Registry {
         self.write(&keep);
         n
     }
+}
+
+/// A pid that fits `pid_t` and is positive; anything else is 0 (no live owner).
+fn parse_pid(s: &str) -> u32 {
+    s.trim().parse::<i32>().ok().filter(|p| *p > 0).map_or(0, |p| p as u32)
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -953,6 +977,35 @@ mod tests {
         assert_eq!(n, 1);
         assert!(live.exists(), "another instance's part survives");
         assert!(!dead.exists(), "control: a dead owner's part is deleted");
+    }
+
+    #[test]
+    fn registry_pid_parse_rejects_out_of_range() {
+        assert_eq!(parse_pid("123"), 123);
+        for bad in ["0", "-5", "2147483648", "4294967295", "x", ""] {
+            assert_eq!(parse_pid(bad), 0, "{bad}");
+        }
+    }
+
+    #[test]
+    fn registry_concurrent_adds_lose_nothing() {
+        let d = tmp("reg-conc");
+        let path = d.join("parts.txt");
+        let hs: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let reg = Registry(path);
+                    for i in 0..25 {
+                        reg.add(Path::new(&format!("/x/{t}-{i}.part")));
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(Registry(path).list().len(), 200);
     }
 
     fn fake_ffmpeg(path: &Path, tag: &str) {
