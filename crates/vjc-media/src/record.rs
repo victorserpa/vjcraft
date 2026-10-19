@@ -366,7 +366,8 @@ impl FrameQueue {
 
     /// Like `push`; `warm` allows the extra warm-up depth.
     fn push_warm(&self, pts: i64, data: Vec<u8>, warm: bool) -> bool {
-        let limit = self.cap + if warm { self.extra } else { 0 };
+        // Steady state: `cap` queued plus the one the encoder holds. Warm-up adds `extra`.
+        let limit = self.cap + 1 + if warm { self.extra } else { 0 };
         if self.pending.load(Ordering::Relaxed) >= limit {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -412,7 +413,7 @@ pub struct Recorder {
     path: PathBuf,
     codec: Arc<Mutex<String>>,
     started: std::time::Instant,
-    /// After opening, frames still get the larger warm-up queue for this long.
+    /// The larger warm-up queue lasts at most this long from the spawn.
     warm_window: std::time::Duration,
     handle: Option<JoinHandle<Result<(u64, bool), String>>>,
 }
@@ -780,9 +781,10 @@ impl Recorder {
         self.queue.push_warm(pts, rgba, self.warming())
     }
 
-    /// True while the encoder is still opening or was opened less than `warm_window` ago.
+    /// True while the encoder is still opening, for at most `warm_window` from the spawn
+    /// (the codec may never be written if the open fails or hangs).
     fn warming(&self) -> bool {
-        self.codec.lock().unwrap().is_empty() || self.started.elapsed() < self.warm_window
+        self.started.elapsed() < self.warm_window && self.codec.lock().unwrap().is_empty()
     }
 
     /// Counts a frame that could not even be captured. Only adds a drop: it must not move
@@ -1350,23 +1352,53 @@ mod tests {
         assert_eq!(r.finish().unwrap().encoded, 12);
     }
 
-    #[test]
-    fn warm_up_ends_once_the_encoder_is_open() {
-        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-        let mut r = Recorder::spawn(&tmp("warm2.mp4"), 2, 2, 4, move |rx, c| {
-            *c.lock().unwrap() = "x".into(); // opened
+    /// Worker that takes one frame (the in-flight one), then holds until released.
+    fn holding(
+        c: Option<&'static str>,
+        gate_rx: std::sync::mpsc::Receiver<()>,
+    ) -> impl FnOnce(Receiver<Job>, &Mutex<String>) -> Result<(u64, bool), String> + Send + 'static
+    {
+        move |rx, cell| {
+            if let Some(c) = c {
+                *cell.lock().unwrap() = c.into();
+            }
+            let first = rx.recv();
             let _ = gate_rx.recv();
-            Ok((rx.iter().count() as u64, false))
-        })
-        .unwrap();
-        r.warm_window = std::time::Duration::ZERO;
-        while r.codec.lock().unwrap().is_empty() {
-            std::thread::yield_now();
+            drop(first);
+            Ok((rx.iter().count() as u64 + 1, false))
         }
-        let ok = (0..12).filter(|_| r.push(vec![0; 16])).count();
-        assert_eq!(ok, 4);
-        assert_eq!(r.dropped(), 8);
+    }
+
+    fn steady_pushes(r: &mut Recorder) -> usize {
+        // let the worker take its in-flight frame first
+        assert!(r.push(vec![0; 16]));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        (0..12).filter(|_| r.push(vec![0; 16])).count() + 1
+    }
+
+    #[test]
+    fn steady_state_depth_is_cap_queued_plus_one_in_flight() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut r = Recorder::spawn(&tmp("warm2.mp4"), 2, 2, 4, holding(Some("x"), gate_rx))
+            .unwrap();
+        r.warm_window = std::time::Duration::ZERO;
+        let ok = steady_pushes(&mut r);
+        assert_eq!(ok, 5, "4 queued + 1 in flight");
         gate_tx.send(()).unwrap();
-        assert_eq!(r.finish().unwrap().dropped, 8);
+        let _ = r.finish();
+    }
+
+    #[test]
+    fn warm_up_ends_after_the_window_even_if_the_codec_never_opens() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut r = Recorder::spawn(&tmp("warm3.mp4"), 2, 2, 4, holding(None, gate_rx)).unwrap();
+        r.warm_window = std::time::Duration::from_millis(50);
+        assert!(r.warming());
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!r.warming(), "codec never written, window over");
+        let ok = steady_pushes(&mut r);
+        assert_eq!(ok, 5);
+        gate_tx.send(()).unwrap();
+        let _ = r.finish();
     }
 }
