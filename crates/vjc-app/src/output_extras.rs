@@ -6,7 +6,7 @@ use eframe::egui;
 use uuid::Uuid;
 use vjc_core::slice_geom::{self, Field, Op, Side};
 use vjc_core::{Command, mapping};
-use vjc_model::{OutputDevice, Screen, Slice};
+use vjc_model::{OutputDevice, Screen, Slice, SliceShape};
 
 /// Default LED cell size in content pixels (the usual tile pitch of a panel).
 pub(crate) const LED_CELL_DEFAULT: u32 = 8;
@@ -146,10 +146,7 @@ impl State {
             .map(|(n, s)| {
                 let mut c = s.clone();
                 c.id = Uuid::new_v4();
-                for p in &mut c.output_mesh {
-                    p.0 += PASTE_SHIFT;
-                    p.1 += PASTE_SHIFT;
-                }
+                shift_pasted(&mut c, (scr.width.max(1) as f32, scr.height.max(1) as f32));
                 Command::AddSlice {
                     screen: scr.id,
                     slice: c,
@@ -157,6 +154,28 @@ impl State {
                 }
             })
             .collect())
+    }
+}
+
+/// Moves a pasted slice by `PASTE_SHIFT`: the mesh (pixels) and every outline that lives in
+/// screen-normalized space (polygon shape, mask), so they stay on the slice.
+fn shift_pasted(c: &mut Slice, screen: (f32, f32)) {
+    for p in &mut c.output_mesh {
+        p.0 += PASTE_SHIFT;
+        p.1 += PASTE_SHIFT;
+    }
+    let (dx, dy) = (PASTE_SHIFT / screen.0, PASTE_SHIFT / screen.1);
+    let mut norm = |pts: &mut Vec<(f32, f32)>| {
+        for p in pts {
+            p.0 += dx;
+            p.1 += dy;
+        }
+    };
+    if let SliceShape::Polygon(pts) = &mut c.shape {
+        norm(pts);
+    }
+    if let Some(m) = &mut c.mask {
+        norm(m);
     }
 }
 
@@ -177,6 +196,26 @@ pub(crate) fn artnet_screen(name: &str, w: u32, h: u32) -> Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_slice_outlines_move_with_the_mesh() {
+        let mut s = mapping::new_slice(1000, 500);
+        s.shape = SliceShape::Polygon(vec![(0.1, 0.1), (0.5, 0.1), (0.3, 0.5)]);
+        s.mask = Some(vec![(0.2, 0.2), (0.4, 0.2), (0.3, 0.4)]);
+        let mesh0 = s.output_mesh[0];
+        shift_pasted(&mut s, (1000.0, 500.0));
+        assert!((s.output_mesh[0].0 - mesh0.0 - PASTE_SHIFT).abs() < 1e-3);
+        let SliceShape::Polygon(p) = &s.shape else {
+            panic!("polygon")
+        };
+        assert!((p[0].0 - (0.1 + 0.016)).abs() < 1e-5 && (p[0].1 - (0.1 + 0.032)).abs() < 1e-5);
+        assert!((s.mask.as_ref().unwrap()[0].0 - 0.216).abs() < 1e-5);
+        // Control: a plain slice without outlines only moves its mesh.
+        let mut r = mapping::new_slice(1000, 500);
+        shift_pasted(&mut r, (1000.0, 500.0));
+        assert_eq!(r.shape, SliceShape::Rect);
+        assert!(r.mask.is_none());
+    }
 
     #[test]
     fn led_grid_has_a_line_every_cell_and_none_when_too_small() {
