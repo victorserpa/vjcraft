@@ -145,10 +145,7 @@ impl State {
                             ui,
                             "Empty = ~/Movies/VJCraft. Recordings carry the master audio (not the PNG sequence).",
                         );
-                        let have = self
-                            .rec_codecs
-                            .get_or_insert_with(vjc_media::record::available)
-                            .clone();
+                        let have = self.rec_codecs.get().to_vec();
                         let cur = vjc_media::record::RecSettings::from_prefs(
                             &p.record.codec,
                             p.record.quality,

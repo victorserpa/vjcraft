@@ -8,7 +8,7 @@ use ffmpeg_next as ff;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 /// What to record with. Ids are stored in the preferences.
@@ -98,6 +98,39 @@ pub fn available() -> Vec<RecCodec> {
         return vec![];
     }
     available_with(|n| ff::encoder::find_by_name(n).is_some())
+}
+
+/// Codec probe run on its own thread: `get` never blocks the caller (the UI thread) and
+/// is empty until the probe finishes.
+#[derive(Clone, Default)]
+pub struct Probe(Arc<OnceLock<Vec<RecCodec>>>);
+
+impl Probe {
+    /// Runs `f` on a new thread.
+    pub fn start(f: impl FnOnce() -> Vec<RecCodec> + Send + 'static) -> Self {
+        let cell = Arc::new(OnceLock::new());
+        let c = cell.clone();
+        std::thread::spawn(move || {
+            let _ = c.set(f());
+        });
+        Self(cell)
+    }
+
+    /// A probe that has already finished with `v` (no thread).
+    pub fn ready(v: Vec<RecCodec>) -> Self {
+        Self(Arc::new(OnceLock::from(v)))
+    }
+
+    /// The codecs, waiting for the probe to finish. For starting a recording, where an
+    /// empty list would pick the wrong codec; the probe is usually done long before.
+    pub fn wait(&self) -> &[RecCodec] {
+        self.0.wait()
+    }
+
+    /// The codecs found so far (none while still probing).
+    pub fn get(&self) -> &[RecCodec] {
+        self.0.get().map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Codec and quality of a recording.
@@ -1400,7 +1433,7 @@ mod tests {
     #[test]
     fn warm_up_lasts_past_the_codec_open_until_first_frames_are_encoded() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-        let mut r =
+        let r =
             Recorder::spawn(&tmp("warm4.mp4"), 2, 2, 4, holding(Some("x"), gate_rx)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!r.codec.lock().unwrap().is_empty(), "codec open");
@@ -1421,5 +1454,33 @@ mod tests {
         assert_eq!(ok, 5);
         gate_tx.send(()).unwrap();
         let _ = r.finish();
+    }
+
+    #[test]
+    fn probe_does_not_block_the_caller() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let p = Probe::start(move || {
+            let _ = rx.recv();
+            vec![RecCodec::H264]
+        });
+        assert!(p.get().is_empty(), "get must not wait for the probe");
+        tx.send(()).unwrap();
+        for _ in 0..200 {
+            if !p.get().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(p.get(), &[RecCodec::H264]);
+    }
+
+    #[test]
+    fn wait_returns_the_full_list_from_a_slow_probe() {
+        let p = Probe::start(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            vec![RecCodec::H264]
+        });
+        assert_eq!(p.wait(), &[RecCodec::H264]);
+        assert_eq!(Probe::ready(vec![RecCodec::H264]).get(), &[RecCodec::H264]);
     }
 }
