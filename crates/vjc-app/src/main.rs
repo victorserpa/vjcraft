@@ -544,6 +544,21 @@ fn cols_on_air(players: &HashMap<LayerId, (DeckId, u32, Player)>, gens: &Gens) -
 
 /// Rewrites the column of a queued command after columns moved; false when its column was
 /// removed (the command is dropped).
+/// Memory key under which the Preferences scale slider stores its widget id.
+pub(crate) fn ui_scale_slider_key() -> egui::Id {
+    egui::Id::new("ui-scale-slider")
+}
+
+/// Is the scale slider being dragged right now? Read from egui's pointer state (not a flag
+/// the slider writes), so it cannot stick when the slider stops being drawn, and it is
+/// already false on the frame the button is released.
+fn ui_scale_dragging(ctx: &egui::Context) -> bool {
+    let Some(id) = ctx.data(|d| d.get_temp::<egui::Id>(ui_scale_slider_key())) else {
+        return false;
+    };
+    ctx.is_being_dragged(id) && ctx.input(|i| i.pointer.any_down() && !i.pointer.any_released())
+}
+
 /// The zoom to set when the `ui_scale` pref differs from the last one applied; None while
 /// it is unchanged, so a Cmd +/- zoom made meanwhile stays.
 /// Not while the scale slider is being dragged: zooming under the pointer moves the slider
@@ -7289,16 +7304,14 @@ impl State {
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         // Only when the pref changes: egui's own Cmd +/- must keep working in between.
-        let dragging = ui
-            .ctx()
-            .data(|d| d.get_temp::<bool>(egui::Id::new("ui-scale-drag")))
-            .unwrap_or(false);
+        let dragging = ui_scale_dragging(ui.ctx());
         if let Some(scale) = scale_to_apply(
             &mut self.applied_ui_scale,
             self.prefs.general.ui_scale,
             dragging,
         ) {
             ui.ctx().set_zoom_factor(scale);
+            ui.ctx().request_repaint();
         }
         params::set_hidden(ui.ctx(), &self.prefs.layouts.current.hidden);
         self.prune_screen_state();
@@ -12726,6 +12739,50 @@ fn numbered_image_folder_drops_as_one_sequence_clip() {
 #[cfg(test)]
 mod remap_tests {
     use super::*;
+
+    #[test]
+    fn ui_scale_drag_follows_the_pointer_and_cannot_stick() {
+        use egui::{Event, PointerButton, Pos2, RawInput};
+        let ctx = egui::Context::default();
+        let mut v = 1.0f32;
+        let mut frame = |ev: Vec<Event>, draw: bool, v: &mut f32| -> bool {
+            let raw = RawInput {
+                events: ev,
+                ..Default::default()
+            };
+            let mut dragging = false;
+            let mut out = ctx.run_ui(raw, |ui| {
+                if draw {
+                    let r = ui.add(egui::Slider::new(v, 0.0..=10.0));
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(ui_scale_slider_key(), r.id));
+                }
+                dragging = ui_scale_dragging(ui.ctx());
+            });
+            out.textures_delta.clear();
+            dragging
+        };
+        let at = |x: f32| Pos2::new(x, 12.0);
+        let mv = |x: f32| Event::PointerMoved(at(x));
+        let btn = |x: f32, pressed: bool| Event::PointerButton {
+            pos: at(x),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(vec![mv(40.0)], true, &mut v);
+        frame(vec![btn(40.0, true)], true, &mut v);
+        let mut during = false;
+        for x in [60.0, 80.0, 100.0] {
+            during = frame(vec![mv(x)], true, &mut v);
+        }
+        assert!(during, "dragging while the button is held on the slider");
+        // The slider stops being drawn mid-drag, then the button goes up: not stuck.
+        frame(vec![mv(110.0)], false, &mut v);
+        let released = frame(vec![btn(110.0, false)], false, &mut v);
+        assert!(!released, "false on the release frame");
+        assert!(!frame(vec![], false, &mut v), "and after it");
+    }
 
     #[test]
     fn ui_scale_is_applied_only_when_the_pref_changes() {

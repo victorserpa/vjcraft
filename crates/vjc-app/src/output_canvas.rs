@@ -1250,7 +1250,10 @@ impl State {
                     egui::TextureOptions::LINEAR,
                 );
                 ctx.data_mut(|d| d.insert_temp(guide_id(j.screen), tex));
-                if let Some(w) = &mut self.out_win {
+                // The Guide toggle is window-wide: only the screen being edited turns it on.
+                if self.sel_screen == Some(j.screen)
+                    && let Some(w) = &mut self.out_win
+                {
                     w.guide_on = true;
                 }
                 self.status = format!("Guide image loaded: {}", j.path.display());
@@ -1269,6 +1272,8 @@ impl State {
 
     /// Removes the guide image of `screen`.
     pub(crate) fn clear_guide(&mut self, ctx: &egui::Context, screen: Uuid) {
+        // A decode still pending for this screen must not bring the guide back.
+        self.guide_jobs.retain(|j| j.screen != screen);
         ctx.data_mut(|d| d.remove::<egui::TextureHandle>(guide_id(screen)));
     }
 
@@ -1290,24 +1295,33 @@ impl State {
         }
         // Only pictures are guide images; a video or folder dropped here stays a clip drop.
         let (images, rest): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| is_guide_image(p));
+        if !rest.is_empty() {
+            self.notify(
+                crate::widgets::Level::Warn,
+                "Only images can be guides (png, jpg)".into(),
+            );
+        }
         let Some(path) = images.first() else {
-            return rest;
+            return vec![];
         };
         match self.sel_screen {
             Some(id) => self.load_guide(ctx, id, path),
             None => self.status = "Select a screen to give it a guide image".into(),
         }
-        rest
+        // Everything dropped on the window stays here; nothing falls through to the grid.
+        vec![]
     }
 }
 
+/// Picture extensions the guide loader accepts: exactly the decoders `image_open` has (the
+/// `image` crate is built with png and jpeg only).
+pub(crate) const GUIDE_EXTS: [&str; 3] = ["png", "jpg", "jpeg"];
+
 /// Is `p` a picture file the guide loader accepts (by extension)?
 pub(crate) fn is_guide_image(p: &Path) -> bool {
-    p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        ["png", "jpg", "jpeg"]
-            .iter()
-            .any(|k| e.eq_ignore_ascii_case(k))
-    })
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| GUIDE_EXTS.iter().any(|k| e.eq_ignore_ascii_case(k)))
 }
 
 /// A guide image being decoded on a worker thread.

@@ -8870,6 +8870,7 @@ fn wait_guide(h: &mut Harness<'_, State>, screen: Uuid) {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    panic!("the guide image never loaded");
 }
 
 #[test]
@@ -8916,4 +8917,112 @@ fn guide_drop_takes_only_pictures() {
     // Control: a video or a folder is not a guide image.
     assert!(!is_guide_image(Path::new("/a/b.mp4")));
     assert!(!is_guide_image(Path::new("/a/folder")));
+}
+
+#[test]
+fn clear_guide_cancels_a_pending_decode() {
+    let mut h = app();
+    let id = Uuid::new_v4();
+    let dir = presets_tmp("guide-clear");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("g.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+        .save(&png)
+        .unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().load_guide(&ctx, id, &png);
+    h.state_mut().clear_guide(&ctx, id);
+    assert!(h.state().guide_jobs.is_empty());
+    for _ in 0..30 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        State::guide_texture(&h.ctx, id).is_none(),
+        "stale result dropped"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn guide_toggle_turns_on_only_for_the_selected_screen() {
+    let mut h = app();
+    let scr = vjc_core::mapping::new_screen("Wall", 1920, 1080);
+    let a = scr.id;
+    h.state_mut().exec(Command::AddScreen {
+        screen: scr,
+        index: 0,
+    });
+    settle(&mut h);
+    let b = Uuid::new_v4();
+    let dir = presets_tmp("guide-on");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("g.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+        .save(&png)
+        .unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().output_setup_open = true;
+    settle(&mut h);
+    h.state_mut().out_win.as_mut().unwrap().guide_on = false;
+    h.state_mut().sel_screen = Some(a);
+    h.state_mut().load_guide(&ctx, b, &png);
+    wait_guide(&mut h, b);
+    assert!(
+        !h.state().out_win.as_ref().unwrap().guide_on,
+        "other screen's job"
+    );
+    h.state_mut().load_guide(&ctx, a, &png);
+    wait_guide(&mut h, a);
+    assert!(h.state().out_win.as_ref().unwrap().guide_on);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_guide_extension_decodes() {
+    let dir = presets_tmp("guide-exts");
+    std::fs::create_dir_all(&dir).unwrap();
+    for e in crate::output_canvas::GUIDE_EXTS {
+        let p = dir.join(format!("g.{e}"));
+        image::RgbImage::from_pixel(4, 4, image::Rgb([9, 9, 9]))
+            .save(&p)
+            .unwrap();
+        assert!(crate::reliability::image_open(&p).is_ok(), "{e}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_images_dropped_on_output_setup_do_not_reach_the_grid() {
+    let mut h = app();
+    h.state_mut().output_setup_open = true;
+    settle(&mut h);
+    h.state_mut().out_win.as_mut().unwrap().rect = eframe::egui::Rect::from_min_size(
+        eframe::egui::pos2(0.0, 0.0),
+        eframe::egui::vec2(600.0, 400.0),
+    );
+    h.hover_at(eframe::egui::pos2(100.0, 100.0));
+    h.step();
+    let small = eframe::egui::Rect::from_min_size(
+        eframe::egui::pos2(0.0, 0.0),
+        eframe::egui::vec2(600.0, 400.0),
+    );
+    h.state_mut().out_win.as_mut().unwrap().rect = small;
+    let ctx = h.ctx.clone();
+    let video = std::path::PathBuf::from("/a/clip.mp4");
+    let left = h.state_mut().out_take_drops(&ctx, vec![video]);
+    assert!(left.is_empty(), "swallowed by the window");
+    assert_eq!(h.state().toasts.len(), 1, "told why");
+    // Control: outside the window the drop is untouched.
+    h.hover_at(eframe::egui::pos2(900.0, 700.0));
+    settle(&mut h);
+    assert_eq!(
+        h.ctx.input(|i| i.pointer.latest_pos()),
+        Some(eframe::egui::pos2(900.0, 700.0))
+    );
+    h.state_mut().out_win.as_mut().unwrap().rect = small;
+    let left = h
+        .state_mut()
+        .out_take_drops(&ctx, vec!["/a/clip.mp4".into()]);
+    assert_eq!(left.len(), 1);
 }

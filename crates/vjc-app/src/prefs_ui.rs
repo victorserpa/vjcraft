@@ -9,6 +9,8 @@ use eframe::egui;
 use vjc_io::prefs::HwDecode;
 use vjc_model::FitMode;
 
+use crate::ui_scale_slider_key;
+
 impl State {
     pub(crate) fn prefs_window(&mut self, ctx: &egui::Context) {
         if !self.prefs_open {
@@ -64,9 +66,8 @@ impl State {
                                     .step_by(0.05)
                                     .fixed_decimals(2),
                             );
-                            let drag = r.dragged();
                             ui.ctx()
-                                .data_mut(|d| d.insert_temp(egui::Id::new("ui-scale-drag"), drag));
+                                .data_mut(|d| d.insert_temp(ui_scale_slider_key(), r.id));
                         });
                         ui.horizontal(|ui| {
                             ui.label("Browser start folder");
