@@ -2072,7 +2072,12 @@ impl State {
             audio_error: false,
             audio_outputs: None,
             audio_inputs: None,
-            rec_codecs: vjc_media::record::Probe::start(vjc_media::record::available),
+            // UI tests get the list at once, so their result does not depend on timing.
+            rec_codecs: if live {
+                vjc_media::record::Probe::start(vjc_media::record::available)
+            } else {
+                vjc_media::record::Probe::ready(vjc_media::record::available())
+            },
             cells: vec![],
             layer_rects: vec![],
             grid_rect: egui::Rect::NOTHING,
@@ -5967,7 +5972,7 @@ impl State {
                         tap: a.tap(),
                         rate: a.sample_rate(),
                     });
-                let have = self.rec_codecs.get();
+                let have = self.rec_codecs.wait();
                 let settings = vjc_media::record::RecSettings::from_prefs(
                     &self.prefs.record.codec,
                     self.prefs.record.quality,

@@ -116,6 +116,17 @@ impl Probe {
         Self(cell)
     }
 
+    /// A probe that has already finished with `v` (no thread).
+    pub fn ready(v: Vec<RecCodec>) -> Self {
+        Self(Arc::new(OnceLock::from(v)))
+    }
+
+    /// The codecs, waiting for the probe to finish. For starting a recording, where an
+    /// empty list would pick the wrong codec; the probe is usually done long before.
+    pub fn wait(&self) -> &[RecCodec] {
+        self.0.wait()
+    }
+
     /// The codecs found so far (none while still probing).
     pub fn get(&self) -> &[RecCodec] {
         self.0.get().map_or(&[], Vec::as_slice)
@@ -1422,7 +1433,7 @@ mod tests {
     #[test]
     fn warm_up_lasts_past_the_codec_open_until_first_frames_are_encoded() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-        let mut r =
+        let r =
             Recorder::spawn(&tmp("warm4.mp4"), 2, 2, 4, holding(Some("x"), gate_rx)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!r.codec.lock().unwrap().is_empty(), "codec open");
@@ -1461,5 +1472,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(p.get(), &[RecCodec::H264]);
+    }
+
+    #[test]
+    fn wait_returns_the_full_list_from_a_slow_probe() {
+        let p = Probe::start(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            vec![RecCodec::H264]
+        });
+        assert_eq!(p.wait(), &[RecCodec::H264]);
+        assert_eq!(Probe::ready(vec![RecCodec::H264]).get(), &[RecCodec::H264]);
     }
 }
