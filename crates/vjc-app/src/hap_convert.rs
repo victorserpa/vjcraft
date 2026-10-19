@@ -67,12 +67,23 @@ pub struct Space {
     pub total: u64,
 }
 
-/// Free and total bytes of the volume holding `path` (or its nearest existing parent).
-pub fn free_space(path: &Path) -> Option<Space> {
+/// The path itself or its nearest existing parent. None when that parent is only a mount
+/// root (`/`, `/Volumes`, `/media`, `/mnt`): the volume the path names (an unmounted drive)
+/// is unknown, and must not be mistaken for the volume holding the root.
+fn nearest_existing(path: &Path) -> Option<&Path> {
     let mut p = path;
+    let mut skipped = false;
     while !p.exists() {
         p = p.parent()?;
+        skipped = true;
     }
+    let mount_root = ["/", "/Volumes", "/media", "/mnt"].iter().any(|r| p == Path::new(r));
+    (!(skipped && mount_root)).then_some(p)
+}
+
+/// Free and total bytes of the volume holding `path` (or its nearest existing parent).
+pub fn free_space(path: &Path) -> Option<Space> {
+    let p = nearest_existing(path)?;
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a valid NUL-terminated path and `st` a properly sized out struct.
@@ -89,10 +100,7 @@ pub fn free_space(path: &Path) -> Option<Space> {
 /// Device id (`st_dev`) of the volume holding `path` (or its nearest existing parent).
 pub fn volume_of(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
-    let mut p = path;
-    while !p.exists() {
-        p = p.parent()?;
-    }
+    let p = nearest_existing(path)?;
     std::fs::metadata(p).ok().map(|m| m.dev())
 }
 
@@ -776,6 +784,18 @@ mod tests {
         let mut other = req(secs);
         other.out_dir = Some(PathBuf::from("/dev"));
         assert!(c.submit_with(other, space).is_ok());
+    }
+
+    #[test]
+    fn a_missing_drive_is_its_own_unknown_volume_not_the_root() {
+        let gone = Path::new("/Volumes/vjc-no-such-drive/out");
+        assert_eq!(volume_of(gone), None);
+        assert!(free_space(gone).is_none());
+        let a = Some(gone.to_path_buf());
+        let b = Some(PathBuf::from("/Volumes/vjc-other-gone-drive/out"));
+        let root = Some(PathBuf::from("/"));
+        assert!(!same_volume(&a, &root), "must not share the root budget");
+        assert!(!same_volume(&a, &b));
     }
 
     #[test]

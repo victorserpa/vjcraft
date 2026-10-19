@@ -8361,6 +8361,35 @@ fn prefs_defaults_apply_to_an_imported_clip() {
 }
 
 #[test]
+fn imported_clip_keeps_core_validation() {
+    let mut h = app();
+    h.state_mut().prefs.defaults.play_mode = vjc_model::PlayMode::Bounce;
+    let layer = h.state().project.composition.layers[0].id;
+    let deck = h.state().project.composition.current_deck;
+    let import = |column| Command::ImportMedia {
+        deck,
+        layer,
+        column,
+        path: "/no/such/file.mp4".into(),
+    };
+    // Same verdicts as core gives the plain command, on a copy of the project.
+    let bad_col = 9_999;
+    let mut copy = h.state().project.clone();
+    assert!(vjc_core::apply(&mut copy, import(bad_col)).is_err());
+    h.state_mut().exec(import(bad_col));
+    assert!(vjc_core::clip_in(&h.state().project, deck, layer, bad_col).is_none());
+    // A locked layer refuses the import.
+    h.state_mut().exec(Command::SetLayerLock {
+        layer,
+        locked: true,
+    });
+    let mut copy = h.state().project.clone();
+    assert!(vjc_core::apply(&mut copy, import(0)).is_err());
+    h.state_mut().exec(import(0));
+    assert!(vjc_core::clip_in(&h.state().project, deck, layer, 0).is_none());
+}
+
+#[test]
 fn prefs_defaults_and_web_tabs_render() {
     let mut h = app();
     h.state_mut().prefs_open = true;

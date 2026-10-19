@@ -399,6 +399,17 @@ fn watch_baseline(env: Option<&str>, ppid: i32) -> i32 {
         .unwrap_or(ppid)
 }
 
+/// Reads `name` and removes it from this process's environment, so descendants (ffmpeg
+/// helpers, scripts) do not inherit it. Call at startup, before other threads exist.
+fn take_env(name: &str) -> Option<String> {
+    let v = std::env::var(name).ok();
+    if v.is_some() {
+        // SAFETY: called once at startup before the app spawns threads that read the env.
+        unsafe { std::env::remove_var(name) };
+    }
+    v
+}
+
 /// Set when the supervisor (our parent) is gone.
 static PARENT_GONE: AtomicBool = AtomicBool::new(false);
 /// Set by the UI when it starts the orphan quit, so the watcher lets it finish.
@@ -418,7 +429,9 @@ pub fn parent_gone() -> bool {
 pub fn start_parent_watch() {
     // SAFETY: getppid has no preconditions.
     let ppid = unsafe { libc::getppid() };
-    let parent = watch_baseline(std::env::var(SUPERVISOR_PID_ENV).ok().as_deref(), ppid);
+    // A supervisor pid that is not our parent means it already died: the baseline is then
+    // that pid and the first check below sees the mismatch and quits.
+    let parent = watch_baseline(take_env(SUPERVISOR_PID_ENV).as_deref(), ppid);
     let _ = std::thread::Builder::new()
         .name("vjc-parent-watch".into())
         .spawn(move || {
@@ -682,6 +695,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn take_env_reads_and_removes() {
+        let n = "VJC_TEST_TAKE_ENV_ONCE";
+        // SAFETY: unique name no other test touches.
+        unsafe { std::env::set_var(n, "42") };
+        assert_eq!(take_env(n).as_deref(), Some("42"));
+        assert!(std::env::var_os(n).is_none(), "must not reach descendants");
+        assert_eq!(take_env(n), None);
+    }
 
     #[test]
     fn stamp_is_utc_civil_time() {
