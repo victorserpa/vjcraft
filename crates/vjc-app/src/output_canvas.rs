@@ -1209,10 +1209,14 @@ impl State {
         ctx.data(|d| d.get_temp::<egui::TextureHandle>(guide_id(screen)))
     }
 
-    /// Loads an image file as the guide of `screen`.
+    /// Starts loading an image file as the guide of `screen`. The decode runs on a worker
+    /// thread; `poll_guides` installs the texture when it is ready.
     pub(crate) fn load_guide(&mut self, ctx: &egui::Context, screen: Uuid, path: &Path) {
-        match crate::reliability::image_open(path) {
-            Ok(img) => {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.to_path_buf();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let r = crate::reliability::image_open(&p).map(|img| {
                 let img = if img.width().max(img.height()) > GUIDE_MAX_SIDE {
                     img.thumbnail(GUIDE_MAX_SIDE, GUIDE_MAX_SIDE)
                 } else {
@@ -1220,17 +1224,47 @@ impl State {
                 };
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
-                let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                let tex =
-                    ctx.load_texture(format!("guide-{screen}"), ci, egui::TextureOptions::LINEAR);
-                ctx.data_mut(|d| d.insert_temp(guide_id(screen), tex));
+                egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+            });
+            let _ = tx.send(r);
+            repaint.request_repaint();
+        });
+        // A newer load for the same screen replaces the older one.
+        self.guide_jobs.retain(|j| j.screen != screen);
+        self.guide_jobs.push(GuideJob {
+            screen,
+            path: path.to_path_buf(),
+            rx,
+        });
+        self.status = format!("Loading guide image: {}", path.display());
+    }
+
+    /// Installs the guide images whose decode finished.
+    pub(crate) fn poll_guides(&mut self, ctx: &egui::Context) {
+        let mut jobs = std::mem::take(&mut self.guide_jobs);
+        jobs.retain(|j| match j.rx.try_recv() {
+            Ok(Ok(ci)) => {
+                let tex = ctx.load_texture(
+                    format!("guide-{}", j.screen),
+                    ci,
+                    egui::TextureOptions::LINEAR,
+                );
+                ctx.data_mut(|d| d.insert_temp(guide_id(j.screen), tex));
                 if let Some(w) = &mut self.out_win {
                     w.guide_on = true;
                 }
-                self.status = format!("Guide image loaded: {}", path.display());
+                self.status = format!("Guide image loaded: {}", j.path.display());
+                false
             }
-            Err(e) => self.status = format!("Could not read the guide image: {e}"),
-        }
+            Ok(Err(e)) => {
+                self.status = format!("Could not read the guide image: {e}");
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(_) => false,
+        });
+        jobs.append(&mut self.guide_jobs);
+        self.guide_jobs = jobs;
     }
 
     /// Removes the guide image of `screen`.
@@ -1260,6 +1294,13 @@ impl State {
         }
         vec![]
     }
+}
+
+/// A guide image being decoded on a worker thread.
+pub(crate) struct GuideJob {
+    screen: Uuid,
+    path: std::path::PathBuf,
+    rx: std::sync::mpsc::Receiver<Result<egui::ColorImage, String>>,
 }
 
 /// Longest side kept of a guide image.

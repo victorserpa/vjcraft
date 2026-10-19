@@ -339,6 +339,8 @@ struct State {
     sel_slices: Vec<Uuid>,
     /// Working copy of the Output setup while its window is open.
     out_win: Option<output_ui::OutWin>,
+    /// Guide images being decoded off the UI thread.
+    guide_jobs: Vec<output_canvas::GuideJob>,
     sel_pt_in: Option<usize>,
     sel_pt_out: Option<usize>,
     snap: bool,
@@ -2136,6 +2138,7 @@ impl State {
             sel_slice: None,
             sel_slices: vec![],
             out_win: None,
+            guide_jobs: vec![],
             sel_pt_in: None,
             sel_pt_out: None,
             snap: false,
@@ -7890,6 +7893,7 @@ impl State {
                 .collect()
         });
         // Files dropped on the Output setup window are a guide image, not clips.
+        self.poll_guides(&ctx);
         let dropped = self.out_take_drops(&ctx, dropped);
         if !dropped.is_empty() {
             match resolve_drop(&self.cells, self.last_pointer, self.selected) {

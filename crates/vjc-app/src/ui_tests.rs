@@ -8301,7 +8301,7 @@ fn output_setup_snapshots() {
     let id = h.state().project.output.screens[0].id;
     let ctx = h.ctx.clone();
     h.state_mut().load_guide(&ctx, id, &png);
-    settle(&mut h);
+    wait_guide(&mut h, id);
     snap(&mut h, "23-output-screen-props");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -8859,4 +8859,50 @@ fn clap_param_edits_reach_the_plugin_and_are_mappable_like_other_params() {
     assert_eq!(specs.len(), 1);
     assert!(specs[0].clap.is_some());
     assert_eq!(shared.param(0), 2.5, "effective value copied to the plugin");
+}
+
+/// Steps the app until the guide of `screen` is installed (the decode is off-thread).
+fn wait_guide(h: &mut Harness<'_, State>, screen: Uuid) {
+    for _ in 0..200 {
+        h.step();
+        if State::guide_texture(&h.ctx, screen).is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn guide_image_decodes_off_the_ui_thread() {
+    let mut h = app();
+    let id = Uuid::new_v4();
+    let dir = presets_tmp("guide-async");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("g.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+        .save(&png)
+        .unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().load_guide(&ctx, id, &png);
+    // The call itself installs nothing: the job is pending.
+    assert!(State::guide_texture(&h.ctx, id).is_none());
+    assert_eq!(h.state().guide_jobs.len(), 1);
+    wait_guide(&mut h, id);
+    assert!(State::guide_texture(&h.ctx, id).is_some());
+    assert!(h.state().guide_jobs.is_empty());
+    // Control: a file that is not an image installs nothing and reports it.
+    let bad = dir.join("bad.png");
+    std::fs::write(&bad, b"nope").unwrap();
+    let other = Uuid::new_v4();
+    h.state_mut().load_guide(&ctx, other, &bad);
+    for _ in 0..200 {
+        h.step();
+        if h.state().guide_jobs.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(State::guide_texture(&h.ctx, other).is_none());
+    assert!(h.state().status.contains("Could not read"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
