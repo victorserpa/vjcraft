@@ -132,8 +132,12 @@ mkdir -p "$SRC/libvpx-build"
 )
 # libvpx installs with a bare install name; give it the absolute one (like dav1d's) so that
 # FFmpeg records a path scripts/bundle-dylibs.sh can resolve.
-install_name_tool -id "$DEPS/lib/libvpx.12.dylib" "$DEPS/lib/libvpx.12.dylib"
-codesign --force -s - "$DEPS/lib/libvpx.12.dylib"
+# The soname (12 for 1.17.0) comes from the built lib, not from a constant here.
+VPX_ID=$(otool -D "$DEPS/lib/libvpx.dylib" | sed -n 2p)
+VPX_SONAME=$(basename "$VPX_ID")
+case "$VPX_SONAME" in libvpx.*.dylib) ;; *) echo "cannot derive libvpx soname from '$VPX_ID'" >&2; exit 1 ;; esac
+install_name_tool -id "$DEPS/lib/$VPX_SONAME" "$DEPS/lib/$VPX_SONAME"
+codesign --force -s - "$DEPS/lib/$VPX_SONAME"
 meson setup "$SRC/dav1d-build" "$SRC/dav1d" --prefix="$DEPS" --libdir=lib --buildtype=release \
   --default-library=shared -Denable_tools=false -Denable_tests=false \
   -Dc_args="-mmacosx-version-min=$MIN_MACOS" -Dc_link_args="-mmacosx-version-min=$MIN_MACOS" >/dev/null

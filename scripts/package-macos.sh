@@ -103,15 +103,19 @@ scripts/bundle-dylibs.sh "$APP"
 
 # Every Mach-O in the bundle must run on macOS 12.0 (minos <= 12.0).
 min_ok=1
+macho_list=$(find "$APP/Contents" -type f \( -perm -u+x -o -name '*.dylib' \)) \
+  || { echo "minos check: find failed in $APP/Contents" >&2; exit 1; }
+[ -n "$macho_list" ] || { echo "minos check: no files in $APP/Contents" >&2; exit 1; }
 while IFS= read -r f; do
   file -b "$f" | grep -q 'Mach-O' || continue
-  mv_list=$(vtool -show-build "$f" | awk '$1=="minos"{print $2}')
+  # LC_BUILD_VERSION prints "minos X"; legacy LC_VERSION_MIN_* prints "version X" in its block.
+  mv_list=$(vtool -show-build "$f" | awk '$1=="minos"{print $2} $1=="cmd"{legacy=($2 ~ /^LC_VERSION_MIN/)} legacy&&$1=="version"{print $2}')
   [ -n "$mv_list" ] || { echo "minos check: no build version in $f" >&2; min_ok=0; continue; }
   for mv in $mv_list; do
     awk -v v="$mv" 'BEGIN{split(v,a,".");exit !((a[1]+0)*10000+(a[2]+0)*100+(a[3]+0) <= 120000)}' \
       || { echo "minos check: $f has minos $mv (> 12.0)" >&2; min_ok=0; }
   done
-done < <(find "$APP/Contents" -type f \( -perm -u+x -o -name '*.dylib' \))
+done <<< "$macho_list"
 [ "$min_ok" -eq 1 ] || { echo "bundle needs a newer macOS than 12.0" >&2; exit 1; }
 
 # Link audit: the binary must use our libav* via @rpath, and no GPL/network/Homebrew-FFmpeg libs.

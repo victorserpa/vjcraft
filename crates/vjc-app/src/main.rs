@@ -5384,8 +5384,7 @@ impl State {
     /// Serves a Snapshot PNG request: the clip's current frame when it is playing, else the
     /// composition output. Saves into the snapshot folder (asked once, then remembered).
     fn serve_snapshot(&mut self, frame: &eframe::Frame) {
-        self.poll_snapshot_job();
-        let Some((deck, layer, column)) = self.snap_req.take() else {
+        let Some((deck, layer, column)) = self.next_snapshot_req() else {
             return;
         };
         let name = vjc_core::clip_in(&self.project, deck, layer, column)
@@ -5426,6 +5425,16 @@ impl State {
                 .and_then(|(rs, comp)| comp.read_rgba(&rs.device, &rs.queue)),
         };
         self.write_snapshot(&name, shot);
+    }
+
+    /// The pending snapshot request, but only when no HAP decode is in flight: the request
+    /// waits its turn instead of replacing the running job.
+    fn next_snapshot_req(&mut self) -> Option<(DeckId, LayerId, u32)> {
+        self.poll_snapshot_job();
+        if self.snap_job.is_some() {
+            return None;
+        }
+        self.snap_req.take()
     }
 
     /// Writes the worker's snapshot once it has finished.
@@ -9294,7 +9303,13 @@ impl State {
             self.selected = Some((l, c));
             match act {
                 wave_ui::ClipAct::Reveal(path) => self.reveal.reveal(&path),
-                wave_ui::ClipAct::Snapshot => self.snap_req = Some((cur, l, c)),
+                wave_ui::ClipAct::Snapshot => {
+                    if self.snap_req.is_some() {
+                        self.status = "Snapshot busy: wait for the current one".into();
+                    } else {
+                        self.snap_req = Some((cur, l, c));
+                    }
+                }
             }
         }
         if let Some((l, c)) = pick

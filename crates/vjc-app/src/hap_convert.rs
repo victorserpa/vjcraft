@@ -68,8 +68,10 @@ pub struct Space {
 }
 
 /// The path itself or its nearest existing parent. None when that parent is only a mount
-/// root (`/`, `/Volumes`, `/media`, `/mnt`): the volume the path names (an unmounted drive)
-/// is unknown, and must not be mistaken for the volume holding the root.
+/// root (`/Volumes`, `/media`, `/mnt`, the Linux automount parents `/media/$USER` and
+/// `/run/media/$USER`): the volume the path names (an unmounted drive) is unknown, and must
+/// not be mistaken for the volume holding the root. A new folder directly under `/` is just
+/// a folder on the root volume, so `/` itself is not one of them.
 fn nearest_existing(path: &Path) -> Option<&Path> {
     let mut p = path;
     let mut skipped = false;
@@ -77,10 +79,20 @@ fn nearest_existing(path: &Path) -> Option<&Path> {
         p = p.parent()?;
         skipped = true;
     }
-    let mount_root = ["/", "/Volumes", "/media", "/mnt"]
+    let user = std::env::var("USER").ok();
+    (!(skipped && is_mount_root(p, user.as_deref()))).then_some(p)
+}
+
+fn is_mount_root(p: &Path, user: Option<&str>) -> bool {
+    if ["/Volumes", "/media", "/mnt", "/run/media"]
         .iter()
-        .any(|r| p == Path::new(r));
-    (!(skipped && mount_root)).then_some(p)
+        .any(|r| p == Path::new(r))
+    {
+        return true;
+    }
+    user.is_some_and(|u| {
+        !u.is_empty() && (p == Path::new("/media").join(u) || p == Path::new("/run/media").join(u))
+    })
 }
 
 /// Free and total bytes of the volume holding `path` (or its nearest existing parent).
@@ -786,6 +798,22 @@ mod tests {
         let mut other = req(secs);
         other.out_dir = Some(PathBuf::from("/dev"));
         assert!(c.submit_with(other, space).is_ok());
+    }
+
+    #[test]
+    fn linux_automount_parents_are_mount_roots() {
+        assert!(is_mount_root(Path::new("/media/vic"), Some("vic")));
+        assert!(is_mount_root(Path::new("/run/media/vic"), Some("vic")));
+        assert!(is_mount_root(Path::new("/run/media"), None));
+        assert!(!is_mount_root(Path::new("/media/vic"), Some("other")));
+        assert!(!is_mount_root(Path::new("/"), Some("vic")));
+    }
+
+    #[test]
+    fn a_new_folder_directly_under_root_has_a_free_space_figure() {
+        let p = Path::new("/vjc-no-such-top-level-folder/out");
+        assert!(free_space(p).is_some());
+        assert!(volume_of(p).is_some());
     }
 
     #[test]

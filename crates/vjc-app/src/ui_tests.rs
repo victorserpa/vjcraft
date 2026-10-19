@@ -6608,6 +6608,24 @@ fn hap_snapshot_follows_the_playhead_and_decodes_off_thread() {
 }
 
 #[test]
+fn a_second_snapshot_waits_for_the_running_hap_decode() {
+    let mut h = app();
+    let layer = h.state().project.composition.layers[0].id;
+    let deck = h.state().project.composition.current_deck;
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.state_mut().snap_job = Some(("First".into(), rx));
+    h.state_mut().snap_req = Some((deck, layer, 1));
+    assert!(
+        h.state_mut().next_snapshot_req().is_none(),
+        "decode in flight"
+    );
+    assert!(h.state().snap_job.is_some(), "first job not replaced");
+    assert!(h.state().snap_req.is_some(), "second request kept");
+    drop(tx);
+    assert_eq!(h.state_mut().next_snapshot_req(), Some((deck, layer, 1)));
+}
+
+#[test]
 fn snapshot_job_is_written_only_when_the_worker_finishes() {
     let mut h = app();
     let dir = std::env::temp_dir().join(format!("vjc-ui-snapjob-{}", std::process::id()));
