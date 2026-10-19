@@ -484,13 +484,21 @@ impl Converter {
     /// running into the same folder will still write their estimate: it counts against it.
     fn submit_with(&mut self, req: Request, mut space: Space) -> Result<(), String> {
         let dir = Self::out_dir(&req);
-        let pending: u64 = self
+        let queued: u64 = self
             .queue
             .iter()
-            .chain(self.current.iter().map(|r| &r.req))
             .filter(|r| Self::out_dir(r) == dir)
             .map(Request::estimate)
             .fold(0, u64::saturating_add);
+        // The running job has already written part of its estimate: `space.free` shows that
+        // part as used, so only the rest is still owed.
+        let running = self
+            .current
+            .iter()
+            .filter(|r| Self::out_dir(&r.req) == dir)
+            .map(|r| (r.req.estimate() as f64 * f64::from(1.0 - r.progress.clamp(0.0, 1.0))) as u64)
+            .fold(0, u64::saturating_add);
+        let pending = queued.saturating_add(running);
         space.free = space.free.saturating_sub(pending);
         check_space(
             req.estimate(),
@@ -714,6 +722,33 @@ mod tests {
         let mut other = req(secs);
         other.out_dir = Some(PathBuf::from("/elsewhere"));
         assert!(c.submit_with(other, space).is_ok());
+    }
+
+    #[test]
+    fn running_job_counts_only_its_unwritten_remainder() {
+        let one = req(1.0).estimate();
+        let secs = (3.0 * GB as f64 / one as f64).ceil();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut c = Converter::default();
+        c.current = Some(Running {
+            handle: None,
+            req: req(secs),
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: 1.0,
+        });
+        // free space already shows the finished job's bytes as used
+        let space = Space {
+            free: 5 * GB,
+            total: 100 * GB,
+        };
+        assert!(
+            c.submit_with(req(secs), space).is_ok(),
+            "done job owes nothing"
+        );
+        // control: a job that has written nothing still owes its whole estimate
+        c.current.as_mut().unwrap().progress = 0.0;
+        assert!(c.submit_with(req(secs), space).is_err());
     }
 
     #[test]
