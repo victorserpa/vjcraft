@@ -291,6 +291,9 @@ struct State {
     osc_monitor_open: bool,
     /// Snapshot PNG asked from a clip menu, served after the next composition frame.
     snap_req: Option<(DeckId, LayerId, u32)>,
+    /// A HAP clip snapshot decoding on a worker: (clip name, result). Never decoded on the UI
+    /// thread; `serve_snapshot` writes it when it arrives.
+    snap_job: Option<(String, SnapRx)>,
     /// Shuffle bags of layer autopilots in Random / Bag mode.
     layer_bags: std::cell::RefCell<HashMap<LayerId, Vec<u32>>>,
     /// Opens a file in the file manager; a no-op in tests.
@@ -664,6 +667,9 @@ struct Held {
 
 /// Longest an action waits for its beat or bar, in bars of wall time.
 const SNAP_MAX_BARS: f64 = 2.0;
+
+/// Result of a snapshot worker: (width, height, RGBA), None when nothing was decoded.
+type SnapRx = std::sync::mpsc::Receiver<Option<(u32, u32, Vec<u8>)>>;
 
 #[derive(Default)]
 struct Flow {
@@ -2096,6 +2102,7 @@ impl State {
             midi_monitor_open: false,
             osc_monitor_open: false,
             snap_req: None,
+            snap_job: None,
             layer_bags: Default::default(),
             reveal: if live {
                 Box::new(wave_ui::SystemReveal)
@@ -3547,6 +3554,25 @@ impl State {
     /// Sends a command through the bus and reacts to the resulting events.
     /// Runs a command; a rejection is reported in the status line.
     fn exec(&mut self, cmd: Command) {
+        // A file imported by API / MCP / MIDI starts with the Defaults prefs too.
+        let cmd = match cmd {
+            Command::ImportMedia {
+                deck,
+                layer,
+                column,
+                path,
+            } => {
+                let mut clip = vjc_core::clip_from_path(path);
+                self.prefs.defaults.apply(&mut clip);
+                Command::SetClip {
+                    deck,
+                    layer,
+                    column,
+                    clip,
+                }
+            }
+            c => c,
+        };
         let cmd = self.resolve_trigger(cmd);
         if let Some(cmd) = self.snap_defer(cmd) {
             self.exec_ok(cmd);
@@ -5088,6 +5114,7 @@ impl State {
                     let mut clip = vjc_core::clip_from_path(PathBuf::new());
                     clip.name = name.clone();
                     clip.source = vjc_model::Source::Network { protocol, name };
+                    self.prefs.defaults.apply(&mut clip);
                     self.exec(Command::SetClip {
                         deck,
                         layer: c.layer,
@@ -5357,6 +5384,7 @@ impl State {
     /// Serves a Snapshot PNG request: the clip's current frame when it is playing, else the
     /// composition output. Saves into the snapshot folder (asked once, then remembered).
     fn serve_snapshot(&mut self, frame: &eframe::Frame) {
+        self.poll_snapshot_job();
         let Some((deck, layer, column)) = self.snap_req.take() else {
             return;
         };
@@ -5366,22 +5394,75 @@ impl State {
             .players
             .get(&layer)
             .filter(|(d, c, _)| *d == deck && *c == column)
-            .and_then(|(_, _, p)| p.latest_frame());
-        let shot = match playing {
+            .map(|(_, _, p)| p);
+        let shot = match playing.and_then(|p| p.latest_frame()) {
             Some(f) if f.hap.is_none() => {
                 let f = f.oriented();
                 Some((f.width, f.height, f.data.to_vec()))
             }
-            Some(_) => frame
-                .wgpu_render_state()
-                .zip(self.comp.as_ref())
-                .and_then(|(rs, comp)| comp.read_rgba(&rs.device, &rs.queue)),
+            // Block-compressed HAP: decode the clip itself on the CPU, on a worker so the
+            // UI thread never waits on the decoder; the PNG is written when it is done.
+            Some(_) => {
+                if let Some((path, pos)) = self.snapshot_source(deck, layer, column) {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let spawned = std::thread::Builder::new()
+                        .name("vjc-snapshot".into())
+                        .spawn(move || {
+                            let shot = vjc_media::snapshot_frame(&path, pos)
+                                .map(|f| (f.width, f.height, f.data.to_vec()));
+                            let _ = tx.send(shot);
+                        });
+                    if spawned.is_ok() {
+                        self.status = "Snapshot: decoding...".into();
+                        self.snap_job = Some((name, rx));
+                        return;
+                    }
+                }
+                None
+            }
             None => frame
                 .wgpu_render_state()
                 .zip(self.comp.as_ref())
                 .and_then(|(rs, comp)| comp.read_rgba(&rs.device, &rs.queue)),
         };
         self.write_snapshot(&name, shot);
+    }
+
+    /// Writes the worker's snapshot once it has finished.
+    fn poll_snapshot_job(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some((name, rx)) = &self.snap_job else {
+            return;
+        };
+        let shot = match rx.try_recv() {
+            Ok(shot) => shot,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let name = name.clone();
+        self.snap_job = None;
+        self.write_snapshot(&name, shot);
+    }
+
+    /// File and playhead of the clip on air in the cell: the position the app drove into the
+    /// player on the latest frame (`flow.pos`), not the first one it was ever given.
+    fn snapshot_source(&self, deck: DeckId, layer: LayerId, column: u32) -> Option<(PathBuf, f64)> {
+        let (_, _, p) = self
+            .players
+            .get(&layer)
+            .filter(|(d, c, _)| *d == deck && *c == column)?;
+        let vjc_model::Source::File { path } =
+            &vjc_core::clip_in(&self.project, deck, layer, column)?.source
+        else {
+            return None;
+        };
+        let pos = self
+            .flow
+            .pos
+            .get(&layer)
+            .copied()
+            .unwrap_or_else(|| p.position());
+        Some((path.clone(), pos))
     }
 
     /// Saves `shot` (width, height, RGBA) as a PNG named after `name`.

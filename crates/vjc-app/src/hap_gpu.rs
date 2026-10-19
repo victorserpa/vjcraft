@@ -317,10 +317,35 @@ mod tests {
 
     static FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Only `1` or `true` require a GPU; `0`, empty or anything else does not.
+    fn gpu_required(v: Option<&str>) -> bool {
+        v.is_some_and(|v| matches!(v.trim(), "1" | "true"))
+    }
+
+    #[test]
+    fn require_gpu_flag_parses_strictly() {
+        assert!(gpu_required(Some("1")));
+        assert!(gpu_required(Some("true")));
+        assert!(!gpu_required(Some("0")));
+        assert!(!gpu_required(Some("")));
+        assert!(!gpu_required(Some("false")));
+        assert!(!gpu_required(None));
+    }
+
+    /// Reports a skipped GPU test loudly (`cargo test -- --nocapture` shows it). With
+    /// `VJC_REQUIRE_GPU=1` (CI with a GPU) a missing capability fails instead.
+    fn skipped(why: &str) {
+        assert!(
+            !gpu_required(std::env::var("VJC_REQUIRE_GPU").ok().as_deref()),
+            "GPU test cannot run: {why} (VJC_REQUIRE_GPU is set)"
+        );
+        eprintln!("SKIPPED (not passed): GPU test did not run: {why}");
+    }
+
     fn device(bc: bool) -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
-            eprintln!("no wgpu adapter: skipped");
+            skipped("no wgpu adapter");
             return None;
         };
         let want = if bc {
@@ -329,14 +354,19 @@ mod tests {
             wgpu::Features::empty()
         };
         if bc && want.is_empty() {
-            eprintln!("adapter has no BC textures: skipped");
+            skipped("adapter has no BC texture support");
             return None;
         }
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: want,
             ..Default::default()
-        }))
-        .ok()
+        })) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                skipped(&format!("request_device failed: {e}"));
+                None
+            }
+        }
     }
 
     fn read(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) -> Vec<u8> {
