@@ -192,11 +192,11 @@ impl State {
             )
         };
         // Enter and Backspace belong to a focused text field; the canvas takes them only
-        // when it is the focused widget or nothing is, and the pointer is over it.
-        let canvas_keys = resp.hovered()
-            && ui
-                .ctx()
-                .memory(|m| m.focused().is_none_or(|f| f == resp.id));
+        // while the draw tool is active, the canvas is the focused widget or nothing is, wherever
+        // the pointer is (it may be over the props panel).
+        let canvas_keys = ui
+            .ctx()
+            .memory(|m| m.focused().is_none_or(|f| f == resp.id));
         let (shift, esc, enter, back) = ui.input(|i| {
             (
                 i.modifiers.shift,
