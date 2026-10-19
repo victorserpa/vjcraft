@@ -3547,6 +3547,25 @@ impl State {
     /// Sends a command through the bus and reacts to the resulting events.
     /// Runs a command; a rejection is reported in the status line.
     fn exec(&mut self, cmd: Command) {
+        // A file imported by API / MCP / MIDI starts with the Defaults prefs too.
+        let cmd = match cmd {
+            Command::ImportMedia {
+                deck,
+                layer,
+                column,
+                path,
+            } => {
+                let mut clip = vjc_core::clip_from_path(path);
+                self.prefs.defaults.apply(&mut clip);
+                Command::SetClip {
+                    deck,
+                    layer,
+                    column,
+                    clip,
+                }
+            }
+            c => c,
+        };
         let cmd = self.resolve_trigger(cmd);
         if let Some(cmd) = self.snap_defer(cmd) {
             self.exec_ok(cmd);
@@ -5088,6 +5107,7 @@ impl State {
                     let mut clip = vjc_core::clip_from_path(PathBuf::new());
                     clip.name = name.clone();
                     clip.source = vjc_model::Source::Network { protocol, name };
+                    self.prefs.defaults.apply(&mut clip);
                     self.exec(Command::SetClip {
                         deck,
                         layer: c.layer,

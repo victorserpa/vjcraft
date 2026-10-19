@@ -8345,6 +8345,22 @@ fn prefs_defaults_apply_to_a_new_clip() {
 }
 
 #[test]
+fn prefs_defaults_apply_to_an_imported_clip() {
+    let mut h = app();
+    h.state_mut().prefs.defaults.play_mode = vjc_model::PlayMode::Bounce;
+    let layer = h.state().project.composition.layers[0].id;
+    let deck = h.state().project.composition.current_deck;
+    h.state_mut().exec(Command::ImportMedia {
+        deck,
+        layer,
+        column: 0,
+        path: "/x/imp.mp4".into(),
+    });
+    let k = vjc_core::clip_in(&h.state().project, deck, layer, 0).expect("clip");
+    assert_eq!(k.transport.play_mode, vjc_model::PlayMode::Bounce);
+}
+
+#[test]
 fn prefs_defaults_and_web_tabs_render() {
     let mut h = app();
     h.state_mut().prefs_open = true;
