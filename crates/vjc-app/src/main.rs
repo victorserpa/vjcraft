@@ -4427,6 +4427,7 @@ impl State {
             h.seek(vjc_core::playback::to_local(pos, reg));
         }
         if let Some((_, _, p)) = self.players.get(&layer) {
+            p.set_on_air(true);
             p.set_position(pos);
         }
         self.flow.pos.insert(layer, pos);
@@ -4795,6 +4796,7 @@ impl State {
                     head.seek(vjc_core::playback::to_local(np, reg));
                     position = np;
                 }
+                player.set_on_air(true);
                 player.set_position(position);
                 // Audio only at forward 1x; any other speed, direction or pause is muted.
                 let audible = rate.is_finite()
@@ -5275,7 +5277,13 @@ impl State {
             return;
         }
         let player = match source {
-            vjc_model::Source::File { path } if path.exists() => Some(Player::open_scrub(path)),
+            vjc_model::Source::File { path } if path.exists() => {
+                let p = Player::open_scrub(path);
+                // Looped on its own clock for the preview: never claims a hardware session
+                // from a clip that is on a layer.
+                p.set_on_air(false);
+                Some(p)
+            }
             _ => None,
         };
         self.clip_prev = Some(ClipPreview {

@@ -145,6 +145,9 @@ pub(crate) struct Shared {
     /// Counts `set_position` calls: a clip driven by the app is on air even when its
     /// position does not change (a trigger at the preload position, a paused clip).
     drives: AtomicU64,
+    /// Whether the app says this clip is the layer's active clip: 0 = not told (inferred
+    /// from `drives`), 1 = on air, 2 = not on air (preloaded, previewed).
+    on_air: AtomicU8,
     /// True while playback only moves forward (streaming is enough).
     sequential: AtomicBool,
     /// Decoder in use: see `hw::ST_*` (0 = not known yet).
@@ -161,6 +164,7 @@ impl Shared {
             duration: AtomicU64::new(0),
             position: AtomicU64::new(0.0f64.to_bits()),
             drives: AtomicU64::new(0),
+            on_air: AtomicU8::new(0),
             sequential: AtomicBool::new(true),
             hw: Arc::new(AtomicU8::new(0)),
         }
@@ -389,6 +393,16 @@ impl Player {
         };
         self.shared.position.store(p.to_bits(), Ordering::Relaxed);
         self.shared.drives.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Tells the player whether it is the active clip of a layer. Only an on-air clip asks
+    /// for a hardware session it lacks; a preloaded or previewed one (also driven by
+    /// `set_position`) never evicts a paused on-air clip. Without a call the player infers
+    /// it from `set_position`.
+    pub fn set_on_air(&self, on_air: bool) {
+        self.shared
+            .on_air
+            .store(if on_air { 1 } else { 2 }, Ordering::Relaxed);
     }
 
     /// Access hint: true when the position only advances (streaming, no cache), false when
@@ -1532,20 +1546,27 @@ fn scrub_loop(
             seen_drives = drives;
             driven_at = Some(Instant::now());
         }
-        let driven = driven_at.is_some_and(|t| t.elapsed() < HW_IDLE);
+        let told = shared.on_air.load(Ordering::Relaxed);
+        let driven = match told {
+            1 => true,
+            2 => false,
+            _ => driven_at.is_some_and(|t| t.elapsed() < HW_IDLE),
+        };
         let pos = f64::from_bits(shared.position.load(Ordering::Relaxed));
         if pos == shown {
             if want_hw && cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
                 if asked {
                     want_hw = !sc.acquire_hw();
                 }
-                if want_hw && driven && !yielded && last_ask.elapsed() >= HW_IDLE {
-                    // Still on air without a session: ask again.
+                if want_hw && driven && last_ask.elapsed() >= HW_IDLE {
+                    // Still on air without a session: a free one is taken (the clip that
+                    // took ours may have closed); else ask again, unless we just gave ours
+                    // away (two paused clips would trade it forever).
                     want_hw = !sc.acquire_hw();
-                    if want_hw {
+                    if want_hw && !yielded {
                         asked = hw::evict_idle_holder(&sc.holder, HW_IDLE);
-                        last_ask = Instant::now();
                     }
+                    last_ask = Instant::now();
                 }
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -1554,7 +1575,12 @@ fn scrub_loop(
         shown = pos;
         idle_since = Instant::now();
         yielded = false;
-        let on_air = std::mem::replace(&mut preloaded, true);
+        let first = std::mem::replace(&mut preloaded, true);
+        let on_air = match told {
+            1 => true,
+            2 => false,
+            _ => first,
+        };
         if on_air {
             sc.holder.touch();
         }

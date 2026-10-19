@@ -167,3 +167,67 @@ fn eviction_asked_while_the_holder_moves_is_asked_again_when_it_idles() {
     assert_eq!(b.decode_status(), Some("hw"), "B re-asked once A idled");
     assert_eq!(a.decode_status(), Some("sw"));
 }
+
+/// Drives A (paused, on air) and B (moving) for `ms`.
+fn drive_pair(a: &Player, b: &Player, ms: u64) {
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(ms) {
+        a.set_position(0.62);
+        b.set_position((t.elapsed().as_millis() as f64 / 4000.0).fract());
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+#[test]
+fn a_driven_clip_that_is_not_on_air_does_not_evict_a_paused_on_air_clip() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(path) = clip("evict-preload") else {
+        return;
+    };
+    setup(1);
+    let a = open_with_frame(&path);
+    a.set_on_air(true);
+    assert_eq!(a.decode_status(), Some("hw"));
+    let b = open_with_frame(&path);
+    b.set_on_air(false);
+    assert_eq!(b.decode_status(), Some("sw"), "cap 1 is taken by A");
+    drive_pair(&a, &b, 5000);
+    assert_eq!(a.decode_status(), Some("hw"), "paused on-air A keeps it");
+    assert_eq!(b.decode_status(), Some("sw"));
+    // Control: the same B told it is on air takes the session of the idle A.
+    b.set_on_air(true);
+    drive_pair(&a, &b, 5000);
+    assert_eq!(b.decode_status(), Some("hw"), "control: on-air B evicts");
+    assert_eq!(a.decode_status(), Some("sw"));
+}
+
+#[test]
+fn a_clip_that_gave_its_session_away_gets_one_back_when_the_taker_closes() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(path) = clip("yield-back") else {
+        return;
+    };
+    setup(1);
+    let a = open_with_frame(&path);
+    a.set_on_air(true);
+    assert_eq!(a.decode_status(), Some("hw"));
+    let mut b = open_with_frame(&path);
+    b.set_on_air(true);
+    assert_eq!(b.decode_status(), Some("sw"));
+    // A is paused on air (idle); B moves on air and takes the session.
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(8000) && b.decode_status() != Some("hw") {
+        drive_pair(&a, &b, 100);
+    }
+    assert_eq!(b.decode_status(), Some("hw"), "B took A's session");
+    assert_eq!(a.decode_status(), Some("sw"));
+    // B closes. A, still paused on air, must get hardware decode back.
+    b.stop();
+    drop(b);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(8000) && a.decode_status() != Some("hw") {
+        a.set_position(0.62);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert_eq!(a.decode_status(), Some("hw"), "A got a free session back");
+}

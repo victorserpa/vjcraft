@@ -2141,7 +2141,11 @@ impl Compositor {
         fixed += self.routed.values().map(|r| b(&r.0)).sum::<u64>();
         crate::vram::Usage {
             fixed,
-            players: self.slots.values().map(|s| b(&s.tex)).sum(),
+            players: self
+                .slots
+                .values()
+                .map(|s| b(&s.tex) + s.turn.as_ref().map_or(0, |t| b(&t.raw)))
+                .sum(),
             pool: self
                 .fx
                 .scratch
@@ -3779,6 +3783,34 @@ mod tests {
         assert_eq!(after.players, busy.players);
         assert_eq!(after.persist, busy.persist);
         assert_eq!(after.fixed, busy.fixed);
+    }
+
+    /// A turned layer holds the displayed texture plus the stored-orientation staging one;
+    /// both count. Control: the same layer unturned counts one. Skipped without an adapter.
+    #[test]
+    fn gpu_vram_counts_the_turn_staging_texture() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let px = [9u8; 4 * 6 * 4];
+        let mut comp = Compositor::new(&device, 4, 6);
+        let mut players = |orient: vjc_media::Orient| {
+            let mut l = solid(5, &[0, 0, 0, 255], 1.0);
+            l.frame = Some((6, 4, &px, 1));
+            l.orient = orient;
+            comp.render(&device, &queue, &[l], &[], 1.0);
+            comp.vram().players
+        };
+        assert_eq!(
+            players(Default::default()),
+            6 * 4 * 4,
+            "unturned: one texture"
+        );
+        assert_eq!(
+            players(vjc_media::Orient::from_code(1)),
+            2 * 6 * 4 * 4,
+            "turned: displayed + staging"
+        );
     }
 
     fn px_near(px: [u8; 4], v: u8) -> bool {
