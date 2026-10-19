@@ -8697,19 +8697,24 @@ fn polygon_presets_and_curved_mesh_from_the_menus() {
 }
 
 #[test]
-fn enter_is_not_taken_by_the_drawing_canvas_when_the_pointer_is_elsewhere() {
+fn enter_closes_the_polygon_while_drawing_even_with_the_pointer_elsewhere() {
     let mut h = precise_slice_setup();
     let (o, k) = (out_canvas_origin(&h), out_k(&h));
     nested_menu(&mut h, "Add polygon slice", "Draw points");
     for (x, y) in [(900.0, 200.0), (1500.0, 200.0), (1500.0, 800.0)] {
         click_at(&mut h, o + egui::vec2(x * k, y * k));
     }
+    // The draw tool is active and no text field has focus, so Enter is the canvas's even
+    // with the pointer over another panel.
     h.hover_at(egui::pos2(1.0, 1.0));
     h.step();
     h.key_press(egui::Key::Enter);
     settle(&mut h);
-    assert!(h.state().poly.draw.is_some(), "Enter went to the canvas");
-    assert_eq!(h.state().project.output.screens[0].slices.len(), 1);
+    assert!(
+        h.state().poly.draw.is_none(),
+        "Enter did not close the polygon"
+    );
+    assert_eq!(h.state().project.output.screens[0].slices.len(), 2);
 }
 
 #[test]
