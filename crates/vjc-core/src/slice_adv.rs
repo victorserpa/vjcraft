@@ -415,7 +415,13 @@ pub fn resize_group(meshes: &[Vec<Pt>], bounds: &[Pt], to: Rect) -> Vec<Vec<Pt>>
         .collect()
 }
 
-/// Polygon validated (3..=`MAX_POLY_POINTS` finite points) and clamped to 0..1.
+/// Points may sit past the screen edge (an outline moved partly off screen keeps its
+/// shape and is clipped when drawn), but not without bound.
+pub const POLY_MIN: f32 = -4.0;
+pub const POLY_MAX: f32 = 5.0;
+
+/// Polygon validated (3..=`MAX_POLY_POINTS` finite points) and clamped to
+/// `POLY_MIN..=POLY_MAX`, so a shape partly off screen survives a round trip.
 pub fn clamp_poly(pts: &[Pt]) -> Result<Vec<Pt>, crate::Error> {
     let ok = (3..=MAX_POLY_POINTS).contains(&pts.len())
         && pts.iter().all(|p| p.0.is_finite() && p.1.is_finite());
@@ -424,6 +430,6 @@ pub fn clamp_poly(pts: &[Pt]) -> Result<Vec<Pt>, crate::Error> {
     }
     Ok(pts
         .iter()
-        .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
+        .map(|p| (p.0.clamp(POLY_MIN, POLY_MAX), p.1.clamp(POLY_MIN, POLY_MAX)))
         .collect())
 }

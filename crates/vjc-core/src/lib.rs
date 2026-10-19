@@ -3105,9 +3105,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 if (fw, fh) != (tw, th) {
                     let scaled: Vec<_> = poly
                         .iter()
-                        .map(|q| {
-                            (q.0 * fw / tw, q.1 * fh / th)
-                        })
+                        .map(|q| (q.0 * fw / tw, q.1 * fh / th))
                         .collect();
                     prev_outline = Some(std::mem::replace(poly, scaled));
                 }
@@ -8402,11 +8400,17 @@ mod tests {
         apply(&mut p, mv(bid, aid)).unwrap();
         assert!(same(&poly(&p, 0), &hexa), "smaller screen and back");
         // Smaller-to-larger first would push points out when going back: use a wide hexagon.
-        let wide: Vec<Pt> = hexa.iter().map(|q| (0.5 + (q.0 - 0.5) * 3.0, q.1)).collect();
+        let wide: Vec<Pt> = hexa
+            .iter()
+            .map(|q| (0.5 + (q.0 - 0.5) * 3.0, q.1))
+            .collect();
         p.output.screens[0].slices[0].shape = vjc_model::SliceShape::Polygon(wide.clone());
         apply(&mut p, mv(aid, bid)).unwrap();
         apply(&mut p, mv(bid, aid)).unwrap();
-        assert!(same(&poly(&p, 0), &wide), "out-of-range survives the round trip");
+        assert!(
+            same(&poly(&p, 0), &wide),
+            "out-of-range survives the round trip"
+        );
     }
 
     #[test]

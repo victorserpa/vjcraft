@@ -724,3 +724,12 @@ fn undo_of_a_mesh_change_restores_stale_length_tangents_exactly() {
     h.undo(&mut p).unwrap().unwrap();
     assert_eq!(p.output.screens[0].slices[0].mesh_tangents, tangents);
 }
+
+#[test]
+fn polygon_points_past_the_edge_survive_validation() {
+    let off = vec![(0.8, 0.2), (1.3, 0.2), (1.3, 0.7), (0.8, 0.7)];
+    assert_eq!(clamp_poly(&off).unwrap(), off);
+    let far = vec![(-100.0, 0.0), (100.0, 0.0), (0.0, 100.0)];
+    let c = clamp_poly(&far).unwrap();
+    assert!(c.iter().all(|p| (POLY_MIN..=POLY_MAX).contains(&p.0)));
+}
