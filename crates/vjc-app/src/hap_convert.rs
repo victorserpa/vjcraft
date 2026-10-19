@@ -729,14 +729,16 @@ mod tests {
         let one = req(1.0).estimate();
         let secs = (3.0 * GB as f64 / one as f64).ceil();
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut c = Converter::default();
-        c.current = Some(Running {
-            handle: None,
-            req: req(secs),
-            rx,
-            cancel: Arc::new(AtomicBool::new(false)),
-            progress: 1.0,
-        });
+        let mut c = Converter {
+            current: Some(Running {
+                handle: None,
+                req: req(secs),
+                rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: 1.0,
+            }),
+            ..Converter::default()
+        };
         // free space already shows the finished job's bytes as used
         let space = Space {
             free: 5 * GB,
