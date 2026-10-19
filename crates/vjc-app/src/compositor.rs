@@ -1380,6 +1380,9 @@ pub struct LayerDraw<'a> {
     /// What this layer masks. A layer with a mask mode is not drawn: its luminance (drawn on
     /// black with its own fit, effects and opacity) multiplies the layer(s) below it.
     pub mask: vjc_model::MaskMode,
+    /// How the stored pixels of `frame` turn for display. `frame`'s width and height are the
+    /// stored ones; the layer texture has the turned size.
+    pub orient: vjc_media::Orient,
 }
 
 /// Where `draw_layer` puts its pass.
@@ -3196,6 +3199,65 @@ mod tests {
         assert!((w - 400.0).abs() > 1.0 && (h - 300.0).abs() > 1.0);
     }
 
+    /// A 3x2 picture with six distinct pixels, rendered in each of the eight orientations,
+    /// equals the CPU-oriented copy (the reference, checked against ffmpeg in vjc-media).
+    /// Skipped when there is no adapter.
+    #[test]
+    fn gpu_orientation_matches_cpu_reference() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no wgpu adapter: skipped");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let stored: Vec<u8> = (0..6u8)
+            .flat_map(|i| [40 * i + 10, 255 - 30 * i, 17 * i, 255])
+            .collect();
+        for code in 0..8 {
+            let orient = vjc_media::Orient::from_code(code);
+            let frame = vjc_media::Frame {
+                width: 3,
+                height: 2,
+                data: std::sync::Arc::new(stored.clone()),
+                seq: 1,
+                hap: None,
+                orient,
+            };
+            let (lw, lh) = frame.display_size();
+            let want = frame.clone().oriented();
+            let mut comp = Compositor::new(&device, lw, lh);
+            let layers = [LayerDraw {
+                id: uuid::Uuid::from_u128(1),
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                fit: FitMode::Stretch,
+                effects: vec![],
+                frame: Some((3, 2, &stored, 1)),
+                generator: None,
+                transition: None,
+                transform: Affine::IDENTITY,
+                channels: Default::default(),
+                mask: Default::default(),
+                orient,
+            }];
+            comp.render(&device, &queue, &layers, &[], 1.0);
+            let (w, h, got) = comp.read_rgba(&device, &queue).expect("read");
+            assert_eq!((w, h), (lw, lh), "orientation {code}");
+            for (g, e) in got.iter().zip(want.data.iter()) {
+                assert!(
+                    g.abs_diff(*e) <= 2,
+                    "orientation {code}: {got:?} vs {:?}",
+                    want.data
+                );
+            }
+        }
+    }
+
     /// Renders every composition mode on the GPU and compares one pixel to the Rust reference.
     /// Skipped when there is no adapter.
     #[test]
@@ -3232,6 +3294,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(2),
@@ -3245,6 +3308,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -3313,6 +3377,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         };
         let layers = [
             draw(1, &[0, 0, 0, 255], true),
@@ -3381,6 +3446,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         };
         let layers = [draw(1, old, true), draw(2, new, false)];
         let mut comp = Compositor::new(&device, w, h);
@@ -3467,6 +3533,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         };
         comp.render(&device, &queue, &[layer], &[], 1.0);
         let busy = comp.vram();
@@ -3740,6 +3807,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             let master = if on_master { vec![fx.clone()] } else { vec![] };
             comp.render(&device, &queue, &layer, &master, 1.0);
@@ -3820,6 +3888,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3894,6 +3963,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4009,6 +4079,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-snapshots");
@@ -4211,6 +4282,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 }];
                 comp.render(&device, &queue, &layer, &[], 1.0);
                 let data = read_target(&device, &queue, &comp);
@@ -4287,6 +4359,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let data = read_target(&device, &queue, &comp);
@@ -4374,6 +4447,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4435,6 +4509,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(device, queue, &layer, &[], 1.0);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -4488,6 +4563,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }];
         comp.render(&device, &queue, &layer, &[], 1.0);
         let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();
@@ -4696,6 +4772,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             comp.read_rgba(&device, &queue).unwrap().2
@@ -4791,6 +4868,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 }];
                 comp.render(&device, &queue, &layer, &[], 1.0);
                 last = read_px(&device, &queue, &comp);
@@ -4847,6 +4925,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render_routed(&device, &queue, (&layer, &[]), (&[], 1.0), &routes);
             main_px = read_px(&device, &queue, &comp);
@@ -4882,6 +4961,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }
     }
 
@@ -5530,6 +5610,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -5553,6 +5634,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layer, &[], 1.0);
@@ -5627,6 +5709,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             if round == 0 {
@@ -5708,6 +5791,7 @@ mod tests {
                 transform: Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let col = read_col(&device, &queue, &comp, 4);
@@ -5949,6 +6033,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
                 LayerDraw {
                     id: uuid::Uuid::from_u128(1),
@@ -5971,6 +6056,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 },
             ];
             comp.render(&device, &queue, &layers, &[], 1.0);
@@ -6000,6 +6086,7 @@ mod tests {
             transform: Affine::IDENTITY,
             channels: Default::default(),
             mask: Default::default(),
+            orient: Default::default(),
         }
     }
 
@@ -6696,6 +6783,7 @@ mod tests {
                     transform: Affine::IDENTITY,
                     channels: Default::default(),
                     mask: Default::default(),
+                    orient: Default::default(),
                 })
                 .collect();
             let t = std::time::Instant::now();

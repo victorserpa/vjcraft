@@ -488,6 +488,7 @@ mod tests {
                 transform: crate::compositor::Affine::IDENTITY,
                 channels: Default::default(),
                 mask: Default::default(),
+                orient: Default::default(),
             }];
             comp.render(&device, &queue, &layer, &[], 1.0);
             let (w, h, got) = comp.read_rgba(&device, &queue).unwrap();

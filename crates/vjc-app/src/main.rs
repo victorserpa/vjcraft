@@ -5300,7 +5300,10 @@ impl State {
             .filter(|(d, c, _)| *d == deck && *c == column)
             .and_then(|(_, _, p)| p.latest_frame());
         let shot = match playing {
-            Some(f) if f.hap.is_none() => Some((f.width, f.height, f.data.to_vec())),
+            Some(f) if f.hap.is_none() => {
+                let f = f.oriented();
+                Some((f.width, f.height, f.data.to_vec()))
+            }
             Some(_) => frame
                 .wgpu_render_state()
                 .zip(self.comp.as_ref())
@@ -5489,7 +5492,7 @@ impl State {
                 continue;
             }
             // Clip chain first, then the layer chain.
-            let size = f.as_ref().map_or((w, h), |f| (f.width, f.height));
+            let size = f.as_ref().map_or((w, h), |f| f.display_size());
             let clip = active_of(players, gens, l.id)
                 .and_then(|(d, col)| clip_for(&self.project, origin, l.id, d, col));
             // Strip video: this clip's picture is not drawn (its audio keeps playing).
@@ -5590,7 +5593,7 @@ impl State {
                     None,
                     &l.track.effects,
                     time,
-                    (of.width, of.height),
+                    of.display_size(),
                     &lctx,
                 );
                 draw_groups.push(l.group);
@@ -5607,7 +5610,7 @@ impl State {
                     transition: Some((kind.shader_id(), prog, true)),
                     transform: compositor::area_affine(
                         &l.extras,
-                        (of.width, of.height),
+                        of.display_size(),
                         (w, h),
                         l.extras.auto_size.fit().unwrap_or(o.fit),
                     )
@@ -5615,6 +5618,7 @@ impl State {
                     channels: channels_of(o.clip.as_ref()),
                     mask: l.mask_mode,
                     frame: Some((of.width, of.height, of.data.as_slice(), of.seq)),
+                    orient: of.orient,
                 });
             }
             draw_groups.push(l.group);
@@ -5635,6 +5639,7 @@ impl State {
                 frame: f
                     .as_ref()
                     .map(|f| (f.width, f.height, f.data.as_slice(), f.seq)),
+                orient: f.as_ref().map(|f| f.orient).unwrap_or_default(),
             });
         }
         // The previewed clip, drawn alone with its own effects: last in the list, so the
@@ -5657,7 +5662,7 @@ impl State {
                 .clip_prev
                 .as_ref()
                 .map_or(0.0, |p| p.since.elapsed().as_secs_f32());
-            let size = prev_frame.as_ref().map_or((w, h), |f| (f.width, f.height));
+            let size = prev_frame.as_ref().map_or((w, h), |f| f.display_size());
             let generator = match &k.source {
                 vjc_model::Source::Generator { kind, params } => {
                     self.fx.request(kind);
@@ -5710,6 +5715,7 @@ impl State {
                     channels: k.channels,
                     mask: Default::default(),
                     frame,
+                    orient: prev_frame.as_ref().map(|f| f.orient).unwrap_or_default(),
                 });
             }
         }

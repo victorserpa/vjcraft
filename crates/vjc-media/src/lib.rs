@@ -47,9 +47,29 @@ pub struct Frame {
     pub seq: u64,
     /// HAP frame still block-compressed (`data` is empty then); the GPU decodes it.
     pub hap: Option<Arc<hap::HapFrame>>,
+    /// How the stored pixels turn for display. `width` / `height` and `data` stay as
+    /// decoded; the renderer applies this on the GPU (no CPU copy).
+    pub orient: Orient,
 }
 
 impl Frame {
+    /// Displayed size in px (after the quarter turn).
+    pub fn display_size(&self) -> (u32, u32) {
+        self.orient.size(self.width, self.height)
+    }
+
+    /// The frame with its orientation baked into the pixels (CPU copy). For thumbnails,
+    /// snapshots and tests; playback never calls it. Block-compressed frames are returned
+    /// as they are.
+    pub fn oriented(self) -> Frame {
+        let o = self.orient;
+        let f = rotate_frame(self, o.deg, o.flip);
+        Frame {
+            orient: Orient::default(),
+            ..f
+        }
+    }
+
     /// Bytes this frame holds in memory (cache accounting).
     pub fn bytes(&self) -> usize {
         self.hap.as_ref().map_or(self.data.len(), |h| h.bytes())
@@ -309,6 +329,7 @@ impl Player {
                             data: Arc::new(data),
                             seq,
                             hap: None,
+                            orient: Orient::default(),
                         });
                         true
                     };
@@ -477,6 +498,7 @@ fn load_image(path: &Path) -> Result<Frame, String> {
         data: Arc::new(img.into_raw()),
         seq: 1,
         hap: None,
+        orient: Orient::default(),
     })
 }
 
@@ -530,6 +552,7 @@ pub(crate) fn frame_to_rgba(
         data: Arc::new(data),
         seq,
         hap: None,
+        orient: Orient::default(),
     })
 }
 
@@ -553,14 +576,26 @@ pub struct SourceInfo {
 /// an optional horizontal mirror of the stored pixels. Phone and camera clips store
 /// portrait video as landscape pixels plus a display matrix; front cameras add a mirror.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Orient {
-    deg: u32,
-    flip: bool,
+pub struct Orient {
+    pub deg: u32,
+    pub flip: bool,
 }
 
 impl Orient {
+    /// Shader code: quarter turns (0..3) plus 4 when mirrored.
+    pub fn code(self) -> u32 {
+        (self.deg / 90) % 4 + if self.flip { 4 } else { 0 }
+    }
+
+    pub fn from_code(c: u32) -> Orient {
+        Orient {
+            deg: (c % 4) * 90,
+            flip: c >= 4,
+        }
+    }
+
     /// The displayed size of a `w` x `h` stored picture.
-    fn size(self, w: u32, h: u32) -> (u32, u32) {
+    pub fn size(self, w: u32, h: u32) -> (u32, u32) {
         if matches!(self.deg, 90 | 270) {
             (h, w)
         } else {
@@ -722,13 +757,7 @@ pub fn probe(path: impl AsRef<Path>) -> Option<SourceInfo> {
     };
     let params = st.parameters();
     let codec = params.id().name().to_string();
-    // Block-compressed HAP frames stay unrotated (see `rotate_frame`), so the size reported
-    // for them is the stored one; everything else is reported as displayed.
-    let orient = if hap::gpu_supported() && hap_probe(path.as_ref()) {
-        Orient::default()
-    } else {
-        stream_orient(&st)
-    };
+    let orient = stream_orient(&st);
     let vpx = vpx_alpha_codec(&st);
     let vpx_alpha = vpx.is_some();
     let (width, height, alpha) = open_sw(params, vpx).ok().map_or((0, 0, false), |d| {
@@ -997,8 +1026,10 @@ impl Scrubber {
     /// Converts a decoded frame to RGBA.
     fn convert(&mut self, decoded: &ff::frame::Video) -> Result<Frame, ff::Error> {
         self.count += 1;
-        frame_to_rgba(&mut self.scaler, decoded, self.count)
-            .map(|f| rotate_frame(f, self.orient.deg, self.orient.flip))
+        frame_to_rgba(&mut self.scaler, decoded, self.count).map(|f| Frame {
+            orient: self.orient,
+            ..f
+        })
     }
 
     /// Next frame in decode order, or None at end of file. Decode errors on a packet or
@@ -1151,6 +1182,7 @@ impl Scrubber {
                     data: Arc::new(Vec::new()),
                     seq: self.count,
                     hap: Some(Arc::new(h)),
+                    orient: self.orient,
                 };
                 self.last_t = t;
                 self.last = Some(f.clone());
@@ -1553,7 +1585,7 @@ fn thumbnail_inner(path: &Path, max_side: u32) -> Result<Frame, String> {
             .next()
             .ok_or("no frames")?
     };
-    Ok(downscale(&frame, max_side))
+    Ok(downscale(&frame, max_side).oriented())
 }
 
 fn downscale(f: &Frame, max_side: u32) -> Frame {
@@ -1578,6 +1610,7 @@ fn downscale(f: &Frame, max_side: u32) -> Frame {
         data: Arc::new(out),
         seq: 1,
         hap: None,
+        orient: f.orient,
     }
 }
 
@@ -1657,6 +1690,7 @@ mod tests {
                     data: Arc::new(vec![0; 4]),
                     seq: 0,
                     hap: None,
+                    orient: Orient::default(),
                 };
                 (*t, f)
             })
@@ -2188,6 +2222,7 @@ mod tests {
             data: Arc::new(data),
             seq: 1,
             hap: None,
+            orient: Orient::default(),
         };
         let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
         let m = rotate_frame(f.clone(), 0, true);
@@ -2207,6 +2242,7 @@ mod tests {
             data: Arc::new(data.clone()),
             seq: 1,
             hap: None,
+            orient: Orient::default(),
         };
         let r = rotate_frame(f, 90, false);
         assert_eq!((r.width as usize, r.height as usize), (h, w));
@@ -2261,6 +2297,7 @@ mod tests {
             data: Arc::new(data),
             seq: 1,
             hap: None,
+            orient: Orient::default(),
         };
         let first = |f: &Frame| f.data.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
         let r90 = rotate_frame(f.clone(), 90, false);
