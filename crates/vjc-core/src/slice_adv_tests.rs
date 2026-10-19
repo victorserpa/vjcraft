@@ -559,7 +559,7 @@ fn exact_outline_setup() -> (Project, Uuid, Uuid) {
 }
 
 #[test]
-fn outline_following_a_mesh_is_clamped_and_undo_is_exact() {
+fn outline_following_a_mesh_may_leave_the_screen_and_undo_is_exact() {
     let (mut p, sid, id) = exact_outline_setup();
     let before = p.clone();
     let mut h = History::new();
@@ -580,10 +580,9 @@ fn outline_following_a_mesh_is_clamped_and_undo_is_exact() {
         Instant::now(),
     )
     .unwrap();
-    assert!(outline(&p, id).iter().all(|q| (0.0..=1.0).contains(&q.0)));
     assert!(
-        outline(&p, id).iter().any(|q| q.0 == 1.0),
-        "clamped to the edge"
+        outline(&p, id).iter().any(|q| q.0 > 1.0),
+        "not clamped, rendered clipped"
     );
     h.undo(&mut p).unwrap().unwrap();
     assert_eq!(p, before, "bit-exact, no float drift");
