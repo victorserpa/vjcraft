@@ -171,6 +171,14 @@ fn handle_pts(r: Rect) -> [(f32, f32); 8] {
 
 /// The rectangle that results from dragging handle `h` of `start` to `q`. Corners keep the
 /// aspect ratio with `keep`. Sizes never drop below one pixel.
+/// Adds a drag sample unless the pointer has not moved (the path would otherwise grow, and
+/// be cloned for painting, on every frame of a long hold).
+fn push_sample(path: &mut Vec<egui::Pos2>, q: egui::Pos2) {
+    if path.last().is_none_or(|l| l.distance(q) >= 0.5) {
+        path.push(q);
+    }
+}
+
 fn resized(start: Rect, h: usize, q: (f32, f32), keep: bool) -> Rect {
     let (mut x0, mut y0, mut x1, mut y1) = (start.x, start.y, start.x + start.w, start.y + start.h);
     if matches!(h, 0 | 6 | 7) {
@@ -803,7 +811,7 @@ impl State {
                 }
                 Grab::Select { lasso, mut path } => {
                     if let Some(q) = cur {
-                        path.push(q);
+                        push_sample(&mut path, q);
                         let line = egui::Stroke::new(STROKE_CANVAS, vis.selection.stroke.color);
                         if lasso {
                             p.add(egui::Shape::line(path.clone(), line));
@@ -1263,4 +1271,21 @@ fn guide_id(screen: Uuid) -> egui::Id {
 
 fn full_uv() -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_pointer_does_not_grow_the_select_path() {
+        let mut path = vec![];
+        let q = egui::pos2(10.0, 10.0);
+        for _ in 0..100 {
+            push_sample(&mut path, q);
+        }
+        assert_eq!(path.len(), 1);
+        push_sample(&mut path, egui::pos2(20.0, 10.0));
+        assert_eq!(path.len(), 2, "control: a moved pointer is recorded");
+    }
 }
