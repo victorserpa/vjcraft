@@ -280,6 +280,7 @@ pub fn run_supervisor(args: &[String]) -> Option<i32> {
         |recover| {
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(&args[1..]).arg("--child");
+            cmd.env(SUPERVISOR_PID_ENV, std::process::id().to_string());
             if recover {
                 cmd.arg("--recover");
             }
@@ -386,6 +387,18 @@ fn end_status_stopped() -> std::process::ExitStatus {
     unreachable!("no stop handlers off unix")
 }
 
+/// Env var the supervisor sets on the child with its own pid.
+pub const SUPERVISOR_PID_ENV: &str = "VJC_SUPERVISOR_PID";
+
+/// The pid the parent watch compares against: the supervisor's own pid when it passed
+/// one (so a supervisor that died before the child sampled `getppid` is still noticed),
+/// else the parent pid seen at start.
+fn watch_baseline(env: Option<&str>, ppid: i32) -> i32 {
+    env.and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|p| *p > 1)
+        .unwrap_or(ppid)
+}
+
 /// Set when the supervisor (our parent) is gone.
 static PARENT_GONE: AtomicBool = AtomicBool::new(false);
 /// Set by the UI when it starts the orphan quit, so the watcher lets it finish.
@@ -404,12 +417,17 @@ pub fn parent_gone() -> bool {
 #[cfg(unix)]
 pub fn start_parent_watch() {
     // SAFETY: getppid has no preconditions.
-    let parent = unsafe { libc::getppid() };
+    let ppid = unsafe { libc::getppid() };
+    let parent = watch_baseline(std::env::var(SUPERVISOR_PID_ENV).ok().as_deref(), ppid);
     let _ = std::thread::Builder::new()
         .name("vjc-parent-watch".into())
         .spawn(move || {
+            let mut first = true;
             loop {
-                std::thread::sleep(Duration::from_millis(500));
+                // The first check is immediate: the supervisor may be dead already.
+                if !std::mem::take(&mut first) {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
                 // SAFETY: as above.
                 if unsafe { libc::getppid() } != parent {
                     PARENT_GONE.store(true, Ordering::SeqCst);
@@ -648,6 +666,21 @@ pub fn image_open(path: impl AsRef<Path>) -> Result<image::DynamicImage, String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watch_baseline_prefers_the_supervisor_pid() {
+        // Supervisor 4242 died before the child sampled: ppid is already 1 (launchd).
+        assert_eq!(watch_baseline(Some("4242"), 1), 4242);
+        assert_ne!(watch_baseline(Some("4242"), 1), 1, "must be seen as gone");
+        assert_eq!(watch_baseline(Some(" 77\n"), 77), 77);
+    }
+
+    #[test]
+    fn watch_baseline_falls_back_to_ppid() {
+        assert_eq!(watch_baseline(None, 55), 55);
+        assert_eq!(watch_baseline(Some("junk"), 55), 55);
+        assert_eq!(watch_baseline(Some("0"), 55), 55);
+    }
+
     use super::*;
 
     #[test]
