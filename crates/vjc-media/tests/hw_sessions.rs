@@ -109,3 +109,64 @@ fn on_air_clip_reclaims_the_session_of_the_idle_holder() {
     wait_until("A goes sw", 5, || a.decode_status() == Some("sw"));
     assert_eq!(vjc_media::active_sessions(), 1);
 }
+
+/// Drives `p` like the app does: `set_position` on every frame, `pos` for `ms` ms.
+fn drive(p: &Player, ms: u64, mut pos: impl FnMut(u64) -> f64) {
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(ms) {
+        p.set_position(pos(t.elapsed().as_millis() as u64));
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+#[test]
+fn first_trigger_at_the_preload_position_still_gets_a_session() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(path) = clip("evict-first") else {
+        return;
+    };
+    setup(1);
+    let a = open_with_frame(&path);
+    assert_eq!(a.decode_status(), Some("hw"));
+    let b = open_with_frame(&path);
+    assert_eq!(b.decode_status(), Some("sw"), "cap 1 is taken by A");
+    // B goes on air at the position it was preloaded at: the position never changes.
+    drive(&b, 4000, |_| 0.0);
+    assert_eq!(b.decode_status(), Some("hw"), "B on air gets A's session");
+    assert_eq!(a.decode_status(), Some("sw"));
+}
+
+#[test]
+fn eviction_asked_while_the_holder_moves_is_asked_again_when_it_idles() {
+    let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(path) = clip("evict-busy") else {
+        return;
+    };
+    setup(1);
+    let a = open_with_frame(&path);
+    assert_eq!(a.decode_status(), Some("hw"));
+    std::thread::sleep(Duration::from_millis(1500)); // A is idle
+    let b = open_with_frame(&path);
+    assert_eq!(b.decode_status(), Some("sw"));
+    // B goes on air and stays on its frame (paused); A moves, so the request to A is not
+    // honoured and gets dropped.
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(1500) {
+        let ms = t.elapsed().as_millis() as f64;
+        a.set_position((ms / 4000.0).fract());
+        let _ = ms;
+        b.set_position(0.3);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert_eq!(b.decode_status(), Some("sw"), "A is not idle yet");
+    // A stops on its frame. B still waits on air without a session: it must ask again.
+    let a_pos = 1500.0 / 4000.0;
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(5000) && b.decode_status() != Some("hw") {
+        a.set_position(a_pos);
+        b.set_position(0.3);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert_eq!(b.decode_status(), Some("hw"), "B re-asked once A idled");
+    assert_eq!(a.decode_status(), Some("sw"));
+}
