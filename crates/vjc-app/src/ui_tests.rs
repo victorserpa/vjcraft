@@ -8553,6 +8553,32 @@ fn recover_keeps_the_recovery_file() {
     let _ = std::fs::remove_file(&file);
 }
 
+// #22 (#32): --recover and the open offer obey the same persist/rehearsal gate as autosave.
+#[test]
+fn recovery_restore_obeys_the_persist_gate() {
+    let file = tmp_vjc("recover-gate.vjc");
+    let mut src = State::headless(prefs());
+    src.dirty = true;
+    assert!(src.save_to(file.clone()));
+    // headless: persist = false -> nothing restored, nothing offered
+    let mut st = State::headless(prefs());
+    auto_recover_from(&mut st, Some(file.clone()));
+    offer_recovery_from(&mut st, Some(file.clone()));
+    assert!(!st.dirty && st.recovery_offer.is_none(), "gated off");
+    // control: live and not rehearsing
+    st.persist = true;
+    offer_recovery_from(&mut st, Some(file.clone()));
+    assert_eq!(st.recovery_offer, Some(file.clone()));
+    st.recovery_offer = None;
+    st.rehearsal = true;
+    auto_recover_from(&mut st, Some(file.clone()));
+    assert!(!st.dirty, "rehearsal gated off");
+    st.rehearsal = false;
+    auto_recover_from(&mut st, Some(file.clone()));
+    assert!(st.dirty, "control: restores when live");
+    let _ = std::fs::remove_file(&file);
+}
+
 /// Presses at the first point of `path`, moves through the rest and releases (a pen stroke).
 fn drag_path(h: &mut Harness<'_, State>, path: &[egui::Pos2]) {
     let button = |pos, pressed| egui::Event::PointerButton {

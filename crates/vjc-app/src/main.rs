@@ -1678,7 +1678,13 @@ fn quarantine_recovery(r: &Path) {
 
 /// Offers to restore a recovery file newer than the last saved project.
 fn offer_recovery(s: &mut State) {
-    let Some(r) = recovery_path() else { return };
+    offer_recovery_from(s, recovery_path());
+}
+
+fn offer_recovery_from(s: &mut State, raw: Option<PathBuf>) {
+    let Some(r) = s.gate_recovery(raw) else {
+        return;
+    };
     if !r.exists() {
         return;
     }
@@ -1688,7 +1694,12 @@ fn offer_recovery(s: &mut State) {
 /// `--recover` (relaunch after a crash): restores the recovery file with no prompt. The
 /// project carries its screens, so the output windows reopen on the same monitors.
 fn auto_recover(s: &mut State) {
-    let Some(r) = recovery_path().filter(|r| r.exists()) else {
+    auto_recover_from(s, recovery_path());
+}
+
+/// Same persist/rehearsal gate as autosave: a rehearsal must not restore the live project.
+fn auto_recover_from(s: &mut State, raw: Option<PathBuf>) {
+    let Some(r) = s.gate_recovery(raw).filter(|r| r.exists()) else {
         return;
     };
     if s.restore_recovery(r) {
@@ -1954,9 +1965,15 @@ impl State {
 
     /// Recovery file, only for the live app.
     fn recovery_path(&self) -> Option<PathBuf> {
-        (self.persist && !self.rehearsal)
-            .then(recovery_path)
-            .flatten()
+        self.gate_recovery(recovery_path())
+    }
+
+    fn gate_recovery(&self, raw: Option<PathBuf>) -> Option<PathBuf> {
+        if self.persist && !self.rehearsal {
+            raw
+        } else {
+            None
+        }
     }
 
     fn build(prefs: Prefs, live: bool) -> Self {
