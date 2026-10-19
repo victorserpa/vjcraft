@@ -559,7 +559,7 @@ fn exact_outline_setup() -> (Project, Uuid, Uuid) {
 }
 
 #[test]
-fn outline_following_a_mesh_is_clamped_and_undo_is_exact() {
+fn outline_following_a_mesh_may_leave_the_screen_and_undo_is_exact() {
     let (mut p, sid, id) = exact_outline_setup();
     let before = p.clone();
     let mut h = History::new();
@@ -580,10 +580,9 @@ fn outline_following_a_mesh_is_clamped_and_undo_is_exact() {
         Instant::now(),
     )
     .unwrap();
-    assert!(outline(&p, id).iter().all(|q| (0.0..=1.0).contains(&q.0)));
     assert!(
-        outline(&p, id).iter().any(|q| q.0 == 1.0),
-        "clamped to the edge"
+        outline(&p, id).iter().any(|q| q.0 > 1.0),
+        "not clamped, rendered clipped"
     );
     h.undo(&mut p).unwrap().unwrap();
     assert_eq!(p, before, "bit-exact, no float drift");
@@ -724,4 +723,13 @@ fn undo_of_a_mesh_change_restores_stale_length_tangents_exactly() {
     h.redo(&mut p).unwrap().unwrap();
     h.undo(&mut p).unwrap().unwrap();
     assert_eq!(p.output.screens[0].slices[0].mesh_tangents, tangents);
+}
+
+#[test]
+fn polygon_points_past_the_edge_survive_validation() {
+    let off = vec![(0.8, 0.2), (1.3, 0.2), (1.3, 0.7), (0.8, 0.7)];
+    assert_eq!(clamp_poly(&off).unwrap(), off);
+    let far = vec![(-100.0, 0.0), (100.0, 0.0), (0.0, 100.0)];
+    let c = clamp_poly(&far).unwrap();
+    assert!(c.iter().all(|p| (POLY_MIN..=POLY_MAX).contains(&p.0)));
 }

@@ -154,9 +154,9 @@ pub fn preset_polygon(preset: ShapePreset, r: Rect) -> Vec<Pt> {
 
 /// When `new` is an affine image of the slice's current mesh (move, nudge, resize, rotate,
 /// flip), applies the same transform to a polygon outline so it keeps following the mesh.
-/// Point edits that are not affine leave the outline alone. The result is clamped to
-/// 0..1. Returns the outline as it was when it changed, so the caller can store the exact
-/// original for undo (following the inverse transform would drift, and clamping loses data).
+/// Point edits that are not affine leave the outline alone. The result may leave
+/// 0..1 (rendered clipped). Returns the outline as it was when it changed, so the caller can store the exact
+/// original for undo (following the inverse transform would drift).
 pub fn follow_outline(
     sl: &mut vjc_model::Slice,
     new: &[Pt],
@@ -216,10 +216,7 @@ pub fn follow_outline(
         .map(|p| (p.0 / w, p.1 / h))
         .collect();
     if out.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
-        let out: Vec<Pt> = out
-            .into_iter()
-            .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
-            .collect();
+        // Never clamp per vertex: that would destroy the shape across moves past the edge.
         if out == *poly {
             return None;
         }
@@ -418,7 +415,13 @@ pub fn resize_group(meshes: &[Vec<Pt>], bounds: &[Pt], to: Rect) -> Vec<Vec<Pt>>
         .collect()
 }
 
-/// Polygon validated (3..=`MAX_POLY_POINTS` finite points) and clamped to 0..1.
+/// Points may sit past the screen edge (an outline moved partly off screen keeps its
+/// shape and is clipped when drawn), but not without bound.
+pub const POLY_MIN: f32 = -4.0;
+pub const POLY_MAX: f32 = 5.0;
+
+/// Polygon validated (3..=`MAX_POLY_POINTS` finite points) and clamped to
+/// `POLY_MIN..=POLY_MAX`, so a shape partly off screen survives a round trip.
 pub fn clamp_poly(pts: &[Pt]) -> Result<Vec<Pt>, crate::Error> {
     let ok = (3..=MAX_POLY_POINTS).contains(&pts.len())
         && pts.iter().all(|p| p.0.is_finite() && p.1.is_finite());
@@ -427,6 +430,6 @@ pub fn clamp_poly(pts: &[Pt]) -> Result<Vec<Pt>, crate::Error> {
     }
     Ok(pts
         .iter()
-        .map(|p| (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0)))
+        .map(|p| (p.0.clamp(POLY_MIN, POLY_MAX), p.1.clamp(POLY_MIN, POLY_MAX)))
         .collect())
 }

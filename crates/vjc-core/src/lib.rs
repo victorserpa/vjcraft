@@ -3105,12 +3105,7 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 if (fw, fh) != (tw, th) {
                     let scaled: Vec<_> = poly
                         .iter()
-                        .map(|q| {
-                            (
-                                (q.0 * fw / tw).clamp(0.0, 1.0),
-                                (q.1 * fh / th).clamp(0.0, 1.0),
-                            )
-                        })
+                        .map(|q| (q.0 * fw / tw, q.1 * fh / th))
                         .collect();
                     prev_outline = Some(std::mem::replace(poly, scaled));
                 }
@@ -8349,6 +8344,72 @@ mod tests {
         assert_eq!(
             apply(&mut q, Command::Batch { commands: vec![] }),
             Err(Error::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn outline_keeps_shape_past_edge_and_across_screens() {
+        use crate::mapping::Pt;
+        let hexa: Vec<Pt> = (0..6)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::TAU / 6.0;
+                (0.5 + 0.3 * a.cos(), 0.5 + 0.3 * a.sin())
+            })
+            .collect();
+        let (mut p, _) = setup();
+        let (a, b) = (
+            mapping::new_screen("A", 1920, 1080),
+            mapping::new_screen("B", 640, 480),
+        );
+        let (aid, bid) = (a.id, b.id);
+        p.output.screens = vec![a, b];
+        let mut s = mapping::new_slice(1920, 1080);
+        s.shape = vjc_model::SliceShape::Polygon(hexa.clone());
+        let sid = s.id;
+        p.output.screens[0].slices = vec![s];
+        let poly = |p: &Project, scr: usize| match &p.output.screens[scr].slices[0].shape {
+            vjc_model::SliceShape::Polygon(v) => v.clone(),
+            _ => panic!("not a polygon"),
+        };
+        let same = |x: &[Pt], y: &[Pt]| {
+            x.iter()
+                .zip(y)
+                .all(|(a, b)| (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5)
+        };
+        let nudge = |p: &mut Project, dx: f32| {
+            let sl = &p.output.screens[0].slices[0];
+            let c = Command::SetSliceMesh {
+                screen: aid,
+                slice: sid,
+                mesh: sl.output_mesh.iter().map(|q| (q.0 + dx, q.1)).collect(),
+                cols: sl.mesh_cols,
+            };
+            apply(p, c).unwrap();
+        };
+        nudge(&mut p, 60.0 + 1920.0 * 0.5);
+        assert!(poly(&p, 0).iter().any(|q| q.0 > 1.0), "went past the edge");
+        nudge(&mut p, -(60.0 + 1920.0 * 0.5));
+        assert!(same(&poly(&p, 0), &hexa), "back by a second command");
+        let mv = |from, to| Command::MoveSlice {
+            from,
+            to,
+            slice: sid,
+            index: 0,
+        };
+        apply(&mut p, mv(aid, bid)).unwrap();
+        apply(&mut p, mv(bid, aid)).unwrap();
+        assert!(same(&poly(&p, 0), &hexa), "smaller screen and back");
+        // Smaller-to-larger first would push points out when going back: use a wide hexagon.
+        let wide: Vec<Pt> = hexa
+            .iter()
+            .map(|q| (0.5 + (q.0 - 0.5) * 3.0, q.1))
+            .collect();
+        p.output.screens[0].slices[0].shape = vjc_model::SliceShape::Polygon(wide.clone());
+        apply(&mut p, mv(aid, bid)).unwrap();
+        apply(&mut p, mv(bid, aid)).unwrap();
+        assert!(
+            same(&poly(&p, 0), &wide),
+            "out-of-range survives the round trip"
         );
     }
 
