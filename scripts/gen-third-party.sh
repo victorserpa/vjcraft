@@ -19,14 +19,24 @@ OUT="$TP/NOTICE.md"
 
 # One table row for a Homebrew formula: library | version | license | homepage | source | sha256.
 brew_row() {
-  local pkg="$1" ver="$2" j
+  local pkg="$1" ver="$2" j rb url sha
   j="$(brew info --json=v2 "$pkg")" || die "brew info $pkg failed"
-  echo "$j" | jq -r --arg v "$ver" '.formulae[0] |
-    (.urls.stable) as $u |
-    "| \(.name) | \($v) | \(.license // "UNKNOWN") | \(.homepage) | \(if $u.revision then "\($u.url) @ \($u.revision)" else $u.url end) | \($u.checksum // "git revision") |"'
   echo "$j" | jq -e '.formulae[0].license' >/dev/null || die "brew has no license id for $pkg"
-  [ "$(echo "$j" | jq -r '.formulae[0].versions.stable')" = "$ver" ] || \
-    echo "gen-third-party: WARNING $pkg bundled $ver but brew stable is $(echo "$j" | jq -r '.formulae[0].versions.stable') (source URL may differ)" >&2
+  if [ "$(echo "$j" | jq -r '.formulae[0].versions.stable')" = "$ver" ]; then
+    echo "$j" | jq -r --arg v "$ver" '.formulae[0] |
+      (.urls.stable) as $u |
+      "| \(.name) | \($v) | \(.license // "UNKNOWN") | \(.homepage) | \(if $u.revision then "\($u.url) @ \($u.revision)" else $u.url end) | \($u.checksum // "git revision") |"'
+    return
+  fi
+  # The installed version differs from the formula's current stable one, so the source
+  # URL must come from the formula copy Homebrew kept with that installed version.
+  rb="$(brew --cellar "$pkg")/$ver/.brew/$pkg.rb"
+  [ -f "$rb" ] || die "$pkg $ver: no installed formula at $rb to find its source"
+  url=$(sed -nE 's/^  url "([^"]+)".*/\1/p' "$rb" | head -1)
+  sha=$(sed -nE 's/^  sha256 "([0-9a-f]{64})".*/\1/p' "$rb" | head -1)
+  [ -n "$url" ] && [ -n "$sha" ] || die "$pkg $ver: no url/sha256 in $rb"
+  echo "$j" | jq -r --arg v "$ver" --arg u "$url" --arg s "$sha" '.formulae[0] |
+    "| \(.name) | \($v) | \(.license // "UNKNOWN") | \(.homepage) | \($u) | \($s) |"'
 }
 
 {
