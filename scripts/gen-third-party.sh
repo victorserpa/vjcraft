@@ -56,6 +56,10 @@ cat <<HDR
 Dylibs and the formula each comes from:
 
 $(sort "$TSV" | awk -F'\t' '{printf "- %s (%s %s)\n", $1, $2, $3}')
+HDR
+
+if [ -f "$RES/ffmpeg" ]; then
+cat <<HDR
 
 ## FFmpeg CLI (Contents/Resources/ffmpeg, HAP conversion)
 
