@@ -34,7 +34,7 @@ scripts/build-ffmpeg.sh || { echo "FFmpeg build failed" >&2; exit 1; }
 FFMPEG_PC="$PWD/target/ffmpeg-libs/lib/pkgconfig"
 for f in dav1d libvpx; do FFMPEG_PC="$FFMPEG_PC:$(brew --prefix "$f")/lib/pkgconfig"; done
 # Clean the ffmpeg-sys artifacts so a build against Homebrew's FFmpeg is never reused.
-cargo clean --release -p ffmpeg-sys-next 2>/dev/null || true
+cargo clean --release -p ffmpeg-sys-next
 PKG_CONFIG_PATH="$FFMPEG_PC" cargo build --release -p vjc-app
 
 rm -rf "$APP" "$DMG" "$DIST/dmg-root"
@@ -100,6 +100,17 @@ cat > "$APP/Contents/Info.plist" <<PL
 PL
 
 scripts/bundle-dylibs.sh "$APP"
+
+# Link audit: the binary must use our libav* via @rpath, and no GPL/network/Homebrew-FFmpeg libs.
+EXE_LIBS=$(otool -L "$APP/Contents/MacOS/vjcraft" | tail -n +2 | awk '{print $1}')
+echo "$EXE_LIBS" | grep -q '^@rpath/libavcodec' || { echo "vjcraft does not link libav* via @rpath" >&2; exit 1; }
+if echo "$EXE_LIBS" | grep -E 'libav|libsw' | grep -v '^@rpath/' | grep -q .; then
+  echo "vjcraft links libav*/libsw* by a non-@rpath path" >&2; exit 1
+fi
+if { echo "$EXE_LIBS"; otool -L "$APP"/Contents/Frameworks/*.dylib | awk '{print $1}'; ls "$APP/Contents/Frameworks"; } \
+  | grep -Eq 'libx264|libx265|libssl|libcrypto|/opt/homebrew/opt/ffmpeg'; then
+  echo "forbidden library (x264/x265/ssl/crypto/Homebrew ffmpeg) in the bundle" >&2; exit 1
+fi
 scripts/gen-third-party.sh "$APP"
 scripts/check-third-party.sh "$APP"
 

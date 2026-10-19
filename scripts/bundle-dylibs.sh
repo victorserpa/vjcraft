@@ -148,7 +148,7 @@ while IFS=$'\t' read -r name orig; do
   case "$orig" in
     */target/ffmpeg-libs/lib/*)
       # Our own LGPL FFmpeg build (scripts/build-ffmpeg.sh); license files from its source.
-      pkg=ffmpeg-vjc; ver="$(sed -n 's/^FFMPEG_VER=//p' "$(dirname "$0")/build-ffmpeg.sh" | head -1)"
+      pkg=ffmpeg-vjc; ver="$(sed -n 's/^FFMPEG_VER=//p' "$(dirname "$0")/build-ffmpeg.sh" | head -1 | tr -d "\"'")"
       mkdir -p "$TP/$pkg"
       for lf in COPYING.LGPLv2.1 LICENSE.md; do
         src_lf="${orig%%/target/ffmpeg-libs/*}/target/ffmpeg-src/ffmpeg/$lf"

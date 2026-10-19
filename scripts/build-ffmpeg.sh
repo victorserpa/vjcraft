@@ -48,7 +48,6 @@ SRC="$OUT_BASE/ffmpeg-src"
 OUT="$OUT_BASE/ffmpeg"
 LIBS="$OUT_BASE/ffmpeg-libs"
 DEPS="$SRC/prefix"
-STAMP="$FFMPEG_VER+$SNAPPY_VER+$(shasum -a 256 "$0" | cut -c1-16)"
 
 # Homebrew's dav1d and libvpx (decoders only are enabled below).
 BREW_PC=""
@@ -58,6 +57,9 @@ for f in dav1d libvpx; do
   BREW_PC="$BREW_PC:$p"
 done
 export PKG_CONFIG_PATH="${BREW_PC#:}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+DAV1D_VER="$(basename "$(cd -P "$(brew --prefix dav1d)" && pwd)")"
+VPX_VER="$(basename "$(cd -P "$(brew --prefix libvpx)" && pwd)")"
+STAMP="$FFMPEG_VER+$SNAPPY_VER+dav1d$DAV1D_VER+vpx$VPX_VER+$(shasum -a 256 "$0" | cut -c1-16)"
 
 if [ "$FORCE" -eq 0 ] && [ -x "$OUT/bin/ffmpeg" ] && [ -f "$LIBS/lib/pkgconfig/libavcodec.pc" ] && [ "$(cat "$OUT/stamp" 2>/dev/null)" = "$STAMP" ]; then
   echo "up to date: $OUT/bin/ffmpeg"
@@ -131,8 +133,10 @@ START=$(date +%s)
   make install
 )
 
-# Shared libs for playback. Encoders: only hap (Convert to HAP) and pcm_s16le; libvpx/dav1d
-# are decoders (their encoders are not enabled). Protocols: file and pipe only.
+# Shared libs for playback and recording (record.rs). Encoders: hap (Convert to HAP), pcm_s16le,
+# aac, png, h264/hevc/prores via VideoToolbox, prores/prores_ks; muxers mov, mp4, image2.
+# No libx264/libx265 (GPL): record.rs falls back to VideoToolbox. zlib (png, mkv) and bzlib
+# (mkv) come from the macOS SDK. libvpx/dav1d are decoders (their encoders are not enabled). Protocols: file and pipe only.
 mkdir -p "$SRC/ffmpeg-libs-build"
 (
   cd "$SRC/ffmpeg-libs-build"
@@ -141,12 +145,12 @@ mkdir -p "$SRC/ffmpeg-libs-build"
     --enable-shared --disable-static \
     --disable-autodetect --disable-doc --disable-debug \
     --disable-network --disable-programs \
-    --enable-zlib --enable-libsnappy \
+    --enable-zlib --enable-bzlib --enable-libsnappy \
     --enable-libdav1d --enable-libvpx --enable-videotoolbox --enable-audiotoolbox \
     --enable-swscale --enable-swresample \
     --disable-protocols --enable-protocol=file,pipe \
-    --disable-encoders --enable-encoder=hap,pcm_s16le \
-    --disable-muxers --enable-muxer=mov \
+    --disable-encoders --enable-encoder=hap,pcm_s16le,aac,png,h264_videotoolbox,hevc_videotoolbox,prores,prores_ks,prores_videotoolbox \
+    --disable-muxers --enable-muxer=mov,mp4,image2 \
     --extra-cflags="-I$DEPS/include -mmacosx-version-min=$MIN_MACOS" \
     --extra-ldflags="-L$DEPS/lib -mmacosx-version-min=$MIN_MACOS" \
     --extra-libs="-lc++"
@@ -170,10 +174,18 @@ fi
 if grep -Eq '^#define CONFIG_(GPL|VERSION3|NONFREE) 1' "$SRC/ffmpeg-libs-build/config.h"; then
   echo "license check failed: GPL/nonfree flag in shared libs" >&2; exit 1
 fi
+# Allowlist: system libs, our own libav*/sw*, dav1d, vpx (first otool line is the lib's own id).
 for l in "$LIBS"/lib/*.dylib; do
-  if otool -L "$l" | grep -Eq 'x264|x265|ssl|crypto|vmaf|lame|SvtAv1'; then
-    echo "unwanted dependency in $l" >&2; exit 1
+  [ -L "$l" ] && continue
+  bad=$(otool -L "$l" | tail -n +2 | awk '{print $1}' \
+    | grep -Ev '^(/usr/lib/|/System/|@rpath/lib(av|sw|postproc)[a-z]*\.|.*/lib(av|sw)[a-z]*\.[0-9.]*dylib$|.*/libdav1d[.0-9]*dylib$|.*/libvpx[.0-9]*dylib$)' || true)
+  if [ -n "$bad" ]; then
+    echo "unexpected dependency in $l:" >&2; echo "$bad" >&2; exit 1
   fi
+done
+for e in aac png h264_videotoolbox hevc_videotoolbox prores_ks prores_videotoolbox; do
+  grep -q "^#define CONFIG_$(echo "$e" | tr a-z A-Z)_ENCODER 1" "$SRC/ffmpeg-libs-build/config_components.h" \
+    || { echo "missing encoder $e" >&2; exit 1; }
 done
 echo "$STAMP" > "$OUT/stamp"
 echo "built $BIN in $((END - START)) s"
