@@ -165,7 +165,7 @@ fn shift_pasted(c: &mut Slice, screen: (f32, f32)) {
         p.1 += PASTE_SHIFT;
     }
     let (dx, dy) = (PASTE_SHIFT / screen.0, PASTE_SHIFT / screen.1);
-    let mut norm = |pts: &mut Vec<(f32, f32)>| {
+    let norm = |pts: &mut Vec<(f32, f32)>| {
         for p in pts {
             p.0 += dx;
             p.1 += dy;

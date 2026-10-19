@@ -8906,3 +8906,14 @@ fn guide_image_decodes_off_the_ui_thread() {
     assert!(h.state().status.contains("Could not read"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn guide_drop_takes_only_pictures() {
+    use crate::output_canvas::is_guide_image;
+    use std::path::Path;
+    assert!(is_guide_image(Path::new("/a/b.PNG")));
+    assert!(is_guide_image(Path::new("/a/b.jpeg")));
+    // Control: a video or a folder is not a guide image.
+    assert!(!is_guide_image(Path::new("/a/b.mp4")));
+    assert!(!is_guide_image(Path::new("/a/folder")));
+}

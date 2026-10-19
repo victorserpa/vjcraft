@@ -215,7 +215,7 @@ impl State {
             if resp.dragged()
                 && let Some(at) = resp.interact_pointer_pos()
             {
-                tool.stroke.push(norm(at));
+                push_stroke(&mut tool.stroke, norm(at));
             }
             if resp.drag_stopped() {
                 let pts = slice_adv::simplify_stroke(&tool.stroke, PEN_TOLERANCE, MAX_POLY_POINTS);
@@ -483,9 +483,33 @@ impl State {
     }
 }
 
+/// Adds a pen sample unless the pointer has not moved: holding still must not grow the
+/// stroke by one point per frame.
+fn push_stroke(stroke: &mut Vec<Pt>, p: Pt) {
+    if stroke
+        .last()
+        .is_none_or(|l| (l.0 - p.0).abs() > 1e-4 || (l.1 - p.1).abs() > 1e-4)
+    {
+        stroke.push(p);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pen_stroke_ignores_a_pointer_that_did_not_move() {
+        let mut s = vec![];
+        for _ in 0..100 {
+            push_stroke(&mut s, (0.5, 0.5));
+        }
+        assert_eq!(s.len(), 1, "held still: one sample");
+        // Control: real movement still adds samples.
+        push_stroke(&mut s, (0.6, 0.5));
+        push_stroke(&mut s, (0.6, 0.6));
+        assert_eq!(s.len(), 3);
+    }
 
     fn scr() -> Screen {
         mapping::new_screen("t", 1920, 1080)

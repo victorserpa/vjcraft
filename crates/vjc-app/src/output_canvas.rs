@@ -1288,12 +1288,26 @@ impl State {
         if dropped.is_empty() || !over {
             return dropped;
         }
-        match (self.sel_screen, dropped.first()) {
-            (Some(id), Some(path)) => self.load_guide(ctx, id, path),
-            _ => self.status = "Select a screen to give it a guide image".into(),
+        // Only pictures are guide images; a video or folder dropped here stays a clip drop.
+        let (images, rest): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| is_guide_image(p));
+        let Some(path) = images.first() else {
+            return rest;
+        };
+        match self.sel_screen {
+            Some(id) => self.load_guide(ctx, id, path),
+            None => self.status = "Select a screen to give it a guide image".into(),
         }
-        vec![]
+        rest
     }
+}
+
+/// Is `p` a picture file the guide loader accepts (by extension)?
+pub(crate) fn is_guide_image(p: &Path) -> bool {
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        ["png", "jpg", "jpeg"]
+            .iter()
+            .any(|k| e.eq_ignore_ascii_case(k))
+    })
 }
 
 /// A guide image being decoded on a worker thread.
