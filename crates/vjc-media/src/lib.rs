@@ -1582,7 +1582,6 @@ fn scrub_loop(
             continue;
         }
         shown = pos;
-        idle_since = Instant::now();
         yielded = false;
         let first = std::mem::replace(&mut preloaded, true);
         let on_air = match told {
@@ -1591,7 +1590,10 @@ fn scrub_loop(
             _ => first,
         };
         if on_air {
+            // Only moves on air count as activity; a preview scrub of an off-air
+            // player must not make it look busy to eviction.
             sc.holder.touch();
+            idle_since = Instant::now();
         }
         if on_air && want_hw && cache.as_ref().is_none_or(|c| c.frames.is_empty()) {
             want_hw = !sc.acquire_hw();
