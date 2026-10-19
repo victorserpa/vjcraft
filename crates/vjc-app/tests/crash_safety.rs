@@ -95,3 +95,115 @@ fn opt_out_runs_the_app_path_directly() {
     assert!(launches(&dir).is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn supervisor_relays_sigterm_to_the_child() {
+    let dir = data_dir("term");
+    let mut sup = Command::new(env!("CARGO_BIN_EXE_vjcraft"))
+        .arg("--fake-child=sleep")
+        .env("VJC_DATA_DIR", &dir)
+        .env_remove("VJC_NO_SUPERVISOR")
+        .spawn()
+        .unwrap();
+    let pid_file = dir.join("child.pid");
+    let mut tries = 0;
+    while !pid_file.exists()
+        || std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        tries += 1;
+        assert!(tries < 200, "child never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let child: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    unsafe { libc::kill(sup.id() as i32, libc::SIGTERM) };
+    sup.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let alive = unsafe { libc::kill(child, 0) } == 0;
+    if alive {
+        unsafe { libc::kill(child, libc::SIGKILL) };
+    }
+    assert!(!alive, "child outlived a SIGTERM to the supervisor");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Waits for `child.pid` to hold a pid and returns it.
+#[cfg(unix)]
+fn wait_child_pid(dir: &Path) -> i32 {
+    let pid_file = dir.join("child.pid");
+    for _ in 0..200 {
+        if let Ok(t) = std::fs::read_to_string(&pid_file)
+            && let Ok(p) = t.parse()
+        {
+            return p;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("child never started");
+}
+
+#[cfg(unix)]
+fn spawn_supervisor(dir: &Path, mode: &str) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_vjcraft"))
+        .arg(format!("--fake-child={mode}"))
+        .env("VJC_DATA_DIR", dir)
+        .env_remove("VJC_NO_SUPERVISOR")
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_to_the_supervisor_quits_even_if_the_child_crashes_on_it() {
+    let dir = data_dir("term-crash");
+    let mut sup = spawn_supervisor(&dir, "sleep-crash-on-term");
+    let child = wait_child_pid(&dir);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    unsafe { libc::kill(sup.id() as i32, libc::SIGTERM) };
+    // Give a (buggy) relaunch time to show up before looking.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let exited = sup.try_wait().unwrap().is_some();
+    if !exited {
+        let _ = sup.kill();
+    }
+    let n = launches(&dir).len();
+    let _ = sup.wait();
+    unsafe { libc::kill(child, libc::SIGKILL) };
+    if n > 1 {
+        // A relaunched child may exist too.
+        let p: i32 = std::fs::read_to_string(dir.join("child.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        unsafe { libc::kill(p, libc::SIGKILL) };
+    }
+    assert_eq!(n, 1, "supervisor relaunched after a SIGTERM");
+    assert!(exited, "supervisor did not exit");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn child_exits_when_the_supervisor_is_sigkilled() {
+    let dir = data_dir("orphan");
+    let mut sup = spawn_supervisor(&dir, "sleep");
+    let child = wait_child_pid(&dir);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    unsafe { libc::kill(sup.id() as i32, libc::SIGKILL) };
+    let _ = sup.wait();
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    // The child is reparented, so reap-less liveness: kill(0) also succeeds on a zombie,
+    // but an orphan is reaped by init, so this reflects real life.
+    let alive = unsafe { libc::kill(child, 0) } == 0;
+    if alive {
+        unsafe { libc::kill(child, libc::SIGKILL) };
+    }
+    assert!(
+        !alive,
+        "orphaned child kept running after its supervisor died"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
