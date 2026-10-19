@@ -6,19 +6,24 @@
 #      swresample, VideoToolbox hwaccel, libvpx + dav1d decoders, HAP encoder only) into
 #      target/ffmpeg-libs. Packaging points the ffmpeg-sys build at it
 #      (PKG_CONFIG_PATH=target/ffmpeg-libs/lib/pkgconfig); dev builds keep using Homebrew.
-# libvpx and dav1d are NOT downloaded: they come from Homebrew (pkg-config), are BSD-licensed,
-# and are bundled by scripts/bundle-dylibs.sh like any other Homebrew dylib.
+# libvpx and dav1d (decoders, BSD) are built here too, as shared libs with
+# -mmacosx-version-min=$MIN_MACOS, so that no bundled dylib needs a newer macOS than the app
+# (Homebrew's bottles target the macOS they were built on). FFmpeg links against them, not Homebrew.
+# A REBUILD (first run, version bump, --force) needs meson and ninja (brew install meson ninja);
+# an up-to-date tree needs neither.
 #
-# Network: exactly two downloads, both pinned and SHA-256 checked, nothing else.
+# Network: exactly four downloads, all pinned and SHA-256 checked, nothing else.
 #   FFmpeg 9.0.2  https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz   (official release tarball)
 #   snappy 1.3.1  https://github.com/google/snappy/archive/refs/tags/1.3.1.tar.gz
+#   libvpx 1.17.0 https://github.com/webmproject/libvpx/archive/refs/tags/v1.17.0.tar.gz
+#   dav1d 1.5.4   https://code.videolan.org/videolan/dav1d/-/archive/1.5.4/dav1d-1.5.4.tar.bz2
 # Checksum source: ffmpeg.org publishes only .asc signatures for current releases (no gpg
-# on the build machine), so both SHA-256 values are the ones in the Homebrew formulas
+# on the build machine), so the FFmpeg and snappy SHA-256 values are the ones in the Homebrew formulas
 # (Formula/f/ffmpeg.rb, Formula/s/snappy.rb), an independent source; the download is
 # refused if it does not match. Re-check and bump them together when changing a version.
 # Licenses: FFmpeg configured without --enable-gpl / --enable-version3 / --enable-nonfree
 # (LGPL-2.1+); snappy is BSD-3-Clause. The result is checked at the end.
-# Source goes to target/ffmpeg-src/{dl,ffmpeg,snappy} (each its own empty dir); only the
+# Source goes to target/ffmpeg-src/{dl,ffmpeg,snappy,libvpx,dav1d} (each its own empty dir); only the
 # trees' own cmake / configure / make are run.
 # Flags: --force rebuild even when up to date. Env: JOBS (default 4).
 set -euo pipefail
@@ -29,6 +34,12 @@ FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 SNAPPY_VER=1.3.1
 SNAPPY_URL="https://github.com/google/snappy/archive/refs/tags/$SNAPPY_VER.tar.gz"
 SNAPPY_SHA256=893f708a0bf4b5529d555ffcee390e940e932fcf90261f682604475a76cd0247
+LIBVPX_VER=1.17.0
+LIBVPX_URL="https://github.com/webmproject/libvpx/archive/refs/tags/v$LIBVPX_VER.tar.gz"
+LIBVPX_SHA256=1020f184046187baa2985dbde38e0691f49c44088bca7a1842b0236c6081dc0a
+DAV1D_VER=1.5.4
+DAV1D_URL="https://code.videolan.org/videolan/dav1d/-/archive/$DAV1D_VER/dav1d-$DAV1D_VER.tar.bz2"
+DAV1D_SHA256=2abfb0c89212e6e4733a54e0ae509ec00a5b845a6360946f918806e14aedb011
 MIN_MACOS=12.0
 JOBS="${JOBS:-4}"
 
@@ -49,17 +60,7 @@ OUT="$OUT_BASE/ffmpeg"
 LIBS="$OUT_BASE/ffmpeg-libs"
 DEPS="$SRC/prefix"
 
-# Homebrew's dav1d and libvpx (decoders only are enabled below).
-BREW_PC=""
-for f in dav1d libvpx; do
-  p="$(brew --prefix "$f" 2>/dev/null)/lib/pkgconfig"
-  [ -d "$p" ] || { echo "missing Homebrew formula $f (brew install $f)" >&2; exit 1; }
-  BREW_PC="$BREW_PC:$p"
-done
-export PKG_CONFIG_PATH="${BREW_PC#:}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-DAV1D_VER="$(basename "$(cd -P "$(brew --prefix dav1d)" && pwd)")"
-VPX_VER="$(basename "$(cd -P "$(brew --prefix libvpx)" && pwd)")"
-STAMP="$FFMPEG_VER+$SNAPPY_VER+dav1d$DAV1D_VER+vpx$VPX_VER+$(shasum -a 256 "$0" | cut -c1-16)"
+STAMP="$FFMPEG_VER+$SNAPPY_VER+dav1d$DAV1D_VER+vpx$LIBVPX_VER+min$MIN_MACOS+$(shasum -a 256 "$0" | cut -c1-16)"
 
 if [ "$FORCE" -eq 0 ] && [ -x "$OUT/bin/ffmpeg" ] && [ -f "$LIBS/lib/pkgconfig/libavcodec.pc" ] && [ "$(cat "$OUT/stamp" 2>/dev/null)" = "$STAMP" ]; then
   echo "up to date: $OUT/bin/ffmpeg"
@@ -91,8 +92,15 @@ unpack() { # tarball dir
 mkdir -p "$SRC/dl"
 fetch "$SNAPPY_URL" "$SNAPPY_SHA256" "$SRC/dl/snappy-$SNAPPY_VER.tar.gz"
 fetch "$FFMPEG_URL" "$FFMPEG_SHA256" "$SRC/dl/ffmpeg-$FFMPEG_VER.tar.xz"
+fetch "$LIBVPX_URL" "$LIBVPX_SHA256" "$SRC/dl/libvpx-$LIBVPX_VER.tar.gz"
+fetch "$DAV1D_URL" "$DAV1D_SHA256" "$SRC/dl/dav1d-$DAV1D_VER.tar.bz2"
+for t in meson ninja; do
+  command -v $t >/dev/null || { echo "$t missing (needed to build dav1d; brew install meson ninja)" >&2; exit 1; }
+done
 unpack "$SRC/dl/snappy-$SNAPPY_VER.tar.gz" "$SRC/snappy"
 unpack "$SRC/dl/ffmpeg-$FFMPEG_VER.tar.xz" "$SRC/ffmpeg"
+unpack "$SRC/dl/libvpx-$LIBVPX_VER.tar.gz" "$SRC/libvpx"
+unpack "$SRC/dl/dav1d-$DAV1D_VER.tar.bz2" "$SRC/dav1d"
 
 # Be gentle with a busy machine: wait for the 1-minute load to drop below 4 (max 20 min).
 for _ in $(seq 40); do
@@ -108,6 +116,33 @@ cmake -S "$SRC/snappy" -B "$SRC/snappy-build" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
 cmake --build "$SRC/snappy-build" -j "$JOBS" >/dev/null
 cmake --install "$SRC/snappy-build" >/dev/null
+
+# libvpx (decoders only, own configure) and dav1d (meson), shared, min macOS $MIN_MACOS.
+# Their licenses are copied next to the libs (share/licenses) for scripts/bundle-dylibs.sh.
+rm -rf "$SRC/libvpx-build" "$SRC/dav1d-build"
+mkdir -p "$SRC/libvpx-build"
+(
+  cd "$SRC/libvpx-build"
+  LDFLAGS="-mmacosx-version-min=$MIN_MACOS" "$SRC/libvpx/configure" --target="$(uname -m)-darwin25-gcc" --prefix="$DEPS" \
+    --enable-shared --disable-static --disable-examples --disable-tools --disable-docs \
+    --disable-unit-tests --disable-vp8-encoder --disable-vp9-encoder --enable-vp9-highbitdepth \
+    --extra-cflags="-mmacosx-version-min=$MIN_MACOS" --extra-cxxflags="-mmacosx-version-min=$MIN_MACOS"
+  make -j"$JOBS"
+  make install
+)
+# libvpx installs with a bare install name; give it the absolute one (like dav1d's) so that
+# FFmpeg records a path scripts/bundle-dylibs.sh can resolve.
+install_name_tool -id "$DEPS/lib/libvpx.12.dylib" "$DEPS/lib/libvpx.12.dylib"
+codesign --force -s - "$DEPS/lib/libvpx.12.dylib"
+meson setup "$SRC/dav1d-build" "$SRC/dav1d" --prefix="$DEPS" --libdir=lib --buildtype=release \
+  --default-library=shared -Denable_tools=false -Denable_tests=false \
+  -Dc_args="-mmacosx-version-min=$MIN_MACOS" -Dc_link_args="-mmacosx-version-min=$MIN_MACOS" >/dev/null
+ninja -C "$SRC/dav1d-build" -j "$JOBS" >/dev/null
+ninja -C "$SRC/dav1d-build" install >/dev/null
+mkdir -p "$DEPS/share/licenses/libvpx" "$DEPS/share/licenses/dav1d"
+cp "$SRC/libvpx/LICENSE" "$SRC/libvpx/PATENTS" "$DEPS/share/licenses/libvpx/"
+cp "$SRC/dav1d/COPYING" "$DEPS/share/licenses/dav1d/"
+export PKG_CONFIG_PATH="$DEPS/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
 rm -rf "$SRC/ffmpeg-build" "$SRC/ffmpeg-libs-build" "$OUT" "$LIBS"
 mkdir -p "$SRC/ffmpeg-build"

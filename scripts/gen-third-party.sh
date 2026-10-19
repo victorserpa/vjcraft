@@ -74,12 +74,12 @@ below (checksums given, so you can verify the tarballs) and the source for VJCra
 available from the project repository, https://github.com/victorserpa/vjcraft. We will also
 provide it on request for at least three years after the release of this version.
 
-## Bundled libraries (Contents/Frameworks, from Homebrew)
+## Bundled libraries (Contents/Frameworks; the table lists Homebrew-built ones, FFmpeg, dav1d and libvpx are in the next section)
 
 | library | version | license | homepage | source | sha256 |
 | --- | --- | --- | --- | --- | --- |
 HDR
-cut -f2,3 "$TSV" | sort -u | grep -v '^ffmpeg-vjc	' | while IFS=$'\t' read -r pkg ver; do brew_row "$pkg" "$ver"; done
+{ cut -f2,3 "$TSV" | sort -u | grep -Ev '^(ffmpeg-vjc|dav1d|libvpx)	' || true; } | while IFS=$'\t' read -r pkg ver; do brew_row "$pkg" "$ver"; done
 
 cat <<HDR
 
@@ -95,8 +95,8 @@ cat <<HDR
 
 Built by \`scripts/build-ffmpeg.sh\` from pinned official sources, LGPL (no --enable-gpl,
 --enable-version3 or --enable-nonfree), statically linked with snappy. The libav* dylibs
-(ffmpeg-vjc in the dylib list above) use the Homebrew dav1d and libvpx listed in the table above
-(decoders only); there is no x264, x265, OpenSSL or network protocol.
+(ffmpeg-vjc in the dylib list above) use the dav1d and libvpx built by the same script (listed
+below, decoders only, shared, minimum macOS 12.0); there is no x264, x265, OpenSSL or network protocol.
 
 | library | version | license | homepage | source | sha256 |
 | --- | --- | --- | --- | --- | --- |
@@ -107,8 +107,11 @@ fv() {
   echo "$v"
 }
 FV=$(fv FFMPEG_VER); SV=$(fv SNAPPY_VER); FSHA=$(fv FFMPEG_SHA256); SSHA=$(fv SNAPPY_SHA256)
+DV=$(fv DAV1D_VER); DSHA=$(fv DAV1D_SHA256); PV=$(fv LIBVPX_VER); PSHA=$(fv LIBVPX_SHA256)
 echo "| FFmpeg | $FV | LGPL-2.1-or-later | https://ffmpeg.org/ | https://ffmpeg.org/releases/ffmpeg-$FV.tar.xz | $FSHA |"
 echo "| snappy | $SV | BSD-3-Clause | https://github.com/google/snappy | https://github.com/google/snappy/archive/refs/tags/$SV.tar.gz | $SSHA |"
+echo "| dav1d | $DV | BSD-2-Clause | https://code.videolan.org/videolan/dav1d | https://code.videolan.org/videolan/dav1d/-/archive/$DV/dav1d-$DV.tar.bz2 | $DSHA |"
+echo "| libvpx | $PV | BSD-3-Clause | https://www.webmproject.org/code/ | https://github.com/webmproject/libvpx/archive/refs/tags/v$PV.tar.gz | $PSHA |"
 echo
 echo "The build recipe is \`scripts/build-ffmpeg.sh\` in the project repository."
 fi

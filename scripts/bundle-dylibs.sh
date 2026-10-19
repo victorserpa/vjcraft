@@ -157,6 +157,15 @@ while IFS=$'\t' read -r name orig; do
       [ -f "$TP/$pkg/COPYING.LGPLv2.1" ] || die "no FFmpeg license file for $name"
       printf '%s\t%s\t%s\n' "$name" "$pkg" "$ver" >> "$TP/dylibs.tsv"
       continue ;;
+    */target/ffmpeg-src/prefix/lib/*)
+      # Our own libvpx / dav1d (scripts/build-ffmpeg.sh); licenses were copied to share/licenses.
+      case "$name" in libdav1d*) pkg=dav1d ;; libvpx*) pkg=libvpx ;; *) die "unexpected $name in the deps prefix" ;; esac
+      ver="$(sed -n "s/^$(echo "$pkg" | tr a-z A-Z)_VER=//p" "$(dirname "$0")/build-ffmpeg.sh" | head -1 | tr -d "\"'")"
+      [ -n "$ver" ] || die "no version for $pkg in build-ffmpeg.sh"
+      mkdir -p "$TP/$pkg"
+      cp -L "${orig%/lib/*}/share/licenses/$pkg/"* "$TP/$pkg/" || die "no license files for $pkg"
+      printf '%s\t%s\t%s\n' "$name" "$pkg" "$ver" >> "$TP/dylibs.tsv"
+      continue ;;
     */Cellar/*) rest="${orig#*/Cellar/}"; pkg="${rest%%/*}"; rest="${rest#*/}"; ver="${rest%%/*}"
       root="${orig%%/Cellar/*}/Cellar/$pkg/$ver" ;;
     *) die "$name ($orig) is not from a Homebrew Cellar; cannot find its license" ;;
