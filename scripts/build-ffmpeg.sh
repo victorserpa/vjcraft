@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Builds a small, LGPL FFmpeg CLI with the HAP encoder (needs libsnappy) into
-# target/ffmpeg/bin/ffmpeg. Used by "Convert to HAP"; playback keeps the linked libav*.
+# Builds, from one pinned FFmpeg source, two LGPL products:
+#   1. a small static FFmpeg CLI with the HAP encoder (needs libsnappy) into
+#      target/ffmpeg/bin/ffmpeg, used by "Convert to HAP";
+#   2. shared libav* libs for playback (all native decoders/demuxers/parsers, swscale,
+#      swresample, VideoToolbox hwaccel, libvpx + dav1d decoders, HAP encoder only) into
+#      target/ffmpeg-libs. Packaging points the ffmpeg-sys build at it
+#      (PKG_CONFIG_PATH=target/ffmpeg-libs/lib/pkgconfig); dev builds keep using Homebrew.
+# libvpx and dav1d are NOT downloaded: they come from Homebrew (pkg-config), are BSD-licensed,
+# and are bundled by scripts/bundle-dylibs.sh like any other Homebrew dylib.
 #
 # Network: exactly two downloads, both pinned and SHA-256 checked, nothing else.
 #   FFmpeg 9.0.2  https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz   (official release tarball)
@@ -39,10 +46,22 @@ ROOT=$PWD
 OUT_BASE="$ROOT/target"
 SRC="$OUT_BASE/ffmpeg-src"
 OUT="$OUT_BASE/ffmpeg"
+LIBS="$OUT_BASE/ffmpeg-libs"
 DEPS="$SRC/prefix"
-STAMP="$FFMPEG_VER+$SNAPPY_VER+$(shasum -a 256 "$0" | cut -c1-16)"
 
-if [ "$FORCE" -eq 0 ] && [ -x "$OUT/bin/ffmpeg" ] && [ "$(cat "$OUT/stamp" 2>/dev/null)" = "$STAMP" ]; then
+# Homebrew's dav1d and libvpx (decoders only are enabled below).
+BREW_PC=""
+for f in dav1d libvpx; do
+  p="$(brew --prefix "$f" 2>/dev/null)/lib/pkgconfig"
+  [ -d "$p" ] || { echo "missing Homebrew formula $f (brew install $f)" >&2; exit 1; }
+  BREW_PC="$BREW_PC:$p"
+done
+export PKG_CONFIG_PATH="${BREW_PC#:}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+DAV1D_VER="$(basename "$(cd -P "$(brew --prefix dav1d)" && pwd)")"
+VPX_VER="$(basename "$(cd -P "$(brew --prefix libvpx)" && pwd)")"
+STAMP="$FFMPEG_VER+$SNAPPY_VER+dav1d$DAV1D_VER+vpx$VPX_VER+$(shasum -a 256 "$0" | cut -c1-16)"
+
+if [ "$FORCE" -eq 0 ] && [ -x "$OUT/bin/ffmpeg" ] && [ -f "$LIBS/lib/pkgconfig/libavcodec.pc" ] && [ "$(cat "$OUT/stamp" 2>/dev/null)" = "$STAMP" ]; then
   echo "up to date: $OUT/bin/ffmpeg"
   exit 0
 fi
@@ -90,7 +109,7 @@ cmake -S "$SRC/snappy" -B "$SRC/snappy-build" -DCMAKE_BUILD_TYPE=Release \
 cmake --build "$SRC/snappy-build" -j "$JOBS" >/dev/null
 cmake --install "$SRC/snappy-build" >/dev/null
 
-rm -rf "$SRC/ffmpeg-build" "$OUT"
+rm -rf "$SRC/ffmpeg-build" "$SRC/ffmpeg-libs-build" "$OUT" "$LIBS"
 mkdir -p "$SRC/ffmpeg-build"
 START=$(date +%s)
 # Inputs: every native demuxer, decoder, parser and bsf (so common sources convert); only the
@@ -113,6 +132,31 @@ START=$(date +%s)
   make -j"$JOBS"
   make install
 )
+
+# Shared libs for playback and recording (record.rs). Encoders: hap (Convert to HAP), pcm_s16le,
+# aac, png, h264/hevc/prores via VideoToolbox, prores/prores_ks; muxers mov, mp4, image2.
+# No libx264/libx265 (GPL): record.rs falls back to VideoToolbox. zlib (png, mkv) and bzlib
+# (mkv) come from the macOS SDK. libvpx/dav1d are decoders (their encoders are not enabled). Protocols: file and pipe only.
+mkdir -p "$SRC/ffmpeg-libs-build"
+(
+  cd "$SRC/ffmpeg-libs-build"
+  "$SRC/ffmpeg/configure" \
+    --prefix="$LIBS" \
+    --enable-shared --disable-static \
+    --disable-autodetect --disable-doc --disable-debug \
+    --disable-network --disable-programs \
+    --enable-zlib --enable-bzlib --enable-libsnappy \
+    --enable-libdav1d --enable-libvpx --enable-videotoolbox --enable-audiotoolbox \
+    --enable-swscale --enable-swresample \
+    --disable-protocols --enable-protocol=file,pipe \
+    --disable-encoders --enable-encoder=hap,pcm_s16le,aac,png,h264_videotoolbox,hevc_videotoolbox,prores,prores_ks,prores_videotoolbox \
+    --disable-muxers --enable-muxer=mov,mp4,image2 \
+    --extra-cflags="-I$DEPS/include -mmacosx-version-min=$MIN_MACOS" \
+    --extra-ldflags="-L$DEPS/lib -mmacosx-version-min=$MIN_MACOS" \
+    --extra-libs="-lc++"
+  make -j"$JOBS"
+  make install
+)
 END=$(date +%s)
 
 BIN="$OUT/bin/ffmpeg"
@@ -126,5 +170,22 @@ fi
 if otool -L "$BIN" | tail -n +2 | grep -Ev '^\s+(/usr/lib/|/System/)' | grep -q .; then
   echo "non-system dynamic library linked:" >&2; otool -L "$BIN" >&2; exit 1
 fi
+# Shared libs: LGPL, no GPL codecs or network libs linked.
+if grep -Eq '^#define CONFIG_(GPL|VERSION3|NONFREE) 1' "$SRC/ffmpeg-libs-build/config.h"; then
+  echo "license check failed: GPL/nonfree flag in shared libs" >&2; exit 1
+fi
+# Allowlist: system libs, our own libav*/sw*, dav1d, vpx (first otool line is the lib's own id).
+for l in "$LIBS"/lib/*.dylib; do
+  [ -L "$l" ] && continue
+  bad=$(otool -L "$l" | tail -n +2 | awk '{print $1}' \
+    | grep -Ev '^(/usr/lib/|/System/|@rpath/lib(av|sw|postproc)[a-z]*\.|.*/lib(av|sw)[a-z]*\.[0-9.]*dylib$|.*/libdav1d[.0-9]*dylib$|.*/libvpx[.0-9]*dylib$)' || true)
+  if [ -n "$bad" ]; then
+    echo "unexpected dependency in $l:" >&2; echo "$bad" >&2; exit 1
+  fi
+done
+for e in aac png h264_videotoolbox hevc_videotoolbox prores_ks prores_videotoolbox; do
+  grep -q "^#define CONFIG_$(echo "$e" | tr a-z A-Z)_ENCODER 1" "$SRC/ffmpeg-libs-build/config_components.h" \
+    || { echo "missing encoder $e" >&2; exit 1; }
+done
 echo "$STAMP" > "$OUT/stamp"
 echo "built $BIN in $((END - START)) s"

@@ -68,7 +68,7 @@ app bundle ships. Full license texts are in \`ThirdParty/<library>/\`.
 
 ## Source offer (GPL)
 
-Parts of this bundle (for example FFmpeg built with --enable-gpl, x264 and x265) are under
+Parts of this bundle (for example Ableton Link via rusty_link and VJCraft itself) are under
 the GPL. The complete corresponding source code for them is available at the source URLs
 below (checksums given, so you can verify the tarballs) and the source for VJCraft itself is
 available from the project repository, https://github.com/victorserpa/vjcraft. We will also
@@ -79,7 +79,7 @@ provide it on request for at least three years after the release of this version
 | library | version | license | homepage | source | sha256 |
 | --- | --- | --- | --- | --- | --- |
 HDR
-cut -f2,3 "$TSV" | sort -u | while IFS=$'\t' read -r pkg ver; do brew_row "$pkg" "$ver"; done
+cut -f2,3 "$TSV" | sort -u | grep -v '^ffmpeg-vjc	' | while IFS=$'\t' read -r pkg ver; do brew_row "$pkg" "$ver"; done
 
 cat <<HDR
 
@@ -88,13 +88,15 @@ Dylibs and the formula each comes from:
 $(sort "$TSV" | awk -F'\t' '{printf "- %s (%s %s)\n", $1, $2, $3}')
 HDR
 
-if [ -f "$RES/ffmpeg" ]; then
+if [ -f "$RES/ffmpeg" ] || grep -q '^[^	]*	ffmpeg-vjc	' "$TSV"; then
 cat <<HDR
 
-## FFmpeg CLI (Contents/Resources/ffmpeg, HAP conversion)
+## FFmpeg (libav* in Contents/Frameworks, CLI Contents/Resources/ffmpeg for HAP conversion)
 
 Built by \`scripts/build-ffmpeg.sh\` from pinned official sources, LGPL (no --enable-gpl,
---enable-version3 or --enable-nonfree), statically linked with snappy.
+--enable-version3 or --enable-nonfree), statically linked with snappy. The libav* dylibs
+(ffmpeg-vjc in the dylib list above) use the Homebrew dav1d and libvpx listed in the table above
+(decoders only); there is no x264, x265, OpenSSL or network protocol.
 
 | library | version | license | homepage | source | sha256 |
 | --- | --- | --- | --- | --- | --- |
