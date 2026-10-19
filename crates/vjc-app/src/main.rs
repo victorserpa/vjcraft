@@ -5625,8 +5625,8 @@ impl State {
                     .map_or(layer_xf, |a| layer_xf.through(&a)),
                     channels: channels_of(o.clip.as_ref()),
                     mask: l.mask_mode,
-                    frame: compositor::frame_input(Some(&of)).0,
-                    orient: compositor::frame_input(Some(&of)).1,
+                    frame: compositor::frame_input(Some(of)).0,
+                    orient: compositor::frame_input(Some(of)).1,
                 });
             }
             draw_groups.push(l.group);

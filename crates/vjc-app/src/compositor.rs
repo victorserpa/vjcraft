@@ -2224,6 +2224,7 @@ impl Compositor {
     }
 
     /// Blocking readback of what a routed source (e.g. the Preview) drew last.
+    #[cfg(test)]
     pub fn read_routed(
         &self,
         device: &wgpu::Device,
