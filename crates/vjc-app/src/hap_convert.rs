@@ -79,20 +79,20 @@ fn nearest_existing(path: &Path) -> Option<&Path> {
         p = p.parent()?;
         skipped = true;
     }
-    let user = std::env::var("USER").ok();
-    (!(skipped && is_mount_root(p, user.as_deref()))).then_some(p)
+    (!(skipped && is_mount_root(p))).then_some(p)
 }
 
-fn is_mount_root(p: &Path, user: Option<&str>) -> bool {
+fn is_mount_root(p: &Path) -> bool {
     if ["/Volumes", "/media", "/mnt", "/run/media"]
         .iter()
         .any(|r| p == Path::new(r))
     {
         return true;
     }
-    user.is_some_and(|u| {
-        !u.is_empty() && (p == Path::new("/media").join(u) || p == Path::new("/run/media").join(u))
-    })
+    // Any `/media/<user>` or `/run/media/<user>`, whoever runs the app (USER may be unset
+    // or differ under sudo or a service).
+    p.parent()
+        .is_some_and(|d| d == Path::new("/media") || d == Path::new("/run/media"))
 }
 
 /// Free and total bytes of the volume holding `path` (or its nearest existing parent).
@@ -802,11 +802,12 @@ mod tests {
 
     #[test]
     fn linux_automount_parents_are_mount_roots() {
-        assert!(is_mount_root(Path::new("/media/vic"), Some("vic")));
-        assert!(is_mount_root(Path::new("/run/media/vic"), Some("vic")));
-        assert!(is_mount_root(Path::new("/run/media"), None));
-        assert!(!is_mount_root(Path::new("/media/vic"), Some("other")));
-        assert!(!is_mount_root(Path::new("/"), Some("vic")));
+        assert!(is_mount_root(Path::new("/media/vic")));
+        assert!(is_mount_root(Path::new("/run/media/vic")));
+        assert!(is_mount_root(Path::new("/run/media")));
+        assert!(is_mount_root(Path::new("/media/someone-else")));
+        assert!(!is_mount_root(Path::new("/media/vic/drive")));
+        assert!(!is_mount_root(Path::new("/")));
     }
 
     #[test]
