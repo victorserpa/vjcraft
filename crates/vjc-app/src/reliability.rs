@@ -273,7 +273,7 @@ pub fn run_supervisor(args: &[String]) -> Option<i32> {
             if recover {
                 cmd.arg("--recover");
             }
-            match cmd.status() {
+            match spawn_and_wait(&mut cmd) {
                 Ok(s) => {
                     let end = end_of(s);
                     if !end.is_clean() {
@@ -311,6 +311,38 @@ pub fn run_supervisor(args: &[String]) -> Option<i32> {
     })
 }
 
+/// Pid of the running child, for the SIGTERM relay (0 = none).
+#[cfg(unix)]
+static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn relay_term(sig: libc::c_int) {
+    let pid = CHILD_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        // SAFETY: kill is async-signal-safe.
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
+/// Like `Command::status`, but a SIGTERM/SIGHUP sent to the supervisor (`kill`, logout) is
+/// relayed to the child, so the app can quit cleanly instead of being orphaned.
+fn spawn_and_wait(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    {
+        CHILD_PID.store(child.id() as i32, Ordering::Relaxed);
+        // SAFETY: the handler only calls an async-signal-safe function.
+        unsafe {
+            libc::signal(libc::SIGTERM, relay_term as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGHUP, relay_term as *const () as libc::sighandler_t);
+        }
+    }
+    let r = child.wait();
+    #[cfg(unix)]
+    CHILD_PID.store(0, Ordering::Relaxed);
+    r
+}
+
 /// A visible message when the supervisor gives up (macOS: dialog; elsewhere stderr only).
 fn alert(msg: &str) {
     #[cfg(target_os = "macos")]
@@ -338,6 +370,7 @@ pub fn fake_child(args: &[String]) {
     let recovered = args.iter().any(|a| a == "--recover");
     if let Some(d) = crate::data_dir() {
         let _ = std::fs::create_dir_all(&d);
+        let _ = std::fs::write(d.join("child.pid"), std::process::id().to_string());
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -345,6 +378,11 @@ pub fn fake_child(args: &[String]) {
         {
             let _ = writeln!(f, "{}", if recovered { "recover" } else { "fresh" });
         }
+    }
+    if mode == "sleep" {
+        // Waits for a relayed SIGTERM (bounded, so a failing test leaks nothing for long).
+        std::thread::sleep(Duration::from_secs(20));
+        std::process::exit(0);
     }
     let crash = match mode {
         "crash" => true,

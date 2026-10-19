@@ -95,3 +95,37 @@ fn opt_out_runs_the_app_path_directly() {
     assert!(launches(&dir).is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn supervisor_relays_sigterm_to_the_child() {
+    let dir = data_dir("term");
+    let mut sup = Command::new(env!("CARGO_BIN_EXE_vjcraft"))
+        .arg("--fake-child=sleep")
+        .env("VJC_DATA_DIR", &dir)
+        .env_remove("VJC_NO_SUPERVISOR")
+        .spawn()
+        .unwrap();
+    let pid_file = dir.join("child.pid");
+    let mut tries = 0;
+    while !pid_file.exists()
+        || std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        tries += 1;
+        assert!(tries < 200, "child never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let child: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    unsafe { libc::kill(sup.id() as i32, libc::SIGTERM) };
+    sup.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let alive = unsafe { libc::kill(child, 0) } == 0;
+    if alive {
+        unsafe { libc::kill(child, libc::SIGKILL) };
+    }
+    assert!(!alive, "child outlived a SIGTERM to the supervisor");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
