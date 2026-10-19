@@ -1379,8 +1379,8 @@ mod tests {
     #[test]
     fn steady_state_depth_is_cap_queued_plus_one_in_flight() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-        let mut r = Recorder::spawn(&tmp("warm2.mp4"), 2, 2, 4, holding(Some("x"), gate_rx))
-            .unwrap();
+        let mut r =
+            Recorder::spawn(&tmp("warm2.mp4"), 2, 2, 4, holding(Some("x"), gate_rx)).unwrap();
         r.warm_window = std::time::Duration::ZERO;
         let ok = steady_pushes(&mut r);
         assert_eq!(ok, 5, "4 queued + 1 in flight");

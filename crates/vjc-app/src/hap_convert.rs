@@ -77,7 +77,9 @@ fn nearest_existing(path: &Path) -> Option<&Path> {
         p = p.parent()?;
         skipped = true;
     }
-    let mount_root = ["/", "/Volumes", "/media", "/mnt"].iter().any(|r| p == Path::new(r));
+    let mount_root = ["/", "/Volumes", "/media", "/mnt"]
+        .iter()
+        .any(|r| p == Path::new(r));
     (!(skipped && mount_root)).then_some(p)
 }
 

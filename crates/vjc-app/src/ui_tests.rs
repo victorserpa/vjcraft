@@ -6587,7 +6587,10 @@ fn hap_snapshot_follows_the_playhead_and_decodes_off_thread() {
             st.flow.pos.insert(layer, want);
         }
         let (_, pos) = h.state().snapshot_source(deck, layer, 0).expect("source");
-        assert!((pos - want).abs() < 1e-9, "snapshot at {pos}, playhead {want}");
+        assert!(
+            (pos - want).abs() < 1e-9,
+            "snapshot at {pos}, playhead {want}"
+        );
     }
     // The player's own value can lag the playhead the app tracks: the playhead wins.
     {
@@ -6613,7 +6616,10 @@ fn snapshot_job_is_written_only_when_the_worker_finishes() {
     let (tx, rx) = std::sync::mpsc::channel();
     h.state_mut().snap_job = Some(("Job".into(), rx));
     h.state_mut().poll_snapshot_job();
-    assert!(h.state().snap_job.is_some(), "still decoding: UI keeps going");
+    assert!(
+        h.state().snap_job.is_some(),
+        "still decoding: UI keeps going"
+    );
     assert!(!dir.exists());
     tx.send(Some((1, 1, vec![9, 9, 9, 255]))).unwrap();
     h.state_mut().poll_snapshot_job();

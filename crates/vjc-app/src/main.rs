@@ -293,7 +293,7 @@ struct State {
     snap_req: Option<(DeckId, LayerId, u32)>,
     /// A HAP clip snapshot decoding on a worker: (clip name, result). Never decoded on the UI
     /// thread; `serve_snapshot` writes it when it arrives.
-    snap_job: Option<(String, std::sync::mpsc::Receiver<Option<(u32, u32, Vec<u8>)>>)>,
+    snap_job: Option<(String, SnapRx)>,
     /// Shuffle bags of layer autopilots in Random / Bag mode.
     layer_bags: std::cell::RefCell<HashMap<LayerId, Vec<u32>>>,
     /// Opens a file in the file manager; a no-op in tests.
@@ -667,6 +667,9 @@ struct Held {
 
 /// Longest an action waits for its beat or bar, in bars of wall time.
 const SNAP_MAX_BARS: f64 = 2.0;
+
+/// Result of a snapshot worker: (width, height, RGBA), None when nothing was decoded.
+type SnapRx = std::sync::mpsc::Receiver<Option<(u32, u32, Vec<u8>)>>;
 
 #[derive(Default)]
 struct Flow {
@@ -5443,12 +5446,7 @@ impl State {
 
     /// File and playhead of the clip on air in the cell: the position the app drove into the
     /// player on the latest frame (`flow.pos`), not the first one it was ever given.
-    fn snapshot_source(
-        &self,
-        deck: DeckId,
-        layer: LayerId,
-        column: u32,
-    ) -> Option<(PathBuf, f64)> {
+    fn snapshot_source(&self, deck: DeckId, layer: LayerId, column: u32) -> Option<(PathBuf, f64)> {
         let (_, _, p) = self
             .players
             .get(&layer)
