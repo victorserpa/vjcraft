@@ -306,6 +306,12 @@ impl AudioEnc {
 /// Default queue depth, in frames.
 pub const QUEUE_FRAMES: usize = 6;
 
+/// Extra queue depth while the encoder is opening or just opened (hardware encoders start
+/// slowly), and how long after the start it lasts. Bounded by `WARM_BYTES`.
+pub const WARM_FRAMES: usize = 30;
+pub const WARM_BYTES: usize = 256 << 20;
+const WARM_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
 struct Job {
     /// Presentation index in frame periods: gaps left by dropped frames keep timing right.
     pts: i64,
@@ -325,6 +331,9 @@ impl Drop for Pending {
 /// Bounded, never-blocking frame queue with a drop counter.
 pub struct FrameQueue {
     tx: SyncSender<Job>,
+    cap: usize,
+    /// Extra frames accepted while warming up.
+    extra: usize,
     dropped: AtomicU64,
     /// Jobs queued or being encoded.
     pending: Arc<AtomicUsize>,
@@ -332,10 +341,16 @@ pub struct FrameQueue {
 
 impl FrameQueue {
     fn new(cap: usize) -> (Self, Receiver<Job>) {
-        let (tx, rx) = sync_channel(cap.max(1));
+        Self::with_extra(cap, 0)
+    }
+
+    fn with_extra(cap: usize, extra: usize) -> (Self, Receiver<Job>) {
+        let (tx, rx) = sync_channel(cap.max(1) + extra);
         (
             Self {
                 tx,
+                cap: cap.max(1),
+                extra,
                 dropped: AtomicU64::new(0),
                 pending: Arc::new(AtomicUsize::new(0)),
             },
@@ -345,6 +360,16 @@ impl FrameQueue {
 
     /// Queues the frame; returns false (and counts a drop) when the queue is full or closed.
     fn push(&self, pts: i64, data: Vec<u8>) -> bool {
+        self.push_warm(pts, data, false)
+    }
+
+    /// Like `push`; `warm` allows the extra warm-up depth.
+    fn push_warm(&self, pts: i64, data: Vec<u8>, warm: bool) -> bool {
+        let limit = self.cap + if warm { self.extra } else { 0 };
+        if self.pending.load(Ordering::Relaxed) >= limit {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         self.pending.fetch_add(1, Ordering::Relaxed);
         let job = Job {
             pts,
@@ -385,6 +410,9 @@ pub struct Recorder {
     height: u32,
     path: PathBuf,
     codec: Arc<Mutex<String>>,
+    started: std::time::Instant,
+    /// After opening, frames still get the larger warm-up queue for this long.
+    warm_window: std::time::Duration,
     handle: Option<JoinHandle<Result<(u64, bool), String>>>,
 }
 
@@ -686,7 +714,9 @@ impl Recorder {
     where
         F: FnOnce(Receiver<Job>, &Mutex<String>) -> Result<(u64, bool), String> + Send + 'static,
     {
-        let (q, rx) = FrameQueue::new(queue);
+        let frame = width as usize * height as usize * 4;
+        let extra = WARM_FRAMES.min(WARM_BYTES / frame.max(1));
+        let (q, rx) = FrameQueue::with_extra(queue, extra);
         let codec = Arc::new(Mutex::new(String::new()));
         let c = codec.clone();
         let handle = std::thread::Builder::new()
@@ -700,6 +730,8 @@ impl Recorder {
             height,
             path: path.to_path_buf(),
             codec,
+            started: std::time::Instant::now(),
+            warm_window: WARM_WINDOW,
             handle: Some(handle),
         })
     }
@@ -733,7 +765,7 @@ impl Recorder {
         }
         let pts = self.last_pts + 1;
         self.last_pts = pts;
-        self.queue.push(pts, rgba)
+        self.queue.push_warm(pts, rgba, self.warming())
     }
 
     /// Offers a frame at an explicit presentation index (frame periods since the start,
@@ -744,7 +776,12 @@ impl Recorder {
             return false;
         }
         self.last_pts = pts;
-        self.queue.push(pts, rgba)
+        self.queue.push_warm(pts, rgba, self.warming())
+    }
+
+    /// True while the encoder is still opening or was opened less than `warm_window` ago.
+    fn warming(&self) -> bool {
+        self.codec.lock().unwrap().is_empty() || self.started.elapsed() < self.warm_window
     }
 
     /// Counts a frame that could not even be captured. Only adds a drop: it must not move
@@ -1290,5 +1327,42 @@ mod tests {
         assert_eq!(q.dropped(), 2);
         assert_eq!(rx.try_iter().count(), 2);
         assert!(q.push(4, vec![0]));
+    }
+
+    #[test]
+    fn slow_encoder_start_keeps_early_frames() {
+        // The encoder is still opening (videotoolbox): the first frames must wait, not drop.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut r = Recorder::spawn(&tmp("warm.mp4"), 2, 2, 4, move |rx, _| {
+            let _ = gate_rx.recv();
+            Ok((rx.iter().count() as u64, false))
+        })
+        .unwrap();
+        for i in 0..12 {
+            assert!(r.push(vec![0; 16]), "frame {i} dropped while the encoder starts");
+        }
+        assert_eq!(r.dropped(), 0);
+        gate_tx.send(()).unwrap();
+        assert_eq!(r.finish().unwrap().encoded, 12);
+    }
+
+    #[test]
+    fn warm_up_ends_once_the_encoder_is_open() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let mut r = Recorder::spawn(&tmp("warm2.mp4"), 2, 2, 4, move |rx, c| {
+            *c.lock().unwrap() = "x".into(); // opened
+            let _ = gate_rx.recv();
+            Ok((rx.iter().count() as u64, false))
+        })
+        .unwrap();
+        r.warm_window = std::time::Duration::ZERO;
+        while r.codec.lock().unwrap().is_empty() {
+            std::thread::yield_now();
+        }
+        let ok = (0..12).filter(|_| r.push(vec![0; 16])).count();
+        assert_eq!(ok, 4);
+        assert_eq!(r.dropped(), 8);
+        gate_tx.send(()).unwrap();
+        assert_eq!(r.finish().unwrap().dropped, 8);
     }
 }
