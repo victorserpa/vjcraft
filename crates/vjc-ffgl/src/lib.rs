@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostError {
@@ -76,6 +76,13 @@ impl Helper {
 
     /// One request/response with a deadline. On timeout the helper is killed.
     pub fn request(&mut self, req: &Request, timeout: Duration) -> Result<Response, HostError> {
+        self.send(req)?;
+        self.recv(timeout)
+    }
+
+    /// Writes a request without waiting for the answer (read it with [`Helper::recv`] or
+    /// [`Helper::try_recv`]).
+    pub fn send(&mut self, req: &Request) -> Result<(), HostError> {
         let line = serde_json::to_string(req).unwrap();
         if writeln!(self.stdin, "{line}")
             .and_then(|_| self.stdin.flush())
@@ -83,6 +90,24 @@ impl Helper {
         {
             return Err(HostError::Died);
         }
+        Ok(())
+    }
+
+    /// The answer if it already arrived. Never blocks; a dead helper is `Died`.
+    pub fn try_recv(&mut self) -> Result<Option<Response>, HostError> {
+        match self.rx.try_recv() {
+            Ok(Response::Err { msg }) => Err(HostError::Plugin(msg)),
+            Ok(r) => Ok(Some(r)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.kill();
+                Err(HostError::Died)
+            }
+        }
+    }
+
+    /// Waits for the answer to a sent request. On timeout the helper is killed.
+    pub fn recv(&mut self, timeout: Duration) -> Result<Response, HostError> {
         match self.rx.recv_timeout(timeout) {
             Ok(Response::Err { msg }) => Err(HostError::Plugin(msg)),
             Ok(r) => Ok(r),
@@ -344,8 +369,17 @@ pub struct FfglEffect {
     dirty: BTreeMap<usize, f32>,
     /// Remark from the host shown next to the status (e.g. the input was resized).
     pub note: Option<String>,
-    shm_path: PathBuf,
-    map: Option<(MmapMut, usize)>,
+    /// Two shared-memory slots (input then output each); see `process`.
+    shm_path: [PathBuf; 2],
+    map: [Option<MmapMut>; 2],
+    /// Bytes of one frame in the slots.
+    map_n: usize,
+    /// The request the helper is working on: (slot, when it was sent).
+    inflight: Option<(usize, Instant)>,
+    /// The slot holding the latest finished result, and its size.
+    ready: Option<(usize, u32, u32)>,
+    /// Size of the request in flight (becomes the size of `ready` when it finishes).
+    ready_dims: (u32, u32),
 }
 
 impl FfglEffect {
@@ -356,8 +390,10 @@ impl FfglEffect {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let shm_path =
-            std::env::temp_dir().join(format!("vjc-ffgl-{}-{n}-{t}.shm", std::process::id()));
+        let shm = |k: u8| {
+            std::env::temp_dir().join(format!("vjc-ffgl-{}-{n}-{t}-{k}.shm", std::process::id()))
+        };
+        let shm_path = [shm(0), shm(1)];
         let mut e = FfglEffect {
             path: path.into(),
             helper_bin: helper_bin.into(),
@@ -368,7 +404,11 @@ impl FfglEffect {
             dirty: BTreeMap::new(),
             note: None,
             shm_path,
-            map: None,
+            map: [None, None],
+            map_n: 0,
+            inflight: None,
+            ready: None,
+            ready_dims: (0, 0),
         };
         e.enable();
         e
@@ -378,6 +418,8 @@ impl FfglEffect {
     pub fn enable(&mut self) {
         self.helper = None;
         self.dirty.clear();
+        self.inflight = None;
+        self.ready = None;
         let r = Helper::spawn(&self.helper_bin).and_then(|mut h| {
             let r = h.request(
                 &Request::Load {
@@ -444,6 +486,7 @@ impl FfglEffect {
         if index >= self.params.len() {
             return None;
         }
+        self.settle();
         self.flush();
         match self.call(Request::Get {
             index: index as u32,
@@ -468,21 +511,70 @@ impl FfglEffect {
         match h.request(&req, self.timeout) {
             Ok(r) => Some(r),
             Err(e) => {
-                self.status = Status::Stopped(e);
-                self.helper = None;
+                self.stop(e);
                 None
             }
         }
     }
 
-    /// Process a frame. Never fails: when the plugin is stopped, crashes or times out the
-    /// input comes back unchanged and `status` says why.
+    fn stop(&mut self, e: HostError) {
+        self.status = Status::Stopped(e);
+        self.helper = None;
+        self.inflight = None;
+        self.ready = None;
+    }
+
+    /// Takes the answer of the request in flight if it has arrived; a helper that stays silent
+    /// past the timeout (or died) stops the effect. Never blocks.
+    fn poll(&mut self) {
+        let (Some((slot, sent)), Some(h)) = (self.inflight, self.helper.as_mut()) else {
+            return;
+        };
+        match h.try_recv() {
+            Ok(Some(Response::Done)) => {
+                self.inflight = None;
+                self.ready = Some((slot, self.ready_dims.0, self.ready_dims.1));
+            }
+            Ok(Some(_)) => self.stop(HostError::Plugin("bad reply".into())),
+            Ok(None) if sent.elapsed() > self.timeout => {
+                h.kill();
+                self.stop(HostError::Timeout);
+            }
+            Ok(None) => {}
+            Err(e) => self.stop(e),
+        }
+    }
+
+    /// Waits for the request in flight (before a synchronous call and in tests; not on the
+    /// render path).
+    pub fn settle(&mut self) {
+        let (Some((slot, sent)), Some(h)) = (self.inflight, self.helper.as_mut()) else {
+            return;
+        };
+        let left = self.timeout.saturating_sub(sent.elapsed());
+        match h.recv(left) {
+            Ok(Response::Done) => {
+                self.inflight = None;
+                self.ready = Some((slot, self.ready_dims.0, self.ready_dims.1));
+            }
+            Ok(_) => self.stop(HostError::Plugin("bad reply".into())),
+            Err(e) => self.stop(e),
+        }
+    }
+
+    /// Process a frame, pipelined (docs/specs/ffgl-host.md, stage 2a+). Never blocks and never
+    /// fails: the input goes to the helper in the free slot, and the result of the latest
+    /// finished request, one frame late, comes back. Until the first result arrives, or while
+    /// stopped, the input comes back unchanged. If the helper is still busy with the previous
+    /// frame this frame is not sent and the last result is shown again. `status` says why a
+    /// plugin stopped.
     pub fn process(&mut self, input: &Frame) -> Frame {
         let pass = || Frame {
             w: input.w,
             h: input.h,
             rgba: input.rgba.clone(),
         };
+        self.poll();
         if self.helper.is_none() {
             return pass();
         }
@@ -490,43 +582,71 @@ impl FfglEffect {
         if input.rgba.len() != n {
             return pass();
         }
-        if self.map.as_ref().is_none_or(|(_, sz)| *sz != n) {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&self.shm_path);
-            let map = file.and_then(|f| {
-                f.set_len(2 * n as u64)?;
-                unsafe { MmapMut::map_mut(&f) }
-            });
-            match map {
-                Ok(m) => self.map = Some((m, n)),
-                Err(_) => return pass(),
+        if self.inflight.is_none() {
+            if self.map_n != n || self.map.iter().any(|m| m.is_none()) {
+                // nobody uses the files now (nothing in flight), so they can be resized
+                self.ready = None;
+                for k in 0..2 {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&self.shm_path[k]);
+                    let map = file.and_then(|f| {
+                        f.set_len(2 * n as u64)?;
+                        unsafe { MmapMut::map_mut(&f) }
+                    });
+                    match map {
+                        Ok(m) => self.map[k] = Some(m),
+                        Err(_) => {
+                            self.map = [None, None];
+                            return pass();
+                        }
+                    }
+                }
+                self.map_n = n;
             }
-        }
-        let (map, _) = self.map.as_mut().unwrap();
-        map[..n].copy_from_slice(&input.rgba);
-        let shm = self.shm_path.to_string_lossy().to_string();
-        let params = std::mem::take(&mut self.dirty)
-            .into_iter()
-            .map(|(i, v)| (i as u32, v))
-            .collect();
-        match self.call(Request::Process {
-            shm,
-            w: input.w,
-            h: input.h,
-            params,
-        }) {
-            Some(Response::Done) => {
-                let (map, _) = self.map.as_ref().unwrap();
-                Frame {
+            // the slot not holding the result that is being shown
+            let slot = match self.ready {
+                Some((r, _, _)) => 1 - r,
+                None => 0,
+            };
+            if let Some(m) = self.map[slot].as_mut() {
+                m[..n].copy_from_slice(&input.rgba);
+            }
+            let shm = self.shm_path[slot].to_string_lossy().to_string();
+            let params: Vec<(u32, f32)> = self.dirty.iter().map(|(i, v)| (*i as u32, *v)).collect();
+            let sent = self.helper.as_mut().map(|h| {
+                h.send(&Request::Process {
+                    shm,
                     w: input.w,
                     h: input.h,
-                    rgba: map[n..2 * n].to_vec(),
+                    params,
+                })
+            });
+            match sent {
+                Some(Ok(())) => {
+                    self.dirty.clear();
+                    self.inflight = Some((slot, Instant::now()));
+                    self.ready_dims = (input.w, input.h);
                 }
+                Some(Err(e)) => {
+                    self.stop(e);
+                    return pass();
+                }
+                None => return pass(),
             }
+        }
+        match self.ready {
+            Some((slot, w, h)) if (w, h) == (input.w, input.h) => match self.map[slot].as_ref() {
+                Some(m) if m.len() >= 2 * n => Frame {
+                    w,
+                    h,
+                    rgba: m[n..2 * n].to_vec(),
+                },
+                _ => pass(),
+            },
             _ => pass(),
         }
     }
@@ -534,6 +654,8 @@ impl FfglEffect {
 
 impl Drop for FfglEffect {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.shm_path);
+        for p in &self.shm_path {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

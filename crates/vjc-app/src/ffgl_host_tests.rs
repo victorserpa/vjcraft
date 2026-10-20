@@ -105,6 +105,8 @@ struct Opts {
     dry_wet: f32,
     fmt: wgpu::TextureFormat,
     place: Place,
+    /// Frames rendered; the plugin's result shows one frame late.
+    frames: u32,
 }
 
 impl Default for Opts {
@@ -114,6 +116,7 @@ impl Default for Opts {
             dry_wet: 1.0,
             fmt: wgpu::TextureFormat::Rgba8Unorm,
             place: Place::Layer,
+            frames: 2,
         }
     }
 }
@@ -202,7 +205,15 @@ fn render_with(host: &FfglHost, o: Opts) -> Option<(Vec<u8>, vjc_model::Effect)>
         mask: Default::default(),
         orient: Default::default(),
     };
-    comp.render_groups(&device, &queue, &[layer], &groups, &on_master, 1.0);
+    let layers = [layer];
+    for k in 0..o.frames {
+        if k > 0
+            && let Some(fx) = host.shared(&effect)
+        {
+            fx.lock().unwrap().settle(); // let the helper finish the frame in flight
+        }
+        comp.render_groups(&device, &queue, &layers, &groups, &on_master, 1.0);
+    }
     let (_, _, out) = comp.read_rgba(&device, &queue)?;
     Some((out, effect))
 }
@@ -333,6 +344,24 @@ fn a_layer_with_the_ffgl_effect_comes_out_inverted() {
 }
 
 #[test]
+fn the_first_frame_passes_through_and_the_second_shows_it_inverted() {
+    let (host, _dir) = scanned("lag");
+    let one = Opts {
+        frames: 1,
+        ..Default::default()
+    };
+    let Some((out, _)) = render_with(&host, one) else {
+        return;
+    };
+    assert_eq!(out, source(), "frame 1 passes through");
+    let (host, _dir) = scanned("lag2");
+    let Some((out, _)) = render_with(&host, Opts::default()) else {
+        return;
+    };
+    assert_inverted(&out);
+}
+
+#[test]
 fn killing_the_helper_passes_the_frame_through_and_marks_the_plugin_stopped() {
     let (host, _dir) = scanned("kill");
     let Some((out, effect)) = render(&host, true) else {
@@ -386,6 +415,34 @@ fn readback_cost_1080p() {
     let (w, h) = (1920u32, 1080u32);
     let src = vec![90u8; (w * h * 4) as usize];
     let mut comp = Compositor::new(&device, w, h);
+    let mut base = vec![];
+    for _ in 0..12 {
+        let draws = crate::draw_chain(&mut lib, &mut ml, None, &[], 0.0, (w, h), &ctx);
+        let layer = LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: draws,
+            frame: Some((w, h, &src, 1)),
+            generator: None,
+            transition: None,
+            transform: vjc_core::transform::Affine::IDENTITY,
+            channels: Default::default(),
+            mask: Default::default(),
+            orient: Default::default(),
+        };
+        let t = std::time::Instant::now();
+        comp.render(&device, &queue, &[layer], &[], 1.0);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        base.push(t.elapsed());
+    }
+    eprintln!(
+        "baseline without the effect, ms: {:?}",
+        base.iter()
+            .map(|t| t.as_secs_f64() * 1e3)
+            .collect::<Vec<_>>()
+    );
     let mut times = vec![];
     for _ in 0..12 {
         let draws = crate::draw_chain(
@@ -416,6 +473,18 @@ fn readback_cost_1080p() {
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         times.push(t.elapsed());
     }
+    let median = |v: &[std::time::Duration]| {
+        let mut t: Vec<f64> = v[4..].iter().map(|t| t.as_secs_f64() * 1e3).collect();
+        t.sort_by(|a, b| a.total_cmp(b));
+        t[t.len() / 2]
+    };
+    let cost = median(&times) - median(&base);
+    eprintln!(
+        "median with {:.2} ms, without {:.2} ms: the effect costs the render thread {cost:.2} ms",
+        median(&times),
+        median(&base)
+    );
+    assert!(cost < 4.0, "effect costs {cost:.2} ms, spec: under 4 ms");
     eprintln!(
         "1080p frame with ffgl effect, ms: {:?}",
         times
