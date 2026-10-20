@@ -643,6 +643,44 @@ pub fn input_for_slice(
     })
 }
 
+/// The rectangle a fixture samples: the bounding box of the slice it follows, else its own
+/// `input`. The flag is true when it follows a slice that does not exist (or is degenerate),
+/// so the UI can say it fell back.
+pub fn resolve_input(
+    f: &Fixture,
+    slices: &[vjc_model::Slice],
+    width: u32,
+    height: u32,
+) -> (vjc_model::FixtureInput, bool) {
+    let Some(id) = f.input_slice else {
+        return (f.input, false);
+    };
+    match slices
+        .iter()
+        .find(|s| s.id == id)
+        .and_then(|s| input_for_slice(s, width, height))
+    {
+        Some(i) => (i, false),
+        None => (f.input, true),
+    }
+}
+
+/// Copies of `fixtures` whose `input` is what they sample right now (see `resolve_input`).
+pub fn resolve_fixtures(
+    fixtures: &[Fixture],
+    slices: &[vjc_model::Slice],
+    width: u32,
+    height: u32,
+) -> Vec<Fixture> {
+    fixtures
+        .iter()
+        .map(|f| Fixture {
+            input: resolve_input(f, slices, width, height).0,
+            ..f.clone()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,5 +1231,61 @@ mod tests {
             label_for(&p2, "/comp/master/opacity").as_deref(),
             Some("DMX 0.3")
         );
+    }
+
+    fn slice_at(x0: f32, y0: f32, x1: f32, y1: f32) -> vjc_model::Slice {
+        let mut s = crate::mapping::new_slice(400, 200);
+        s.output_mesh = vec![(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+        s.mesh_cols = 2;
+        s
+    }
+
+    #[test]
+    fn fixture_follows_a_moved_slice_within_one_pixel() {
+        let mut s = slice_at(100.0, 50.0, 300.0, 150.0);
+        let f = Fixture {
+            input_slice: Some(s.id),
+            ..Fixture::default()
+        };
+        let (i, dangling) = resolve_input(&f, std::slice::from_ref(&s), 400, 200);
+        assert!(!dangling);
+        assert!((i.x - 0.5).abs() < 1.0 / 400.0 && (i.w - 0.5).abs() < 1.0 / 400.0);
+        // Move the slice by 40 x 20 px: the fixture rect follows.
+        for p in &mut s.output_mesh {
+            p.0 += 40.0;
+            p.1 += 20.0;
+        }
+        let (i, _) = resolve_input(&f, std::slice::from_ref(&s), 400, 200);
+        assert!((i.x * 400.0 - 240.0).abs() <= 1.0, "x {}", i.x * 400.0);
+        assert!((i.y * 200.0 - 120.0).abs() <= 1.0, "y {}", i.y * 200.0);
+        assert!((i.w * 400.0 - 200.0).abs() <= 1.0 && (i.h * 200.0 - 100.0).abs() <= 1.0);
+    }
+
+    #[test]
+    fn dangling_input_slice_falls_back_to_the_fixture_rect() {
+        let s = slice_at(100.0, 50.0, 300.0, 150.0);
+        let mut f = Fixture {
+            input_slice: Some(uuid::Uuid::new_v4()),
+            ..Fixture::default()
+        };
+        f.input.x = 0.25;
+        let (i, dangling) = resolve_input(&f, std::slice::from_ref(&s), 400, 200);
+        assert!(dangling);
+        assert_eq!(i, f.input);
+        // No link: the rect as is, not dangling.
+        f.input_slice = None;
+        assert_eq!(resolve_input(&f, &[s], 400, 200), (f.input, false));
+    }
+
+    #[test]
+    fn resolve_fixtures_writes_the_followed_rect() {
+        let s = slice_at(100.0, 50.0, 300.0, 150.0);
+        let f = Fixture {
+            input_slice: Some(s.id),
+            ..Fixture::default()
+        };
+        let out = resolve_fixtures(std::slice::from_ref(&f), std::slice::from_ref(&s), 400, 200);
+        assert_eq!(out[0].input.w, 0.5);
+        assert_eq!(out[0].input_slice, f.input_slice);
     }
 }

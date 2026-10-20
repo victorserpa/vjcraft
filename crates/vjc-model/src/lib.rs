@@ -1601,6 +1601,10 @@ pub struct Fixture {
     pub start_channel: u16,
     /// Part of the screen this fixture samples (the whole screen by default).
     pub input: FixtureInput,
+    /// Slice of the same screen to follow: the fixture samples the bounding box of its
+    /// output area instead of `input`. `None` = use `input`; a slice that no longer exists
+    /// also falls back to `input`.
+    pub input_slice: Option<Uuid>,
     pub flip_h: bool,
     pub flip_v: bool,
     pub color: SliceColor,
@@ -1649,6 +1653,7 @@ impl Default for Fixture {
             serpentine: false,
             start_channel: 1,
             input: FixtureInput::default(),
+            input_slice: None,
             flip_h: false,
             flip_v: false,
             color: SliceColor::default(),
@@ -3013,5 +3018,19 @@ mod tests {
                 .unwrap()
                 .additive_overlap
         );
+    }
+
+    #[test]
+    fn fixture_input_slice_round_trips_and_defaults_to_none() {
+        let old: Fixture = serde_json::from_str(r#"{"name":"M"}"#).unwrap();
+        assert_eq!(old.input_slice, None);
+        for input_slice in [None, Some(Uuid::new_v4())] {
+            let f = Fixture {
+                input_slice,
+                ..Fixture::default()
+            };
+            let back: Fixture = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+            assert_eq!(back, f);
+        }
     }
 }

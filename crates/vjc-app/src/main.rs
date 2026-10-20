@@ -6239,7 +6239,9 @@ impl State {
                     id: s.id,
                     ip: ip.clone(),
                     universe: *universe,
-                    fixtures: fixtures.clone(),
+                    fixtures: vjc_core::dmx::resolve_fixtures(
+                        fixtures, &s.slices, s.width, s.height,
+                    ),
                     fps: *fps,
                     delay_ms: *delay_ms,
                 }),
