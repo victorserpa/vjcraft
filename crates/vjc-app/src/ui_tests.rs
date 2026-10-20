@@ -1091,6 +1091,44 @@ fn output_setup_soft_edge_and_mask() {
     snap(&mut h, "10-output-soft-edge");
 }
 
+#[test]
+fn output_setup_slice_transform_scale_drag_undoes() {
+    let mut h = app();
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    add_screen(&mut h);
+    add_slice(&mut h);
+    let scale = |h: &Harness<'_, State>| {
+        h.state().project.output.screens[0].slices[0]
+            .transform
+            .scale
+    };
+    assert_eq!(scale(&h), 1.0);
+    // The geometry rows have a "Scale" too; the Transform section comes after them.
+    let last = |h: &Harness<'_, State>| {
+        h.get_all_by_label("Scale")
+            .map(|n| n.rect())
+            .max_by(|a, b| a.center().y.total_cmp(&b.center().y))
+            .unwrap()
+    };
+    h.get_all_by_label("Scale")
+        .max_by(|a, b| a.rect().center().y.total_cmp(&b.rect().center().y))
+        .unwrap()
+        .scroll_to_me();
+    h.run_steps(30);
+    // The slider on the same row as that label.
+    let y = last(&h).center().y;
+    let rect = slider_rects(&h)
+        .into_iter()
+        .find(|r| (r.center().y - y).abs() < 4.0)
+        .expect("Scale slider");
+    drag_to_slider_pct(&mut h, rect, 0.8);
+    assert!(scale(&h) > 1.0, "{}", scale(&h));
+    // The whole drag is one undo step.
+    click(&mut h, "Undo edit");
+    assert_eq!(scale(&h), 1.0);
+}
+
 // 11
 #[test]
 fn panel_tabs_switch() {
@@ -8340,9 +8378,17 @@ fn output_toolbar_modes_sit_right_and_flip_is_icons() {
     let (mut h, _tex) = stage_setup();
     click(&mut h, "Centre");
     click_tab(&mut h, "Output");
-    let t = h.get_by_label("Transform").rect();
-    let e = h.get_by_label("Edit points").rect();
     let hand = h.get_by_label("Hand tool").rect();
+    // The properties panel has a "Transform" section too: take the toolbar one.
+    let t = h
+        .get_all_by_label("Transform")
+        .map(|n| n.rect())
+        .min_by(|a, b| {
+            let d = |r: &egui::Rect| (r.center().y - hand.center().y).abs();
+            d(a).total_cmp(&d(b))
+        })
+        .unwrap();
+    let e = h.get_by_label("Edit points").rect();
     assert!(hand.max.x < t.min.x, "modes are right of the tools");
     assert!(t.max.x < e.min.x, "Edit points is the rightmost");
     for l in ["Rotate 90", "Rotate 180", "Rotate 270", "Flip H", "Flip V"] {

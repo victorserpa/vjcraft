@@ -16,7 +16,7 @@ use uuid::Uuid;
 use vjc_core::slice_adv;
 use vjc_core::slice_geom::{self, Field, Op, Side};
 use vjc_core::{Command, mapping};
-use vjc_model::{OutputDevice, Screen, Slice, SliceColor, SliceSource, SoftEdge};
+use vjc_model::{OutputDevice, Screen, Slice, SliceColor, SliceSource, SliceTransform, SoftEdge};
 
 /// Turns the soft edge of the selected slices on or off. Turning on keeps the widths a
 /// slice already has; only a slice without an edge gets the default one.
@@ -410,6 +410,7 @@ impl State {
         });
         self.geometry_rows(ui, scr, sl, &ids, cmds);
         self.colour_rows(ui, scr, sl, &ids, cmds);
+        self.slice_transform_rows(ui, scr, sl, &ids, cmds);
         self.key_rows(ui, scr, sl, &ids, cmds);
         self.edge_rows(ui, scr, sl, &ids, true, cmds);
         self.outline_rows(ui, scr, sl, cmds);
@@ -443,6 +444,7 @@ impl State {
         });
         self.geometry_rows(ui, scr, sl, &ids, cmds);
         self.colour_rows(ui, scr, sl, &ids, cmds);
+        self.slice_transform_rows(ui, scr, sl, &ids, cmds);
         self.key_rows(ui, scr, sl, &ids, cmds);
         self.edge_rows(ui, scr, sl, &ids, false, cmds);
         self.mask_rows(ui, scr, sl, &ids, cmds);
@@ -707,6 +709,70 @@ impl State {
                         })
                         .collect();
                     cmds.extend(one_command(all));
+                }
+            });
+        });
+    }
+
+    /// Scale, position and rotation of the content inside the slice.
+    fn slice_transform_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        scr: &Screen,
+        sl: &Slice,
+        ids: &[Uuid],
+        cmds: &mut Vec<Command>,
+    ) {
+        widgets::fold_section(ui, "slice", "Transform", |ui| {
+            row(ui, "slice-transform", |ui| {
+                type Pick = fn(&mut SliceTransform) -> &mut f32;
+                type Spec = (f32, (f32, f32), f32);
+                let fields: [(&str, &str, Pick, Spec); 4] = [
+                    (
+                        "scale",
+                        "Scale",
+                        |t| &mut t.scale,
+                        (1.0, mapping::SCALE_RANGE, 0.01),
+                    ),
+                    (
+                        "x",
+                        "Position X",
+                        |t| &mut t.offset.0,
+                        (0.0, (-1.0, 1.0), 0.01),
+                    ),
+                    (
+                        "y",
+                        "Position Y",
+                        |t| &mut t.offset.1,
+                        (0.0, (-1.0, 1.0), 0.01),
+                    ),
+                    (
+                        "rot",
+                        "Rotation",
+                        |t| &mut t.rotation,
+                        (0.0, (-180.0, 180.0), 1.0),
+                    ),
+                ];
+                for (key, label, pick, spec) in fields {
+                    let mut cur = sl.transform;
+                    let now = *pick(&mut cur);
+                    if let Some(v) = num(ui, (sl.id, "tf", key), label, now, spec) {
+                        let all = scr
+                            .slices
+                            .iter()
+                            .filter(|s| ids.contains(&s.id))
+                            .map(|s| {
+                                let mut transform = s.transform;
+                                *pick(&mut transform) = v;
+                                Command::SetSliceTransform {
+                                    screen: scr.id,
+                                    slice: s.id,
+                                    transform,
+                                }
+                            })
+                            .collect();
+                        cmds.extend(one_command(all));
+                    }
                 }
             });
         });

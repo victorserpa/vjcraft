@@ -1697,6 +1697,31 @@ pub struct Slice {
     /// shorter than the mesh = zero handles.
     #[serde(default)]
     pub mesh_tangents: Vec<((f32, f32), (f32, f32))>,
+    /// Zoom, shift and turn of the content inside the slice; the outline does not move.
+    #[serde(default)]
+    pub transform: SliceTransform,
+}
+
+/// Placement of the content inside a slice, pivoting on the centre of its input area.
+/// The default is the identity, so older projects load unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SliceTransform {
+    /// Zoom factor, 1 = as is.
+    pub scale: f32,
+    /// Shift of the content as a fraction of the input area's width and height.
+    pub offset: (f32, f32),
+    /// Turn of the content in degrees, clockwise.
+    pub rotation: f32,
+}
+
+impl Default for SliceTransform {
+    fn default() -> Self {
+        SliceTransform {
+            scale: 1.0,
+            offset: (0.0, 0.0),
+            rotation: 0.0,
+        }
+    }
 }
 
 /// Outline of a slice.
@@ -2313,6 +2338,26 @@ mod tests {
         );
         let sl: Slice = serde_json::from_str(&s2).unwrap();
         assert_eq!(sl.color.brightness, 0.5);
+    }
+
+    #[test]
+    fn slice_transform_roundtrips_and_old_files_load_as_identity() {
+        let s = r#"{"id":"00000000-0000-0000-0000-000000000001","input":[],"output_mesh":[],"mesh_cols":2,"mask":null,"soft_edge":null}"#;
+        let sl: Slice = serde_json::from_str(s).unwrap();
+        assert_eq!(sl.transform, SliceTransform::default());
+        assert_eq!(sl.transform.scale, 1.0);
+        assert_eq!(sl.transform.offset, (0.0, 0.0));
+        assert_eq!(sl.transform.rotation, 0.0);
+        // Negative control: a stored transform survives a save and load.
+        let mut set = sl.clone();
+        set.transform = SliceTransform {
+            scale: 2.5,
+            offset: (0.1, -0.2),
+            rotation: 30.0,
+        };
+        let back: Slice = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.transform, set.transform);
+        assert_ne!(back.transform, SliceTransform::default());
     }
 
     #[test]
