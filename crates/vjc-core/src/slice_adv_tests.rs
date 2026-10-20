@@ -733,3 +733,91 @@ fn polygon_points_past_the_edge_survive_validation() {
     let c = clamp_poly(&far).unwrap();
     assert!(c.iter().all(|p| (POLY_MIN..=POLY_MAX).contains(&p.0)));
 }
+
+// Curved mask edges (spec section 3).
+
+#[test]
+fn zero_mask_tangents_give_the_same_coverage_as_straight_edges() {
+    let poly = hexagon();
+    let (w, h) = (64u32, 48u32);
+    let plain = rasterize_coverage(&poly, w, h);
+    for tangents in [vec![], vec![(0.0, 0.0); poly.len()]] {
+        let flat = flatten_mask(&poly, &tangents);
+        assert_eq!(rasterize_coverage(&flat, w, h), plain);
+    }
+    // A list of the wrong length is ignored (straight edges).
+    assert_eq!(flatten_mask(&poly, &[(0.1, 0.1)]), poly);
+}
+
+#[test]
+fn four_points_with_tangents_match_a_reference_disc_within_one_pixel() {
+    let (w, h, r) = (200u32, 200u32, 80.0f32);
+    let n = |v: f32| v / 200.0;
+    let c = 100.0;
+    // Clockwise on screen: right, bottom, left, top. Handle = 0.5523 r along the tangent.
+    let k = 0.5523 * r;
+    let poly = vec![
+        (n(c + r), n(c)),
+        (n(c), n(c + r)),
+        (n(c - r), n(c)),
+        (n(c), n(c - r)),
+    ];
+    let tangents = vec![
+        (0.0, n(k)),
+        (n(-k), 0.0),
+        (0.0, n(-k)),
+        (n(k), 0.0),
+    ];
+    let flat = flatten_mask(&poly, &tangents);
+    assert!(flat.len() <= MAX_POLY_POINTS && flat.len() > 4 * 8);
+    let cov = rasterize_coverage(&flat, w, h);
+    let mut inside = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let d = ((x as f32 + 0.5 - c).hypot(y as f32 + 0.5 - c)) - r;
+            let got = cov[(y * w + x) as usize] > 127;
+            inside += got as u32;
+            if d.abs() > 1.0 {
+                assert_eq!(got, d < 0.0, "pixel {x},{y} is {d} px from the circle");
+            }
+        }
+    }
+    assert!(inside > 19_000, "disc area {inside}");
+}
+
+#[test]
+fn old_files_without_mask_tangents_load_as_straight() {
+    let scr = mapping::new_screen("s", 200, 100);
+    let mut v = serde_json::to_value(&scr).unwrap();
+    v.as_object_mut().unwrap().remove("output_mask_tangents");
+    let back: vjc_model::Screen = serde_json::from_value(v).unwrap();
+    assert!(back.output_mask_tangents.is_empty());
+    assert!(mapping::new_slice(200, 100).mask_tangents.is_empty());
+}
+
+#[test]
+fn mask_tangent_commands_undo_and_clear_when_the_point_count_changes() {
+    let (mut p, sid, _) = setup();
+    let mut hist = History::new();
+    let mut run = |p: &mut Project, c| hist.exec(p, c, Instant::now());
+    let pts = vec![(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)];
+    let mask = |m| Command::SetScreenMask {
+        screen: sid,
+        mask: Some(m),
+    };
+    run(&mut p, mask(Mask::Polygon(pts.clone()))).unwrap();
+    let t = vec![(0.05, 0.0); 4];
+    let set = |tangents| Command::SetScreenMaskTangents {
+        screen: sid,
+        tangents,
+    };
+    run(&mut p, set(t.clone())).unwrap();
+    assert_eq!(p.output.screens[0].output_mask_tangents, t);
+    assert!(run(&mut p, set(vec![(f32::NAN, 0.0); 4])).is_err());
+    run(&mut p, mask(Mask::Polygon(pts[..3].to_vec()))).unwrap();
+    assert!(p.output.screens[0].output_mask_tangents.is_empty());
+    hist.undo(&mut p).unwrap().unwrap();
+    assert_eq!(p.output.screens[0].output_mask_tangents, t);
+    hist.undo(&mut p).unwrap().unwrap();
+    assert!(p.output.screens[0].output_mask_tangents.is_empty());
+}
