@@ -383,7 +383,7 @@ pub fn flatten_mask(pts: &[Pt], tangents: &[Pt]) -> Vec<Pt> {
 /// line between its neighbours. `amount` 0 = corners (empty list), 1 = fully rounded.
 pub fn smooth_tangents(pts: &[Pt], amount: f32) -> Vec<Pt> {
     let n = pts.len();
-    if n < 3 || !(amount > 0.0) {
+    if n < 3 || amount.is_nan() || amount <= 0.0 {
         return vec![];
     }
     let k = amount.min(1.0) / 6.0;
