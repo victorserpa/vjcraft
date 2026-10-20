@@ -7429,6 +7429,43 @@ fn audio_prefs_are_sanitized_before_they_reach_the_engine() {
     assert_eq!(st.audio_cfg.channels, None);
 }
 
+#[test]
+fn saving_prefs_with_new_clap_folders_starts_a_rescan() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.prefs
+        .audio
+        .clap_dirs
+        .push("/nonexistent/vjc-clap-test".into());
+    st.save_prefs();
+    assert_eq!(st.clap_dirs_scanned, st.prefs.audio.clap_dirs);
+}
+
+#[test]
+fn dj_tempo_mirror_neither_dirties_nor_touches_history() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.project.composition.tempo.bpm = 90.0;
+    st.dirty = false;
+    assert!(!st.history.can_undo());
+    let gen_before = st.project_gen;
+    st.mirror_dj_tempo(true);
+    assert_eq!(st.project.composition.tempo.bpm, st.clock.bpm(), "mirrored");
+    assert!(!st.dirty, "live tempo must not dirty the project");
+    assert!(!st.history.can_undo(), "no undo entry");
+    assert!(st.project_gen > gen_before, "caches still see the change");
+}
+
+#[test]
+fn closing_prefs_commits_a_typed_dj_address() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.dj_iface_buf = Some(" 192.168.7.9 ".into());
+    st.commit_dj_iface_buf();
+    assert_eq!(st.prefs.dj.interface, "192.168.7.9");
+    assert!(st.dj_iface_buf.is_none());
+}
+
 fn top_layer_no(h: &Harness<'_, State>) -> usize {
     h.state().project.composition.layers.len()
 }

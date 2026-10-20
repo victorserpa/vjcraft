@@ -125,6 +125,9 @@ struct Cache {
     /// Plugins that failed, crashed or hung, by path -> mtime; not retried until the file changes.
     #[serde(default)]
     failed: BTreeMap<String, u64>,
+    /// Plugins whose info timed out once; retried with the long deadline.
+    #[serde(default)]
+    slow: BTreeMap<String, u64>,
 }
 
 /// The file that is actually loaded. A macOS `.bundle` is a directory: the executable lives in
@@ -175,15 +178,41 @@ fn mtime(p: &Path) -> u64 {
 /// that crashes or hangs while being read is skipped (the helper is restarted). Returns the
 /// entries and the number of plugins that had to be loaded (cache misses).
 pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entry>, usize) {
+    scan_with(dirs, cache_file, helper_bin, false, SCAN_QUICK, SCAN_LONG)
+}
+
+/// Like [`scan`], but forgets the plugins remembered as failed or slow first (the Rescan button).
+pub fn scan_forced(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entry>, usize) {
+    scan_with(dirs, cache_file, helper_bin, true, SCAN_QUICK, SCAN_LONG)
+}
+
+pub const SCAN_QUICK: Duration = Duration::from_secs(5);
+pub const SCAN_LONG: Duration = Duration::from_secs(30);
+
+/// [`scan`] with explicit deadlines: `quick` for a first try, `long` for a retry of a plugin that
+/// timed out. `force` clears the failed and slow memory and gives every uncached plugin `long`.
+pub fn scan_with(
+    dirs: &[PathBuf],
+    cache_file: &Path,
+    helper_bin: &Path,
+    force: bool,
+    quick: Duration,
+    long: Duration,
+) -> (Vec<Entry>, usize) {
     let mut cache: Cache = std::fs::read(cache_file)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
+    if force {
+        cache.failed.clear();
+        cache.slow.clear();
+    }
     let mut found = Vec::new();
     let mut loads = 0;
     let mut helper: Option<Helper> = None;
     let mut next = BTreeMap::new();
     let mut next_failed = BTreeMap::new();
+    let mut next_slow = BTreeMap::new();
     for d in dirs {
         let Ok(rd) = std::fs::read_dir(d) else {
             continue;
@@ -210,12 +239,14 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
                 next_failed.insert(key, mt);
                 continue;
             }
+            let retry = force || cache.slow.get(&key) == Some(&mt);
             loads += 1;
             if helper.is_none() {
                 helper = Helper::spawn(helper_bin).ok();
             }
             let Some(h) = helper.as_mut() else { continue };
-            let r = h.request(&Request::Info { path: key.clone() }, Duration::from_secs(5));
+            let deadline = if retry { long } else { quick };
+            let r = h.request(&Request::Info { path: key.clone() }, deadline);
             match r {
                 Ok(Response::Info { info }) => {
                     let e = Entry {
@@ -229,8 +260,16 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
                 Err(HostError::Plugin(_)) => {
                     next_failed.insert(key, mt);
                 }
+                Err(HostError::Timeout) => {
+                    helper = None; // killed by the timeout
+                    if retry {
+                        next_failed.insert(key, mt);
+                    } else {
+                        next_slow.insert(key, mt);
+                    }
+                }
                 _ => {
-                    // crashed or hung: drop it, next plugin gets a fresh one
+                    // crashed: drop it, next plugin gets a fresh one
                     helper = None;
                     next_failed.insert(key, mt);
                 }
@@ -245,6 +284,7 @@ pub fn scan(dirs: &[PathBuf], cache_file: &Path, helper_bin: &Path) -> (Vec<Entr
         serde_json::to_vec(&Cache {
             entries: next,
             failed: next_failed,
+            slow: next_slow,
         })
         .unwrap(),
     );
@@ -349,9 +389,16 @@ impl FfglEffect {
                         index: i as u32,
                         value: *v,
                     };
-                    if let Err(e) = h.request(&set, self.timeout) {
-                        self.status = Status::Stopped(e);
-                        return; // helper stays None: pass-through
+                    match h.request(&set, self.timeout) {
+                        Ok(_) => {}
+                        // real plugins reject single values: log it and carry on
+                        Err(HostError::Plugin(msg)) => {
+                            eprintln!("ffgl: restoring parameter {i} rejected: {msg}");
+                        }
+                        Err(e) => {
+                            self.status = Status::Stopped(e);
+                            return; // helper stays None: pass-through
+                        }
                     }
                 }
                 self.helper = Some(h);

@@ -66,14 +66,15 @@ impl ClapHost {
 
     /// Scans in a background thread (nothing happens while a scan runs). The cache file keeps
     /// the plugin info by path and mtime, so only new or changed files are loaded.
-    /// `force` (the Rescan button) also retries the files remembered as failed.
-    pub fn rescan(&self, extra_dirs: &[String], cache: Option<PathBuf>, force: bool) {
+    /// `force` (the Rescan button) also retries the files remembered as failed. Returns whether
+    /// a scan was started (false while another one runs).
+    pub fn rescan(&self, extra_dirs: &[String], cache: Option<PathBuf>, force: bool) -> bool {
         {
             let Ok(mut c) = self.catalog.lock() else {
-                return;
+                return false;
             };
             if c.scanning {
-                return;
+                return false;
             }
             c.scanning = true;
         }
@@ -100,7 +101,9 @@ impl ClapHost {
             && let Ok(mut c) = cat.lock()
         {
             c.scanning = false;
+            return false;
         }
+        true
     }
 
     /// The shared state of a CLAP effect (made on first use from the values in the project);

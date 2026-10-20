@@ -12,6 +12,13 @@ use vjc_model::FitMode;
 use crate::ui_scale_slider_key;
 
 impl State {
+    /// A DJ address still being typed when Preferences closes is applied, not lost.
+    pub(crate) fn commit_dj_iface_buf(&mut self) {
+        if let Some(buf) = self.dj_iface_buf.take() {
+            self.prefs.dj.interface = buf.trim().to_owned();
+        }
+    }
+
     pub(crate) fn prefs_window(&mut self, ctx: &egui::Context) {
         if !self.prefs_open {
             return;
@@ -492,7 +499,10 @@ impl State {
                         ui.add_enabled_ui(d.enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Network");
-                                let ifaces = crate::dj_io::local_ifaces();
+                                let ifaces = self
+                                    .dj_ifaces
+                                    .get_with(std::time::Instant::now(), crate::dj_io::local_ifaces)
+                                    .to_vec();
                                 if ifaces.is_empty() {
                                     // Cannot list interfaces here: typed address, applied
                                     // on Enter or when the field loses focus.
@@ -744,6 +754,9 @@ impl State {
                     done = true;
                 }
             });
+        if !open || done {
+            self.commit_dj_iface_buf();
+        }
         if self.prefs != before {
             crate::apply_hw_decode(&self.prefs);
             self.prefs_dirty = true;

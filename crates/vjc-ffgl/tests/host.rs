@@ -308,3 +308,64 @@ fn failed_plugins_are_cached_by_mtime() {
         "changed file is retried"
     );
 }
+
+#[test]
+fn enable_carries_on_when_restoring_a_parameter_returns_ff_fail() {
+    let mut e = effect(5000);
+    e.set_param(1, 0.25); // fixture answers FF_FAIL for this value
+    e.enable();
+    assert_eq!(e.status, Status::Running, "{:?}", e.status);
+    e.set_param(0, 1.0);
+    assert_eq!(e.process(&frame(100)).rgba[0], 200);
+}
+
+fn slow_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("vjc-ffgl-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let src = PathBuf::from(plugin());
+    let dst = d.join(src.file_name().unwrap());
+    std::fs::copy(&src, &dst).unwrap();
+    let mut slow = dst.clone().into_os_string();
+    slow.push(".slow");
+    std::fs::write(slow, b"").unwrap();
+    d
+}
+
+#[test]
+fn scan_timeout_is_retried_with_the_long_deadline() {
+    let d = slow_dir("slowretry");
+    let cache = d.join("cache.json");
+    let (quick, long) = (Duration::from_millis(300), Duration::from_secs(10));
+    let dirs = std::slice::from_ref(&d);
+    let (f, loads) = scan_with(dirs, &cache, Path::new(HELPER), false, quick, long);
+    assert_eq!((f.len(), loads), (0, 1), "first try times out");
+    let (f, loads) = scan_with(dirs, &cache, Path::new(HELPER), false, quick, long);
+    assert_eq!(
+        (f.len(), loads),
+        (1, 1),
+        "slow plugin retried with the long deadline"
+    );
+}
+
+#[test]
+fn forced_scan_clears_a_cached_timeout() {
+    let d = slow_dir("slowforce");
+    let cache = d.join("cache.json");
+    let dirs = std::slice::from_ref(&d);
+    let (quick, short) = (Duration::from_millis(300), Duration::from_millis(300));
+    // both deadlines too short: ends up in failed
+    scan_with(dirs, &cache, Path::new(HELPER), false, quick, short);
+    scan_with(dirs, &cache, Path::new(HELPER), false, quick, short);
+    let (_, loads) = scan_with(dirs, &cache, Path::new(HELPER), false, quick, short);
+    assert_eq!(loads, 0, "failed is remembered");
+    let (f, loads) = scan_with(
+        dirs,
+        &cache,
+        Path::new(HELPER),
+        true,
+        quick,
+        Duration::from_secs(10),
+    );
+    assert_eq!((f.len(), loads), (1, 1), "force retries it");
+}

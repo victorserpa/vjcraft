@@ -1,6 +1,6 @@
 // Minimal FFGL 2.x style test plugin written from the documented ABI. Built by the tests
 // with rustc --crate-type cdylib. Params: 0 Gain (default 0.5, output = input * 2 * gain),
-// 1 Crash (>0.5: abort while processing; exactly 0.75: abort while setting), 2 Hang (>0.5: never return while processing).
+// 1 Crash (>0.5: abort while processing; exactly 0.75: abort while setting, exactly 0.25: SETPARAMETER returns FF_FAIL), 2 Hang (>0.5: never return while processing).
 use std::ffi::c_void;
 
 #[repr(C)]
@@ -47,6 +47,20 @@ unsafe extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
 }
 
+/// True when `<this library>.<ext>` exists.
+fn sibling_exists(ext: &str) -> bool {
+    unsafe {
+        let mut i = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+        if dladdr(plugMain as *const c_void, &mut i) == 0 || i.fname.is_null() {
+            return false;
+        }
+        let mut p = std::ffi::CStr::from_ptr(i.fname).to_string_lossy().to_string();
+        p.push('.');
+        p.push_str(ext);
+        std::path::Path::new(&p).exists()
+    }
+}
+
 /// Lifecycle log: appends the function code to `<this library>.log`, only if that file exists.
 fn log(code: u32) {
     unsafe {
@@ -69,6 +83,9 @@ fn log(code: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> FFMixed {
     log(code);
+    if code == 0 && sibling_exists("slow") {
+        std::thread::sleep(std::time::Duration::from_millis(1500)); // slow GETINFO
+    }
     let has_inst = inst as *const u8 == &TOKEN as *const u8;
     if matches!(code, 8 | 9 | 12 | 0x7F00) && !has_inst {
         return FFMixed { u: 0xFFFF_FFFF };
@@ -87,6 +104,9 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> F
                 let s = &*(v.p as *const SetP);
                 if s.index == 1 && f32::from_bits(s.value.u) == 0.75 {
                     std::process::abort(); // crash while setting
+                }
+                if s.index == 1 && f32::from_bits(s.value.u) == 0.25 {
+                    return FFMixed { u: 0xFFFF_FFFF }; // rejects this single value
                 }
                 VALS[s.index as usize] = f32::from_bits(s.value.u);
                 FFMixed { u: 0 }
