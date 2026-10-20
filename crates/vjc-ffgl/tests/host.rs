@@ -369,3 +369,38 @@ fn forced_scan_clears_a_cached_timeout() {
     );
     assert_eq!((f.len(), loads), (1, 1), "force retries it");
 }
+
+#[test]
+fn param_changes_are_coalesced_and_sent_with_the_frame() {
+    let mut e = effect(5000);
+    // 0.75 on param 1 makes the fixture abort when it is set; only the latest value may go out
+    e.set_param(1, 0.75);
+    e.set_param(1, 0.0);
+    e.set_param(0, 0.5);
+    let out = e.process(&frame(100));
+    assert_eq!(e.status, Status::Running, "{:?}", e.status);
+    assert_eq!(
+        out.rgba[..4],
+        [100, 50, 10, 200],
+        "gain 0.5 applied with the frame"
+    );
+}
+
+#[test]
+fn setting_a_param_never_talks_to_the_helper_before_the_frame() {
+    let mut e = effect(5000);
+    e.kill_helper();
+    let t = std::time::Instant::now();
+    for i in 0..50 {
+        e.set_param(0, i as f32 / 100.0);
+    }
+    assert!(t.elapsed() < Duration::from_millis(200));
+    assert_eq!(
+        e.status,
+        Status::Running,
+        "only the frame notices the dead helper"
+    );
+    let f = frame(80);
+    assert_eq!(e.process(&f).rgba, f.rgba);
+    assert!(matches!(e.status, Status::Stopped(_)));
+}

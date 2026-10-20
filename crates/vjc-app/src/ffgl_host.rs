@@ -251,3 +251,16 @@ impl FfglHost {
         }
     }
 }
+
+/// Effect params for the inputs, and the plugin parameter index of each (TODO stub).
+pub fn params_for(_inputs: &[vjc_fx::Input]) -> (Vec<Param>, Vec<usize>) {
+    (vec![], vec![])
+}
+
+impl FfglHost {
+    /// Temp cache file of a scan without a data folder (TODO stub).
+    #[cfg(test)]
+    pub fn temp_cache(&self) -> Option<PathBuf> {
+        None
+    }
+}

@@ -93,14 +93,53 @@ fn source() -> Vec<u8> {
     px
 }
 
-/// One frame through the compositor with the fixture on the layer.
+#[derive(Clone, Copy, PartialEq)]
+enum Place {
+    Layer,
+    Master,
+    Group,
+}
+
+struct Opts {
+    kill: bool,
+    dry_wet: f32,
+    fmt: wgpu::TextureFormat,
+    place: Place,
+    /// Size of the source frame (the compositor is always N x N).
+    frame: u32,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            kill: false,
+            dry_wet: 1.0,
+            fmt: wgpu::TextureFormat::Rgba8Unorm,
+            place: Place::Layer,
+            frame: N,
+        }
+    }
+}
+
+/// One frame through the compositor with the fixture on the layer, a group or the master.
 fn render(host: &FfglHost, kill_first: bool) -> Option<(Vec<u8>, vjc_model::Effect)> {
+    render_with(
+        host,
+        Opts {
+            kill: kill_first,
+            ..Default::default()
+        },
+    )
+}
+
+fn render_with(host: &FfglHost, o: Opts) -> Option<(Vec<u8>, vjc_model::Effect)> {
     let (device, queue) = gpu().or_else(|| {
         eprintln!("no wgpu adapter: skipped");
         None
     })?;
     let id = vjc_ffgl::effect_id(&host.effect_entries()[0]);
-    let effect = host.new_effect(&id).unwrap();
+    let mut effect = host.new_effect(&id).unwrap();
+    effect.dry_wet = o.dry_wet;
     let mut lib = crate::fx::FxLib::new();
     lib.ffgl = host.clone();
     let mut ml = crate::ml_fx::MlHub::new();
@@ -123,19 +162,42 @@ fn render(host: &FfglHost, kill_first: bool) -> Option<(Vec<u8>, vjc_model::Effe
             eprintln!("no GL context: skipped");
             return None;
         }
-        if kill_first {
+        if o.kill {
             fx.kill_helper();
         }
     }
-    let src = source();
-    let mut comp = Compositor::new(&device, N, N);
+    let f = o.frame;
+    let src: Vec<u8> = source()
+        .chunks(4)
+        .take((f * f) as usize)
+        .flatten()
+        .copied()
+        .collect();
+    let mut comp = Compositor::with_format(&device, N, N, o.fmt);
+    let (on_layer, on_master, groups) = match o.place {
+        Place::Layer => (draws, vec![], vec![]),
+        Place::Master => (vec![], draws, vec![]),
+        Place::Group => (
+            vec![],
+            vec![],
+            vec![crate::compositor::GroupDraw {
+                id: None,
+                start: 0,
+                len: 1,
+                opacity: 1.0,
+                blend: BlendMode::Normal,
+                effects: draws,
+                mask: Default::default(),
+            }],
+        ),
+    };
     let layer = LayerDraw {
         id: uuid::Uuid::from_u128(1),
         opacity: 1.0,
         blend: BlendMode::Normal,
         fit: FitMode::Stretch,
-        effects: draws,
-        frame: Some((N, N, &src, 1)),
+        effects: on_layer,
+        frame: Some((f, f, &src, 1)),
         generator: None,
         transition: None,
         transform: vjc_core::transform::Affine::IDENTITY,
@@ -143,9 +205,136 @@ fn render(host: &FfglHost, kill_first: bool) -> Option<(Vec<u8>, vjc_model::Effe
         mask: Default::default(),
         orient: Default::default(),
     };
-    comp.render(&device, &queue, &[layer], &[], 1.0);
+    comp.render_groups(&device, &queue, &[layer], &groups, &on_master, 1.0);
     let (_, _, out) = comp.read_rgba(&device, &queue)?;
     Some((out, effect))
+}
+
+fn assert_inverted(out: &[u8]) {
+    for (i, (a, b)) in source().chunks(4).zip(out.chunks(4)).enumerate() {
+        for c in 0..3 {
+            let want = 255 - a[c] as i32;
+            assert!(
+                (want - b[c] as i32).abs() <= 2,
+                "pixel {i} ch {c}: {a:?} -> {b:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn half_dry_wet_mixes_the_plugin_with_its_input() {
+    let (host, _dir) = scanned("drywet");
+    let Some((out, _)) = render_with(
+        &host,
+        Opts {
+            dry_wet: 0.5,
+            ..Default::default()
+        },
+    ) else {
+        return;
+    };
+    for (i, b) in out.chunks(4).enumerate() {
+        for c in 0..3 {
+            assert!((b[c] as i32 - 128).abs() <= 2, "pixel {i} ch {c}: {b:?}");
+        }
+    }
+}
+
+#[test]
+fn a_16_bit_composition_still_runs_the_plugin() {
+    let (host, _dir) = scanned("fmt16");
+    let Some((out, _)) = render_with(
+        &host,
+        Opts {
+            fmt: wgpu::TextureFormat::Rgba16Float,
+            ..Default::default()
+        },
+    ) else {
+        return;
+    };
+    assert_inverted(&out);
+}
+
+#[test]
+fn the_plugin_runs_on_the_master_and_on_a_group() {
+    let (host, _dir) = scanned("places");
+    for place in [Place::Master, Place::Group] {
+        let Some((out, _)) = render_with(
+            &host,
+            Opts {
+                place,
+                ..Default::default()
+            },
+        ) else {
+            return;
+        };
+        assert_inverted(&out);
+    }
+}
+
+#[test]
+fn an_input_of_another_size_shows_a_note() {
+    let (host, _dir) = scanned("size");
+    let Some((_, effect)) = render_with(
+        &host,
+        Opts {
+            frame: 32,
+            ..Default::default()
+        },
+    ) else {
+        return;
+    };
+    assert!(
+        host.badge(&effect).is_some_and(|b| b.contains("size")),
+        "{:?}",
+        host.badge(&effect)
+    );
+}
+
+#[test]
+fn params_follow_the_plugin_index_when_an_input_is_not_mapped() {
+    use vjc_fx::{Input, InputKind};
+    let inputs = vec![
+        Input {
+            name: "tint".into(),
+            group: None,
+            kind: InputKind::Color { default: [0.0; 4] },
+        },
+        Input {
+            name: "amount".into(),
+            group: None,
+            kind: InputKind::Float {
+                min: 0.0,
+                max: 1.0,
+                default: 0.5,
+            },
+        },
+        Input {
+            name: "on".into(),
+            group: None,
+            kind: InputKind::Bool { default: true },
+        },
+    ];
+    let (params, index) = crate::ffgl_host::params_for(&inputs);
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].name, "amount");
+    assert_eq!(index, vec![1, 2], "effect param 0 is plugin parameter 1");
+}
+
+#[test]
+fn temp_cache_of_a_default_scan_is_removed_when_the_host_is_dropped() {
+    let dir = temp("tmpcache");
+    let host = FfglHost::default();
+    assert!(host.rescan(&[dir.display().to_string()], None, false));
+    let t = std::time::Instant::now();
+    while host.scanning() && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let cache = host.temp_cache().expect("fallback cache in use");
+    assert!(cache.exists());
+    drop(host);
+    assert!(!cache.exists());
 }
 
 #[test]
