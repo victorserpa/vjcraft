@@ -16,3 +16,9 @@ scripts/package-macos.sh                  # target/dist/VJCraft.app + .dmg (need
 - Tests read the owner's local Example.avc when present (vjc-avc/src/lib.rs); they skip when absent.
 - `VJC_DATA_DIR=<dir>` (dev/testing) replaces the per-user data and config dir (recovery.vjc, prefs.json, output-presets, models), so runs never touch the real one. Rehearsal (`VJC_REHEARSE`) also disables autosave and recovery writes.
 - `VJC_VRAM_LIMIT_MB=<n>` sets the texture-memory watchdog limit (default 3072); over it, thumbnails and the effect scratch pool are dropped, then the status bar warns (vram.rs).
+
+## Linux cross-check (issue #15, first step)
+
+`scripts/check-linux.sh` runs `cargo check --target x86_64-unknown-linux-gnu` (needs `rustup target add x86_64-unknown-linux-gnu`) for vjc-net, vjc-model, vjc-core, vjc-io, vjc-avc, vjc-fx, vjc-ffgl and vjc-clap. It type-checks only; nothing is linked or run on Linux.
+
+Blocked from macOS: vjc-ml (tract-linalg build script needs a Linux C compiler), vjc-media (alsa-sys needs libasound, plus ffmpeg), vjc-app (depends on both). Check those on a Linux host.
