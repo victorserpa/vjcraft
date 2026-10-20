@@ -119,8 +119,11 @@ impl FfglHost {
             cache = Some(c);
         }
         let cache = cache.unwrap_or_else(|| {
-            let p =
-                std::env::temp_dir().join(format!("vjc-ffgl-cache-{}.json", std::process::id()));
+            // One file per host, so dropping one host never deletes another's cache.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir()
+                .join(format!("vjc-ffgl-cache-{}-{n}.json", std::process::id()));
             if let Ok(mut t) = self.inner.temp_cache.lock() {
                 *t = Some(p.clone());
             }
