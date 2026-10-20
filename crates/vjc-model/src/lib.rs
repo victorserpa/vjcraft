@@ -679,9 +679,6 @@ pub struct Transport {
     /// Follow this DJ player (1..=4): play state and track position drive the clip.
     #[serde(default)]
     pub follow_player: Option<u8>,
-    /// While following, keep clip speed (the player's key lock) and still hold position.
-    #[serde(default)]
-    pub follow_master_tempo: bool,
 }
 
 /// Timecode frame rates.
@@ -1975,7 +1972,6 @@ impl Default for Transport {
             timecode_start: None,
             duration_secs: None,
             follow_player: None,
-            follow_master_tempo: false,
         }
     }
 }
@@ -2642,10 +2638,9 @@ mod tests {
         let mut t = serde_json::to_value(Transport::default()).unwrap();
         let o = t.as_object_mut().unwrap();
         o.remove("follow_player");
-        o.remove("follow_master_tempo");
+        o.insert("follow_master_tempo".into(), true.into()); // from a build that had it
         let t: Transport = serde_json::from_value(t).unwrap();
         assert_eq!(t.follow_player, None);
-        assert!(!t.follow_master_tempo);
     }
 
     #[test]

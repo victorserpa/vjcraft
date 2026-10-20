@@ -204,7 +204,8 @@ struct State {
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
     heads: HashMap<LayerId, Playhead>,
     /// Followers of clips that track a DJ player, per layer (runtime only).
-    followers: HashMap<LayerId, vjc_core::djlink::ClipFollower>,
+    /// Keyed with the clip it belongs to; a different clip starts a fresh follower.
+    followers: HashMap<LayerId, ((DeckId, u32), vjc_core::djlink::ClipFollower)>,
     /// Codec / size / fps of file clips, probed on demand.
     src_info: source_info::SourceInfos,
     /// Convert to HAP: queue, the question being asked, and the swap offer after a finish.
@@ -4259,6 +4260,7 @@ impl State {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(1, |d| d.as_nanos() as u64);
                         self.heads.insert(layer, Playhead::new(dir, seed));
+                        self.followers.remove(&layer);
                         self.flow.regions.remove(&layer);
                         let own_last =
                             resume_pos(&self.project, &self.flow.resume, (deck, src, column));
@@ -4308,6 +4310,7 @@ impl State {
                         .insert(layer, (deck, column, Player::open_capture(&device)));
                     self.set_origin(layer, deck, src_of(layer), column);
                     self.heads.remove(&layer);
+                    self.followers.remove(&layer);
                 }
                 Event::NetworkStarted {
                     deck,
@@ -4329,6 +4332,7 @@ impl State {
                                 .insert(layer, (deck, column, open_network(p, name)));
                             self.set_origin(layer, deck, src_of(layer), column);
                             self.heads.remove(&layer);
+                            self.followers.remove(&layer);
                         }
                         None => self.status = "Spout is not available on macOS".into(),
                     }
@@ -5099,25 +5103,30 @@ impl State {
                 let t = match (&tr.timecode_start, tc_now) {
                     _ if let Some(n) = tr.follow_player => {
                         // Follows a DJ player: trigger, direction and play mode are ignored.
-                        let fl = self
+                        let slot = self
                             .followers
                             .entry(*layer)
-                            .or_insert_with(|| vjc_core::djlink::ClipFollower::new(false));
-                        fl.master_tempo = tr.follow_master_tempo;
-                        let target =
-                            self.dj_tracker
-                                .track_pos(n, now)
-                                .map(|p| vjc_core::djlink::TrackPos {
-                                    secs: p.secs * tr.speed,
-                                    rate: p.rate * tr.speed,
-                                    ..p
-                                });
+                            .or_insert_with(|| ((*deck, *col), Default::default()));
+                        if slot.0 != (*deck, *col) {
+                            *slot = ((*deck, *col), Default::default());
+                        }
+                        let fl = &mut slot.1;
+                        let target = self
+                            .dj_tracker
+                            .track_pos(n, now)
+                            .map(|p| vjc_core::djlink::TrackPos { ..p });
+                        // Clip speed is ignored while following. A clip with no usable
+                        // length yet skips the frame and keeps the playhead where it was.
                         fl.step(target, dt, d);
-                        let position = (fl.pos / d).clamp(0.0, 1.0);
-                        head.seek(position);
-                        vjc_core::playhead::Tick {
-                            position,
-                            finished: false,
+                        match fl.fraction(d) {
+                            Some(position) => {
+                                head.seek(position);
+                                vjc_core::playhead::Tick {
+                                    position,
+                                    finished: false,
+                                }
+                            }
+                            None => head.tick(0.0, tr.play_mode, Direction::Pause, 1.0, 1.0),
                         }
                     }
                     (Some(start), Some(cur)) if tc_on => {
@@ -10986,17 +10995,11 @@ impl State {
             if let Some(p) =
                 params::combo(ui, "follow", "Follow player", &t.follow_player, &players)
             {
-                follow_cmd = Some((p, t.follow_master_tempo));
+                follow_cmd = Some(p);
             }
             if let Some(n) = t.follow_player {
-                let mut mt = t.follow_master_tempo;
-                if ui
-                    .checkbox(&mut mt, "Master tempo")
-                    .on_hover_text("Keep the clip speed when the player's pitch moves, and still hold its position")
-                    .changed()
-                {
-                    follow_cmd = Some((Some(n), mt));
-                }
+                ui.weak("Clip speed is ignored while following")
+                    .on_hover_text("The clip moves at the player's speed, pitch included");
                 match self.dj_tracker.follow_note(n, std::time::Instant::now()) {
                     Some(vjc_core::djlink::FollowNote::Lost(n)) => {
                         ui.weak(format!("Player {n} lost, running free"));
@@ -11007,13 +11010,12 @@ impl State {
                     None => {}
                 }
             }
-            if let Some((player, master_tempo)) = follow_cmd {
+            if let Some(player) = follow_cmd {
                 cmds.push(Command::SetClipFollow {
                     deck,
                     layer,
                     column,
                     player,
-                    master_tempo,
                 });
             }
             if let Some(mut start) = t.timecode_start {

@@ -17,7 +17,7 @@ DJ sync drives the master tempo, but a clip cannot follow one player's track: it
 ## Behaviour
 
 - The clip Transport panel gets "Follow player": Off, 1, 2, 3 or 4. The default is Off.
-- **Player playing:** the clip plays at clip speed × pitch. With "Master tempo" on, it plays at clip speed and still holds position.
+- **Player playing:** the clip plays at the player's speed (pitch applied). Clip speed is ignored while following: a clip that holds position must move at the player's speed.
 - **Player paused:** the clip pauses on its current frame.
 - **Cue or jump** (a position change larger than one beat in one update): the clip jumps on the next frame.
 - **Mapping:** clip time = in point + (track seconds mod clip length). A clip shorter than the track loops.
@@ -32,9 +32,8 @@ Status packets may not reach a passive listener (see dj-sync.md). Without them, 
 
 ## Data model
 
-`Transport` gets two new fields:
+`Transport` gets a new field:
 - `#[serde(default)] follow_player: Option<u8>` (1..=4)
-- `#[serde(default)] follow_master_tempo: bool`
 
 Old projects load with follow off. `PlayMode` is unchanged.
 
@@ -58,7 +57,7 @@ Old projects load with follow off. `PlayMode` is unchanged.
   - 64 beats at 128 BPM gives 30.0 s;
   - it extrapolates while playing and holds while paused.
 - **Jitter:** with ±10 ms packet jitter there is no hard lock, and |drift| stays under 20 ms for 60 s.
-- **Pitch:** +8 % pitch gives rate 1.08; with master tempo the rate is 1.0 and position is still held.
+- **Pitch:** +8 % pitch gives rate 1.08 and position is still held.
 - **Jumps and pause:** a 16-beat jump locks within 1 step; a pause gives rate 0 in the same step.
 - **Mapping:** a 10 s clip with the track at 25 s sits at 5 s.
 - **Stale player:** free run, then a relock when packets resume.

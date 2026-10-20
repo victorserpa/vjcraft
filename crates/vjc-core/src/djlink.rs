@@ -224,22 +224,32 @@ const TRIM_MAX: f64 = 0.05;
 pub struct ClipFollower {
     pub pos: f64,
     pub rate: f64,
-    /// Keep rate 1.0 and still hold position.
-    pub master_tempo: bool,
     /// Hard locks so far.
     pub locks: u32,
     primed: bool,
 }
 
+impl Default for ClipFollower {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClipFollower {
-    pub fn new(master_tempo: bool) -> Self {
+    pub fn new() -> Self {
         ClipFollower {
             pos: 0.0,
             rate: 1.0,
-            master_tempo,
             locks: 0,
             primed: false,
         }
+    }
+
+    /// Position as a 0..1 share of a clip of `clip_len` seconds; None for an unusable
+    /// length (not probed yet, in == out), so callers skip the frame.
+    pub fn fraction(&self, clip_len: f64) -> Option<f64> {
+        (clip_len.is_finite() && clip_len > 0.0 && self.pos.is_finite())
+            .then(|| (self.pos / clip_len).clamp(0.0, 1.0))
     }
 
     /// One frame of `dt` seconds. No target keeps position and rate running free.
@@ -269,11 +279,6 @@ impl ClipFollower {
         }
         if !t.playing {
             self.rate = 0.0;
-            return;
-        }
-        if self.master_tempo {
-            self.rate = 1.0;
-            self.pos = goal;
             return;
         }
         let trim = (drift * TRIM_GAIN).clamp(-TRIM_MAX, TRIM_MAX);
@@ -783,25 +788,44 @@ mod tests {
     }
 
     #[test]
-    fn follower_master_tempo_keeps_rate_1_and_holds_position() {
-        let mut f = ClipFollower::new(true);
+    fn follower_pitched_rate_holds_position() {
+        let mut f = ClipFollower::new();
         let mut truth = 20.0;
+        f.step(Some(tp(truth, 1.08, true)), 0.016, 100.0);
         for _ in 0..300 {
             truth += 0.016 * 1.08;
             f.step(Some(tp(truth, 1.08, true)), 0.016, 100.0);
-            assert!((f.rate - 1.0).abs() < 1e-9);
-            assert!((f.pos - truth).abs() < 0.001, "{} vs {truth}", f.pos);
+            assert!((f.rate - 1.08).abs() < 0.06);
+            assert!((f.pos - truth).abs() < 0.020, "{} vs {truth}", f.pos);
         }
-        let mut g = ClipFollower::new(false);
-        g.step(Some(tp(20.0, 1.08, true)), 0.016, 100.0);
-        assert!((g.rate - 1.08).abs() < 0.06);
+    }
+
+    #[test]
+    fn fraction_is_finite_or_none() {
+        let mut f = ClipFollower::new();
+        f.step(Some(tp(5.0, 1.0, true)), 0.016, 10.0);
+        assert_eq!(f.fraction(10.0), Some(0.5));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(f.fraction(bad), None, "len {bad}");
+        }
+        // a zero-length clip never moves or poisons the follower
+        f.step(Some(tp(7.0, 1.0, true)), 0.016, 0.0);
+        assert!(f.pos.is_finite() && f.rate.is_finite());
+        assert_eq!(f.fraction(10.0), Some(0.5));
+    }
+
+    #[test]
+    fn fresh_follower_without_data_sits_at_the_in_point() {
+        let mut f = ClipFollower::new();
+        f.step(None, 0.0, 10.0);
+        assert_eq!(f.fraction(10.0), Some(0.0));
     }
 
     #[test]
     fn follower_jitter_never_hard_locks_and_stays_within_20ms() {
         let t0 = Instant::now();
         let mut t = Tracker::default();
-        let mut f = ClipFollower::new(false);
+        let mut f = ClipFollower::new();
         let mut rng = 12345u64;
         let mut jitter = move || {
             rng = rng
@@ -855,7 +879,7 @@ mod tests {
 
     #[test]
     fn follower_jump_locks_in_one_step_and_pause_gives_rate_0() {
-        let mut f = ClipFollower::new(false);
+        let mut f = ClipFollower::new();
         f.step(Some(tp(10.0, 1.0, true)), 0.016, 100.0);
         let locks = f.locks;
         let jump = 10.0 + 16.0 * T128;
@@ -871,7 +895,7 @@ mod tests {
 
     #[test]
     fn follower_maps_track_time_onto_a_shorter_clip() {
-        let mut f = ClipFollower::new(false);
+        let mut f = ClipFollower::new();
         f.step(Some(tp(25.0, 1.0, true)), 0.016, 10.0);
         assert!((f.pos - 5.0).abs() < 1e-9, "{}", f.pos);
         f.step(Some(tp(25.0 + 0.016, 1.0, true)), 0.016, 10.0);
@@ -880,7 +904,7 @@ mod tests {
 
     #[test]
     fn follower_wraps_drift_across_the_loop_point() {
-        let mut f = ClipFollower::new(false);
+        let mut f = ClipFollower::new();
         f.step(Some(tp(9.99, 1.0, true)), 0.0, 10.0);
         let locks = f.locks;
         // target just past the wrap: drift is 20 ms, not -9.98 s
@@ -892,7 +916,7 @@ mod tests {
     fn stale_player_runs_free_then_relocks() {
         let t0 = Instant::now();
         let mut t = Tracker::default();
-        let mut f = ClipFollower::new(false);
+        let mut f = ClipFollower::new();
         feed_st(&mut t, st(1, true, Some(64), NORMAL_PITCH), t0);
         f.step(t.track_pos(1, t0), 0.016, 100.0);
         let rate = f.rate;
@@ -919,7 +943,7 @@ mod tests {
         assert_eq!(t.track_pos(3, t0), None);
         assert_eq!(t.follow_note(3, t0), Some(FollowNote::NoPosition(3)));
         assert_eq!(t.follow_note(4, t0), Some(FollowNote::Lost(4)));
-        let mut f = ClipFollower::new(false);
+        let mut f = ClipFollower::new();
         f.rate = 1.0;
         f.step(None, 0.1, 100.0);
         assert!((f.pos - 0.1).abs() < 1e-9);
