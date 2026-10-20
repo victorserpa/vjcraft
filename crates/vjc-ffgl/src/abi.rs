@@ -1,7 +1,7 @@
 //! FFGL 2.x C ABI as documented by the public specification: one exported entry point,
 //! `plugMain(functionCode, inputValue, instanceID)`, and a handful of plain structs.
 //! Written from the documented layout only; no SDK header or code is used or vendored.
-//! Constants are from the documented function-code table (not machine-checked against the SDK).
+//! Function codes were checked against the open SDK headers (see docs/specs/ffgl-host.md).
 use std::ffi::c_void;
 
 /// Documented `FFMixed`: a 32-bit unsigned or a pointer.
@@ -16,16 +16,19 @@ pub type PlugMain = unsafe extern "C" fn(u32, FFMixed, *mut c_void) -> FFMixed;
 
 pub const FF_FAIL: u32 = 0xFFFF_FFFF;
 pub const FF_GETINFO: u32 = 0;
-pub const FF_INITIALISE: u32 = 1;
 pub const FF_DEINITIALISE: u32 = 2;
 pub const FF_GETNUMPARAMETERS: u32 = 4;
 pub const FF_GETPARAMETERNAME: u32 = 5;
 pub const FF_GETPARAMETERDEFAULT: u32 = 6;
 pub const FF_SETPARAMETER: u32 = 8;
 pub const FF_GETPARAMETER: u32 = 9;
-pub const FF_INSTANTIATE: u32 = 11;
-pub const FF_DEINSTANTIATE: u32 = 12;
 pub const FF_GETPARAMETERTYPE: u32 = 15;
+pub const FF_PROCESS_OPENGL: u32 = 17;
+pub const FF_INSTANTIATE_GL: u32 = 18;
+pub const FF_DEINSTANTIATE_GL: u32 = 19;
+pub const FF_SET_TIME: u32 = 20;
+pub const FF_RESIZE: u32 = 23;
+pub const FF_INITIALISE_V2: u32 = 34;
 /// VJCraft stage-1 extension (not part of FFGL): process an RGBA8 frame on the CPU.
 /// Lets the helper be tested without an OpenGL context; real plugins answer FF_FAIL.
 pub const FF_PROCESS_CPU_EXT: u32 = 0x7F00;
@@ -58,7 +61,25 @@ pub struct CpuFrameStruct {
     pub height: u32,
 }
 
-/// Documented viewport passed to INSTANTIATE.
+/// Documented `FFGLTextureStruct`.
+#[repr(C)]
+pub struct TextureStruct {
+    pub width: u32,
+    pub height: u32,
+    pub hardware_width: u32,
+    pub hardware_height: u32,
+    pub handle: u32,
+}
+
+/// Documented `ProcessOpenGLStruct`.
+#[repr(C)]
+pub struct ProcessOpenGlStruct {
+    pub num_input_textures: u32,
+    pub input_textures: *mut *mut TextureStruct,
+    pub host_fbo: u32,
+}
+
+/// Documented viewport passed to INSTANTIATE_GL and RESIZE.
 #[repr(C)]
 pub struct ViewportStruct {
     pub x: u32,

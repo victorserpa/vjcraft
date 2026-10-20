@@ -237,10 +237,10 @@ fn lifecycle_follows_the_ffgl_order() {
         .collect();
     let seq: Vec<u32> = codes
         .into_iter()
-        .filter(|c| matches!(c, 1 | 2 | 11 | 12))
+        .filter(|c| matches!(c, 34 | 2 | 18 | 19))
         .collect();
     // INITIALISE, INSTANTIATE, then DEINSTANTIATE + DEINITIALISE on replace and on quit
-    assert_eq!(seq, [1, 11, 12, 2, 1, 11, 12, 2]);
+    assert_eq!(seq, [34, 18, 19, 2, 34, 18, 19, 2]);
 }
 
 #[cfg(target_os = "macos")]

@@ -79,6 +79,10 @@ fn log(code: u32) {
     }
 }
 
+/// Marks this as a VJCraft test fixture: the helper drives it with the private CPU code.
+#[unsafe(no_mangle)]
+pub static vjcraft_cpu_test_plugin: u8 = 1;
+
 // Needs an instance id (the one INSTANTIATE returned) for everything per-instance, like FFGL 2.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> FFMixed {
@@ -87,15 +91,15 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> F
         std::thread::sleep(std::time::Duration::from_millis(1500)); // slow GETINFO
     }
     let has_inst = inst as *const u8 == &TOKEN as *const u8;
-    if matches!(code, 8 | 9 | 12 | 0x7F00) && !has_inst {
+    if matches!(code, 8 | 9 | 19 | 0x7F00) && !has_inst {
         return FFMixed { u: 0xFFFF_FFFF };
     }
     unsafe {
         match code {
-            11 => FFMixed { p: &TOKEN as *const u8 as *mut c_void },
-            12 | 2 => FFMixed { u: 0 },
+            18 => FFMixed { p: &TOKEN as *const u8 as *mut c_void },
+            19 | 2 => FFMixed { u: 0 },
             0 => FFMixed { p: &INFO as *const Info as *mut c_void },
-            1 => FFMixed { u: 0 },
+            34 => FFMixed { u: 0 },
             4 => FFMixed { u: 3 },
             5 => FFMixed { p: NAMES[v.u as usize].as_ptr() as *mut c_void },
             6 => FFMixed { u: (if v.u == 0 { 0.5f32 } else { 0.0 }).to_bits() },

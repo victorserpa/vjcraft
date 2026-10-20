@@ -2,6 +2,7 @@
 //! frames cross through a shared file mapping, and any crash or timeout turns the effect
 //! into a pass-through instead of taking the show down.
 pub mod abi;
+pub mod glhost;
 pub mod proto;
 
 use memmap2::MmapMut;
