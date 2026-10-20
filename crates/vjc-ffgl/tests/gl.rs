@@ -51,7 +51,13 @@ fn gl_plugin_inverts_a_64x64_frame() {
     }
     let f = Frame { w: 64, h: 64, rgba };
     assert_eq!(e.process(&f).rgba, f.rgba, "frame 1 passes through");
-    std::thread::sleep(Duration::from_millis(500));
+    let t = std::time::Instant::now();
+    while e.status == Status::Running && t.elapsed() < Duration::from_secs(20) {
+        e.settle();
+        if e.process(&f).rgba != f.rgba {
+            break;
+        }
+    }
     let out = e.process(&f); // the previous frame, inverted
     if let Status::Stopped(HostError::Plugin(m)) = &e.status
         && m.contains("OpenGL context")

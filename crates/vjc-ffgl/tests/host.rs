@@ -402,6 +402,7 @@ fn param_changes_are_coalesced_and_sent_with_the_frame() {
 #[test]
 fn setting_a_param_never_talks_to_the_helper_before_the_frame() {
     let mut e = effect(5000);
+    // the helper dies while the request sent by the last call is in flight
     e.kill_helper();
     let t = std::time::Instant::now();
     for i in 0..50 {
@@ -460,7 +461,11 @@ fn a_slow_helper_never_slows_the_render_loop() {
 fn a_killed_helper_passes_through_without_blocking() {
     let mut e = effect(5000);
     let f = frame(50);
-    settled(&mut e, &f);
+    e.set_param(0, 1.0); // x2: a processed frame differs from the input
+    let before = settled(&mut e, &f);
+    assert_ne!(before.rgba, f.rgba, "the plugin changes the frame");
+    // the answer to the request in flight is already waiting; then the helper dies
+    std::thread::sleep(Duration::from_millis(400));
     e.kill_helper();
     let t = std::time::Instant::now();
     assert_eq!(e.process(&f).rgba, f.rgba, "no stale result after the kill");

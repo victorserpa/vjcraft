@@ -14,7 +14,7 @@ use vjc_model::{Effect, EffectId, Param, Value};
 pub const GROUP: &str = "FFGL plugins";
 
 /// Effect tooltip: frames are pipelined to keep the render thread free.
-pub const LATENCY_TIP: &str = "FFGL plugin: runs in a helper process, so its output arrives one frame late (about 17 ms at 60 fps).";
+pub const LATENCY_TIP: &str = "FFGL plugin: runs in a helper process, so its output has at least one frame of latency; more when the plugin is slower than the frame rate.";
 
 /// How long one request to the helper may take before the plugin counts as stopped.
 const TIMEOUT: Duration = Duration::from_secs(3);
