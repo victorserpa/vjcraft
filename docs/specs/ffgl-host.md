@@ -79,3 +79,29 @@ Tests, written first:
 - UI: with a folder that holds the fixture, the plugin shows up in the Effects browser and can be added to a layer.
 
 Not verifiable here: a real third-party FFGL plugin binary, which the owner tests with his own plugins; 60 fps; Windows.
+
+## Stage 2a+: pipelined frames (approved)
+
+Measured in a release build, at 1080p with one FFGL effect: about 12.5 ms per frame. All of it runs serially on the render thread:
+- readback map and wait: 1.2 ms
+- copy into shared memory: 0.7 ms
+- synchronous IPC round trip, including the helper's GL upload, process and read: 5.6 ms
+- copy back and upload: 0.9 ms
+
+Design:
+- **Double buffering.** Each FFGL effect gets two shared-memory slots, so the render thread never waits on the helper. On frame N it:
+  1. writes the input into the free slot;
+  2. sends `Process` without waiting;
+  3. uploads the most recent finished result, which is frame N-1.
+
+  The effect output is one frame late. That is invisible in live use, and it is shown in the effect's tooltip.
+- **First frame, or no finished result yet:** pass the input through.
+- **Helper too slow:** if it has not finished the previous request when the next frame arrives, skip that frame's send and keep the last result, so the render thread never blocks. If no answer arrives within the existing timeout, the effect is marked stopped, as today.
+- **Parameter changes** ride on the next request, as now.
+
+Tests, written first:
+- a 1080p frame with an FFGL effect costs the render thread under 4 ms in a release build. This is an ignored perf test, run by hand;
+- the output equals the inverted input of the previous frame;
+- frame 1 passes through;
+- a helper that sleeps 50 ms per frame does not slow the render loop: 10 frames finish in under 100 ms;
+- a killed helper still passes through.
