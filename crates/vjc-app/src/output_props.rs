@@ -313,13 +313,28 @@ impl State {
                     {
                         let mut p = m.points().to_vec();
                         p.remove(i);
-                        cmds.push(Command::SetScreenMask {
+                        let set = Command::SetScreenMask {
                             screen: scr.id,
                             mask: Some(match m {
                                 vjc_model::Mask::Path(_) => vjc_model::Mask::Path(p),
                                 vjc_model::Mask::Polygon(_) => vjc_model::Mask::Polygon(p),
                             }),
-                        });
+                        };
+                        let mut t = scr.output_mask_tangents.clone();
+                        if t.len() == n {
+                            t.remove(i);
+                            cmds.push(Command::Batch {
+                                commands: vec![
+                                    set,
+                                    Command::SetScreenMaskTangents {
+                                        screen: scr.id,
+                                        tangents: t,
+                                    },
+                                ],
+                            });
+                        } else {
+                            cmds.push(set);
+                        }
                     }
                     if widgets::btn(ui, "Clear output mask", Kind::Secondary).clicked() {
                         self.poly.edit_omask = false;

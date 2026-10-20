@@ -828,3 +828,32 @@ fn smooth_tangents_round_a_stroke_and_zero_means_corners() {
     let flat = flatten_mask(&sq, &t);
     assert!(flat.len() <= MAX_POLY_POINTS);
 }
+
+#[test]
+fn mask_tangents_longer_than_the_mask_or_without_a_mask_are_rejected() {
+    let (mut p, sid, ids) = setup();
+    let run = |p: &mut Project, c| apply(p, c);
+    let slice = |t: usize| Command::SetSliceMaskTangents {
+        screen: sid,
+        slice: ids[0],
+        tangents: vec![(0.01, 0.0); t],
+    };
+    assert!(run(&mut p, slice(1)).is_err(), "slice has no mask");
+    let pts = vec![(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)];
+    run(
+        &mut p,
+        Command::SetSliceMask {
+            screen: sid,
+            slice: ids[0],
+            mask: Some(pts),
+        },
+    )
+    .unwrap();
+    assert!(run(&mut p, slice(4)).is_err(), "longer than the mask");
+    assert!(run(&mut p, slice(3)).is_ok());
+    let screen = |t: usize| Command::SetScreenMaskTangents {
+        screen: sid,
+        tangents: vec![(0.01, 0.0); t],
+    };
+    assert!(run(&mut p, screen(1)).is_err(), "screen has no mask");
+}

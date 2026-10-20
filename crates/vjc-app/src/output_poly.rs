@@ -103,21 +103,53 @@ pub(crate) fn finish_command(
         }),
         DrawFor::OutputMask => {
             let pts = slice_adv::clamp_poly(pts).ok()?;
-            Some(Command::SetScreenMask {
+            let set = Command::SetScreenMask {
                 screen: scr.id,
                 mask: Some(if pen {
                     Mask::Path(pts)
                 } else {
                     Mask::Polygon(pts)
                 }),
+            };
+            // A new drawing is a new shape: the old handles do not belong to it.
+            Some(if scr.output_mask_tangents.is_empty() {
+                set
+            } else {
+                Command::Batch {
+                    commands: vec![
+                        set,
+                        Command::SetScreenMaskTangents {
+                            screen: scr.id,
+                            tangents: vec![],
+                        },
+                    ],
+                }
             })
         }
         DrawFor::SliceMask(slice) => {
             let mask = slice_adv::clamp_poly(pts).ok()?;
-            Some(Command::SetSliceMask {
+            let set = Command::SetSliceMask {
                 screen: scr.id,
                 slice,
                 mask: Some(mask),
+            };
+            let old = scr
+                .slices
+                .iter()
+                .any(|s| s.id == slice && !s.mask_tangents.is_empty());
+            Some(if old {
+                Command::Batch {
+                    commands: vec![
+                        set,
+                        Command::SetSliceMaskTangents {
+                            screen: scr.id,
+                            slice,
+                            tangents: vec![],
+                        },
+                    ],
+                }
+            } else {
+                set
             })
         }
     }
@@ -394,6 +426,7 @@ impl State {
         };
         let curve_key = id.with("curve-drag");
         let mut curved = false;
+        let mut held = None;
         if let Some(c) = &curve
             && let Some(q) = resp.interact_pointer_pos()
         {
@@ -403,7 +436,7 @@ impl State {
                 let start = hit.filter(|_| alt);
                 ui.data_mut(|d| d.insert_temp::<Option<usize>>(curve_key, start));
             }
-            let held = ui.data(|d| d.get_temp::<Option<usize>>(curve_key).flatten());
+            held = ui.data(|d| d.get_temp::<Option<usize>>(curve_key).flatten());
             let mut next = tg.clone();
             next.resize(pts.len(), (0.0, 0.0));
             if resp.dragged()
@@ -455,9 +488,12 @@ impl State {
             },
             _ => set(next),
         };
-        let moved = moved.filter(|_| !curved && !(alt && curve.is_some()));
-        if curved {
-        } else if let Some((i, mut q)) = moved.filter(|&(i, _)| i < pts.len()) {
+        // Only a press that began on a point under Alt is a handle gesture; the rest of the
+        // canvas (moves, Delete, adding points) works as usual.
+        let handle_gesture = curved || held.is_some();
+        let moved = moved.filter(|_| !handle_gesture);
+        let delete = delete && !handle_gesture;
+        if let Some((i, mut q)) = moved.filter(|&(i, _)| i < pts.len()) {
             if shift {
                 q = snap_norm(pts[(i + pts.len() - 1) % pts.len()], q, size);
             }
@@ -477,9 +513,12 @@ impl State {
             }
             cmds.push(with_handles(next, t));
         } else if let Some(at) = ui.input(|i| {
-            (i.pointer.primary_clicked() && resp.hovered())
-                .then(|| i.pointer.interact_pos())
-                .flatten()
+            (i.pointer.primary_clicked()
+                && resp.hovered()
+                && !handle_gesture
+                && !(alt && curve.is_some()))
+            .then(|| i.pointer.interact_pos())
+            .flatten()
         }) {
             let q = (
                 (at.x - rect.min.x) / rect.width(),

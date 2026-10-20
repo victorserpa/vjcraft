@@ -1465,8 +1465,8 @@ fn apply_inner_meshes(
 }
 
 /// Mask handles that are finite and at most as many as a mask has points.
-fn checked_tangents(t: Vec<(f32, f32)>) -> Result<Vec<(f32, f32)>, Error> {
-    let ok = t.len() <= slice_adv::MAX_POLY_POINTS
+fn checked_tangents(t: Vec<(f32, f32)>, points: usize) -> Result<Vec<(f32, f32)>, Error> {
+    let ok = t.len() <= points
         && t.iter()
             .all(|h| h.0.is_finite() && h.1.is_finite() && h.0.abs() <= 8.0 && h.1.abs() <= 8.0);
     if ok { Ok(t) } else { Err(Error::InvalidValue) }
@@ -3540,8 +3540,9 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             undoable(Command::SetScreenMask { screen, mask: prev }, vec![])
         }
         Command::SetScreenMaskTangents { screen, tangents } => {
-            let tangents = checked_tangents(tangents)?;
             let s = screen_mut(p, screen)?;
+            let n = s.output_mask.as_ref().map_or(0, |m| m.points().len());
+            let tangents = checked_tangents(tangents, n)?;
             let prev = std::mem::replace(&mut s.output_mask_tangents, tangents);
             let inverse = Command::SetScreenMaskTangents {
                 screen,
@@ -3554,8 +3555,8 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             slice,
             tangents,
         } => {
-            let tangents = checked_tangents(tangents)?;
             let s = slice_mut(p, screen, slice)?;
+            let tangents = checked_tangents(tangents, s.mask.as_ref().map_or(0, Vec::len))?;
             let prev = std::mem::replace(&mut s.mask_tangents, tangents);
             let inverse = Command::SetSliceMaskTangents {
                 screen,
