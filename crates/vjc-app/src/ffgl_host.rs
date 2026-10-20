@@ -43,6 +43,18 @@ struct Inner {
     /// Tests: always use this cache file.
     #[cfg(test)]
     cache: Mutex<Option<PathBuf>>,
+    /// Cache file in the temp folder (no data folder): removed with the host.
+    temp_cache: Mutex<Option<PathBuf>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Ok(c) = self.temp_cache.get_mut()
+            && let Some(p) = c.take()
+        {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// Cheap to clone: all clones share one catalog and rack.
@@ -70,6 +82,12 @@ impl FfglHost {
 
     pub fn scanning(&self) -> bool {
         self.inner.catalog.lock().is_ok_and(|c| c.scanning)
+    }
+
+    /// The temp cache file in use, if any.
+    #[cfg(test)]
+    pub fn temp_cache(&self) -> Option<PathBuf> {
+        self.inner.temp_cache.lock().ok()?.clone()
     }
 
     #[cfg(test)]
@@ -100,13 +118,18 @@ impl FfglHost {
         if let Some(c) = self.inner.cache.lock().unwrap().clone() {
             cache = Some(c);
         }
+        let cache = cache.unwrap_or_else(|| {
+            let p =
+                std::env::temp_dir().join(format!("vjc-ffgl-cache-{}.json", std::process::id()));
+            if let Ok(mut t) = self.inner.temp_cache.lock() {
+                *t = Some(p.clone());
+            }
+            p
+        });
         let inner = self.inner.clone();
         let spawned = std::thread::Builder::new().name("ffgl-scan".into()).spawn({
             let inner = inner.clone();
             move || {
-                let cache = cache.unwrap_or_else(|| {
-                    std::env::temp_dir().join(format!("vjc-ffgl-cache-{}.json", std::process::id()))
-                });
                 let helper = vjc_ffgl::helper_path();
                 let (found, _) = if force {
                     vjc_ffgl::scan_forced(&dirs, &cache, &helper)
@@ -147,25 +170,7 @@ impl FfglHost {
     /// A new effect for the plugin `kind` (`ffgl:<id>`), with one param per plugin parameter.
     pub fn new_effect(&self, kind: &str) -> Option<Effect> {
         let inputs = self.inputs(kind)?;
-        let params = inputs
-            .iter()
-            .filter_map(|i| {
-                let (value, range) = match &i.kind {
-                    vjc_fx::InputKind::Float { min, max, default } => {
-                        (Value::Number(*default), Some((*min, *max)))
-                    }
-                    vjc_fx::InputKind::Bool { default } => (Value::Bool(*default), None),
-                    _ => return None,
-                };
-                Some(Param {
-                    name: i.name.clone(),
-                    default: value.clone(),
-                    value,
-                    range,
-                    animation: None,
-                })
-            })
-            .collect();
+        let (params, _) = params_for(&inputs);
         Some(Effect {
             blend: Default::default(),
             id: uuid::Uuid::new_v4(),
@@ -200,10 +205,17 @@ impl FfglHost {
         Some(fx)
     }
 
-    /// Passes this frame's param values to the plugin (by position).
-    pub fn apply_params(fx: &Shared, params: &[Param]) {
+    /// Plugin parameter index of each param of an effect of this kind.
+    pub fn index_map(&self, kind: &str) -> Vec<usize> {
+        self.inputs(kind)
+            .map(|i| params_for(&i).1)
+            .unwrap_or_default()
+    }
+
+    /// Hands this frame's param values to the plugin; they travel with the next frame.
+    pub fn apply_params(fx: &Shared, params: &[Param], index: &[usize]) {
         let Ok(mut f) = fx.lock() else { return };
-        for (i, p) in params.iter().enumerate() {
+        for (p, &i) in params.iter().zip(index) {
             let v = match p.value {
                 Value::Number(n) => n as f32,
                 Value::Bool(b) => f32::from(u8::from(b)),
@@ -213,11 +225,15 @@ impl FfglHost {
         }
     }
 
-    /// "Plugin stopped" when the helper of this effect crashed, hung or was never started.
+    /// "Plugin stopped" when the helper of this effect crashed or hung; else a host remark
+    /// (such as the input being resized).
     pub fn badge(&self, e: &Effect) -> Option<String> {
         let rack = self.inner.rack.lock().ok()?;
         let fx = rack.get(&e.id)?.fx.lock().ok()?;
-        matches!(fx.status, Status::Stopped(_)).then(|| "Plugin stopped".to_string())
+        if matches!(fx.status, Status::Stopped(_)) {
+            return Some("Plugin stopped".to_string());
+        }
+        fx.note.clone()
     }
 
     /// Why the plugin stopped, for a tooltip.
@@ -252,15 +268,28 @@ impl FfglHost {
     }
 }
 
-/// Effect params for the inputs, and the plugin parameter index of each (TODO stub).
-pub fn params_for(_inputs: &[vjc_fx::Input]) -> (Vec<Param>, Vec<usize>) {
-    (vec![], vec![])
-}
-
-impl FfglHost {
-    /// Temp cache file of a scan without a data folder (TODO stub).
-    #[cfg(test)]
-    pub fn temp_cache(&self) -> Option<PathBuf> {
-        None
+/// Effect params for the plugin inputs, and the plugin parameter index of each one. Inputs
+/// that are not a number or a switch get no param; the index list keeps the others aimed at
+/// their real plugin parameter.
+pub fn params_for(inputs: &[vjc_fx::Input]) -> (Vec<Param>, Vec<usize>) {
+    let mut params = Vec::new();
+    let mut index = Vec::new();
+    for (k, i) in inputs.iter().enumerate() {
+        let (value, range) = match &i.kind {
+            vjc_fx::InputKind::Float { min, max, default } => {
+                (Value::Number(*default), Some((*min, *max)))
+            }
+            vjc_fx::InputKind::Bool { default } => (Value::Bool(*default), None),
+            _ => continue,
+        };
+        params.push(Param {
+            name: i.name.clone(),
+            default: value.clone(),
+            value,
+            range,
+            animation: None,
+        });
+        index.push(k);
     }
+    (params, index)
 }

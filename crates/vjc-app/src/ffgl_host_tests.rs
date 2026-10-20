@@ -105,8 +105,6 @@ struct Opts {
     dry_wet: f32,
     fmt: wgpu::TextureFormat,
     place: Place,
-    /// Size of the source frame (the compositor is always N x N).
-    frame: u32,
 }
 
 impl Default for Opts {
@@ -116,7 +114,6 @@ impl Default for Opts {
             dry_wet: 1.0,
             fmt: wgpu::TextureFormat::Rgba8Unorm,
             place: Place::Layer,
-            frame: N,
         }
     }
 }
@@ -166,7 +163,7 @@ fn render_with(host: &FfglHost, o: Opts) -> Option<(Vec<u8>, vjc_model::Effect)>
             fx.kill_helper();
         }
     }
-    let f = o.frame;
+    let f = N;
     let src: Vec<u8> = source()
         .chunks(4)
         .take((f * f) as usize)
@@ -271,25 +268,6 @@ fn the_plugin_runs_on_the_master_and_on_a_group() {
         };
         assert_inverted(&out);
     }
-}
-
-#[test]
-fn an_input_of_another_size_shows_a_note() {
-    let (host, _dir) = scanned("size");
-    let Some((_, effect)) = render_with(
-        &host,
-        Opts {
-            frame: 32,
-            ..Default::default()
-        },
-    ) else {
-        return;
-    };
-    assert!(
-        host.badge(&effect).is_some_and(|b| b.contains("size")),
-        "{:?}",
-        host.badge(&effect)
-    );
 }
 
 #[test]

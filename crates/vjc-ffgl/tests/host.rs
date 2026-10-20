@@ -186,8 +186,8 @@ fn out_of_range_index_and_non_finite_values_are_rejected_locally() {
 #[test]
 fn enable_stays_stopped_when_restoring_a_parameter_fails() {
     let mut e = effect(5000);
-    e.set_param(1, 0.75); // fixture aborts while setting this value
-    assert!(matches!(e.status, Status::Stopped(_)));
+    e.set_param(1, 0.75); // fixture aborts while setting this value; sent later
+    assert_eq!(e.status, Status::Running);
     e.enable(); // restore replays the same Set, which crashes again
     assert!(matches!(e.status, Status::Stopped(_)), "{:?}", e.status);
     let f = frame(80);

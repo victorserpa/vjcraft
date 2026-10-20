@@ -799,7 +799,11 @@ fn draw_chain(
                 continue;
             }
             if let Some(fx) = lib.ffgl.shared(e) {
-                ffgl_host::FfglHost::apply_params(&fx, &vjc_core::anim::resolve(&e.params, ctx));
+                ffgl_host::FfglHost::apply_params(
+                    &fx,
+                    &vjc_core::anim::resolve(&e.params, ctx),
+                    &lib.ffgl.index_map(&e.kind),
+                );
                 out.push(EffectDraw {
                     kind: e.kind.clone(),
                     uniforms: [[0.0; 4]; vjc_fx::MAX_SLOTS],

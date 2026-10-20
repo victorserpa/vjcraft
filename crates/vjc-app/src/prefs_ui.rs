@@ -448,7 +448,8 @@ impl State {
                             let busy = self.fx.ffgl.scanning();
                             if crate::widgets::btn_if(ui, !busy, "Rescan", Kind::Secondary).clicked() {
                                 let cache = crate::data_dir().map(|d| d.join("ffgl-cache.json"));
-                                self.fx.ffgl.rescan(&p.video.ffgl_dirs, cache, true);
+                                // only the saved folders, never the draft being edited
+                                self.fx.ffgl.rescan(&self.prefs.video.ffgl_dirs, cache, true);
                             }
                             let n = self.fx.ffgl.effect_entries().len();
                             ui.label(if busy {

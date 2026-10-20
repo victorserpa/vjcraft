@@ -25,6 +25,9 @@ pub enum Request {
         shm: String,
         w: u32,
         h: u32,
+        /// Parameter changes applied right before the frame (index, value).
+        #[serde(default)]
+        params: Vec<(u32, f32)>,
     },
     Quit,
 }
