@@ -12,6 +12,16 @@ use vjc_model::FitMode;
 use crate::ui_scale_slider_key;
 
 impl State {
+    /// A DJ address still being typed when Preferences closes is applied, not lost.
+    pub(crate) fn commit_dj_iface_buf(&mut self) {
+        let edited = std::mem::take(&mut self.dj_iface_edited);
+        if let Some(buf) = self.dj_iface_buf.take()
+            && edited
+        {
+            self.prefs.dj.interface = buf.trim().to_owned();
+        }
+    }
+
     pub(crate) fn prefs_window(&mut self, ctx: &egui::Context) {
         if !self.prefs_open {
             return;
@@ -19,6 +29,7 @@ impl State {
         let mut open = true;
         let mut done = false;
         let before = self.prefs.clone();
+        let mut list_shown = false;
         panel_window(ctx, "Preferences")
             .open(&mut open)
             .collapsible(false)
@@ -492,7 +503,10 @@ impl State {
                         ui.add_enabled_ui(d.enabled, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Network");
-                                let ifaces = crate::dj_io::local_ifaces();
+                                let ifaces = self
+                                    .dj_ifaces
+                                    .get_with(std::time::Instant::now(), crate::dj_io::local_ifaces)
+                                    .to_vec();
                                 if ifaces.is_empty() {
                                     // Cannot list interfaces here: typed address, applied
                                     // on Enter or when the field loses focus.
@@ -500,11 +514,16 @@ impl State {
                                         .dj_iface_buf
                                         .get_or_insert_with(|| d.interface.clone());
                                     let r = field_text(ui, buf, Width::Md, None);
+                                    if r.changed() {
+                                        self.dj_iface_edited = true;
+                                    }
                                     if r.lost_focus() {
                                         d.interface = buf.trim().to_owned();
                                         self.dj_iface_buf = None;
+                                        self.dj_iface_edited = false;
                                     }
                                 } else {
+                                    list_shown = true;
                                     let label = |ip: &str| -> String {
                                         if ip == "0.0.0.0" {
                                             return "Any".into();
@@ -744,6 +763,14 @@ impl State {
                     done = true;
                 }
             });
+        if list_shown {
+            // The list replaces the text field: an edited address is kept, an untouched
+            // buffer is dropped so it never overwrites a later pick.
+            self.commit_dj_iface_buf();
+        }
+        if !open || done {
+            self.commit_dj_iface_buf();
+        }
         if self.prefs != before {
             crate::apply_hw_decode(&self.prefs);
             self.prefs_dirty = true;

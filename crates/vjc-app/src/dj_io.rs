@@ -15,6 +15,9 @@ const TICK: Duration = Duration::from_millis(1);
 /// A failed open is tried again this often while the feature stays enabled.
 const RETRY: Duration = Duration::from_secs(2);
 
+/// While listening, the interface list is looked at this often to keep the sender filter right.
+const IFACE_POLL: Duration = Duration::from_secs(2);
+
 /// What the sockets should be: interface (None = off) and the two UDP ports.
 /// `0.0.0.0` means every network.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +100,30 @@ pub fn mirror_bpm(project: &mut vjc_model::Project, clock_bpm: f64, locked: bool
     vjc_core::apply(project, vjc_core::Command::SetBpm { bpm: clock_bpm }).is_ok()
 }
 
+/// `local_ifaces` kept for a short while: the Preferences window draws every frame and must
+/// not call `getifaddrs` each time.
+#[derive(Default)]
+pub struct IfaceCache {
+    at: Option<Instant>,
+    list: Vec<Iface>,
+}
+
+impl IfaceCache {
+    pub const TTL: Duration = Duration::from_secs(2);
+
+    /// The cached list; `list` is called (at most once) when it is older than [`Self::TTL`].
+    pub fn get_with(&mut self, now: Instant, list: impl FnOnce() -> Vec<Iface>) -> &[Iface] {
+        if self
+            .at
+            .is_none_or(|t| now.saturating_duration_since(t) >= Self::TTL)
+        {
+            self.list = list();
+            self.at = Some(now);
+        }
+        &self.list
+    }
+}
+
 /// Which senders are accepted: everyone, or those inside `ip`/`mask`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Filter {
@@ -158,6 +185,8 @@ pub struct Dj {
 struct Env {
     bind: Box<dyn Fn(u16) -> std::io::Result<UdpSocket> + Send>,
     retry: Duration,
+    /// Lists the local interfaces (swapped in tests).
+    ifaces: fn() -> Vec<Iface>,
     /// Loop turns of the worker (tests check it does not spin while disabled).
     turns: Arc<AtomicU64>,
 }
@@ -180,6 +209,7 @@ impl Dj {
         let env = Env {
             bind: Box::new(bind),
             retry: RETRY,
+            ifaces: local_ifaces,
             turns: Arc::default(),
         };
         if let Err(e) = start(Box::new(move || run(tx, cfg_rx, st, env))) {
@@ -298,6 +328,22 @@ struct Socks {
     beat: UdpSocket,
     status: UdpSocket,
     filter: Filter,
+    listen: Ipv4Addr,
+    /// Interfaces the filter was computed from.
+    ifaces: Vec<Iface>,
+}
+
+impl Socks {
+    /// Recomputes the filter when the interface list changed (cable plugged, DHCP lease,
+    /// Wi-Fi switch). True when it did.
+    fn refresh(&mut self, now: Vec<Iface>) -> bool {
+        if now == self.ifaces {
+            return false;
+        }
+        self.filter = Filter::for_listen(self.listen, &now);
+        self.ifaces = now;
+        true
+    }
 }
 
 fn open(c: &Cfg, st: &SharedStatus, env: &Env) -> Option<Socks> {
@@ -306,10 +352,13 @@ fn open(c: &Cfg, st: &SharedStatus, env: &Env) -> Option<Socks> {
     match both {
         Ok((beat, status)) => {
             set_status(st, Status::Listening(ip));
+            let ifaces = (env.ifaces)();
             Some(Socks {
                 beat,
                 status,
-                filter: Filter::for_listen(ip, &local_ifaces()),
+                filter: Filter::for_listen(ip, &ifaces),
+                listen: ip,
+                ifaces,
             })
         }
         Err(e) => {
@@ -339,6 +388,7 @@ fn run(tx: Sender<(Packet, Instant)>, cfg_rx: Receiver<Cfg>, status: SharedStatu
     let mut socks: Option<Socks> = None;
     let mut cur: Option<Cfg> = None;
     let mut retry_at: Option<Instant> = None;
+    let mut ifaces_at = Instant::now();
     let mut buf = vec![0u8; 2048];
     let mut out = vec![];
     loop {
@@ -378,7 +428,11 @@ fn run(tx: Sender<(Packet, Instant)>, cfg_rx: Receiver<Cfg>, status: SharedStatu
                 set_status(&status, Status::Off);
             }
         }
-        if let Some(s) = &socks {
+        if let Some(s) = &mut socks {
+            if ifaces_at.elapsed() >= IFACE_POLL {
+                ifaces_at = Instant::now();
+                s.refresh((env.ifaces)());
+            }
             drain(&s.beat, &s.filter, &mut buf, &mut out);
             drain(&s.status, &s.filter, &mut buf, &mut out);
             for p in out.drain(..) {
@@ -427,6 +481,7 @@ mod tests {
         Env {
             bind: Box::new(bind),
             retry,
+            ifaces: local_ifaces,
             turns: Arc::default(),
         }
     }
@@ -619,5 +674,66 @@ mod tests {
         assert!(!mirror_bpm(&mut p, 127.5, true), "no change, no write");
         assert!(!mirror_bpm(&mut p, 90.0, false), "not locked: left alone");
         assert_eq!(p.composition.tempo.bpm, 127.5);
+    }
+}
+
+#[cfg(test)]
+mod iface_tests {
+    use super::*;
+
+    fn iface(ip: [u8; 4]) -> Iface {
+        Iface {
+            name: "en0".into(),
+            ip: Ipv4Addr::from(ip),
+            mask: Ipv4Addr::new(255, 255, 255, 0),
+        }
+    }
+
+    fn socks(listen: Ipv4Addr, ifaces: Vec<Iface>) -> Socks {
+        Socks {
+            beat: bind(0).unwrap(),
+            status: bind(0).unwrap(),
+            filter: Filter::for_listen(listen, &ifaces),
+            listen,
+            ifaces,
+        }
+    }
+
+    #[test]
+    fn filter_follows_the_interface_list_while_listening() {
+        let ip = Ipv4Addr::new(192, 168, 1, 20);
+        // opened before the interface was up: nothing filtered
+        let mut s = socks(ip, vec![]);
+        assert!(s.filter.accepts(Ipv4Addr::new(10, 0, 0, 9)));
+        assert!(s.refresh(vec![iface([192, 168, 1, 20])]), "list changed");
+        assert!(!s.filter.accepts(Ipv4Addr::new(10, 0, 0, 9)));
+        assert!(s.filter.accepts(Ipv4Addr::new(192, 168, 1, 77)));
+        assert!(
+            !s.refresh(vec![iface([192, 168, 1, 20])]),
+            "same list, no work"
+        );
+        // the lease moved to another network
+        assert!(s.refresh(vec![iface([192, 168, 1, 20]), iface([10, 0, 0, 2])]));
+    }
+
+    #[test]
+    fn iface_list_is_cached_for_two_seconds() {
+        let t0 = Instant::now();
+        let mut c = IfaceCache::default();
+        let mut calls = 0;
+        for ms in [0, 16, 32, 1900] {
+            c.get_with(t0 + Duration::from_millis(ms), || {
+                calls += 1;
+                vec![iface([192, 168, 1, 20])]
+            });
+        }
+        assert_eq!(calls, 1);
+        let n = c
+            .get_with(t0 + Duration::from_millis(2100), || {
+                calls += 1;
+                vec![]
+            })
+            .len();
+        assert_eq!((calls, n), (2, 0));
     }
 }

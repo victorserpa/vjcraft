@@ -43,6 +43,9 @@ struct Catalog {
 pub struct ClapHost {
     catalog: Arc<Mutex<Catalog>>,
     rack: Mutex<HashMap<EffectId, Arc<ClapShared>>>,
+    /// Tests: scan only the given folders, with this cache file.
+    #[cfg(test)]
+    isolated: Option<PathBuf>,
 }
 
 impl ClapHost {
@@ -58,6 +61,11 @@ impl ClapHost {
     }
 
     #[cfg(test)]
+    pub fn isolate(&mut self, cache: PathBuf) {
+        self.isolated = Some(cache);
+    }
+
+    #[cfg(test)]
     pub fn set_entries(&self, entries: Vec<Entry>) {
         if let Ok(mut c) = self.catalog.lock() {
             c.entries = entries;
@@ -66,18 +74,27 @@ impl ClapHost {
 
     /// Scans in a background thread (nothing happens while a scan runs). The cache file keeps
     /// the plugin info by path and mtime, so only new or changed files are loaded.
-    /// `force` (the Rescan button) also retries the files remembered as failed.
-    pub fn rescan(&self, extra_dirs: &[String], cache: Option<PathBuf>, force: bool) {
+    /// `force` (the Rescan button) also retries the files remembered as failed. Returns whether
+    /// a scan was started (false while another one runs).
+    pub fn rescan(&self, extra_dirs: &[String], cache: Option<PathBuf>, force: bool) -> bool {
         {
             let Ok(mut c) = self.catalog.lock() else {
-                return;
+                return false;
             };
             if c.scanning {
-                return;
+                return false;
             }
             c.scanning = true;
         }
-        let dirs = scan_dirs(extra_dirs);
+        #[allow(unused_mut)]
+        let mut dirs = scan_dirs(extra_dirs);
+        #[allow(unused_mut)]
+        let mut cache = cache;
+        #[cfg(test)]
+        if let Some(c) = &self.isolated {
+            dirs = extra_dirs.iter().map(PathBuf::from).collect();
+            cache = Some(c.clone());
+        }
         let cat = self.catalog.clone();
         let spawned = std::thread::Builder::new().name("clap-scan".into()).spawn({
             let cat = cat.clone();
@@ -100,7 +117,9 @@ impl ClapHost {
             && let Ok(mut c) = cat.lock()
         {
             c.scanning = false;
+            return false;
         }
+        true
     }
 
     /// The shared state of a CLAP effect (made on first use from the values in the project);

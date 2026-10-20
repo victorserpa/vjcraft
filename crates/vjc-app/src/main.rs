@@ -164,6 +164,8 @@ struct State {
     audio: Option<AudioEngine>,
     /// CLAP plugin catalog and per-effect plugin state.
     clap: clap_host::ClapHost,
+    /// CLAP folders (from the preferences) the last scan was started with.
+    clap_dirs_scanned: Vec<String>,
     /// Click output, created the first time a beat lands with Metronome on.
     metro: Option<vjc_media::audio::Metronome>,
     audio_failed: bool,
@@ -310,6 +312,10 @@ struct State {
     dj_cfg: Option<dj_io::Cfg>,
     /// Interface text being typed in Preferences > DJ sync (applied on commit only).
     dj_iface_buf: Option<String>,
+    /// The user typed in `dj_iface_buf` (an untouched buffer is not committed on close).
+    dj_iface_edited: bool,
+    /// Interfaces listed for Preferences > DJ sync, refreshed every couple of seconds.
+    dj_ifaces: dj_io::IfaceCache,
     dj_tracker: vjc_core::djlink::Tracker,
     dj_follow: vjc_core::djlink::Follower,
     dmx: dmx_io::Dmx,
@@ -2095,6 +2101,7 @@ impl State {
             monitors_polled: (!live).then(std::time::Instant::now),
             persist: live,
             audio_failed: !live,
+            clap_dirs_scanned: prefs.audio.clap_dirs.clone(),
             audio_cfg: audio_prefs::out_config(&prefs.audio),
             audio_error: false,
             audio_outputs: None,
@@ -2162,6 +2169,8 @@ impl State {
             },
             dj_cfg: None,
             dj_iface_buf: None,
+            dj_iface_edited: false,
+            dj_ifaces: Default::default(),
             dj_tracker: Default::default(),
             dj_follow: Default::default(),
             dmx: if live {
@@ -3210,6 +3219,21 @@ impl State {
         });
     }
 
+    /// New or removed plugin folders: scan again. While a scan runs this does nothing and the
+    /// per-frame call retries once it has finished.
+    fn sync_clap_dirs(&mut self) {
+        if self.prefs.audio.clap_dirs == self.clap_dirs_scanned {
+            return;
+        }
+        let cache = self
+            .persist
+            .then(|| data_dir().map(|d| d.join("clap-cache.json")))
+            .flatten();
+        if self.clap.rescan(&self.prefs.audio.clap_dirs, cache, false) {
+            self.clap_dirs_scanned = self.prefs.audio.clap_dirs.clone();
+        }
+    }
+
     fn save_prefs(&mut self) {
         // Out-of-range wishes (rate, buffer, channels) never reach the engine.
         self.prefs.sanitize();
@@ -3227,6 +3251,7 @@ impl State {
         }
         self.audio_react
             .set_config(audio_react::InCfg::from_prefs(&self.prefs.audio));
+        self.sync_clap_dirs();
         let Some(p) = self.persist.then(prefs_path).flatten() else {
             self.prefs_dirty = false;
             return;
@@ -4859,6 +4884,10 @@ impl State {
         );
         // DJ players (Preferences > DJ sync) steer tempo and bar phase; Link wins if on.
         self.dj_pump(now, !on);
+        // Only saved folders are scanned: never half-typed paths while Preferences is open.
+        if !self.prefs_open {
+            self.sync_clap_dirs();
+        }
         // Transport of the tempo clock follows the saved play state.
         match self.project.composition.tempo.play_state {
             vjc_model::PlayState::Play => self.clock.play(now),
@@ -6871,8 +6900,14 @@ impl State {
                 self.dj_follow.state,
                 vjc_core::djlink::SyncState::Locked { .. }
             );
+        self.mirror_dj_tempo(locked);
+    }
+
+    /// Copies the followed player's tempo into the project. Live state: the project is not
+    /// marked dirty (no "unsaved changes" prompt because a fader moved) and no history entry
+    /// is made; the value is simply saved along with the next explicit save.
+    fn mirror_dj_tempo(&mut self, locked: bool) {
         if dj_io::mirror_bpm(&mut self.project, self.clock.bpm(), locked) {
-            self.dirty = true;
             self.project_gen += 1;
         }
     }

@@ -7429,6 +7429,100 @@ fn audio_prefs_are_sanitized_before_they_reach_the_engine() {
     assert_eq!(st.audio_cfg.channels, None);
 }
 
+fn wait_clap_idle(st: &State) {
+    let t = std::time::Instant::now();
+    while st.clap.scanning() && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!st.clap.scanning(), "scan did not finish");
+}
+
+#[test]
+fn saving_prefs_with_new_clap_folders_starts_a_rescan() {
+    let d = multi_dir("clap-rescan");
+    let mut h = app();
+    let st = h.state_mut();
+    st.clap.isolate(d.join("cache.json"));
+    assert!(!st.clap.scanning(), "app() starts no scan");
+    st.prefs.audio.clap_dirs.push(d.display().to_string());
+    st.save_prefs();
+    assert_eq!(st.clap_dirs_scanned, st.prefs.audio.clap_dirs);
+    wait_clap_idle(st);
+    assert!(
+        d.join("cache.json").exists(),
+        "the scan ran on the isolated cache"
+    );
+}
+
+#[test]
+fn folder_change_saved_during_a_scan_is_scanned_when_it_ends() {
+    let d = multi_dir("clap-pending");
+    let mut h = app();
+    let st = h.state_mut();
+    st.clap.isolate(d.join("cache.json"));
+    st.prefs.audio.clap_dirs.push(d.display().to_string());
+    st.save_prefs(); // scan 1 starts
+    let d2 = d.join("second");
+    std::fs::create_dir_all(&d2).unwrap();
+    st.prefs.audio.clap_dirs.push(d2.display().to_string());
+    st.save_prefs(); // may land while scan 1 runs
+    wait_clap_idle(st);
+    st.sync_clap_dirs(); // the per-frame call
+    wait_clap_idle(st);
+    assert_eq!(
+        st.clap_dirs_scanned, st.prefs.audio.clap_dirs,
+        "nothing left pending"
+    );
+}
+
+#[test]
+fn picked_dj_interface_is_not_overwritten_by_an_old_typed_buffer() {
+    let mut h = app();
+    let st = h.state_mut();
+    // The interface list appears while an address is being typed: the edit is kept.
+    st.dj_iface_buf = Some("1.2.3.4".into());
+    st.dj_iface_edited = true;
+    st.commit_dj_iface_buf();
+    assert_eq!(
+        st.prefs.dj.interface, "1.2.3.4",
+        "a typed address is not lost"
+    );
+    // Then an interface is picked from the list, and Preferences closes.
+    st.prefs.dj.interface = "10.0.0.5".into();
+    st.commit_dj_iface_buf();
+    assert_eq!(st.prefs.dj.interface, "10.0.0.5", "the pick wins");
+    // An untouched buffer is never committed.
+    st.dj_iface_buf = Some("9.9.9.9".into());
+    st.commit_dj_iface_buf();
+    assert_eq!(st.prefs.dj.interface, "10.0.0.5");
+}
+
+#[test]
+fn dj_tempo_mirror_neither_dirties_nor_touches_history() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.project.composition.tempo.bpm = 90.0;
+    st.dirty = false;
+    assert!(!st.history.can_undo());
+    let gen_before = st.project_gen;
+    st.mirror_dj_tempo(true);
+    assert_eq!(st.project.composition.tempo.bpm, st.clock.bpm(), "mirrored");
+    assert!(!st.dirty, "live tempo must not dirty the project");
+    assert!(!st.history.can_undo(), "no undo entry");
+    assert!(st.project_gen > gen_before, "caches still see the change");
+}
+
+#[test]
+fn closing_prefs_commits_a_typed_dj_address() {
+    let mut h = app();
+    let st = h.state_mut();
+    st.dj_iface_buf = Some(" 192.168.7.9 ".into());
+    st.dj_iface_edited = true;
+    st.commit_dj_iface_buf();
+    assert_eq!(st.prefs.dj.interface, "192.168.7.9");
+    assert!(st.dj_iface_buf.is_none());
+}
+
 fn top_layer_no(h: &Harness<'_, State>) -> usize {
     h.state().project.composition.layers.len()
 }
