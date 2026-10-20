@@ -416,12 +416,23 @@ impl FfglEffect {
         if index >= self.params.len() || !value.is_finite() {
             return false;
         }
+        if self.params[index] == value {
+            return true; // already there: no round trip to the helper
+        }
         self.params[index] = value;
         self.call(Request::Set {
             index: index as u32,
             value,
         });
         true
+    }
+
+    /// Kills the helper process but leaves `status` alone, like a crash would: the next frame
+    /// finds the helper gone, passes through and reports "plugin stopped".
+    pub fn kill_helper(&mut self) {
+        if let Some(h) = self.helper.as_mut() {
+            h.kill();
+        }
     }
 
     /// Read a parameter back from the plugin.

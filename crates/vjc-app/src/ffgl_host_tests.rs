@@ -44,7 +44,11 @@ fn scanned(name: &str) -> (FfglHost, PathBuf) {
         "build the helper first: cargo build -p vjc-ffgl"
     );
     let host = FfglHost::default();
-    assert!(host.rescan(&[dir.display().to_string()], Some(dir.join("cache.json")), false));
+    assert!(host.rescan(
+        &[dir.display().to_string()],
+        Some(dir.join("cache.json")),
+        false
+    ));
     let t = std::time::Instant::now();
     while host.scanning() && t.elapsed() < std::time::Duration::from_secs(60) {
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -101,7 +105,15 @@ fn render(host: &FfglHost, kill_first: bool) -> Option<(Vec<u8>, vjc_model::Effe
     lib.ffgl = host.clone();
     let mut ml = crate::ml_fx::MlHub::new();
     let ctx = vjc_core::anim::AnimCtx::default();
-    let draws = crate::draw_chain(&mut lib, &mut ml, None, &[effect.clone()], 0.0, (N, N), &ctx);
+    let draws = crate::draw_chain(
+        &mut lib,
+        &mut ml,
+        None,
+        std::slice::from_ref(&effect),
+        0.0,
+        (N, N),
+        &ctx,
+    );
     assert_eq!(draws.len(), 1, "the ffgl effect is drawn");
     if let Some(fx) = host.shared(&effect) {
         let mut fx = fx.lock().unwrap();
@@ -139,11 +151,16 @@ fn render(host: &FfglHost, kill_first: bool) -> Option<(Vec<u8>, vjc_model::Effe
 #[test]
 fn a_layer_with_the_ffgl_effect_comes_out_inverted() {
     let (host, _dir) = scanned("invert");
-    let Some((out, _)) = render(&host, false) else { return };
+    let Some((out, _)) = render(&host, false) else {
+        return;
+    };
     for (i, (a, b)) in source().chunks(4).zip(out.chunks(4)).enumerate() {
         for c in 0..3 {
             let want = 255 - a[c] as i32;
-            assert!((want - b[c] as i32).abs() <= 1, "pixel {i} ch {c}: {a:?} -> {b:?}");
+            assert!(
+                (want - b[c] as i32).abs() <= 1,
+                "pixel {i} ch {c}: {a:?} -> {b:?}"
+            );
         }
     }
 }
@@ -151,11 +168,16 @@ fn a_layer_with_the_ffgl_effect_comes_out_inverted() {
 #[test]
 fn killing_the_helper_passes_the_frame_through_and_marks_the_plugin_stopped() {
     let (host, _dir) = scanned("kill");
-    let Some((out, effect)) = render(&host, true) else { return };
+    let Some((out, effect)) = render(&host, true) else {
+        return;
+    };
     let src = source();
     for (i, (a, b)) in src.chunks(4).zip(out.chunks(4)).enumerate() {
         for c in 0..3 {
-            assert!((a[c] as i32 - b[c] as i32).abs() <= 1, "pixel {i}: {a:?} vs {b:?}");
+            assert!(
+                (a[c] as i32 - b[c] as i32).abs() <= 1,
+                "pixel {i}: {a:?} vs {b:?}"
+            );
         }
     }
     assert_eq!(host.badge(&effect).as_deref(), Some("Plugin stopped"));
@@ -175,5 +197,63 @@ fn saving_prefs_with_ffgl_folders_starts_a_scan_of_those_folders_only() {
     while st.fx.ffgl.scanning() && t.elapsed() < std::time::Duration::from_secs(30) {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(dir.join("cache.json").exists(), "the scan ran on the isolated cache");
+    assert!(
+        dir.join("cache.json").exists(),
+        "the scan ran on the isolated cache"
+    );
+}
+
+/// Cost of one CPU round trip at 1080p (GPU readback + helper + upload). Run by hand:
+/// `cargo test -p vjc-app --bin vjcraft readback_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn readback_cost_1080p() {
+    let (host, _dir) = scanned("cost");
+    let Some((device, queue)) = gpu() else { return };
+    let id = vjc_ffgl::effect_id(&host.effect_entries()[0]);
+    let effect = host.new_effect(&id).unwrap();
+    let mut lib = crate::fx::FxLib::new();
+    lib.ffgl = host.clone();
+    let mut ml = crate::ml_fx::MlHub::new();
+    let ctx = vjc_core::anim::AnimCtx::default();
+    let (w, h) = (1920u32, 1080u32);
+    let src = vec![90u8; (w * h * 4) as usize];
+    let mut comp = Compositor::new(&device, w, h);
+    let mut times = vec![];
+    for _ in 0..12 {
+        let draws = crate::draw_chain(
+            &mut lib,
+            &mut ml,
+            None,
+            std::slice::from_ref(&effect),
+            0.0,
+            (w, h),
+            &ctx,
+        );
+        let layer = LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: draws,
+            frame: Some((w, h, &src, 1)),
+            generator: None,
+            transition: None,
+            transform: vjc_core::transform::Affine::IDENTITY,
+            channels: Default::default(),
+            mask: Default::default(),
+            orient: Default::default(),
+        };
+        let t = std::time::Instant::now();
+        comp.render(&device, &queue, &[layer], &[], 1.0);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        times.push(t.elapsed());
+    }
+    eprintln!(
+        "1080p frame with ffgl effect, ms: {:?}",
+        times
+            .iter()
+            .map(|t| t.as_secs_f64() * 1e3)
+            .collect::<Vec<_>>()
+    );
 }

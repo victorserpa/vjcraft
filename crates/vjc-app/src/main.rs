@@ -10,14 +10,15 @@ mod autopilot_ui;
 mod browser;
 mod capture;
 mod clap_host;
-#[cfg(test)]
-mod ffgl_host_tests;
 mod clip_thumbs;
 mod col_ops;
 mod color_depth;
 mod compositor;
 mod dj_io;
 mod dmx_io;
+mod ffgl_host;
+#[cfg(test)]
+mod ffgl_host_tests;
 mod frame_stats;
 mod fx;
 mod fx_thumbs;
@@ -168,6 +169,8 @@ struct State {
     clap: clap_host::ClapHost,
     /// CLAP folders (from the preferences) the last scan was started with.
     clap_dirs_scanned: Vec<String>,
+    /// FFGL folders (from the preferences) the last scan was started with.
+    ffgl_dirs_scanned: Vec<String>,
     /// Click output, created the first time a beat lands with Metronome on.
     metro: Option<vjc_media::audio::Metronome>,
     audio_failed: bool,
@@ -790,6 +793,27 @@ fn draw_chain(
 ) -> Vec<EffectDraw> {
     let mut out = vec![];
     for e in chain.iter().filter(|e| !e.bypass) {
+        // FFGL plugin: runs on the CPU in the compositor; no shader to wait for.
+        if ffgl_host::is_kind(&e.kind) {
+            if e.dry_wet.is_nan() || e.dry_wet <= 0.0 {
+                continue;
+            }
+            if let Some(fx) = lib.ffgl.shared(e) {
+                ffgl_host::FfglHost::apply_params(&fx, &vjc_core::anim::resolve(&e.params, ctx));
+                out.push(EffectDraw {
+                    kind: e.kind.clone(),
+                    uniforms: [[0.0; 4]; vjc_fx::MAX_SLOTS],
+                    dry_wet: e.dry_wet,
+                    blend: vjc_core::blend::fx_mix_id(&e.blend),
+                    lut: None,
+                    ml: None,
+                    persistent: None,
+                    ticking: false,
+                    ffgl: Some(fx),
+                });
+            }
+            continue;
+        }
         lib.request(&e.kind);
         if lib.status(&e.kind) != Some(&fx::Status::Ready) {
             continue;
@@ -835,6 +859,7 @@ fn draw_chain(
                 ml: ml_draw,
                 persistent: isf.needs_instance().then_some(e.id),
                 ticking: isf.tick_input.is_some(),
+                ffgl: None,
             });
         }
     }
@@ -1681,6 +1706,21 @@ fn browser_fx() -> &'static [browser::FxEntry] {
     })
 }
 
+/// `browser_fx` plus the effect plugins the FFGL host found, in their own group.
+fn browser_fx_with(ffgl: &ffgl_host::FfglHost) -> std::borrow::Cow<'static, [browser::FxEntry]> {
+    let plugins = ffgl.effect_entries();
+    if plugins.is_empty() {
+        return std::borrow::Cow::Borrowed(browser_fx());
+    }
+    let mut v = browser_fx().to_vec();
+    v.extend(plugins.iter().map(|e| browser::FxEntry {
+        name: e.info.name.clone(),
+        category: Some(ffgl_host::GROUP.to_string()),
+        item: browser::Item::Effect(vjc_ffgl::effect_id(e)),
+    }));
+    std::borrow::Cow::Owned(v)
+}
+
 fn project_dirs() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("", "", "VJCraft")
 }
@@ -2013,6 +2053,7 @@ impl State {
         // the plugin catalog is ready before the first audio effect is added, whether or not
         // the audio engine has opened yet
         s.start_clap_scan();
+        s.start_ffgl_scan();
         s
     }
 
@@ -2104,6 +2145,7 @@ impl State {
             persist: live,
             audio_failed: !live,
             clap_dirs_scanned: prefs.audio.clap_dirs.clone(),
+            ffgl_dirs_scanned: prefs.video.ffgl_dirs.clone(),
             audio_cfg: audio_prefs::out_config(&prefs.audio),
             audio_error: false,
             audio_outputs: None,
@@ -2576,6 +2618,13 @@ impl State {
                 act: Act::AddEffect(id.to_string()),
             });
         }
+        for e in self.fx.ffgl.effect_entries() {
+            v.push(Entry {
+                kind: Kind::Effect,
+                label: e.info.name.clone(),
+                act: Act::AddEffect(vjc_ffgl::effect_id(&e)),
+            });
+        }
         for (id, _) in vjc_fx::GENERATORS {
             v.push(Entry {
                 kind: Kind::Generator,
@@ -2647,7 +2696,7 @@ impl State {
     fn palette_run(&mut self, act: palette::Act) {
         use palette::{Act, Cmd};
         match act {
-            Act::AddEffect(id) => match vjc_fx::new_effect(&id) {
+            Act::AddEffect(id) => match self.new_fx(&id) {
                 Some(effect) => {
                     let target = self.palette_target();
                     self.exec(Command::AddEffect {
@@ -3236,6 +3285,41 @@ impl State {
         }
     }
 
+    /// Starts the background scan for FFGL plugins in the saved folders (cached by mtime).
+    fn start_ffgl_scan(&self) {
+        let cache = data_dir().map(|d| d.join("ffgl-cache.json"));
+        self.fx
+            .ffgl
+            .rescan(&self.prefs.video.ffgl_dirs, cache, false);
+    }
+
+    /// New or removed FFGL folders: scan again (retried per frame while a scan runs).
+    fn sync_ffgl_dirs(&mut self) {
+        if self.prefs.video.ffgl_dirs == self.ffgl_dirs_scanned {
+            return;
+        }
+        let cache = self
+            .persist
+            .then(|| data_dir().map(|d| d.join("ffgl-cache.json")))
+            .flatten();
+        if self
+            .fx
+            .ffgl
+            .rescan(&self.prefs.video.ffgl_dirs, cache, false)
+        {
+            self.ffgl_dirs_scanned = self.prefs.video.ffgl_dirs.clone();
+        }
+    }
+
+    /// A new effect by browser/palette id: a bundled one or an FFGL plugin.
+    fn new_fx(&self, id: &str) -> Option<vjc_model::Effect> {
+        if ffgl_host::is_kind(id) {
+            self.fx.ffgl.new_effect(id)
+        } else {
+            vjc_fx::new_effect(id)
+        }
+    }
+
     fn save_prefs(&mut self) {
         // Out-of-range wishes (rate, buffer, channels) never reach the engine.
         self.prefs.sanitize();
@@ -3254,6 +3338,7 @@ impl State {
         self.audio_react
             .set_config(audio_react::InCfg::from_prefs(&self.prefs.audio));
         self.sync_clap_dirs();
+        self.sync_ffgl_dirs();
         let Some(p) = self.persist.then(prefs_path).flatten() else {
             self.prefs_dirty = false;
             return;
@@ -4889,6 +4974,7 @@ impl State {
         // Only saved folders are scanned: never half-typed paths while Preferences is open.
         if !self.prefs_open {
             self.sync_clap_dirs();
+            self.sync_ffgl_dirs();
         }
         // Transport of the tempo clock follows the saved play state.
         match self.project.composition.tempo.play_state {
@@ -5288,7 +5374,7 @@ impl State {
                 } else {
                     None
                 };
-                match (target, vjc_fx::new_effect(&id)) {
+                match (target, self.new_fx(&id)) {
                     (Some(target), Some(effect)) => self.exec(Command::AddEffect {
                         target,
                         effect,
@@ -5773,6 +5859,7 @@ impl State {
             };
             self.fx.set_status(&done.kind, st);
         }
+        self.fx.ffgl.sweep();
         let time = self.fx_epoch.elapsed().as_secs_f32();
         self.ml.set_dir(ml_fx::models_dir(
             self.prefs.general.models_folder.as_ref(),
@@ -5829,6 +5916,7 @@ impl State {
                         ml: None,
                         persistent: None,
                         ticking: false,
+                        ffgl: None,
                     })
                 }
                 _ => None,
@@ -5976,6 +6064,7 @@ impl State {
                         ml: None,
                         persistent: None,
                         ticking: false,
+                        ffgl: None,
                     })
                 }
                 _ => None,
@@ -7825,7 +7914,8 @@ impl State {
                 }
             });
         });
-        let fxs = browser_fx();
+        let fxs = browser_fx_with(&self.fx.ffgl);
+        let fxs = &*fxs;
         let mut opened = None;
         let lay = self.prefs.layouts.current.clone();
         // A panel clipped by a small window keeps its clipped size in egui memory; when the
@@ -11584,13 +11674,18 @@ impl State {
             .to_vec();
         let n = chain.len();
         for (i, e) in chain.iter().enumerate() {
-            let inputs = self.fx.isf(&e.kind).map(|f| f.inputs.clone());
+            let inputs = self
+                .fx
+                .isf(&e.kind)
+                .map(|f| f.inputs.clone())
+                .or_else(|| self.fx.ffgl.inputs(&e.kind));
             let dials = self.dials_for(Some(target));
             let actx = self.anim_ctx(&dials);
             let failure = match self.fx.status(&e.kind) {
                 Some(fx::Status::Failed(why)) => Some(why.clone()),
                 _ => self.ml.problem(&e.kind, e.id),
             };
+            let stopped = self.fx.ffgl.badge(e);
             let open_id = ui.id().with(("fx-open", e.id));
             let open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(true);
             let mut toggle_open = false;
@@ -11600,7 +11695,21 @@ impl State {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        let name = ui.strong(fx_label(&e.kind));
+                        let label = self
+                            .fx
+                            .ffgl
+                            .name_of(&e.kind)
+                            .unwrap_or_else(|| fx_label(&e.kind));
+                        let name = ui.strong(label);
+                        if let Some(b) = &stopped {
+                            ui.colored_label(theme::WARN, b.as_str())
+                                .on_hover_text(self.fx.ffgl.stop_reason(e).unwrap_or_default());
+                            if crate::widgets::btn(ui, "Restart", crate::widgets::Kind::Secondary)
+                                .clicked()
+                            {
+                                self.fx.ffgl.restart(e);
+                            }
+                        }
                         name.context_menu(|ui| {
                             if crate::widgets::btn_if(
                                 ui,

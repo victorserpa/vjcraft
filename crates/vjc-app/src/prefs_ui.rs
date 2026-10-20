@@ -412,6 +412,57 @@ impl State {
                         });
                         help(ui, "Clips decoding on the GPU at once; the rest use software. Applies to clips opened afterwards.");
                         toggle(ui, &mut p.video.output_10bit, "10-bit output when the display allows it (applies on next launch)");
+                        ui.separator();
+                        ui.label("FFGL plugin folders");
+                        let mut remove = None;
+                        for (i, d) in p.video.ffgl_dirs.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(d);
+                                if btn(ui, "Remove", Kind::Secondary).clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(i) = remove {
+                            p.video.ffgl_dirs.remove(i);
+                        }
+                        ui.horizontal(|ui| {
+                            let id = ui.id().with("ffgl-dir-input");
+                            let mut t: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+                            field_text(ui, &mut t, Width::Lg, None);
+                            if btn(ui, "Choose...", Kind::Secondary).clicked()
+                                && let Some(d) = rfd::FileDialog::new().pick_folder()
+                            {
+                                t = d.display().to_string();
+                            }
+                            if crate::widgets::btn_if(ui, !t.trim().is_empty(), "Add folder", Kind::Secondary).clicked() {
+                                let d = t.trim().to_string();
+                                if !p.video.ffgl_dirs.contains(&d) {
+                                    p.video.ffgl_dirs.push(d);
+                                }
+                                t.clear();
+                            }
+                            ui.data_mut(|d| d.insert_temp(id, t));
+                        });
+                        ui.horizontal(|ui| {
+                            let busy = self.fx.ffgl.scanning();
+                            if crate::widgets::btn_if(ui, !busy, "Rescan", Kind::Secondary).clicked() {
+                                let cache = crate::data_dir().map(|d| d.join("ffgl-cache.json"));
+                                self.fx.ffgl.rescan(&p.video.ffgl_dirs, cache, true);
+                            }
+                            let n = self.fx.ffgl.effect_entries().len();
+                            ui.label(if busy {
+                                "Scanning...".to_string()
+                            } else {
+                                format!("{n} effect plugin(s) found")
+                            });
+                        });
+                        help(
+                            ui,
+                            "Folders with video effect plugins (FFGL 2). Only saved folders are searched. \
+                             Each plugin runs in its own helper process; one that crashes shows as stopped \
+                             on its layer and the picture passes through unchanged.",
+                        );
                     }
                     PrefsTab::Control => {
                         toggle(ui, &mut p.control.default_shortcuts, "New projects get the default shortcut preset");

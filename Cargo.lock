@@ -4686,6 +4686,7 @@ dependencies = [
  "vjc-avc",
  "vjc-clap",
  "vjc-core",
+ "vjc-ffgl",
  "vjc-fx",
  "vjc-io",
  "vjc-media",

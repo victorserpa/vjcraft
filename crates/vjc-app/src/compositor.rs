@@ -562,6 +562,9 @@ pub struct EffectDraw {
     /// The effect declares a tick input (freeze): only then does the runtime write the
     /// `NEW_TICK` flag into slot 0. Every other effect's uniforms are left as packed.
     pub ticking: bool,
+    /// An FFGL plugin instance: the effect runs on the CPU (read the layer back, process, upload).
+    /// A stopped plugin leaves the frame as it is.
+    pub ffgl: Option<crate::ffgl_host::Shared>,
 }
 
 /// Writes the `NEW_TICK` flag into slot 0 of a ticking effect (rate in, flag out) and
@@ -865,7 +868,8 @@ fn make_scratch(device: &wgpu::Device, fmt: wgpu::TextureFormat, (w, h): (u32, u
             format: fmt,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let v = t.create_view(&Default::default());
@@ -1089,8 +1093,11 @@ impl Fx {
             if plan == MixPlan::Skip {
                 continue;
             }
-            let Some(pipe) = self.pipes.get(&e.kind) else {
-                continue;
+            // An FFGL effect has no shader; `mix_pipe` only stands in for the unused binding.
+            let pipe = match self.pipes.get(&e.kind) {
+                Some(p) => p,
+                None if e.ffgl.is_some() => &self.mix_pipe,
+                None => continue,
             };
             let in_view = match cur {
                 None => input,
@@ -1131,7 +1138,49 @@ impl Fx {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
-            if let Some(passes) = self.passes.get(&e.kind) {
+            if let Some(f) = &e.ffgl {
+                // CPU path: read the input back, let the plugin process it, upload the result.
+                if !f
+                    .lock()
+                    .is_ok_and(|f| f.status == vjc_ffgl::Status::Running)
+                {
+                    continue; // stopped: the frame passes through
+                }
+                let in_tex = match cur {
+                    None => input.texture().clone(),
+                    Some(i) => scratch[i].0.clone(),
+                };
+                if (in_tex.width(), in_tex.height()) != size {
+                    continue;
+                }
+                // The input was drawn into `enc`: send it before reading.
+                let done =
+                    std::mem::replace(enc, device.create_command_encoder(&Default::default()));
+                queue.submit(Some(done.finish()));
+                let Some((w, h, px)) = Compositor::read_texture(device, queue, &in_tex) else {
+                    continue;
+                };
+                let frame = vjc_ffgl::Frame { w, h, rgba: px };
+                let Ok(mut f) = f.lock() else { continue };
+                let res = f.process(&frame);
+                if f.status != vjc_ffgl::Status::Running {
+                    continue;
+                }
+                queue.write_texture(
+                    scratch[out].0.as_image_copy(),
+                    &res.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            } else if let Some(passes) = self.passes.get(&e.kind) {
                 let base = e.persistent.map(|id| persist_key(id, self.persist_scope));
                 let names = vjc_fx::targets_of(passes);
                 // Buffer of each target name: persistent when any pass says so (and the
@@ -2822,6 +2871,7 @@ impl Compositor {
                         format: FORMAT,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING
                             | wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::COPY_SRC
                             | wgpu::TextureUsages::RENDER_ATTACHMENT,
                         view_formats: &[],
                     })
@@ -3754,6 +3804,7 @@ mod tests {
             ml: None,
             persistent: Some(uuid::Uuid::from_u128(99)),
             ticking: false,
+            ffgl: None,
         };
         let layer = LayerDraw {
             id: uuid::Uuid::from_u128(7),
@@ -4054,6 +4105,7 @@ mod tests {
             ml: None,
             persistent: None,
             ticking: false,
+            ffgl: None,
         };
         let src = [51u8, 102, 204, 255];
         for on_master in [false, true] {
@@ -4145,6 +4197,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -4220,6 +4273,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -4336,6 +4390,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -4526,6 +4581,7 @@ mod tests {
                     ml: None,
                     persistent: isf.needs_instance().then(|| uuid::Uuid::from_u128(77)),
                     ticking: false,
+                    ffgl: None,
                 };
                 let (effects, gen_draw, fr) = if generator {
                     (vec![], Some(draw), None)
@@ -4608,6 +4664,7 @@ mod tests {
                 ml: None,
                 persistent: isf.needs_instance().then(|| uuid::Uuid::from_u128(78)),
                 ticking: false,
+                ffgl: None,
             };
             let layer = [LayerDraw {
                 id: uuid::Uuid::from_u128(3),
@@ -4685,6 +4742,7 @@ mod tests {
             ml: None,
             persistent: None,
             ticking: false,
+            ffgl: None,
         };
         let src = [255u8, 255, 255, 255];
         // (chain, expected red)
@@ -4854,6 +4912,7 @@ mod tests {
                     ml: None,
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 };
                 let got = render_pixel(&mut comp, &device, &queue, vec![fx], src);
                 let d = 128.0 / 255.0;
@@ -4895,6 +4954,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }
         };
         let id = std::sync::Arc::new(vjc_fx::lut::Lut::identity(17));
@@ -4948,6 +5008,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             };
             render_pixel(&mut comp, &device, &queue, vec![fx], src)[0]
         };
@@ -5020,6 +5081,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             };
             let src = [255u8; 8];
             let layer = [LayerDraw {
@@ -5115,6 +5177,7 @@ mod tests {
                 ml: None,
                 persistent: instance_id,
                 ticking: false,
+                ffgl: None,
             };
             let mut last = [0u8; 4];
             for (serial, px) in [[255u8; 4], [0, 0, 0, 255]].iter().enumerate() {
@@ -5169,6 +5232,7 @@ mod tests {
             ml: None,
             persistent: Some(uuid::Uuid::from_u128(7)),
             ticking: false,
+            ffgl: None,
         };
         let mut comp = Compositor::new(&device, 1, 1);
         comp.add_effect(&device, "trails", &wgsl).unwrap();
@@ -5296,6 +5360,7 @@ mod tests {
             ml: None,
             persistent,
             ticking: isf.tick_input.is_some(),
+            ffgl: None,
         };
         let l = [layer(1, 1.0, BlendMode::Normal, vec![fx], data, serial)];
         comp.render(device, queue, &l, &[], 1.0);
@@ -5889,6 +5954,7 @@ mod tests {
                         ml: Some(ml.clone()),
                         persistent: None,
                         ticking: false,
+                        ffgl: None,
                     }],
                     frame: Some((2, 1, &red, 1)),
                     generator: None,
@@ -5964,6 +6030,7 @@ mod tests {
                     ml: Some(ml.clone()),
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 }],
                 frame: Some((2, 1, &red, 1)),
                 generator: None,
@@ -6046,6 +6113,7 @@ mod tests {
                     ml: None,
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 }],
                 frame: Some((1, 4, &img, 1)),
                 generator: None,
@@ -6311,6 +6379,7 @@ mod tests {
                         ml: Some(ml.clone()),
                         persistent: None,
                         ticking: false,
+                        ffgl: None,
                     }],
                     frame: Some((1, 4, &red, 1)),
                     generator: None,
@@ -6686,6 +6755,7 @@ mod tests {
             ml: None,
             persistent: None,
             ticking: false,
+            ffgl: None,
         };
         let (below, src) = ([255u8, 0, 0, 255], [51u8, 102, 204, 255]);
         let layers = [solid(1, &below, 1.0), solid(2, &src, 1.0)];
@@ -7051,6 +7121,7 @@ mod tests {
                     ml: None,
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 }
             })
             .collect();

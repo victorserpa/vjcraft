@@ -24,6 +24,8 @@ pub struct FxLib {
     tx: Sender<Compiled>,
     rx: Receiver<Compiled>,
     /// Parsed `.cube` files by path: modification time and the LUT (None = unreadable).
+    /// FFGL plugin catalog and running instances (shared with the Preferences and the browser).
+    pub ffgl: crate::ffgl_host::FfglHost,
     luts: HashMap<
         String,
         (
@@ -42,6 +44,7 @@ impl FxLib {
             tx,
             rx,
             luts: HashMap::new(),
+            ffgl: Default::default(),
         }
     }
 
