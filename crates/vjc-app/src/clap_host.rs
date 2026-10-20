@@ -43,6 +43,9 @@ struct Catalog {
 pub struct ClapHost {
     catalog: Arc<Mutex<Catalog>>,
     rack: Mutex<HashMap<EffectId, Arc<ClapShared>>>,
+    /// Tests: scan only the given folders, with this cache file.
+    #[cfg(test)]
+    isolated: Option<PathBuf>,
 }
 
 impl ClapHost {
@@ -55,6 +58,11 @@ impl ClapHost {
 
     pub fn scanning(&self) -> bool {
         self.catalog.lock().is_ok_and(|c| c.scanning)
+    }
+
+    #[cfg(test)]
+    pub fn isolate(&mut self, cache: PathBuf) {
+        self.isolated = Some(cache);
     }
 
     #[cfg(test)]
@@ -78,7 +86,15 @@ impl ClapHost {
             }
             c.scanning = true;
         }
-        let dirs = scan_dirs(extra_dirs);
+        #[allow(unused_mut)]
+        let mut dirs = scan_dirs(extra_dirs);
+        #[allow(unused_mut)]
+        let mut cache = cache;
+        #[cfg(test)]
+        if let Some(c) = &self.isolated {
+            dirs = extra_dirs.iter().map(PathBuf::from).collect();
+            cache = Some(c.clone());
+        }
         let cat = self.catalog.clone();
         let spawned = std::thread::Builder::new().name("clap-scan".into()).spawn({
             let cat = cat.clone();
