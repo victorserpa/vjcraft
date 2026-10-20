@@ -3014,4 +3014,18 @@ mod tests {
                 .additive_overlap
         );
     }
+
+    #[test]
+    fn fixture_input_slice_round_trips_and_defaults_to_none() {
+        let old: Fixture = serde_json::from_str(r#"{"name":"M"}"#).unwrap();
+        assert_eq!(old.input_slice, None);
+        for input_slice in [None, Some(Uuid::new_v4())] {
+            let f = Fixture {
+                input_slice,
+                ..Fixture::default()
+            };
+            let back: Fixture = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+            assert_eq!(back, f);
+        }
+    }
 }
