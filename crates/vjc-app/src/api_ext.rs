@@ -654,8 +654,9 @@ pub enum SnapSrc {
     Screen(uuid::Uuid),
 }
 
-/// A texture to read back: texture, size, whether it goes out black (black-out).
-pub type SnapTex<'a> = (&'a eframe::egui_wgpu::wgpu::Texture, (u32, u32), bool);
+/// A texture to read back and whether it goes out black (black-out). The size is the
+/// texture's own: the Preview and a screen need not match the composition.
+pub type SnapTex<'a> = (&'a eframe::egui_wgpu::wgpu::Texture, bool);
 
 /// Every texture a snapshot can come from, as of this frame.
 pub struct SnapTargets<'a> {
@@ -703,9 +704,10 @@ pub fn snap_plan(
                     .and_then(|i| i.checked_sub(1))
                     .and_then(|i| screens.get(usize::try_from(i).ok()?))
                     .copied(),
-                Some(Value::String(t)) => {
-                    t.parse::<uuid::Uuid>().ok().filter(|u| screens.contains(u))
-                }
+                Some(Value::String(t)) => match t.parse::<usize>() {
+                    Ok(i) => i.checked_sub(1).and_then(|i| screens.get(i)).copied(),
+                    Err(_) => t.parse::<uuid::Uuid>().ok().filter(|u| screens.contains(u)),
+                },
                 Some(_) => None,
             };
             id.map(SnapSrc::Screen).ok_or_else(none)
@@ -721,13 +723,94 @@ pub struct SnapJob {
     pub reply: std::sync::mpsc::SyncSender<Reply>,
     pub at: std::time::Instant,
     read: Option<Readback>,
+    /// Service passes that found no texture yet.
+    misses: u8,
 }
+
+/// Passes a job waits for its texture: a Preview or screen starts rendering only once the
+/// request asks for it, so the first one after idle finds nothing yet.
+const SNAP_WAIT_PASSES: u8 = 3;
 
 struct Readback {
     buf: eframe::egui_wgpu::wgpu::Buffer,
     state: crate::capture::MapState,
     size: (u32, u32),
+    bpp: u32,
+    bgra: bool,
     black: bool,
+}
+
+/// Starts the readback of `tex` at its own size; RGBA8, BGRA8 and half-float RGBA.
+fn start_read(
+    device: &eframe::egui_wgpu::wgpu::Device,
+    queue: &eframe::egui_wgpu::wgpu::Queue,
+    (tex, black): SnapTex,
+) -> Result<Readback, ApiErr> {
+    use eframe::egui_wgpu::wgpu::TextureFormat as F;
+    let (bpp, bgra) = match tex.format() {
+        F::Rgba8Unorm | F::Rgba8UnormSrgb => (4, false),
+        F::Bgra8Unorm | F::Bgra8UnormSrgb => (4, true),
+        F::Rgba16Float => (8, false),
+        f => return Err(err(500, format!("cannot read a {f:?} texture"))),
+    };
+    let size = (tex.width(), tex.height());
+    let stride = (size.0 * bpp).div_ceil(256) * 256;
+    let buf = device.create_buffer(&eframe::egui_wgpu::wgpu::BufferDescriptor {
+        label: Some("snapshot"),
+        size: u64::from(stride) * u64::from(size.1),
+        usage: eframe::egui_wgpu::wgpu::BufferUsages::COPY_DST
+            | eframe::egui_wgpu::wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        tex.as_image_copy(),
+        eframe::egui_wgpu::wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: eframe::egui_wgpu::wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(size.1),
+            },
+        },
+        eframe::egui_wgpu::wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(enc.finish()));
+    let state = crate::capture::map_read(&buf);
+    Ok(Readback {
+        buf,
+        state,
+        size,
+        bpp,
+        bgra,
+        black,
+    })
+}
+
+/// Mapped rows (padded) to tight RGBA8.
+fn to_rgba8(src: &[u8], r: &Readback) -> Vec<u8> {
+    let (w, h) = r.size;
+    let (row, stride) = (
+        (w * r.bpp) as usize,
+        (w * r.bpp).div_ceil(256) as usize * 256,
+    );
+    let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in 0..h as usize {
+        out.extend_from_slice(&src[y * stride..y * stride + row]);
+    }
+    if r.bpp == 8 {
+        out = crate::compositor::half_to_rgba8(&out);
+    }
+    if r.bgra {
+        for p in out.as_chunks_mut::<4>().0 {
+            p.swap(0, 2);
+        }
+    }
+    out
 }
 
 impl SnapJob {
@@ -738,6 +821,7 @@ impl SnapJob {
             reply,
             at: std::time::Instant::now(),
             read: None,
+            misses: 0,
         }
     }
 }
@@ -801,16 +885,11 @@ pub fn snap_service(
     let _ = device.poll(eframe::egui_wgpu::wgpu::PollType::Poll);
     jobs.retain_mut(|j| {
         if j.read.is_none() {
-            match snap_target(j.src, targets) {
-                Ok((tex, size, black)) => {
-                    let (buf, state) =
-                        crate::capture::start_readback(device, queue, tex, size, "snapshot");
-                    j.read = Some(Readback {
-                        buf,
-                        state,
-                        size,
-                        black,
-                    });
+            match snap_target(j.src, targets).and_then(|t| start_read(device, queue, t)) {
+                Ok(r) => j.read = Some(r),
+                Err(e) if e.status == 409 && j.misses < SNAP_WAIT_PASSES => {
+                    j.misses += 1;
+                    return true;
                 }
                 Err(e) => {
                     let _ = j.reply.try_send(Err(e));
@@ -835,7 +914,7 @@ pub fn snap_service(
                 .buf
                 .slice(..)
                 .get_mapped_range()
-                .map(|m| crate::capture::unpad(&m, w, h))
+                .map(|m| to_rgba8(&m, r))
                 .unwrap_or_default();
             r.buf.unmap();
             if r.black {
@@ -1196,6 +1275,21 @@ mod snap_plan_tests {
         assert_eq!(
             want(Some(json!(s[1].to_string()))).unwrap(),
             SnapSrc::Screen(s[1])
+        );
+    }
+
+    #[test]
+    fn output_screen_accepts_a_numeric_string_as_index() {
+        let s = ids();
+        assert_eq!(
+            snap_plan("output", Some(&json!("2")), false, &s).unwrap(),
+            SnapSrc::Screen(s[1])
+        );
+        assert_eq!(
+            snap_plan("output", Some(&json!("3")), false, &s)
+                .unwrap_err()
+                .status,
+            404
         );
     }
 

@@ -6297,16 +6297,14 @@ impl State {
             }
         }
         let targets = api_ext::SnapTargets {
-            comp: (comp.readable(), comp.size, self.master_bypass),
-            preview: comp
-                .preview_texture()
-                .map(|t| (t, comp.size, self.master_bypass)),
+            comp: (comp.readable(), self.master_bypass),
+            preview: comp.preview_texture().map(|t| (t, self.master_bypass)),
             screens: self
                 .screen_rt
                 .iter()
                 .map(|(id, t)| {
                     let black = self.master_bypass || self.blackouts.contains(id);
-                    (*id, (&t.tex, t.size, black))
+                    (*id, (&t.tex, black))
                 })
                 .collect(),
         };
