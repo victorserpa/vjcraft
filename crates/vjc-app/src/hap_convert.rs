@@ -394,6 +394,8 @@ pub fn run_job(
         Ok(c) => c,
         Err(e) => return fail(format!("cannot start ffmpeg: {e}")),
     };
+    let helper_pid = child.id();
+    crate::reliability::register_helper(helper_pid);
     let stdout = child.stdout.take();
     let tx2 = tx.clone();
     let reader = std::thread::spawn(move || {
@@ -443,6 +445,7 @@ pub fn run_job(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    crate::reliability::unregister_helper(helper_pid);
     // Not joined: a grandchild holding the pipe must not stall the cleanup.
     drop(reader);
     match result {

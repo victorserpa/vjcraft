@@ -121,6 +121,12 @@ fn sync_parent(path: &Path) {
 
 /// Saves `project` to `path`. Media inside the project folder become relative.
 pub fn save(project: &Project, path: &Path) -> Result<(), Error> {
+    write_atomic(path, &encode(project, path)?)?;
+    Ok(())
+}
+
+/// The bytes `save` would write to `path` (media inside the project folder relative).
+pub fn encode(project: &Project, path: &Path) -> Result<Vec<u8>, Error> {
     let mut p = project.clone();
     p.format_version = CURRENT_VERSION;
     // Pause is live state: a saved project never opens paused.
@@ -132,9 +138,7 @@ pub fn save(project: &Project, path: &Path) -> Result<(), Error> {
             }
         }
     }
-    let json = serde_json::to_vec_pretty(&p)?;
-    write_atomic(path, &json)?;
-    Ok(())
+    Ok(serde_json::to_vec_pretty(&p)?)
 }
 
 fn find_by_name(dir: &Path, name: &std::ffi::OsStr, depth: u32) -> Option<PathBuf> {
@@ -286,6 +290,71 @@ mod tests {
         let bytes = encode(&p, &b).unwrap();
         write_atomic(&b, &bytes).unwrap();
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    /// Snapshot cost (docs/specs/orphan-recovery-off-ui.md): `encode` of a 64-layer project.
+    /// Run: cargo test -p vjc-io --release -- --ignored --nocapture encode_cost
+    #[test]
+    #[ignore = "measurement"]
+    fn encode_cost_of_a_64_layer_project() {
+        let d = tmp("cost");
+        let mut p = Project::new("Big");
+        let proto = vjc_model::Layer {
+            color: None,
+            folded: false,
+            id: vjc_model::LayerId::new_v4(),
+            name: "L".into(),
+            track: vjc_model::Track::new(vjc_model::BlendMode::Normal),
+            solo: false,
+            bypass: false,
+            transition: vjc_model::Transition {
+                kind: "Cut".into(),
+                duration_beats: None,
+                duration_secs: 0.0,
+            },
+            autopilot: Default::default(),
+            crossfader_bus: None,
+            ignore_column_trigger: false,
+            lock_content: false,
+            fader_start: false,
+            extras: Default::default(),
+            mask_mode: Default::default(),
+            audio: true,
+            video: true,
+            trigger_mode: vjc_model::TriggerMode::Restart,
+            group: None,
+        };
+        p.composition.layers.clear();
+        let mut clips = vec![];
+        for i in 0..64 {
+            let mut l = proto.clone();
+            l.id = vjc_model::LayerId::new_v4();
+            l.name = format!("Layer {i}");
+            for c in 0..8 {
+                let mut clip = vjc_core::clip_from_path(d.join(format!("media/l{i}-c{c}.mp4")));
+                clip.name = format!("clip {i}-{c}");
+                clips.push(CellClip {
+                    layer: l.id,
+                    column: c,
+                    clip,
+                });
+            }
+            p.composition.layers.push(l);
+        }
+        p.composition.decks[0].clips = clips;
+        let f = d.join("big.vjc");
+        let mut times = vec![];
+        let mut len = 0;
+        for _ in 0..50 {
+            let t = std::time::Instant::now();
+            len = encode(&p, &f).unwrap().len();
+            times.push(t.elapsed());
+        }
+        times.sort();
+        println!(
+            "encode 64 layers x 8 clips: {len} bytes, median {:?}, max {:?}",
+            times[25], times[49]
+        );
     }
 
     #[test]

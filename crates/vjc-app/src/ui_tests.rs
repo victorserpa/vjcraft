@@ -9290,10 +9290,14 @@ fn recovery_publish_encodes_at_most_once_a_second_across_100_edits() {
         st.publish_recovery_to(Some(file.clone()));
     }
     assert_eq!(st.publish_count, 1);
-    // No change since: even past the throttle nothing is encoded again.
+    // Past the throttle the pending edits are published once...
     st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
     st.publish_recovery_to(Some(file.clone()));
-    assert_eq!(st.publish_count, 1, "unchanged project costs nothing");
+    assert_eq!(st.publish_count, 2);
+    // ...and with no change since, nothing is encoded again.
+    st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    st.publish_recovery_to(Some(file.clone()));
+    assert_eq!(st.publish_count, 2, "unchanged project costs nothing");
     reliability::slot_set(None);
 }
 

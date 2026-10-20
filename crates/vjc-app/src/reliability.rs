@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -418,7 +419,91 @@ pub static ORPHAN_QUITTING: AtomicBool = AtomicBool::new(false);
 /// How long the watcher waits for the UI loop to start the orphan quit before exiting. The
 /// watcher wakes the UI, so a live loop starts the quit within a frame; this only bounds a
 /// UI thread that is blocked (a heavy load, a modal dialog), which must still get to save.
-const ORPHAN_START_GRACE: Duration = Duration::from_secs(10);
+const ORPHAN_START_GRACE: Duration = Duration::from_secs(1);
+
+/// What the watcher writes if the UI never starts the orphan quit.
+pub struct Snapshot {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+
+impl Snapshot {
+    #[cfg(test)]
+    pub fn test(path: &Path) -> Self {
+        Snapshot {
+            path: path.to_path_buf(),
+            bytes: b"{}".to_vec(),
+        }
+    }
+}
+
+/// The latest recovery snapshot (`None` = nothing to write).
+static SLOT: Mutex<Option<Snapshot>> = Mutex::new(None);
+/// Held around every recovery write, so the fixed `.tmp` name is never shared.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// True in `--child` mode: only then does the UI publish snapshots.
+static CHILD_MODE: AtomicBool = AtomicBool::new(false);
+/// Pids of helper processes (ffmpeg) the watcher stops before it exits.
+static HELPERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn is_child() -> bool {
+    CHILD_MODE.load(Ordering::Relaxed)
+}
+
+pub fn slot_set(s: Option<Snapshot>) {
+    *lock(&SLOT) = s;
+}
+
+/// Clears the slot, then runs `f` with the write lock held (an in-flight watcher write
+/// finishes first), so a deleted recovery file is never brought back.
+pub fn clear_slot_then<R>(f: impl FnOnce() -> R) -> R {
+    slot_set(None);
+    let _w = lock(&WRITE_LOCK);
+    f()
+}
+
+/// `(path, bytes)` copy of the slot, for tests.
+#[cfg(test)]
+pub fn slot_peek() -> Option<Snapshot> {
+    lock(&SLOT).as_ref().map(|s| Snapshot {
+        path: s.path.clone(),
+        bytes: s.bytes.clone(),
+    })
+}
+
+/// Atomic recovery write under `WRITE_LOCK`.
+pub fn write_recovery(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let _w = lock(&WRITE_LOCK);
+    vjc_io::write_atomic(path, bytes)
+}
+
+pub fn register_helper(pid: u32) {
+    lock(&HELPERS).push(pid);
+}
+
+pub fn unregister_helper(pid: u32) {
+    lock(&HELPERS).retain(|p| *p != pid);
+}
+
+/// Watcher exit path: stop helpers, write the slot (if any).
+#[cfg(unix)]
+fn flush_slot_and_stop_helpers() {
+    for pid in lock(&HELPERS).iter() {
+        // SAFETY: SIGTERM to a pid this process spawned.
+        unsafe { libc::kill(*pid as i32, libc::SIGTERM) };
+    }
+    let snap = lock(&SLOT).take();
+    if let Some(s) = snap {
+        if let Some(d) = s.path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = write_recovery(&s.path, &s.bytes);
+    }
+}
 
 /// True once the supervisor died (SIGKILL, crash): the app must save and quit.
 pub fn parent_gone() -> bool {
@@ -432,6 +517,7 @@ pub fn parent_gone() -> bool {
 /// writing, so a large project's recovery file is not cut short.
 #[cfg(unix)]
 pub fn start_parent_watch() {
+    CHILD_MODE.store(true, Ordering::Relaxed);
     // SAFETY: getppid has no preconditions.
     let ppid = unsafe { libc::getppid() };
     // A supervisor pid that is not our parent means it already died: the baseline is then
@@ -460,6 +546,7 @@ pub fn start_parent_watch() {
                         }
                         std::thread::sleep(Duration::from_millis(50));
                     }
+                    flush_slot_and_stop_helpers();
                     std::process::exit(0);
                 }
             }
@@ -512,6 +599,17 @@ pub fn fake_child(args: &[String]) {
         }
         // SAFETY: the handler only calls _exit.
         unsafe { libc::signal(libc::SIGTERM, die as *const () as libc::sighandler_t) };
+        std::thread::sleep(Duration::from_secs(20));
+        std::process::exit(0);
+    }
+    if mode == "snapshot-stuck-ui" {
+        // As stuck-ui, but the UI published a snapshot before it got stuck.
+        if let Some(d) = crate::data_dir() {
+            slot_set(Some(Snapshot {
+                path: d.join("recovery.vjc"),
+                bytes: b"{\"published\":\"snapshot\"}".to_vec(),
+            }));
+        }
         std::thread::sleep(Duration::from_secs(20));
         std::process::exit(0);
     }
