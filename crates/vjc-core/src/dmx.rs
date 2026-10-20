@@ -1269,7 +1269,7 @@ mod tests {
             ..Fixture::default()
         };
         f.input.x = 0.25;
-        let (i, dangling) = resolve_input(&f, &[s.clone()], 400, 200);
+        let (i, dangling) = resolve_input(&f, std::slice::from_ref(&s), 400, 200);
         assert!(dangling);
         assert_eq!(i, f.input);
         // No link: the rect as is, not dangling.
@@ -1284,7 +1284,7 @@ mod tests {
             input_slice: Some(s.id),
             ..Fixture::default()
         };
-        let out = resolve_fixtures(&[f.clone()], &[s], 400, 200);
+        let out = resolve_fixtures(std::slice::from_ref(&f), std::slice::from_ref(&s), 400, 200);
         assert_eq!(out[0].input.w, 0.5);
         assert_eq!(out[0].input_slice, f.input_slice);
     }
