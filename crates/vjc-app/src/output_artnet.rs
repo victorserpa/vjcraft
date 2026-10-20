@@ -205,7 +205,7 @@ impl State {
         });
         // What the fixture samples: a free rectangle, or the area of one slice that it follows.
         let slice_label = |n: usize, s: &vjc_model::Slice| {
-            if s.name.is_empty() {
+            if s.name.trim().is_empty() {
                 format!("Slice {}", n + 1)
             } else {
                 s.name.clone()
@@ -237,13 +237,16 @@ impl State {
                     }
                 }
             });
-        if f.input_slice.is_some() && followed.is_none() {
+        // Same check the sender uses: a missing or empty slice falls back to the rectangle,
+        // which is then shown so what is on air can be seen and edited.
+        let (_, fallback) = dmx::resolve_input(f, &scr.slices, scr.width, scr.height);
+        if fallback {
             widgets::help(
                 ui,
-                "The followed slice is gone; sampling the free rectangle instead.",
+                "The followed slice is gone or has no area; sampling the free rectangle instead.",
             );
         }
-        if f.input_slice.is_none() {
+        if f.input_slice.is_none() || fallback {
             ui.label("Input (centre, size, rotation)");
             ui.horizontal(|ui| {
                 widgets::field_num(ui, &mut f.input.x, -2.0..=3.0, 0.005);
