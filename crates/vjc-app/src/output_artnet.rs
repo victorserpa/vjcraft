@@ -171,6 +171,7 @@ impl State {
                         *f = Fixture {
                             start_channel: f.start_channel,
                             input: f.input,
+                            input_slice: f.input_slice,
                             flip_h: f.flip_h,
                             flip_v: f.flip_v,
                             color: f.color,
@@ -202,29 +203,71 @@ impl State {
             toggle(ui, &mut f.flip_h, "Flip H");
             toggle(ui, &mut f.flip_v, "Flip V");
         });
-        ui.label("Input (centre, size, rotation)");
-        ui.horizontal(|ui| {
-            widgets::field_num(ui, &mut f.input.x, -2.0..=3.0, 0.005);
-            widgets::field_num(ui, &mut f.input.y, -2.0..=3.0, 0.005);
-            widgets::field_num(ui, &mut f.input.w, 0.01..=4.0, 0.005);
-            widgets::field_num(ui, &mut f.input.h, 0.01..=4.0, 0.005);
-            widgets::field_num(ui, &mut f.input.rotation, -360.0..=360.0, 0.5);
-            if widgets::btn(ui, "Whole screen", Kind::Secondary).clicked() {
-                f.input = Default::default();
+        // What the fixture samples: a free rectangle, or the area of one slice that it follows.
+        let slice_label = |n: usize, s: &vjc_model::Slice| {
+            if s.name.is_empty() {
+                format!("Slice {}", n + 1)
+            } else {
+                s.name.clone()
             }
-        });
-        // Sample the area of one slice of this screen instead of typing numbers. The slices
-        // are the working copy's (`scr`), not the project's, which lags while the window is open.
-        ui.menu_button("Fit to slice", |ui| {
-            for (n, s) in scr.slices.iter().enumerate() {
-                if ui.button(format!("Slice {}", n + 1)).clicked() {
-                    if let Some(i) = dmx::input_for_slice(s, scr.width, scr.height) {
-                        f.input = i;
-                    }
-                    ui.close();
+        };
+        let followed = f
+            .input_slice
+            .and_then(|id| scr.slices.iter().enumerate().find(|(_, s)| s.id == id));
+        let selected = match followed {
+            Some((n, s)) => format!("Slice: {}", slice_label(n, s)),
+            None => "Free rect".to_string(),
+        };
+        egui::ComboBox::from_label("Samples")
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(f.input_slice.is_none(), "Free rect")
+                    .clicked()
+                {
+                    f.input_slice = None;
                 }
-            }
-        });
+                for (n, s) in scr.slices.iter().enumerate() {
+                    let on = f.input_slice == Some(s.id);
+                    if ui
+                        .selectable_label(on, format!("Slice: {}", slice_label(n, s)))
+                        .clicked()
+                    {
+                        f.input_slice = Some(s.id);
+                    }
+                }
+            });
+        if f.input_slice.is_some() && followed.is_none() {
+            widgets::help(
+                ui,
+                "The followed slice is gone; sampling the free rectangle instead.",
+            );
+        }
+        if f.input_slice.is_none() {
+            ui.label("Input (centre, size, rotation)");
+            ui.horizontal(|ui| {
+                widgets::field_num(ui, &mut f.input.x, -2.0..=3.0, 0.005);
+                widgets::field_num(ui, &mut f.input.y, -2.0..=3.0, 0.005);
+                widgets::field_num(ui, &mut f.input.w, 0.01..=4.0, 0.005);
+                widgets::field_num(ui, &mut f.input.h, 0.01..=4.0, 0.005);
+                widgets::field_num(ui, &mut f.input.rotation, -360.0..=360.0, 0.5);
+                if widgets::btn(ui, "Whole screen", Kind::Secondary).clicked() {
+                    f.input = Default::default();
+                }
+            });
+            // One-off copy of a slice's area into the free rectangle. The slices are the
+            // working copy's (`scr`), not the project's, which lags while the window is open.
+            ui.menu_button("Fit to slice", |ui| {
+                for (n, s) in scr.slices.iter().enumerate() {
+                    if ui.button(format!("Slice {}", n + 1)).clicked() {
+                        if let Some(i) = dmx::input_for_slice(s, scr.width, scr.height) {
+                            f.input = i;
+                        }
+                        ui.close();
+                    }
+                }
+            });
+        }
         widgets::slider(ui, &mut f.color.brightness, 0.0..=2.0, "Brightness");
         widgets::slider(ui, &mut f.color.contrast, 0.0..=2.0, "Contrast");
         widgets::slider(ui, &mut f.color.r, 0.0..=2.0, "Red");

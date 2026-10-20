@@ -1601,6 +1601,10 @@ pub struct Fixture {
     pub start_channel: u16,
     /// Part of the screen this fixture samples (the whole screen by default).
     pub input: FixtureInput,
+    /// Slice of the same screen to follow: the fixture samples the bounding box of its
+    /// output area instead of `input`. `None` = use `input`; a slice that no longer exists
+    /// also falls back to `input`.
+    pub input_slice: Option<Uuid>,
     pub flip_h: bool,
     pub flip_v: bool,
     pub color: SliceColor,
@@ -1649,6 +1653,7 @@ impl Default for Fixture {
             serpentine: false,
             start_channel: 1,
             input: FixtureInput::default(),
+            input_slice: None,
             flip_h: false,
             flip_v: false,
             color: SliceColor::default(),

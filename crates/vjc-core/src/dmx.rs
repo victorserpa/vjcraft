@@ -643,6 +643,44 @@ pub fn input_for_slice(
     })
 }
 
+/// The rectangle a fixture samples: the bounding box of the slice it follows, else its own
+/// `input`. The flag is true when it follows a slice that does not exist (or is degenerate),
+/// so the UI can say it fell back.
+pub fn resolve_input(
+    f: &Fixture,
+    slices: &[vjc_model::Slice],
+    width: u32,
+    height: u32,
+) -> (vjc_model::FixtureInput, bool) {
+    let Some(id) = f.input_slice else {
+        return (f.input, false);
+    };
+    match slices
+        .iter()
+        .find(|s| s.id == id)
+        .and_then(|s| input_for_slice(s, width, height))
+    {
+        Some(i) => (i, false),
+        None => (f.input, true),
+    }
+}
+
+/// Copies of `fixtures` whose `input` is what they sample right now (see `resolve_input`).
+pub fn resolve_fixtures(
+    fixtures: &[Fixture],
+    slices: &[vjc_model::Slice],
+    width: u32,
+    height: u32,
+) -> Vec<Fixture> {
+    fixtures
+        .iter()
+        .map(|f| Fixture {
+            input: resolve_input(f, slices, width, height).0,
+            ..f.clone()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
