@@ -24,6 +24,9 @@ struct U {
                                 // flags bit 0 invert mask, bit 1 is key, bit 2 black bg
     sgain: vec4<f32>,           // screen rgb multiplier
     ext: vec4<f32>,             // slice shape point count, output mask point count
+    tf: vec4<f32>,              // content transform: scale, shift x, shift y, rotation (radians)
+    piv: vec4<f32>,             // input area centre x, y, width, height (source UV)
+    tfx: vec4<f32>,             // source aspect (w / h), transform active (0 or 1)
     pts: array<vec4<f32>, 96>,  // two points per entry: mask 0.., shape 32.., output mask 64..
 };
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -47,6 +50,17 @@ fn ramp(d: f32, w: f32) -> f32 {
 fn contrast(c: vec3<f32>, k: f32) -> vec3<f32> {
     // Exactly 1.0 must not touch the pixel (no float round trip).
     return select(clamp((c - vec3(0.5)) * k + vec3(0.5), vec3(0.0), vec3(1.0)), c, k == 1.0);
+}
+// Where the transformed content comes from: the pixel's source UV goes through the inverse
+// of the transform, pivoting on the centre of the input area.
+fn xform_uv(uv: vec2<f32>) -> vec2<f32> {
+    let asp = vec2(u.tfx.x, 1.0);
+    let d = (uv - u.piv.xy - u.tf.yz * u.piv.zw) * asp;
+    let c = cos(u.tf.w);
+    let s = sin(u.tf.w);
+    // Inverse turn (the content turns clockwise on screen, y points down).
+    let r = vec2(d.x * c + d.y * s, -d.x * s + d.y * c) / u.tf.x;
+    return u.piv.xy + r / asp;
 }
 fn inside(off: u32, n: u32, p: vec2<f32>) -> bool {
     var res = false;
@@ -79,7 +93,15 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     }
     let lin = ramp(in.st.x, u.edge.x) * ramp(1.0 - in.st.x, u.edge.y)
         * ramp(in.st.y, u.edge.z) * ramp(1.0 - in.st.y, u.edge.w);
-    var c = textureSample(src, smp, in.uv);
+    var uv = in.uv;
+    if (u.tfx.y > 0.5) {
+        uv = xform_uv(uv);
+    }
+    var c = textureSample(src, smp, uv);
+    if (u.tfx.y > 0.5 && (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)) {
+        // Outside the source: transparent.
+        c = vec4(0.0);
+    }
     let flags = u32(u.con.w);
     if ((flags & 2u) != 0u) {
         // Is Key: alpha as a grey level, opaque.
@@ -98,11 +120,13 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
 
 /// Points each polygon region (slice mask, slice shape, output mask) holds in the uniform.
 const REGION: usize = 64;
-/// Uniform block size: 6 vec4 + 3 regions of 32 vec4.
-const UNIFORM_FLOATS: usize = 24 + 3 * 2 * REGION;
+/// Floats before the point regions: 9 vec4.
+const HEADER: usize = 36;
+/// Uniform block size: the header + 3 regions of 32 vec4.
+const UNIFORM_FLOATS: usize = HEADER + 3 * 2 * REGION;
 
 /// Packs the per-slice uniform (see `U` in the shader).
-fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
+fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
     let mut u = vec![0.0f32; UNIFORM_FLOATS];
     let (mut n_mask, mut n_shape, mut n_out) = (0, 0, 0);
     if let Some(e) = &s.soft_edge {
@@ -113,8 +137,8 @@ fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
     }
     let mut put = |region: usize, pts: &[(f32, f32)]| {
         for (i, p) in pts.iter().enumerate() {
-            u[24 + 2 * (region * REGION + i)] = p.0;
-            u[25 + 2 * (region * REGION + i)] = p.1;
+            u[HEADER + 2 * (region * REGION + i)] = p.0;
+            u[HEADER + 1 + 2 * (region * REGION + i)] = p.1;
         }
     };
     if let Some(m) = s.mask.as_ref().filter(|m| mapping::mask_valid(m)) {
@@ -145,6 +169,19 @@ fn slice_uniform(screen: &Screen, s: &Slice) -> Vec<f32> {
     u[14] = screen.color.opacity;
     u[16..19].copy_from_slice(&mapping::slice_gain(&screen.color.color));
     u[19] = 1.0;
+    let t = &s.transform;
+    u[24..28].copy_from_slice(&[t.scale, t.offset.0, t.offset.1, t.rotation.to_radians()]);
+    let xs = s.input.iter().map(|p| p.0);
+    let ys = s.input.iter().map(|p| p.1);
+    let (x0, x1) = xs.fold((f32::MAX, f32::MIN), |a, v| (a.0.min(v), a.1.max(v)));
+    let (y0, y1) = ys.fold((f32::MAX, f32::MIN), |a, v| (a.0.min(v), a.1.max(v)));
+    if x1 > x0 && y1 > y0 {
+        u[28..32].copy_from_slice(&[(x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0]);
+    } else {
+        u[28..32].copy_from_slice(&[0.5, 0.5, 1.0, 1.0]);
+    }
+    u[32] = src_size.0.max(1) as f32 / src_size.1.max(1) as f32;
+    u[33] = (*t != vjc_model::SliceTransform::default()) as u32 as f32;
     u[15] = (s.mask_invert as u32 | (s.is_key as u32) << 1 | (s.black_bg as u32) << 2) as f32;
     u
 }
@@ -321,7 +358,7 @@ impl SliceRenderer {
                         contents: &bytes,
                         usage: wgpu::BufferUsages::VERTEX,
                     });
-                    let ub: Vec<u8> = slice_uniform(screen, s)
+                    let ub: Vec<u8> = slice_uniform(screen, s, src_size)
                         .iter()
                         .flat_map(|f| f.to_ne_bytes())
                         .collect();
@@ -346,7 +383,9 @@ impl SliceRenderer {
                             bind_with(view, &self.sampler),
                             bind_with(view, &self.nearest),
                         ),
-                        screen.pixel_perfect && mapping::slice_unscaled(src_size, s),
+                        screen.pixel_perfect
+                            && s.transform == vjc_model::SliceTransform::default()
+                            && mapping::slice_unscaled(src_size, s),
                     )
                 })
             })
@@ -644,12 +683,7 @@ mod tests {
     }
 
     /// Same from a `size` source image (RGBA bytes, row-major).
-    fn render_src(
-        screen: &Screen,
-        src_px: &[u8],
-        size: (u32, u32),
-        card: bool,
-    ) -> Option<Vec<u8>> {
+    fn render_src(screen: &Screen, src_px: &[u8], size: (u32, u32), card: bool) -> Option<Vec<u8>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no wgpu adapter: skipped");
@@ -886,7 +920,11 @@ mod tests {
             for y in 0..4 {
                 for x in 0..4 {
                     let want = px(&src, 8, x + 2, y + 2);
-                    assert!(close(px(&got, 4, x, y), want), "({x},{y}) {:?}", px(&got, 4, x, y));
+                    assert!(
+                        close(px(&got, 4, x, y), want),
+                        "({x},{y}) {:?}",
+                        px(&got, 4, x, y)
+                    );
                 }
             }
         }
@@ -901,8 +939,16 @@ mod tests {
         screen.slices.push(sl);
         let src = gradient_8();
         if let Some(got) = render_src(&screen, &src, (8, 8), false) {
-            assert_eq!(px(&got, 4, 0, 0), [0, 0, 0, 0], "left edge is outside the source");
-            assert_eq!(px(&got, 4, 3, 0)[3], 255, "right half still shows the source");
+            assert_eq!(
+                px(&got, 4, 0, 0),
+                [0, 0, 0, 0],
+                "left edge is outside the source"
+            );
+            assert_eq!(
+                px(&got, 4, 3, 0)[3],
+                255,
+                "right half still shows the source"
+            );
         }
     }
 

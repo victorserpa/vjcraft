@@ -943,6 +943,10 @@ fn slider_inner(
             out = Some(x);
         }
         let reset = reset_to(&Value::Number(value), &Value::Number(default));
+        // Double-click on the slider: reset to the default.
+        if sr.double_clicked() {
+            out = Some(default.clamp(range.0, range.1));
+        }
         // Right click on the slider: reset to the default.
         sr.interact(egui::Sense::click()).context_menu(|ui| {
             if crate::widgets::btn_if(

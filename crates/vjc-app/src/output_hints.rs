@@ -130,6 +130,9 @@ pub(crate) fn text(key: &str) -> Option<&'static str> {
         "slice-rot" => "Turns the slice by this many degrees.",
         "slice-flip" => "Mirrors the slice left to right or top to bottom.",
         "slice-colour" => "Brightness, contrast and colour gains of this slice, to match panels.",
+        "slice-transform" => {
+            "Zooms, shifts and turns the picture inside the slice. The outline stays where it is. Double-click a value to reset it."
+        }
         "slice-key" => "Is Key: shows the slice as a black and white matte of its transparency.",
         "slice-black" => "Black BG: puts black behind the slice so transparent areas turn black.",
         "slice-soft" => "Fades the slice edges so neighbouring slices blend into each other.",

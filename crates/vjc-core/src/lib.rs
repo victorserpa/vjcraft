@@ -496,6 +496,12 @@ pub enum Command {
         slice: Uuid,
         soft_edge: Option<vjc_model::SoftEdge>,
     },
+    /// Scale (clamped to 0.1..=10), shift and rotation of the content in the slice. Coalesces.
+    SetSliceTransform {
+        screen: Uuid,
+        slice: Uuid,
+        transform: vjc_model::SliceTransform,
+    },
     /// Brightness and RGB gains (each clamped to 0..=2). Coalesces.
     SetSliceColor {
         screen: Uuid,
@@ -1096,6 +1102,7 @@ enum Target {
     SliceKey(Uuid),
     ScreenDelay(Uuid),
     SliceColor(Uuid),
+    SliceTransform(Uuid),
     ScreenEnabled(Uuid),
     ScreenColor(Uuid),
     SliceInput(Uuid, Uuid),
@@ -1141,6 +1148,7 @@ impl Command {
             Command::SetSliceKey { slice, .. } => Some(Target::SliceKey(*slice)),
             Command::SetScreenDelay { screen, .. } => Some(Target::ScreenDelay(*screen)),
             Command::SetSliceColor { slice, .. } => Some(Target::SliceColor(*slice)),
+            Command::SetSliceTransform { slice, .. } => Some(Target::SliceTransform(*slice)),
             Command::SetScreenEnabled { screen, .. } => Some(Target::ScreenEnabled(*screen)),
             Command::SetScreenColor { screen, .. } => Some(Target::ScreenColor(*screen)),
             Command::SetSliceInput { screen, slice, .. } => {
@@ -3266,6 +3274,36 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     screen,
                     slice,
                     soft_edge: prev,
+                },
+                vec![],
+            )
+        }
+        Command::SetSliceTransform {
+            screen,
+            slice,
+            transform,
+        } => {
+            let t = transform;
+            let finite = t.scale.is_finite()
+                && t.rotation.is_finite()
+                && t.offset.0.is_finite()
+                && t.offset.1.is_finite();
+            if !finite {
+                return Err(Error::InvalidValue);
+            }
+            let transform = vjc_model::SliceTransform {
+                scale: t
+                    .scale
+                    .clamp(mapping::SCALE_RANGE.0, mapping::SCALE_RANGE.1),
+                ..t
+            };
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.transform, transform);
+            undoable(
+                Command::SetSliceTransform {
+                    screen,
+                    slice,
+                    transform: prev,
                 },
                 vec![],
             )

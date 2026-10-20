@@ -1697,6 +1697,31 @@ pub struct Slice {
     /// shorter than the mesh = zero handles.
     #[serde(default)]
     pub mesh_tangents: Vec<((f32, f32), (f32, f32))>,
+    /// Zoom, shift and turn of the content inside the slice; the outline does not move.
+    #[serde(default)]
+    pub transform: SliceTransform,
+}
+
+/// Placement of the content inside a slice, pivoting on the centre of its input area.
+/// The default is the identity, so older projects load unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SliceTransform {
+    /// Zoom factor, 1 = as is.
+    pub scale: f32,
+    /// Shift of the content as a fraction of the input area's width and height.
+    pub offset: (f32, f32),
+    /// Turn of the content in degrees, clockwise.
+    pub rotation: f32,
+}
+
+impl Default for SliceTransform {
+    fn default() -> Self {
+        SliceTransform {
+            scale: 1.0,
+            offset: (0.0, 0.0),
+            rotation: 0.0,
+        }
+    }
 }
 
 /// Outline of a slice.

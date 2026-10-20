@@ -31,6 +31,9 @@ pub fn full_input() -> Vec<Pt> {
     vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 }
 
+/// Range of the slice transform scale.
+pub const SCALE_RANGE: (f32, f32) = (0.1, 10.0);
+
 /// A slice showing the whole composition on the whole screen (2x2 mesh).
 pub fn new_slice(w: u32, h: u32) -> Slice {
     Slice {
@@ -49,6 +52,7 @@ pub fn new_slice(w: u32, h: u32) -> Slice {
         shape: Default::default(),
         mesh_mode: Default::default(),
         mesh_tangents: vec![],
+        transform: Default::default(),
     }
 }
 
