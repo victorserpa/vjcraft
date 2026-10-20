@@ -635,27 +635,30 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             ((rng >> 33) % 21) as f64 - 10.0 // -10..=10 ms
         };
-        // one status packet every 50 ms; the count follows the real position
+        // Status packets every 50 ms; the count only moves on a beat edge, and the packet
+        // that first carries a new count arrives on that edge (+-10 ms of network jitter).
         let dt = 0.016;
         let mut now_s = 0.0;
         let mut next_pkt = 0.0;
         let mut worst: f64 = 0.0;
         let clip = 1000.0;
         let start = 10.0; // track seconds at t = 0
+        let mut count_sent = None;
         while now_s < 60.0 {
             while next_pkt <= now_s {
                 let truth = start + next_pkt;
                 let count = (truth / T128).floor() as u32;
-                // arrival time is shifted, the beat count describes the exact beat edge
-                let edge = f64::from(count) * T128 - start;
-                let at = t0 + Duration::from_secs_f64((edge.max(0.0)) + 0.0)
-                    + Duration::from_millis(10);
-                let _ = at;
-                let arrive = (next_pkt + jitter() / 1000.0).max(0.0);
+                let arrive = if count_sent == Some(count) {
+                    next_pkt
+                } else {
+                    // first packet of this count: it is sent on the edge itself
+                    f64::from(count) * T128 - start + jitter() / 1000.0
+                };
+                count_sent = Some(count);
                 feed_st(
                     &mut t,
                     st(1, true, Some(count), NORMAL_PITCH),
-                    t0 + Duration::from_secs_f64(arrive),
+                    t0 + Duration::from_secs_f64(arrive.max(0.0)),
                 );
                 next_pkt += 0.05;
             }
