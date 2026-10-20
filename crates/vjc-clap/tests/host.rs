@@ -25,14 +25,16 @@ fn plugin() -> &'static str {
     })
 }
 
-/// Same plugin built with a mono-only port.
-fn mono_plugin() -> &'static str {
-    static P: OnceLock<String> = OnceLock::new();
-    P.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("vjc-clap-mono-{}", std::process::id()));
+/// The fixture built with an extra `--cfg` (`mono`: one-channel ports, `surround`: six).
+fn variant(cfg: &'static str) -> &'static str {
+    static P: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>> =
+        OnceLock::new();
+    let mut m = P.get_or_init(Default::default).lock().unwrap();
+    m.entry(cfg).or_insert_with(|| {
+        let dir = std::env::temp_dir().join(format!("vjc-clap-{cfg}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gain_plugin.rs");
-        let out = dir.join("mono.clap");
+        let out = dir.join(format!("{cfg}.clap"));
         let st = std::process::Command::new("rustc")
             .args([
                 "--edition",
@@ -40,7 +42,7 @@ fn mono_plugin() -> &'static str {
                 "--crate-type",
                 "cdylib",
                 "--cfg",
-                "mono",
+                cfg,
                 "-O",
                 "-o",
             ])
@@ -48,9 +50,13 @@ fn mono_plugin() -> &'static str {
             .arg(src)
             .status()
             .unwrap();
-        assert!(st.success(), "mono fixture build failed");
-        out.to_string_lossy().to_string()
+        assert!(st.success(), "{cfg} fixture build failed");
+        Box::leak(out.to_string_lossy().to_string().into_boxed_str())
     })
+}
+
+fn mono_plugin() -> &'static str {
+    variant("mono")
 }
 
 const ID: &str = "org.vjcraft.test.gain";
@@ -257,21 +263,48 @@ fn macos_bundle_is_resolved_to_its_executable() {
     assert_eq!(resolve_binary(&f), f);
 }
 
-#[test]
-fn plugin_without_a_stereo_port_is_rejected_with_a_clear_message() {
-    let e = ClapEffect::new(
-        mono_plugin(),
+fn with(path: &str) -> ClapEffect {
+    ClapEffect::new(
+        path,
         ID,
         Path::new(HELPER),
-        Duration::from_millis(500),
+        Duration::from_millis(5000),
         RATE,
-    );
-    match &e.status {
-        Status::Stopped(HostError::Plugin(m)) => {
-            assert!(m.contains("stereo"), "message names the problem: {m}")
-        }
-        s => panic!("expected a rejection, got {s:?}"),
+    )
+}
+
+#[test]
+fn stereo_into_a_mono_plugin_is_downmixed_and_upmixed_back() {
+    let mut e = with(mono_plugin());
+    assert_eq!(e.status, Status::Running, "a mono plugin loads");
+    let mut b: Vec<f32> = (0..64).flat_map(|_| [0.6, 0.2]).collect();
+    assert!(e.process(&mut b));
+    for fr in b.chunks(2) {
+        assert!(
+            (fr[0] - 0.4).abs() < 1e-6 && (fr[1] - 0.4).abs() < 1e-6,
+            "{fr:?}"
+        );
     }
+}
+
+#[test]
+fn a_surround_plugin_gets_the_first_two_channels_and_the_rest_stays_silent() {
+    let mut e = with(variant("surround"));
+    assert_eq!(e.status, Status::Running, "a six-channel plugin loads");
+    assert!(e.set_param(0, 2.0));
+    let mut b: Vec<f32> = (0..64).flat_map(|_| [0.25, -0.1]).collect();
+    assert!(e.process(&mut b));
+    for fr in b.chunks(2) {
+        // the fixture adds channel 3 (index 2) to the left output: silence keeps it at 0.5
+        assert!(
+            (fr[0] - 0.5).abs() < 1e-6 && (fr[1] + 0.2).abs() < 1e-6,
+            "{fr:?}"
+        );
+    }
+}
+
+#[test]
+fn mono_and_surround_plugins_are_listed_as_usable_by_the_scan() {
     let dir = tmp("monoscan");
     std::fs::copy(mono_plugin(), dir.join("mono.clap")).unwrap();
     std::fs::copy(plugin(), dir.join("gain.clap")).unwrap();
@@ -282,7 +315,7 @@ fn plugin_without_a_stereo_port_is_rejected_with_a_clear_message() {
     );
     assert_eq!(found.len(), 2);
     let stereo: Vec<bool> = found.iter().map(|f| f.stereo).collect();
-    assert_eq!(stereo, vec![true, false], "sorted by file name: gain, mono");
+    assert_eq!(stereo, vec![true, true], "sorted by file name: gain, mono");
 }
 
 #[test]

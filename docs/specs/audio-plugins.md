@@ -10,7 +10,7 @@ Clip/layer audio effects are built-in only.
 - Non-goal: plugin GUIs in the first step (parameters only), instruments.
 
 ## Design
-- Plugins run in a helper process (`vjc-clap-helper`); the ABI is written from the public spec. A worker thread per effect talks to it; the audio callback only moves samples through lock-free rings and plays the dry audio when wet audio is late, the plugin is starting, crashed, over its 40 ms budget, or has no stereo port. The wet signal is one callback late. Bypassed effects show a badge and a Restart button.
+- Plugins run in a helper process (`vjc-clap-helper`); the ABI is written from the public spec. A worker thread per effect talks to it; the audio callback only moves samples through lock-free rings and plays the dry audio when wet audio is late, the plugin is starting, crashed, over its 40 ms budget, or has no audio ports. Mono plugins get a stereo downmix that is copied to both sides; plugins with more than two channels get the first two and silence on the rest. The wet signal is one callback late. Bypassed effects show a badge and a Restart button.
 - A CLAP effect is stored as kind `clap:<id>|<path>` with one ranged number param per plugin parameter, so animation, MIDI/OSC/dashboard mapping use the normal effect-param path.
 - Listed in a "CLAP plugins" group of the Add audio effect menu (the Effects browser tab is for video effects).
 - Folders in Prefs > Audio (add/remove, Rescan); recursive scan in a background thread at startup, cached by mtime.

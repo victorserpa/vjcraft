@@ -320,12 +320,25 @@ impl State {
         let Some(shared) = self.clap.shared(e) else {
             return;
         };
-        match shared.status() {
-            vjc_clap::LaneStatus::Running => {
+        use crate::clap_host::Badge;
+        match self.clap.badge(e) {
+            Some(Badge::Running) => {
                 ui.label(egui::RichText::new("Running").color(theme::TEXT_MUTED));
             }
-            vjc_clap::LaneStatus::Starting => {}
-            vjc_clap::LaneStatus::Bypassed(why) => {
+            Some(Badge::Idle) => {
+                ui.label(egui::RichText::new("Idle").color(theme::TEXT_MUTED))
+                    .on_hover_text("The plugin loads when the clip plays");
+            }
+            Some(Badge::Missing) if self.clap.scanning() => {
+                ui.label(egui::RichText::new("Looking for plugin").color(theme::TEXT_MUTED));
+            }
+            Some(Badge::Missing) => {
+                ui.label(egui::RichText::new("Plugin not found").color(theme::WARN))
+                    .on_hover_text(
+                        "This plugin is not in the scanned list. Check the plugin folders in Prefs and rescan.",
+                    );
+            }
+            Some(Badge::Bypassed(why)) => {
                 ui.label(egui::RichText::new("Bypassed").color(theme::WARN))
                     .on_hover_text(why);
                 if crate::widgets::btn(ui, "Restart", crate::widgets::Kind::Secondary)
@@ -335,6 +348,7 @@ impl State {
                     shared.restart();
                 }
             }
+            None => {}
         }
     }
 
@@ -363,11 +377,11 @@ impl State {
                 crate::widgets::btn_if(
                     ui,
                     false,
-                    &format!("{} (no stereo port)", en.name),
+                    &format!("{} (no audio port)", en.name),
                     crate::widgets::Kind::Secondary,
                 )
                 .on_disabled_hover_text(
-                    "This plugin has no stereo audio port, so it cannot be used as an effect here.",
+                    "This plugin has no audio input and output, so it cannot be used as an effect here.",
                 );
             }
         }

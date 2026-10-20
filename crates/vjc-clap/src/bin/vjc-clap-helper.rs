@@ -147,21 +147,28 @@ fn create(lib: &Lib, id: &str) -> Result<(*const Plugin, *const ParamsExt), Stri
     }
 }
 
-/// True when the plugin has a stereo input port and a stereo output port (the layout the host
-/// feeds). A plugin without the audio-ports extension has no ports to feed.
-fn has_stereo_ports(p: *const Plugin) -> bool {
+/// Channel counts of the first input and first output port: what the host feeds. None when
+/// the plugin has no audio-ports extension or lacks an input or an output port.
+fn port_channels(p: *const Plugin) -> Option<(u32, u32)> {
     unsafe {
         let ext = ((*p).get_extension)(p, AUDIO_PORTS_EXT_ID.as_ptr()) as *const AudioPortsExt;
         if ext.is_null() {
-            return false;
+            return None;
         }
-        [true, false].into_iter().all(|input| {
-            (0..((*ext).count)(p, input).min(64)).any(|i| {
+        let first = |input: bool| {
+            (0..((*ext).count)(p, input).min(64)).find_map(|i| {
                 let mut info: AudioPortInfo = std::mem::zeroed();
-                ((*ext).get)(p, i, input, &mut info) && info.channel_count == 2
+                (((*ext).get)(p, i, input, &mut info) && info.channel_count > 0)
+                    .then_some(info.channel_count)
             })
-        })
+        };
+        Some((first(true)?, first(false)?))
     }
+}
+
+/// Usable as an effect: mono, stereo and multi-channel ports are all adapted to the stereo bus.
+fn has_stereo_ports(p: *const Plugin) -> bool {
+    port_channels(p).is_some()
 }
 
 fn info(path: &str) -> Result<Vec<PluginInfo>, String> {
@@ -201,6 +208,14 @@ fn load(path: &str, id: &str, rate: u32, max_frames: u32) -> Result<Instance, St
     let lib = Lib::open(path)?;
     let (plugin, params) = create(&lib, id)?;
     let infos = param_infos(plugin, params);
+    let Some((in_ch, out_ch)) = port_channels(plugin) else {
+        unsafe { ((*plugin).destroy)(plugin) };
+        return Err("plugin has no audio input and output port; it cannot be used here".into());
+    };
+    let (in_n, out_n) = (
+        (in_ch as usize).clamp(1, 64),
+        (out_ch as usize).clamp(1, 64),
+    );
     let mut inst = Instance {
         plugin,
         params,
@@ -208,17 +223,11 @@ fn load(path: &str, id: &str, rate: u32, max_frames: u32) -> Result<Instance, St
         active: false,
         pending: BTreeMap::new(),
         infos,
-        ins: vec![vec![0.0; max_frames as usize]; 2],
-        outs: vec![vec![0.0; max_frames as usize]; 2],
+        ins: vec![vec![0.0; max_frames as usize]; in_n],
+        outs: vec![vec![0.0; max_frames as usize]; out_n],
         steady: 0,
         _lib: lib,
     };
-    if !has_stereo_ports(plugin) {
-        return Err(
-            "plugin has no stereo audio port (mono or surround only); it cannot be used here"
-                .into(),
-        );
-    }
     unsafe {
         if !((*plugin).activate)(plugin, rate as f64, 1, max_frames) {
             return Err("activate failed".into());
@@ -263,10 +272,19 @@ impl Instance {
         if map.len() < n * 16 {
             return Err("mapping too small".into());
         }
+        // the bus is stereo: a mono port gets the downmix, a wider port gets the two channels
+        // in its first slots and silence in the rest
+        let mono = self.ins.len() == 1;
         for i in 0..n {
-            for c in 0..2 {
+            let at = |c: usize| {
                 let o = (i * 2 + c) * 4;
-                self.ins[c][i] = f32::from_le_bytes(map[o..o + 4].try_into().unwrap());
+                f32::from_le_bytes(map[o..o + 4].try_into().unwrap())
+            };
+            if mono {
+                self.ins[0][i] = (at(0) + at(1)) * 0.5;
+            } else {
+                self.ins[0][i] = at(0);
+                self.ins[1][i] = at(1);
             }
         }
         let events: Vec<ParamValueEvent> = std::mem::take(&mut self.pending)
@@ -297,19 +315,19 @@ impl Instance {
             ctx: std::ptr::null_mut(),
             try_push: out_push,
         };
-        let mut in_ptrs = [self.ins[0].as_mut_ptr(), self.ins[1].as_mut_ptr()];
-        let mut out_ptrs = [self.outs[0].as_mut_ptr(), self.outs[1].as_mut_ptr()];
+        let mut in_ptrs: Vec<*mut f32> = self.ins.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let mut out_ptrs: Vec<*mut f32> = self.outs.iter_mut().map(|v| v.as_mut_ptr()).collect();
         let input = AudioBuffer {
             data32: in_ptrs.as_mut_ptr(),
             data64: std::ptr::null_mut(),
-            channel_count: 2,
+            channel_count: in_ptrs.len() as u32,
             latency: 0,
             constant_mask: 0,
         };
         let mut output = AudioBuffer {
             data32: out_ptrs.as_mut_ptr(),
             data64: std::ptr::null_mut(),
-            channel_count: 2,
+            channel_count: out_ptrs.len() as u32,
             latency: 0,
             constant_mask: 0,
         };
@@ -332,8 +350,10 @@ impl Instance {
         let base = n * 8;
         for i in 0..n {
             for c in 0..2 {
+                // a mono output feeds both sides
+                let v = self.outs[c.min(self.outs.len() - 1)][i];
                 let o = base + (i * 2 + c) * 4;
-                map[o..o + 4].copy_from_slice(&self.outs[c][i].to_le_bytes());
+                map[o..o + 4].copy_from_slice(&v.to_le_bytes());
             }
         }
         Ok(())
