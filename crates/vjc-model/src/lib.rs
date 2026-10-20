@@ -1455,6 +1455,10 @@ pub enum FftBand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputSetup {
     pub screens: Vec<Screen>,
+    /// Ordered dither when a composition above 8-bit is written to the 8-bit outputs.
+    /// Only takes effect when `Composition::bit_depth` is above 8.
+    #[serde(default = "default_true")]
+    pub dither: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2106,7 +2110,10 @@ impl Project {
                 trigger_style: Default::default(),
                 clip_target: Default::default(),
             },
-            output: OutputSetup { screens: vec![] },
+            output: OutputSetup {
+                screens: vec![],
+                dither: true,
+            },
             shortcuts: vec![],
         }
     }

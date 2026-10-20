@@ -126,6 +126,19 @@ impl State {
             .id_salt("out-props-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Project-wide, applied at once and undoable from the menu (not part of
+                // Cancel / Save & Close).
+                let deep = self.project.composition.bit_depth > 8;
+                let mut dither = self.project.output.dither;
+                let r = ui
+                    .add_enabled_ui(deep, |ui| {
+                        widgets::toggle(ui, &mut dither, "Dither 16-bit to 8-bit output")
+                    })
+                    .inner;
+                if r.changed() {
+                    self.exec_ok(Command::SetOutputDither { on: dither });
+                }
+                ui.add_space(SP_4);
                 let Some((scr, prim)) = self.out_selected(screens) else {
                     widgets::help(ui, "No screens yet: use + in the tree to add one.");
                     return;

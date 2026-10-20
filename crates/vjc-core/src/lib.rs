@@ -670,6 +670,10 @@ pub enum Command {
     SetCompBitDepth {
         depth: u8,
     },
+    /// Turns the 16-bit to 8-bit output dither on or off. Undoable.
+    SetOutputDither {
+        on: bool,
+    },
     /// Palette colour (1..=PALETTE_LEN, None = none) of a layer, column or clip. Undoable.
     SetColor {
         target: ColorTarget,
@@ -3836,6 +3840,10 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
             }
             let prev = std::mem::replace(&mut p.composition.bit_depth, depth);
             undoable(Command::SetCompBitDepth { depth: prev }, vec![])
+        }
+        Command::SetOutputDither { on } => {
+            let prev = std::mem::replace(&mut p.output.dither, on);
+            undoable(Command::SetOutputDither { on: prev }, vec![])
         }
         Command::SetColor { target, color } => {
             if color.is_some_and(|c| c == 0 || c > vjc_model::PALETTE_LEN) {

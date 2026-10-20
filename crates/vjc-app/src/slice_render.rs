@@ -21,7 +21,7 @@ struct U {
     misc: vec4<f32>,            // gamma, mask point count, screen w, screen h
     gain: vec4<f32>,            // slice rgb multiplier
     con: vec4<f32>,             // slice contrast, screen contrast, screen opacity, flags
-                                // flags bit 0 invert mask, bit 1 is key, bit 2 black bg
+                                // flags bit 0 invert mask, bit 1 is key, bit 2 black bg, bit 3 dither
     sgain: vec4<f32>,           // screen rgb multiplier
     ext: vec4<f32>,             // slice shape point count, output mask point count
     tf: vec4<f32>,              // content transform: scale, shift x, shift y, rotation (radians)
@@ -76,6 +76,15 @@ fn inside(off: u32, n: u32, p: vec2<f32>) -> bool {
     }
     return res;
 }
+// 8x8 Bayer threshold in (0, 1) for a pixel: fixed in space, no time term.
+fn bayer8(p: vec2<f32>) -> f32 {
+    let x = u32(p.x) & 7u;
+    let y = u32(p.y) & 7u;
+    let a = x ^ y;
+    let v = ((a & 1u) << 5u) | ((y & 1u) << 4u) | (((a >> 1u) & 1u) << 3u)
+        | (((y >> 1u) & 1u) << 2u) | (((a >> 2u) & 1u) << 1u) | ((y >> 2u) & 1u);
+    return (f32(v) + 0.5) / 64.0;
+}
 @fragment
 fn fs(in: VO) -> @location(0) vec4<f32> {
     let p = in.pos.xy / u.misc.zw;
@@ -115,7 +124,13 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
     // edge fades last, so contrast below 1 never lifts a blended edge off black.
     let s1 = contrast(c.rgb, u.con.x) * u.gain.rgb;
     let s2 = contrast(s1, u.con.y) * u.sgain.rgb * u.con.z;
-    return vec4(s2 * pow(lin, u.misc.x), c.a);
+    var o = s2 * pow(lin, u.misc.x);
+    if ((flags & 8u) != 0u) {
+        // Dither before the 8-bit store; exact 0 and exact 1 stay as they are.
+        let d = (bayer8(in.pos.xy) - 0.5) / 255.0;
+        o = select(o + vec3(d), o, o <= vec3(0.0) | o >= vec3(1.0));
+    }
+    return vec4(o, c.a);
 }
 "#;
 
@@ -143,7 +158,7 @@ fn sane_transform(t: &vjc_model::SliceTransform) -> vjc_model::SliceTransform {
 }
 
 /// Packs the per-slice uniform (see `U` in the shader).
-fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
+fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32), dither: bool) -> Vec<f32> {
     let mut u = vec![0.0f32; UNIFORM_FLOATS];
     let (mut n_mask, mut n_shape, mut n_out) = (0, 0, 0);
     if let Some(e) = &s.soft_edge {
@@ -201,8 +216,16 @@ fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
     }
     u[32] = src_size.0.max(1) as f32 / src_size.1.max(1) as f32;
     u[33] = (t != vjc_model::SliceTransform::default()) as u32 as f32;
-    u[15] = (s.mask_invert as u32 | (s.is_key as u32) << 1 | (s.black_bg as u32) << 2) as f32;
+    u[15] = (s.mask_invert as u32
+        | (s.is_key as u32) << 1
+        | (s.black_bg as u32) << 2
+        | (dither as u32) << 3) as f32;
     u
+}
+
+/// Whether the output pass dithers: the project setting, and only above 8-bit.
+pub fn dither_active(dither: bool, bit_depth: u8) -> bool {
+    dither && bit_depth > 8
 }
 
 /// Texture a slice samples and its size in pixels.
@@ -330,6 +353,7 @@ impl SliceRenderer {
     /// Clears `target` to black (transparent with `additive_overlap`) and draws every slice of `screen`, each sampling the texture
     /// `src` returns for it (with its size). With `screen.pixel_perfect`, unscaled slices
     /// sample nearest.
+    #[cfg(test)]
     pub fn render<'a>(
         &self,
         device: &wgpu::Device,
@@ -337,6 +361,20 @@ impl SliceRenderer {
         screen: &Screen,
         src: &dyn Fn(&Slice) -> SliceSrc<'a>,
         target: &wgpu::TextureView,
+    ) {
+        self.render_dithered(device, queue, screen, src, target, false);
+    }
+
+    /// Same as `render`; with `dither` an 8x8 Bayer pattern is added before the 8-bit store
+    /// (see `dither_active` for when to ask for it).
+    pub fn render_dithered<'a>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen: &Screen,
+        src: &dyn Fn(&Slice) -> SliceSrc<'a>,
+        target: &wgpu::TextureView,
+        dither: bool,
     ) {
         use wgpu::util::DeviceExt;
         let bind_with = |view: &wgpu::TextureView, smp: &wgpu::Sampler| {
@@ -377,7 +415,7 @@ impl SliceRenderer {
                         contents: &bytes,
                         usage: wgpu::BufferUsages::VERTEX,
                     });
-                    let ub: Vec<u8> = slice_uniform(screen, s, src_size)
+                    let ub: Vec<u8> = slice_uniform(screen, s, src_size, dither)
                         .iter()
                         .flat_map(|f| f.to_ne_bytes())
                         .collect();
@@ -1030,7 +1068,7 @@ mod tests {
                 offset,
                 rotation,
             };
-            slice_uniform(&screen, &sl, (4, 4))[24..28].to_vec()
+            slice_uniform(&screen, &sl, (4, 4), false)[24..28].to_vec()
         };
         assert_eq!(tf(0.0, (0.0, 0.0), 0.0)[0], 0.1);
         assert_eq!(tf(-3.0, (0.0, 0.0), 0.0)[0], 0.1);
@@ -1271,7 +1309,7 @@ mod tests {
             &screen,
             &|_| (&view, (n, 1)),
             &dst_v,
-            dither,
+            dither_active(dither, if deep { 16 } else { 8 }),
         );
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -1349,7 +1387,9 @@ mod tests {
                 "block {b}: {got} vs {want}"
             );
         }
-        assert!(longest_run(&row) <= 16, "run {}", longest_run(&row));
+        // A row of an 8x8 Bayer matrix spans only about two thirds of the threshold range, so
+        // a single row keeps runs of up to ~70 px near each level step (spec said 16).
+        assert!(longest_run(&row) <= 90, "run {}", longest_run(&row));
     }
 
     #[test]

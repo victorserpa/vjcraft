@@ -6346,7 +6346,11 @@ impl State {
                 let view = comp.routed_view(sl.source).unwrap_or(&comp.target_view);
                 (view, comp.size)
             };
-            r.render(&rs.device, &rs.queue, scr, &source, target_view);
+            let dither = slice_render::dither_active(
+                self.project.output.dither,
+                self.project.composition.bit_depth,
+            );
+            r.render_dithered(&rs.device, &rs.queue, scr, &source, target_view, dither);
             // The test card goes into the screen target itself, so Art-Net, Syphon and NDI
             // see it too. Black-out and a disabled screen stay black.
             if self.test_cards.contains(&id) && !self.blackouts.contains(&id) && scr.enabled {
