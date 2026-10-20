@@ -25,6 +25,7 @@ pollster = "1"
 directories = "6"
 vjc-fx = { path = "../vjc-fx" }
 vjc-clap = { path = "../vjc-clap" }
+vjc-ffgl = { path = "../vjc-ffgl" }
 vjc-ml = { path = "../vjc-ml" }
 midir = "0.11.1"
 vjc-net = { path = "../vjc-net", default-features = false }

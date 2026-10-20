@@ -10,6 +10,8 @@ mod autopilot_ui;
 mod browser;
 mod capture;
 mod clap_host;
+#[cfg(test)]
+mod ffgl_host_tests;
 mod clip_thumbs;
 mod col_ops;
 mod color_depth;
