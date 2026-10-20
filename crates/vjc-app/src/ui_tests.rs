@@ -7479,13 +7479,19 @@ fn folder_change_saved_during_a_scan_is_scanned_when_it_ends() {
 fn picked_dj_interface_is_not_overwritten_by_an_old_typed_buffer() {
     let mut h = app();
     let st = h.state_mut();
+    // The interface list appears while an address is being typed: the edit is kept.
     st.dj_iface_buf = Some("1.2.3.4".into());
     st.dj_iface_edited = true;
-    st.prefs.dj.interface = "10.0.0.5".into(); // picked from the list
-    st.dj_iface_picked();
     st.commit_dj_iface_buf();
-    assert_eq!(st.prefs.dj.interface, "10.0.0.5");
-    // an untouched buffer is not committed either
+    assert_eq!(
+        st.prefs.dj.interface, "1.2.3.4",
+        "a typed address is not lost"
+    );
+    // Then an interface is picked from the list, and Preferences closes.
+    st.prefs.dj.interface = "10.0.0.5".into();
+    st.commit_dj_iface_buf();
+    assert_eq!(st.prefs.dj.interface, "10.0.0.5", "the pick wins");
+    // An untouched buffer is never committed.
     st.dj_iface_buf = Some("9.9.9.9".into());
     st.commit_dj_iface_buf();
     assert_eq!(st.prefs.dj.interface, "10.0.0.5");

@@ -22,12 +22,6 @@ impl State {
         }
     }
 
-    /// An interface picked from the list replaces whatever was typed before.
-    pub(crate) fn dj_iface_picked(&mut self) {
-        self.dj_iface_buf = None;
-        self.dj_iface_edited = false;
-    }
-
     pub(crate) fn prefs_window(&mut self, ctx: &egui::Context) {
         if !self.prefs_open {
             return;
@@ -770,7 +764,9 @@ impl State {
                 }
             });
         if list_shown {
-            self.dj_iface_picked(); // the list replaces whatever was typed before
+            // The list replaces the text field: an edited address is kept, an untouched
+            // buffer is dropped so it never overwrites a later pick.
+            self.commit_dj_iface_buf();
         }
         if !open || done {
             self.commit_dj_iface_buf();

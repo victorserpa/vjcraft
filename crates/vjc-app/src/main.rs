@@ -4884,7 +4884,10 @@ impl State {
         );
         // DJ players (Preferences > DJ sync) steer tempo and bar phase; Link wins if on.
         self.dj_pump(now, !on);
-        self.sync_clap_dirs();
+        // Only saved folders are scanned: never half-typed paths while Preferences is open.
+        if !self.prefs_open {
+            self.sync_clap_dirs();
+        }
         // Transport of the tempo clock follows the saved play state.
         match self.project.composition.tempo.play_state {
             vjc_model::PlayState::Play => self.clock.play(now),
