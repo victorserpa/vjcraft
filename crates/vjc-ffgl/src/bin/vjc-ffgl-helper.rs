@@ -305,12 +305,25 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
                 msg: "no plugin loaded".into(),
             },
         },
-        Request::Process { shm, w, h } => {
+        Request::Process { shm, w, h, params } => {
             let Some(p) = cur else {
                 return Response::Err {
                     msg: "no plugin loaded".into(),
                 };
             };
+            for (index, value) in params {
+                let s = SetParameterStruct {
+                    index,
+                    value: FFMixed { u: value.to_bits() },
+                };
+                // a plugin may refuse a value: the frame still runs
+                p.call(
+                    FF_SETPARAMETER,
+                    FFMixed {
+                        p: &s as *const _ as *mut c_void,
+                    },
+                );
+            }
             let n = w as usize * h as usize * 4;
             let file = match std::fs::OpenOptions::new()
                 .read(true)

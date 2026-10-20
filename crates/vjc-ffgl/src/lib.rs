@@ -340,6 +340,10 @@ pub struct FfglEffect {
     helper: Option<Helper>,
     pub status: Status,
     params: Vec<f32>,
+    /// Changed since the last frame: sent together with the next one, latest value only.
+    dirty: BTreeMap<usize, f32>,
+    /// Remark from the host shown next to the status (e.g. the input was resized).
+    pub note: Option<String>,
     shm_path: PathBuf,
     map: Option<(MmapMut, usize)>,
 }
@@ -361,6 +365,8 @@ impl FfglEffect {
             helper: None,
             status: Status::Stopped(HostError::Died),
             params: Vec::new(),
+            dirty: BTreeMap::new(),
+            note: None,
             shm_path,
             map: None,
         };
@@ -371,6 +377,7 @@ impl FfglEffect {
     /// (Re)start the helper and load the plugin; restores the parameters. Call again after "plugin stopped".
     pub fn enable(&mut self) {
         self.helper = None;
+        self.dirty.clear();
         let r = Helper::spawn(&self.helper_bin).and_then(|mut h| {
             let r = h.request(
                 &Request::Load {
@@ -416,12 +423,20 @@ impl FfglEffect {
         if index >= self.params.len() || !value.is_finite() {
             return false;
         }
+        if self.params[index] == value {
+            return true; // already there: no round trip to the helper
+        }
         self.params[index] = value;
-        self.call(Request::Set {
-            index: index as u32,
-            value,
-        });
+        self.dirty.insert(index, value);
         true
+    }
+
+    /// Kills the helper process but leaves `status` alone, like a crash would: the next frame
+    /// finds the helper gone, passes through and reports "plugin stopped".
+    pub fn kill_helper(&mut self) {
+        if let Some(h) = self.helper.as_mut() {
+            h.kill();
+        }
     }
 
     /// Read a parameter back from the plugin.
@@ -429,11 +444,22 @@ impl FfglEffect {
         if index >= self.params.len() {
             return None;
         }
+        self.flush();
         match self.call(Request::Get {
             index: index as u32,
         }) {
             Some(Response::Value { value }) => Some(value),
             _ => None,
+        }
+    }
+
+    /// Sends the pending parameter changes on their own (only needed before a read).
+    fn flush(&mut self) {
+        for (index, value) in std::mem::take(&mut self.dirty) {
+            self.call(Request::Set {
+                index: index as u32,
+                value,
+            });
         }
     }
 
@@ -483,10 +509,15 @@ impl FfglEffect {
         let (map, _) = self.map.as_mut().unwrap();
         map[..n].copy_from_slice(&input.rgba);
         let shm = self.shm_path.to_string_lossy().to_string();
+        let params = std::mem::take(&mut self.dirty)
+            .into_iter()
+            .map(|(i, v)| (i as u32, v))
+            .collect();
         match self.call(Request::Process {
             shm,
             w: input.w,
             h: input.h,
+            params,
         }) {
             Some(Response::Done) => {
                 let (map, _) = self.map.as_ref().unwrap();

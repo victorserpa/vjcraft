@@ -562,6 +562,9 @@ pub struct EffectDraw {
     /// The effect declares a tick input (freeze): only then does the runtime write the
     /// `NEW_TICK` flag into slot 0. Every other effect's uniforms are left as packed.
     pub ticking: bool,
+    /// An FFGL plugin instance: the effect runs on the CPU (read the layer back, process, upload).
+    /// A stopped plugin leaves the frame as it is.
+    pub ffgl: Option<crate::ffgl_host::Shared>,
 }
 
 /// Writes the `NEW_TICK` flag into slot 0 of a ticking effect (rate in, flag out) and
@@ -640,6 +643,113 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     return vec4(mix(d.rgb, c, u.t.x), mix(d.a, w.a, u.t.x));
 }
 "#;
+
+/// One mix pass: `dst = mix(dry, wet, t.x)` blended with mode `t.y` (0 = plain mix).
+fn mix_draw(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    enc: &mut wgpu::CommandEncoder,
+    (pipe, bgl, sampler): (
+        &wgpu::RenderPipeline,
+        &wgpu::BindGroupLayout,
+        &wgpu::Sampler,
+    ),
+    mbuf: &wgpu::Buffer,
+    (dry, wet, dst): (&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView),
+    t: [f32; 4],
+) {
+    queue.write_buffer(mbuf, 0, bytemuck::cast_slice(&t));
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mix_bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mbuf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(dry),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(wet),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("fx_mix"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: dst,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 0x1f, h & 0x3ff);
+    let v = match e {
+        0 => f32::from(m) * 2f32.powi(-24),
+        31 => {
+            if m == 0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + f32::from(m) / 1024.0) * 2f32.powi(i32::from(e) - 15),
+    };
+    if s == 1 { -v } else { v }
+}
+
+/// Half-float bits of a value in 0..=1 (the only range the 8-bit path produces).
+fn f32_to_half01(v: f32) -> u16 {
+    let v = v.clamp(0.0, 1.0);
+    if v == 0.0 {
+        return 0;
+    }
+    let bits = v.to_bits();
+    let e = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    if e <= 0 {
+        return (v * 2f32.powi(24)).round() as u16;
+    }
+    let m = ((bits & 0x7f_ffff) + 0x1000) >> 13; // round to nearest
+    ((e as u32) << 10).wrapping_add(m) as u16
+}
+
+/// RGBA half floats (little endian) to RGBA8, clamped.
+fn half_to_rgba8(raw: &[u8]) -> Vec<u8> {
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| {
+            (half_to_f32(u16::from_le_bytes([c[0], c[1]])).clamp(0.0, 1.0) * 255.0).round() as u8
+        })
+        .collect()
+}
+
+/// RGBA8 to RGBA half floats (little endian).
+fn rgba8_to_half(px: &[u8]) -> Vec<u8> {
+    px.iter()
+        .flat_map(|&b| f32_to_half01(f32::from(b) / 255.0).to_le_bytes())
+        .collect()
+}
 
 /// Two effect-sized textures to ping-pong plus a third for the mix result.
 type Scratch = [(wgpu::Texture, wgpu::TextureView); 3];
@@ -865,7 +975,8 @@ fn make_scratch(device: &wgpu::Device, fmt: wgpu::TextureFormat, (w, h): (u32, u
             format: fmt,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let v = t.create_view(&Default::default());
@@ -1089,8 +1200,11 @@ impl Fx {
             if plan == MixPlan::Skip {
                 continue;
             }
-            let Some(pipe) = self.pipes.get(&e.kind) else {
-                continue;
+            // An FFGL effect has no shader; `mix_pipe` only stands in for the unused binding.
+            let pipe = match self.pipes.get(&e.kind) {
+                Some(p) => p,
+                None if e.ffgl.is_some() => &self.mix_pipe,
+                None => continue,
             };
             let in_view = match cur {
                 None => input,
@@ -1131,7 +1245,90 @@ impl Fx {
                 None => input,
                 Some(i) => &scratch[i].1,
             };
-            if let Some(passes) = self.passes.get(&e.kind) {
+            if let Some(f) = &e.ffgl {
+                // CPU path: copy the input into a scratch texture (which can always be read
+                // back, whatever the input is), let the plugin process it, upload the result.
+                if !f
+                    .lock()
+                    .is_ok_and(|f| f.status == vjc_ffgl::Status::Running)
+                {
+                    continue; // stopped: the frame passes through
+                }
+                let bpp = match self.fmt {
+                    wgpu::TextureFormat::Rgba8Unorm => 4,
+                    wgpu::TextureFormat::Rgba16Float => 8,
+                    _ => {
+                        if let Ok(mut f) = f.lock() {
+                            f.note = Some("Composition format not supported".into());
+                        }
+                        continue;
+                    }
+                };
+                let in_size = match cur {
+                    None => (input.texture().width(), input.texture().height()),
+                    Some(_) => size,
+                };
+                let tmp = (0..3).find(|&i| Some(i) != cur && i != out).unwrap_or(0);
+                if self.mix_bufs.len() <= self.mix_next {
+                    self.mix_bufs
+                        .push(device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("mix_u"),
+                            size: 16,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        }));
+                }
+                mix_draw(
+                    device,
+                    queue,
+                    enc,
+                    (&self.mix_pipe, &self.mix_bgl, sampler),
+                    &self.mix_bufs[self.mix_next],
+                    (src, src, &scratch[tmp].1),
+                    [0.0; 4],
+                );
+                self.mix_next += 1;
+                // The copy was drawn into `enc`: send it before reading.
+                let done =
+                    std::mem::replace(enc, device.create_command_encoder(&Default::default()));
+                queue.submit(Some(done.finish()));
+                let Some((w, h, raw)) =
+                    Compositor::read_texture_bpp(device, queue, &scratch[tmp].0, bpp)
+                else {
+                    continue;
+                };
+                let rgba = if bpp == 8 { half_to_rgba8(&raw) } else { raw };
+                let Ok(mut f) = f.lock() else { continue };
+                f.note = (in_size != size).then(|| {
+                    format!(
+                        "Input size {}x{} differs from {}x{}",
+                        in_size.0, in_size.1, size.0, size.1
+                    )
+                });
+                let res = f.process(&vjc_ffgl::Frame { w, h, rgba });
+                if f.status != vjc_ffgl::Status::Running {
+                    continue;
+                }
+                let bytes = if bpp == 8 {
+                    rgba8_to_half(&res.rgba)
+                } else {
+                    res.rgba
+                };
+                queue.write_texture(
+                    scratch[out].0.as_image_copy(),
+                    &bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * bpp),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            } else if let Some(passes) = self.passes.get(&e.kind) {
                 let base = e.persistent.map(|id| persist_key(id, self.persist_scope));
                 let names = vjc_fx::targets_of(passes);
                 // Buffer of each target name: persistent when any pass says so (and the
@@ -1298,53 +1495,16 @@ impl Fx {
                 }
                 let mbuf = &self.mix_bufs[self.mix_next];
                 self.mix_next += 1;
-                queue.write_buffer(
-                    mbuf,
-                    0,
-                    bytemuck::cast_slice(&[t, e.blend as f32, 0.0, 0.0]),
-                );
                 let dst = (0..3).find(|&i| Some(i) != cur && i != out).unwrap_or(0);
-                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("mix_bg"),
-                    layout: &self.mix_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: mbuf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(src),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&scratch[out].1),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Sampler(sampler),
-                        },
-                    ],
-                });
-                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("fx_mix"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &scratch[dst].1,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&self.mix_pipe);
-                pass.set_bind_group(0, &bind, &[]);
-                pass.draw(0..3, 0..1);
+                mix_draw(
+                    device,
+                    queue,
+                    enc,
+                    (&self.mix_pipe, &self.mix_bgl, sampler),
+                    mbuf,
+                    (src, &scratch[out].1, &scratch[dst].1),
+                    [t, e.blend as f32, 0.0, 0.0],
+                );
                 cur = Some(dst);
             } else {
                 cur = Some(out);
@@ -2240,8 +2400,18 @@ impl Compositor {
         queue: &wgpu::Queue,
         tex: &wgpu::Texture,
     ) -> Option<(u32, u32, Vec<u8>)> {
+        Self::read_texture_bpp(device, queue, tex, 4)
+    }
+
+    /// Tight readback of a texture with `bpp` bytes per pixel.
+    fn read_texture_bpp(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        bpp: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
         let (w, h) = (tex.width(), tex.height());
-        let row = (w * 4).div_ceil(256) * 256;
+        let row = (w * bpp).div_ceil(256) * 256;
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("snapshot"),
             size: u64::from(row) * u64::from(h),
@@ -2268,11 +2438,11 @@ impl Compositor {
         queue.submit(Some(enc.finish()));
         buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        let mut out = Vec::with_capacity((w * h * bpp) as usize);
         {
             let data = buf.slice(..).get_mapped_range().ok()?;
             for y in 0..h as usize {
-                out.extend_from_slice(&data[y * row as usize..][..(w * 4) as usize]);
+                out.extend_from_slice(&data[y * row as usize..][..(w * bpp) as usize]);
             }
         }
         buf.unmap();
@@ -2822,6 +2992,7 @@ impl Compositor {
                         format: FORMAT,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING
                             | wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::COPY_SRC
                             | wgpu::TextureUsages::RENDER_ATTACHMENT,
                         view_formats: &[],
                     })
@@ -3754,6 +3925,7 @@ mod tests {
             ml: None,
             persistent: Some(uuid::Uuid::from_u128(99)),
             ticking: false,
+            ffgl: None,
         };
         let layer = LayerDraw {
             id: uuid::Uuid::from_u128(7),
@@ -4054,6 +4226,7 @@ mod tests {
             ml: None,
             persistent: None,
             ticking: false,
+            ffgl: None,
         };
         let src = [51u8, 102, 204, 255];
         for on_master in [false, true] {
@@ -4145,6 +4318,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -4220,6 +4394,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -4336,6 +4511,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }),
             transition: None,
             transform: Affine::IDENTITY,
@@ -4526,6 +4702,7 @@ mod tests {
                     ml: None,
                     persistent: isf.needs_instance().then(|| uuid::Uuid::from_u128(77)),
                     ticking: false,
+                    ffgl: None,
                 };
                 let (effects, gen_draw, fr) = if generator {
                     (vec![], Some(draw), None)
@@ -4608,6 +4785,7 @@ mod tests {
                 ml: None,
                 persistent: isf.needs_instance().then(|| uuid::Uuid::from_u128(78)),
                 ticking: false,
+                ffgl: None,
             };
             let layer = [LayerDraw {
                 id: uuid::Uuid::from_u128(3),
@@ -4685,6 +4863,7 @@ mod tests {
             ml: None,
             persistent: None,
             ticking: false,
+            ffgl: None,
         };
         let src = [255u8, 255, 255, 255];
         // (chain, expected red)
@@ -4854,6 +5033,7 @@ mod tests {
                     ml: None,
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 };
                 let got = render_pixel(&mut comp, &device, &queue, vec![fx], src);
                 let d = 128.0 / 255.0;
@@ -4895,6 +5075,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             }
         };
         let id = std::sync::Arc::new(vjc_fx::lut::Lut::identity(17));
@@ -4948,6 +5129,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             };
             render_pixel(&mut comp, &device, &queue, vec![fx], src)[0]
         };
@@ -5020,6 +5202,7 @@ mod tests {
                 ml: None,
                 persistent: None,
                 ticking: false,
+                ffgl: None,
             };
             let src = [255u8; 8];
             let layer = [LayerDraw {
@@ -5115,6 +5298,7 @@ mod tests {
                 ml: None,
                 persistent: instance_id,
                 ticking: false,
+                ffgl: None,
             };
             let mut last = [0u8; 4];
             for (serial, px) in [[255u8; 4], [0, 0, 0, 255]].iter().enumerate() {
@@ -5169,6 +5353,7 @@ mod tests {
             ml: None,
             persistent: Some(uuid::Uuid::from_u128(7)),
             ticking: false,
+            ffgl: None,
         };
         let mut comp = Compositor::new(&device, 1, 1);
         comp.add_effect(&device, "trails", &wgsl).unwrap();
@@ -5296,6 +5481,7 @@ mod tests {
             ml: None,
             persistent,
             ticking: isf.tick_input.is_some(),
+            ffgl: None,
         };
         let l = [layer(1, 1.0, BlendMode::Normal, vec![fx], data, serial)];
         comp.render(device, queue, &l, &[], 1.0);
@@ -5889,6 +6075,7 @@ mod tests {
                         ml: Some(ml.clone()),
                         persistent: None,
                         ticking: false,
+                        ffgl: None,
                     }],
                     frame: Some((2, 1, &red, 1)),
                     generator: None,
@@ -5964,6 +6151,7 @@ mod tests {
                     ml: Some(ml.clone()),
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 }],
                 frame: Some((2, 1, &red, 1)),
                 generator: None,
@@ -6046,6 +6234,7 @@ mod tests {
                     ml: None,
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 }],
                 frame: Some((1, 4, &img, 1)),
                 generator: None,
@@ -6311,6 +6500,7 @@ mod tests {
                         ml: Some(ml.clone()),
                         persistent: None,
                         ticking: false,
+                        ffgl: None,
                     }],
                     frame: Some((1, 4, &red, 1)),
                     generator: None,
@@ -6686,6 +6876,7 @@ mod tests {
             ml: None,
             persistent: None,
             ticking: false,
+            ffgl: None,
         };
         let (below, src) = ([255u8, 0, 0, 255], [51u8, 102, 204, 255]);
         let layers = [solid(1, &below, 1.0), solid(2, &src, 1.0)];
@@ -7051,6 +7242,7 @@ mod tests {
                     ml: None,
                     persistent: None,
                     ticking: false,
+                    ffgl: None,
                 }
             })
             .collect();

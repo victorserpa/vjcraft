@@ -36,10 +36,17 @@ FFMPEG_PC="$FFMPEG_PC:$PWD/target/ffmpeg-src/prefix/lib/pkgconfig"  # our dav1d 
 # Clean the ffmpeg-sys artifacts so a build against Homebrew's FFmpeg is never reused.
 cargo clean --release -p ffmpeg-sys-next
 PKG_CONFIG_PATH="$FFMPEG_PC" cargo build --release -p vjc-app
+# Plugin hosts run each plugin in a helper process found next to the app binary.
+cargo build --release -p vjc-clap -p vjc-ffgl --bins
 
 rm -rf "$APP" "$DMG" "$DIST/dmg-root"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "${CARGO_TARGET_DIR:-target}/release/vjcraft" "$APP/Contents/MacOS/vjcraft"
+HELPERS=(vjc-clap-helper vjc-ffgl-helper)
+for h in "${HELPERS[@]}"; do
+  cp "${CARGO_TARGET_DIR:-target}/release/$h" "$APP/Contents/MacOS/$h" \
+    || { echo "missing plugin helper $h" >&2; exit 1; }
+done
 
 # HAP-capable ffmpeg CLI for "Convert to HAP" (LGPL, static), built above.
 if [ -x target/ffmpeg/bin/ffmpeg ]; then
@@ -139,6 +146,10 @@ else
 fi
 for lib in "$APP"/Contents/Frameworks/*.dylib; do
   codesign "${SIGN_OPTS[@]}" "$lib"
+done
+# Helpers load third-party plugins: same entitlements as the app (library validation off).
+for h in "${HELPERS[@]}"; do
+  codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP/Contents/MacOS/$h"
 done
 if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
   codesign "${SIGN_OPTS[@]}" --entitlements scripts/entitlements.plist "$APP/Contents/Resources/ffmpeg"
