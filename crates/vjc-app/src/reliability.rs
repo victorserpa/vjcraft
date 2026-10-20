@@ -415,8 +415,10 @@ static PARENT_GONE: AtomicBool = AtomicBool::new(false);
 /// Set by the UI when it starts the orphan quit, so the watcher lets it finish.
 pub static ORPHAN_QUITTING: AtomicBool = AtomicBool::new(false);
 
-/// How long the watcher waits for the UI loop to start the orphan quit before exiting.
-const ORPHAN_START_GRACE: Duration = Duration::from_millis(1000);
+/// How long the watcher waits for the UI loop to start the orphan quit before exiting. The
+/// watcher wakes the UI, so a live loop starts the quit within a frame; this only bounds a
+/// UI thread that is blocked (a heavy load, a modal dialog), which must still get to save.
+const ORPHAN_START_GRACE: Duration = Duration::from_secs(10);
 
 /// True once the supervisor died (SIGKILL, crash): the app must save and quit.
 pub fn parent_gone() -> bool {

@@ -208,11 +208,11 @@ fn child_exits_when_the_supervisor_is_sigkilled() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The UI loop may never run (hidden window, nothing repaints): the watcher must still end
-/// the orphan within about 1.5 s instead of the old 10 s.
+/// The UI loop may never start the quit (its thread is blocked): the watcher must still end
+/// the orphan once the start grace (10 s) runs out.
 #[cfg(unix)]
 #[test]
-fn stuck_ui_child_exits_quickly_after_supervisor_sigkill() {
+fn stuck_ui_child_exits_after_the_start_grace() {
     let dir = data_dir("orphan-stuck");
     let mut sup = spawn_supervisor(&dir, "stuck-ui");
     let child = wait_child_pid(&dir);
@@ -220,7 +220,7 @@ fn stuck_ui_child_exits_quickly_after_supervisor_sigkill() {
     unsafe { libc::kill(sup.id() as i32, libc::SIGKILL) };
     let _ = sup.wait();
     let t = std::time::Instant::now();
-    while t.elapsed() < std::time::Duration::from_millis(2500)
+    while t.elapsed() < std::time::Duration::from_millis(12_000)
         && unsafe { libc::kill(child, 0) } == 0
     {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -229,6 +229,6 @@ fn stuck_ui_child_exits_quickly_after_supervisor_sigkill() {
     if alive {
         unsafe { libc::kill(child, libc::SIGKILL) };
     }
-    assert!(!alive, "stuck-UI orphan lived past 2.5 s");
+    assert!(!alive, "stuck-UI orphan lived past 12 s");
     std::fs::remove_dir_all(&dir).unwrap();
 }
