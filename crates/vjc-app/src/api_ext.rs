@@ -667,8 +667,17 @@ pub struct SnapTargets<'a> {
 
 /// The texture for `src`.
 pub fn snap_target<'a>(src: SnapSrc, t: &SnapTargets<'a>) -> Result<SnapTex<'a>, ApiErr> {
-    let _ = src;
-    Ok(t.comp)
+    match src {
+        SnapSrc::Composition => Ok(t.comp),
+        SnapSrc::Preview => t
+            .preview
+            .ok_or_else(|| err(409, "no preview render: select a clip or layer first")),
+        SnapSrc::Screen(id) => t
+            .screens
+            .get(&id)
+            .copied()
+            .ok_or_else(|| err(409, "that screen is not rendering right now")),
+    }
 }
 
 /// Turns the request into a source. `preview_selected`: a clip or layer is selected for the
@@ -680,12 +689,27 @@ pub fn snap_plan(
     preview_selected: bool,
     screens: &[uuid::Uuid],
 ) -> Result<SnapSrc, ApiErr> {
-    let _ = (screen, preview_selected, screens);
     match kind {
-        "preview" => Err(err(
-            501,
-            "preview snapshots are not available; use composition",
-        )),
+        "preview" if !preview_selected => {
+            Err(err(409, "no preview render: select a clip or layer first"))
+        }
+        "preview" => Ok(SnapSrc::Preview),
+        "output" => {
+            let none = || err(404, "unknown screen");
+            let id = match screen {
+                None | Some(Value::Null) => screens.first().copied(),
+                Some(Value::Number(n)) => n
+                    .as_u64()
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| screens.get(usize::try_from(i).ok()?))
+                    .copied(),
+                Some(Value::String(t)) => {
+                    t.parse::<uuid::Uuid>().ok().filter(|u| screens.contains(u))
+                }
+                Some(_) => None,
+            };
+            id.map(SnapSrc::Screen).ok_or_else(none)
+        }
         _ => Ok(SnapSrc::Composition),
     }
 }
@@ -707,10 +731,6 @@ struct Readback {
 }
 
 impl SnapJob {
-    pub fn new(jpeg: bool, reply: std::sync::mpsc::SyncSender<Reply>) -> Self {
-        Self::of(SnapSrc::Composition, jpeg, reply)
-    }
-
     pub fn of(src: SnapSrc, jpeg: bool, reply: std::sync::mpsc::SyncSender<Reply>) -> Self {
         SnapJob {
             jpeg,
@@ -1129,7 +1149,7 @@ mod snap_expire_tests {
     #[test]
     fn queue_expires_without_any_render() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let mut jobs = vec![SnapJob::new(false, tx)];
+        let mut jobs = vec![SnapJob::of(SnapSrc::Composition, false, tx)];
         snap_expire(&mut jobs);
         assert_eq!(jobs.len(), 1, "fresh job stays");
         jobs[0].at -= SNAP_TTL + std::time::Duration::from_millis(10);

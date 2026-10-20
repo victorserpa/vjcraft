@@ -2924,8 +2924,12 @@ impl Compositor {
     }
 
     /// The texture of the Preview monitor, `None` while no preview is rendered.
+    /// Also `None` when the composition renders at 16 bits: the readback is 8-bit only.
     pub fn preview_texture(&self) -> Option<&wgpu::Texture> {
-        None
+        self.routed
+            .get(&SliceSource::Preview)
+            .map(|t| &t.0)
+            .filter(|t| t.format() == self.readable().format())
     }
 
     /// The view of a routed layer / group rendered by the last `render_routed`.
@@ -7470,7 +7474,7 @@ mod tests {
         );
         let mut screen = vjc_core::mapping::new_screen("t", 8, 4);
         let mut sl = vjc_core::mapping::new_slice(8, 4);
-        sl.output_mesh = vec![(0.0, 0.0), (0.5, 0.0), (0.0, 1.0), (0.5, 1.0)];
+        sl.output_mesh = vec![(0.0, 0.0), (4.0, 0.0), (0.0, 4.0), (4.0, 4.0)];
         screen.slices.push(sl);
         let renderer = crate::slice_render::SliceRenderer::new(&device);
         let (tex, view) = crate::slice_render::make_screen_target(&device, 8, 4);

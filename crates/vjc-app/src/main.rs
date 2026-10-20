@@ -6298,8 +6298,17 @@ impl State {
         }
         let targets = api_ext::SnapTargets {
             comp: (comp.readable(), comp.size, self.master_bypass),
-            preview: None,
-            screens: Default::default(),
+            preview: comp
+                .preview_texture()
+                .map(|t| (t, comp.size, self.master_bypass)),
+            screens: self
+                .screen_rt
+                .iter()
+                .map(|(id, t)| {
+                    let black = self.master_bypass || self.blackouts.contains(id);
+                    (*id, (&t.tex, t.size, black))
+                })
+                .collect(),
         };
         api_ext::snap_service(&mut self.snap_jobs, &rs.device, &rs.queue, &targets);
         self.render_screens(rs);
@@ -7268,9 +7277,12 @@ impl State {
             }
             "monitor" => {
                 let kind = body["kind"].as_str().unwrap_or("");
-                if kind == "preview" {
-                    return bad(501, "preview snapshots are not available; use composition");
-                }
+                let screens: Vec<Uuid> = self.project.output.screens.iter().map(|s| s.id).collect();
+                let selected = self.preview_target != PreviewTarget::Composition;
+                let src = match api_ext::snap_plan(kind, body.get("screen"), selected, &screens) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(e)),
+                };
                 let now = std::time::Instant::now();
                 if self.snap_jobs.len() >= api_ext::SNAP_QUEUE
                     || self
@@ -7280,7 +7292,10 @@ impl State {
                     return bad(429, "snapshots are rate limited (4 per second)");
                 }
                 self.snap_last = Some(now);
-                self.snap_jobs.push(api_ext::SnapJob::new(
+                // The preview and the screens render only while something shows them.
+                self.monitor_seen = true;
+                self.snap_jobs.push(api_ext::SnapJob::of(
+                    src,
                     body["format"] == "jpg",
                     reply.clone(),
                 ));
