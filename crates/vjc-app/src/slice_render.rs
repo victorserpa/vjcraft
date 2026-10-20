@@ -159,7 +159,8 @@ fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
         }
     };
     if let Some(m) = s.mask.as_ref().filter(|m| mapping::mask_valid(m)) {
-        put(0, m);
+        let m = vjc_core::slice_adv::flatten_mask(m, &s.mask_tangents);
+        put(0, &m);
         n_mask = m.len();
     }
     if let vjc_model::SliceShape::Polygon(poly) = &s.shape
@@ -171,7 +172,8 @@ fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
     if let Some(m) = screen.output_mask.as_ref().map(|m| m.points())
         && mapping::mask_valid(m)
     {
-        put(2, m);
+        let m = vjc_core::slice_adv::flatten_mask(m, &screen.output_mask_tangents);
+        put(2, &m);
         n_out = m.len();
     }
     u[5] = n_mask as f32;

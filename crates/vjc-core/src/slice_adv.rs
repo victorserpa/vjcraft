@@ -353,6 +353,48 @@ fn cubic(p0: Pt, p1: Pt, h0: Pt, h1: Pt, t: f32) -> Pt {
     )
 }
 
+/// The closed outline `pts` with its curve handles flattened to a polygon of at most
+/// `MAX_POLY_POINTS` points, ready for `rasterize_coverage` and the mask uniform. A handle
+/// `h` at a point puts the outgoing control at `point + h` and the incoming one at
+/// `point - h`. Straight edges (no handles, a list that is not one per point, or all zero)
+/// return `pts` unchanged.
+pub fn flatten_mask(pts: &[Pt], tangents: &[Pt]) -> Vec<Pt> {
+    let n = pts.len();
+    if n < 3 || tangents.len() != n || tangents.iter().all(|t| *t == (0.0, 0.0)) {
+        return pts.to_vec();
+    }
+    let sub = (MAX_POLY_POINTS / n).max(1);
+    let mut out = Vec::with_capacity(n * sub);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (p0, p1) = (pts[i], pts[j]);
+        // `cubic` offsets its controls from the third points of the segment.
+        let third = ((p1.0 - p0.0) / 3.0, (p1.1 - p0.1) / 3.0);
+        let h0 = (tangents[i].0 - third.0, tangents[i].1 - third.1);
+        let h1 = (tangents[j].0 - third.0, tangents[j].1 - third.1);
+        for k in 0..sub {
+            out.push(cubic(p0, p1, h0, h1, k as f32 / sub as f32));
+        }
+    }
+    out
+}
+
+/// Handles that round a closed outline (pen strokes): each point's handle follows the
+/// line between its neighbours. `amount` 0 = corners (empty list), 1 = fully rounded.
+pub fn smooth_tangents(pts: &[Pt], amount: f32) -> Vec<Pt> {
+    let n = pts.len();
+    if n < 3 || amount.is_nan() || amount <= 0.0 {
+        return vec![];
+    }
+    let k = amount.min(1.0) / 6.0;
+    (0..n)
+        .map(|i| {
+            let (a, b) = (pts[(i + n - 1) % n], pts[(i + 1) % n]);
+            ((b.0 - a.0) * k, (b.1 - a.1) * k)
+        })
+        .collect()
+}
+
 /// Tessellates a Bezier mesh to a dense grid: `sub` steps per cell. Handles are offsets
 /// from the one-third points of each segment (zero handles = the linear mesh). Returns the
 /// points and the column count.

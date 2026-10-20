@@ -52,6 +52,7 @@ pub fn new_slice(w: u32, h: u32) -> Slice {
         shape: Default::default(),
         mesh_mode: Default::default(),
         mesh_tangents: vec![],
+        mask_tangents: vec![],
         transform: Default::default(),
     }
 }
@@ -87,6 +88,7 @@ pub fn new_screen(name: &str, w: u32, h: u32) -> Screen {
         delay_ms: 0,
         additive_overlap: false,
         output_mask: None,
+        output_mask_tangents: vec![],
     }
 }
 

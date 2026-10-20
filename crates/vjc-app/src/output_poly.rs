@@ -54,6 +54,13 @@ impl DrawTool {
     }
 }
 
+/// Curve handles of the polygon `poly_canvas` edits: the current ones (one per point, or
+/// none) and how to store a new list.
+pub(crate) struct Curve<'a> {
+    pub(crate) tangents: &'a [Pt],
+    pub(crate) set: &'a dyn Fn(Vec<Pt>) -> Command,
+}
+
 /// Polygon editing state of the window.
 #[derive(Default)]
 pub(crate) struct PolyUi {
@@ -96,21 +103,53 @@ pub(crate) fn finish_command(
         }),
         DrawFor::OutputMask => {
             let pts = slice_adv::clamp_poly(pts).ok()?;
-            Some(Command::SetScreenMask {
+            let set = Command::SetScreenMask {
                 screen: scr.id,
                 mask: Some(if pen {
                     Mask::Path(pts)
                 } else {
                     Mask::Polygon(pts)
                 }),
+            };
+            // A new drawing is a new shape: the old handles do not belong to it.
+            Some(if scr.output_mask_tangents.is_empty() {
+                set
+            } else {
+                Command::Batch {
+                    commands: vec![
+                        set,
+                        Command::SetScreenMaskTangents {
+                            screen: scr.id,
+                            tangents: vec![],
+                        },
+                    ],
+                }
             })
         }
         DrawFor::SliceMask(slice) => {
             let mask = slice_adv::clamp_poly(pts).ok()?;
-            Some(Command::SetSliceMask {
+            let set = Command::SetSliceMask {
                 screen: scr.id,
                 slice,
                 mask: Some(mask),
+            };
+            let old = scr
+                .slices
+                .iter()
+                .any(|s| s.id == slice && !s.mask_tangents.is_empty());
+            Some(if old {
+                Command::Batch {
+                    commands: vec![
+                        set,
+                        Command::SetSliceMaskTangents {
+                            screen: scr.id,
+                            slice,
+                            tangents: vec![],
+                        },
+                    ],
+                }
+            } else {
+                set
             })
         }
     }
@@ -340,23 +379,89 @@ impl State {
         (rect, clip): (egui::Rect, egui::Rect),
         sel: &mut Option<usize>,
         set: &dyn Fn(Vec<Pt>) -> Command,
+        curve: Option<Curve<'_>>,
         cmds: &mut Vec<Command>,
     ) {
         let col = ui.visuals().selection.stroke.color;
-        let screen_pts: Vec<egui::Pos2> = pts
-            .iter()
-            .map(|q| {
-                egui::pos2(
-                    rect.min.x + q.0 * rect.width(),
-                    rect.min.y + q.1 * rect.height(),
-                )
-            })
-            .collect();
+        let to_screen = |q: &Pt| {
+            egui::pos2(
+                rect.min.x + q.0 * rect.width(),
+                rect.min.y + q.1 * rect.height(),
+            )
+        };
+        let tg: Vec<Pt> = curve
+            .as_ref()
+            .filter(|c| c.tangents.len() == pts.len())
+            .map(|c| c.tangents.to_vec())
+            .unwrap_or_default();
+        let outline = slice_adv::flatten_mask(pts, &tg);
+        let screen_pts: Vec<egui::Pos2> = outline.iter().map(to_screen).collect();
         ui.painter_at(clip).add(egui::Shape::closed_line(
             screen_pts,
             egui::Stroke::new(STROKE_CANVAS, col),
         ));
         *sel = sel.filter(|&i| i < pts.len());
+        if let Some(i) = *sel
+            && let Some(t) = tg.get(i).filter(|t| **t != (0.0, 0.0))
+        {
+            // The two arms of the selected point's handle.
+            let p = pts[i];
+            let (a, b) = (
+                to_screen(&(p.0 - t.0, p.1 - t.1)),
+                to_screen(&(p.0 + t.0, p.1 + t.1)),
+            );
+            let painter = ui.painter_at(clip);
+            painter.line_segment([a, b], egui::Stroke::new(STROKE_HANDLE, col));
+            for end in [a, b] {
+                painter.circle_filled(end, HANDLE_R * 0.7, col);
+            }
+        }
+        // Alt+drag on a point pulls out its handle, Alt+click makes it a corner again.
+        let alt = ui.input(|i| i.modifiers.alt);
+        let to_norm = |q: egui::Pos2| {
+            (
+                (q.x - rect.min.x) / rect.width(),
+                (q.y - rect.min.y) / rect.height(),
+            )
+        };
+        let curve_key = id.with("curve-drag");
+        let mut curved = false;
+        let mut held = None;
+        if let Some(c) = &curve
+            && let Some(q) = resp.interact_pointer_pos()
+        {
+            let radius = HANDLE_R * HANDLE_GRAB_K / rect.width();
+            let hit = mapping::hit_test(pts, to_norm(q), radius);
+            if resp.drag_started() {
+                let start = hit.filter(|_| alt);
+                ui.data_mut(|d| d.insert_temp::<Option<usize>>(curve_key, start));
+            }
+            held = ui.data(|d| d.get_temp::<Option<usize>>(curve_key).flatten());
+            let mut next = tg.clone();
+            next.resize(pts.len(), (0.0, 0.0));
+            if resp.dragged()
+                && let Some(i) = held
+            {
+                let u = to_norm(q);
+                next[i] = (u.0 - pts[i].0, u.1 - pts[i].1);
+                *sel = Some(i);
+                cmds.push((c.set)(next));
+                curved = true;
+            } else if resp.clicked()
+                && alt
+                && let Some(i) = hit
+            {
+                *sel = Some(i);
+                curved = true;
+                if tg.get(i).is_some_and(|t| *t != (0.0, 0.0)) {
+                    next[i] = (0.0, 0.0);
+                    cmds.push((c.set)(next));
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            ui.data_mut(|d| d.insert_temp::<Option<usize>>(curve_key, None));
+        }
         let moved = handles(
             ui,
             resp,
@@ -376,6 +481,18 @@ impl State {
         let delete = resp.hovered()
             && ui
                 .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+        // Points move, go away or appear with their handles in step.
+        let with_handles = |next: Vec<Pt>, tangents: Vec<Pt>| match &curve {
+            Some(c) if !tangents.is_empty() => Command::Batch {
+                commands: vec![set(next), (c.set)(tangents)],
+            },
+            _ => set(next),
+        };
+        // Only a press that began on a point under Alt is a handle gesture; the rest of the
+        // canvas (moves, Delete, adding points) works as usual.
+        let handle_gesture = curved || held.is_some();
+        let moved = moved.filter(|_| !handle_gesture);
+        let delete = delete && !handle_gesture;
         if let Some((i, mut q)) = moved.filter(|&(i, _)| i < pts.len()) {
             if shift {
                 q = snap_norm(pts[(i + pts.len() - 1) % pts.len()], q, size);
@@ -390,11 +507,18 @@ impl State {
             let mut next = pts.to_vec();
             next.remove(i);
             *sel = None;
-            cmds.push(set(next));
+            let mut t = tg.clone();
+            if !t.is_empty() {
+                t.remove(i);
+            }
+            cmds.push(with_handles(next, t));
         } else if let Some(at) = ui.input(|i| {
-            (i.pointer.primary_clicked() && resp.hovered())
-                .then(|| i.pointer.interact_pos())
-                .flatten()
+            (i.pointer.primary_clicked()
+                && resp.hovered()
+                && !handle_gesture
+                && !(alt && curve.is_some()))
+            .then(|| i.pointer.interact_pos())
+            .flatten()
         }) {
             let q = (
                 (at.x - rect.min.x) / rect.width(),
@@ -406,7 +530,11 @@ impl State {
                 let mut next = pts.to_vec();
                 next.insert(i, q);
                 *sel = Some(i);
-                cmds.push(set(next));
+                let mut t = tg.clone();
+                if !t.is_empty() {
+                    t.insert(i, (0.0, 0.0));
+                }
+                cmds.push(with_handles(next, t));
             }
         }
     }

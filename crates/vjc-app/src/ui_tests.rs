@@ -9372,3 +9372,273 @@ fn write_lock_serialises_two_writers_and_leaves_no_tmp() {
     tmp.push(".tmp");
     assert!(!std::path::Path::new(&tmp).exists());
 }
+
+/// Drags with `mods` held for the whole gesture.
+fn drag_held(h: &mut Harness<'_, State>, from: egui::Pos2, to: egui::Pos2, mods: egui::Modifiers) {
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: mods,
+    };
+    h.hover_at(from);
+    h.step();
+    h.event_modifiers(button(from, true), mods);
+    h.step();
+    for i in 1..=6 {
+        h.event_modifiers(
+            egui::Event::PointerMoved(from.lerp(to, i as f32 / 6.0)),
+            mods,
+        );
+        h.step();
+    }
+    h.event_modifiers(button(to, false), mods);
+    settle(h);
+}
+
+#[test]
+fn alt_drag_on_a_mask_point_pulls_out_a_handle_and_undo_removes_it() {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add output mask", "Draw points");
+    let corners = [
+        (600.0, 300.0),
+        (1400.0, 300.0),
+        (1400.0, 800.0),
+        (600.0, 800.0),
+    ];
+    for (x, y) in corners {
+        click_at(&mut h, o + egui::vec2(x * k, y * k));
+    }
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let scr = h.state().project.output.screens[0].clone();
+    assert_eq!(scr.output_mask.as_ref().map(|m| m.points().len()), Some(4));
+    assert!(scr.output_mask_tangents.is_empty(), "straight at first");
+    let before = scr.output_mask.clone();
+    let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
+    drag_held(
+        &mut h,
+        at(600.0, 300.0),
+        at(800.0, 300.0),
+        egui::Modifiers::ALT,
+    );
+    let scr = h.state().project.output.screens[0].clone();
+    assert_eq!(scr.output_mask, before, "the point itself did not move");
+    assert_eq!(scr.output_mask_tangents.len(), 4);
+    assert!(
+        scr.output_mask_tangents[0].0 > 0.05,
+        "handle pulled to the right"
+    );
+    assert_eq!(scr.output_mask_tangents[1], (0.0, 0.0));
+    click(&mut h, "Undo edit");
+    assert!(
+        h.state().project.output.screens[0]
+            .output_mask_tangents
+            .iter()
+            .all(|t| *t == (0.0, 0.0))
+    );
+}
+
+#[test]
+fn alt_click_turns_a_curved_mask_point_back_into_a_corner() {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add output mask", "Draw points");
+    for (x, y) in [
+        (600.0, 300.0),
+        (1400.0, 300.0),
+        (1400.0, 800.0),
+        (600.0, 800.0),
+    ] {
+        click_at(&mut h, o + egui::vec2(x * k, y * k));
+    }
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
+    drag_held(
+        &mut h,
+        at(600.0, 300.0),
+        at(800.0, 300.0),
+        egui::Modifiers::ALT,
+    );
+    assert_ne!(
+        h.state().project.output.screens[0].output_mask_tangents[0],
+        (0.0, 0.0)
+    );
+    let p = at(600.0, 300.0);
+    h.hover_at(p);
+    h.step();
+    let ev = |pressed| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::ALT,
+    };
+    h.event_modifiers(ev(true), egui::Modifiers::ALT);
+    h.step();
+    h.event_modifiers(ev(false), egui::Modifiers::ALT);
+    settle(&mut h);
+    assert_eq!(
+        h.state().project.output.screens[0].output_mask_tangents[0],
+        (0.0, 0.0)
+    );
+}
+
+/// Output mask of four corners drawn through the menus, curved at point 0 by Alt+drag.
+fn curved_square_mask() -> (Harness<'static, State>, egui::Pos2, f32) {
+    let mut h = precise_slice_setup();
+    let (o, k) = (out_canvas_origin(&h), out_k(&h));
+    nested_menu(&mut h, "Add output mask", "Draw points");
+    for (x, y) in [
+        (600.0, 300.0),
+        (1400.0, 300.0),
+        (1400.0, 800.0),
+        (600.0, 800.0),
+    ] {
+        click_at(&mut h, o + egui::vec2(x * k, y * k));
+    }
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
+    drag_held(
+        &mut h,
+        at(600.0, 300.0),
+        at(800.0, 300.0),
+        egui::Modifiers::ALT,
+    );
+    assert_eq!(
+        h.state().project.output.screens[0]
+            .output_mask_tangents
+            .len(),
+        4
+    );
+    (h, o, k)
+}
+
+#[test]
+fn drawing_a_new_mask_clears_the_old_handles() {
+    let (mut h, o, k) = curved_square_mask();
+    nested_menu(&mut h, "Add output mask", "Draw points");
+    for (x, y) in [
+        (300.0, 200.0),
+        (1500.0, 250.0),
+        (1500.0, 900.0),
+        (300.0, 850.0),
+    ] {
+        click_at(&mut h, o + egui::vec2(x * k, y * k));
+    }
+    h.key_press(egui::Key::Enter);
+    settle(&mut h);
+    let scr = h.state().project.output.screens[0].clone();
+    assert_eq!(scr.output_mask.as_ref().map(|m| m.points().len()), Some(4));
+    assert!(
+        scr.output_mask_tangents.iter().all(|t| *t == (0.0, 0.0)),
+        "outline is straight"
+    );
+}
+
+#[test]
+fn remove_output_mask_point_drops_only_its_handle() {
+    let (mut h, _, _) = curved_square_mask();
+    let t = h.state().project.output.screens[0]
+        .output_mask_tangents
+        .clone();
+    h.state_mut().sel_slice = None;
+    h.state_mut().sel_slices.clear();
+    settle(&mut h);
+    h.state_mut().poly.sel_omask = Some(2);
+    settle(&mut h);
+    click_far(&mut h, "Remove output mask point");
+    let scr = h.state().project.output.screens[0].clone();
+    assert_eq!(scr.output_mask.as_ref().map(|m| m.points().len()), Some(3));
+    assert_eq!(scr.output_mask_tangents, vec![t[0], t[1], t[3]]);
+}
+
+#[test]
+fn alt_held_on_empty_canvas_still_allows_delete_and_adds_no_point() {
+    let (mut h, o, k) = curved_square_mask();
+    let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
+    // Alt+click on empty canvas: no new point.
+    let p = at(1000.0, 550.0);
+    h.hover_at(p);
+    h.step();
+    let ev = |pressed| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::ALT,
+    };
+    h.event_modifiers(ev(true), egui::Modifiers::ALT);
+    h.step();
+    h.event_modifiers(ev(false), egui::Modifiers::ALT);
+    settle(&mut h);
+    let n = |h: &Harness<'_, State>| {
+        h.state().project.output.screens[0]
+            .output_mask
+            .as_ref()
+            .map(|m| m.points().len())
+    };
+    assert_eq!(n(&h), Some(4));
+    // Delete with Alt held removes the selected point.
+    h.state_mut().poly.sel_omask = Some(2);
+    h.hover_at(p);
+    settle(&mut h);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::Delete);
+    settle(&mut h);
+    assert_eq!(n(&h), Some(3));
+}
+
+#[test]
+fn plain_click_after_an_alt_drag_still_adds_a_point() {
+    let (mut h, o, k) = curved_square_mask();
+    let n = |h: &Harness<'_, State>| {
+        h.state().project.output.screens[0]
+            .output_mask
+            .as_ref()
+            .map(|m| m.points().len())
+    };
+    assert_eq!(n(&h), Some(4));
+    click_at(&mut h, o + egui::vec2(1000.0 * k, 300.0 * k));
+    assert_eq!(n(&h), Some(5));
+}
+
+#[test]
+fn undo_and_redo_of_remove_point_restore_the_handles() {
+    let (mut h, _, _) = curved_square_mask();
+    let t = h.state().project.output.screens[0]
+        .output_mask_tangents
+        .clone();
+    h.state_mut().sel_slice = None;
+    h.state_mut().sel_slices.clear();
+    settle(&mut h);
+    h.state_mut().poly.sel_omask = Some(2);
+    settle(&mut h);
+    click_far(&mut h, "Remove output mask point");
+    let scr = |h: &Harness<'_, State>| h.state().project.output.screens[0].clone();
+    assert_eq!(scr(&h).output_mask_tangents.len(), 3);
+    click(&mut h, "Undo edit");
+    let s = scr(&h);
+    assert_eq!(s.output_mask.as_ref().map(|m| m.points().len()), Some(4));
+    assert_eq!(s.output_mask_tangents, t);
+    click(&mut h, "Redo edit");
+    let s = scr(&h);
+    assert_eq!(s.output_mask.as_ref().map(|m| m.points().len()), Some(3));
+    assert_eq!(s.output_mask_tangents.len(), 3);
+}
+
+#[test]
+fn remove_point_clears_handles_that_do_not_match_the_mask() {
+    let (mut h, _, _) = curved_square_mask();
+    h.state_mut().sel_slice = None;
+    h.state_mut().sel_slices.clear();
+    settle(&mut h);
+    h.state_mut().out_win.as_mut().unwrap().proj.output.screens[0].output_mask_tangents =
+        vec![(0.01, 0.0); 2];
+    h.state_mut().poly.sel_omask = Some(2);
+    settle(&mut h);
+    click_far(&mut h, "Remove output mask point");
+    let s = h.state().project.output.screens[0].clone();
+    assert_eq!(s.output_mask.as_ref().map(|m| m.points().len()), Some(3));
+    assert!(s.output_mask_tangents.is_empty());
+}
