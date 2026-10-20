@@ -1199,6 +1199,178 @@ mod tests {
         assert_eq!((r(2), r(7)), (255, 255));
     }
 
+    /// f32 to IEEE half bits (normal range, zero and one only; enough for the ramps below).
+    fn f16_bits(v: f32) -> u16 {
+        if v == 0.0 {
+            return 0;
+        }
+        let b = v.to_bits();
+        let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        ((e as u32) << 10 | (b & 0x7f_ffff) >> 13) as u16
+    }
+
+    /// Renders a 1024 x 8 screen from a 1024 x 1 source of grey values `f(x)` (16-bit
+    /// source when `deep`, else 8-bit), with `dither`. Returns the red channel of row 3.
+    fn dither_row(deep: bool, dither: bool, f: &dyn Fn(usize) -> f32) -> Option<Vec<u8>> {
+        let (device, queue) = gpu()?;
+        let n = 1024u32;
+        let (fmt, bytes): (_, Vec<u8>) = if deep {
+            let b = (0..n as usize)
+                .flat_map(|x| {
+                    let h = f16_bits(f(x)).to_le_bytes();
+                    let one = f16_bits(1.0).to_le_bytes();
+                    [h, h, h, one].concat()
+                })
+                .collect();
+            (wgpu::TextureFormat::Rgba16Float, b)
+        } else {
+            let b = (0..n as usize)
+                .flat_map(|x| {
+                    let v = (f(x) * 255.0).round() as u8;
+                    [v, v, v, 255]
+                })
+                .collect();
+            (wgpu::TextureFormat::Rgba8Unorm, b)
+        };
+        let src = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: n,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: fmt,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let px = bytes.len() as u32 / n;
+        queue.write_texture(
+            src.as_image_copy(),
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(px * n),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: n,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = src.create_view(&Default::default());
+        let mut screen = vjc_core::mapping::new_screen("t", n, 8);
+        screen.slices.push(vjc_core::mapping::new_slice(n, 8));
+        let (dst, dst_v) = make_screen_target(&device, n, 8);
+        SliceRenderer::new(&device).render_dithered(
+            &device,
+            &queue,
+            &screen,
+            &|_| (&view, (n, 1)),
+            &dst_v,
+            dither,
+        );
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4096 * 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            dst.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4096),
+                    rows_per_image: Some(8),
+                },
+            },
+            wgpu::Extent3d {
+                width: n,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let d = buf.slice(..).get_mapped_range().expect("map").to_vec();
+        buf.unmap();
+        Some((0..n as usize).map(|x| d[3 * 4096 + x * 4]).collect())
+    }
+
+    fn longest_run(row: &[u8]) -> usize {
+        let (mut best, mut cur) = (0, 0);
+        for i in 0..row.len() {
+            cur = if i > 0 && row[i] == row[i - 1] {
+                cur + 1
+            } else {
+                1
+            };
+            best = best.max(cur);
+        }
+        best
+    }
+
+    fn ramp(x: usize) -> f32 {
+        0.40 + 0.02 * (x as f32 + 0.5) / 1024.0
+    }
+
+    #[test]
+    fn gpu_dither_off_bands_a_deep_ramp() {
+        let Some(row) = dither_row(true, false, &ramp) else {
+            return;
+        };
+        let mut distinct = row.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert!(distinct.len() <= 6, "{} distinct", distinct.len());
+        assert!(longest_run(&row) > 100, "run {}", longest_run(&row));
+    }
+
+    #[test]
+    fn gpu_dither_on_keeps_block_means_and_breaks_runs() {
+        let Some(row) = dither_row(true, true, &ramp) else {
+            return;
+        };
+        for b in 0..16 {
+            let r = b * 64..(b + 1) * 64;
+            let got = row[r.clone()].iter().map(|&v| v as f32).sum::<f32>() / 64.0 / 255.0;
+            let want = r.map(ramp).sum::<f32>() / 64.0;
+            assert!(
+                (got - want).abs() <= 0.5 / 255.0,
+                "block {b}: {got} vs {want}"
+            );
+        }
+        assert!(longest_run(&row) <= 16, "run {}", longest_run(&row));
+    }
+
+    #[test]
+    fn gpu_dither_flag_changes_nothing_for_an_8_bit_source() {
+        let f = |x: usize| (x % 256) as f32 / 255.0;
+        let (Some(a), Some(b)) = (dither_row(false, false, &f), dither_row(false, true, &f)) else {
+            return;
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn gpu_dither_never_moves_black_or_white() {
+        let f = |x: usize| if x < 512 { 0.0 } else { 1.0 };
+        let Some(row) = dither_row(true, true, &f) else {
+            return;
+        };
+        assert!(row[..512].iter().all(|&v| v == 0), "black moved");
+        assert!(row[512..].iter().all(|&v| v == 255), "white moved");
+    }
+
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;

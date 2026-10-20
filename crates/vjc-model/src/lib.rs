@@ -2303,6 +2303,19 @@ impl std::fmt::Display for Timecode {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn output_dither_defaults_on_and_round_trips_off() {
+        let old: OutputSetup = serde_json::from_str(r#"{"screens":[]}"#).unwrap();
+        assert!(old.dither, "old projects load with dither on");
+        let off = OutputSetup {
+            screens: vec![],
+            dither: false,
+        };
+        let back: OutputSetup =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.dither);
+    }
+
+    #[test]
     fn artnet_device_loads_the_old_single_fixture_format() {
         let old = r#"{"ArtNet":{"ip":"10.0.0.9","universe":3,"fixture":{"name":"M","width":8,"height":8,"format":"Rgb","order":"Grb","gamma":2.2,"serpentine":true}}}"#;
         let d: OutputDevice = serde_json::from_str(old).unwrap();
