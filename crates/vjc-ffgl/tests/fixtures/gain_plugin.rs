@@ -79,6 +79,10 @@ fn log(code: u32) {
     }
 }
 
+/// Marks this as a VJCraft test fixture: the helper drives it with the private CPU code.
+#[unsafe(no_mangle)]
+pub static vjcraft_cpu_test_plugin: u8 = 1;
+
 // Needs an instance id (the one INSTANTIATE returned) for everything per-instance, like FFGL 2.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> FFMixed {

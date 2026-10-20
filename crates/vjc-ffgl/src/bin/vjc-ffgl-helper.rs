@@ -28,7 +28,6 @@ struct Plugin {
 /// test code (fixture only) stays on the CPU path, everything else is driven over OpenGL.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    Unknown,
     Cpu,
     Gl,
 }
@@ -56,6 +55,9 @@ impl Plugin {
                 .map_err(|e| e.to_string())?;
             let main: Symbol<PlugMain> = lib.get(b"plugMain\0").map_err(|e| e.to_string())?;
             let main = *main;
+            // Only VJCraft's own test fixtures export this marker; real plugins are never sent
+            // the private CPU process code.
+            let cpu = lib.get::<*const u8>(b"vjcraft_cpu_test_plugin\0").is_ok();
             Ok(Plugin {
                 main,
                 initialised: false,
@@ -63,7 +65,7 @@ impl Plugin {
                 gl: None,
                 gl_error: String::new(),
                 viewport: DEFAULT_VIEWPORT,
-                mode: Mode::Unknown,
+                mode: if cpu { Mode::Cpu } else { Mode::Gl },
                 started: Instant::now(),
                 _lib: lib,
             })
@@ -250,6 +252,12 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
                         Ok(g) => p.gl = Some(g),
                         Err(e) => p.gl_error = e,
                     }
+                    // A GL plugin must not be instantiated without a current context.
+                    if p.mode == Mode::Gl && p.gl.is_none() {
+                        return Response::Err {
+                            msg: format!("no OpenGL context: {}", p.gl_error),
+                        };
+                    }
                     match p.info().and_then(|i| p.instantiate().map(|_| i)) {
                         Ok(info) => {
                             *cur = Some(p);
@@ -322,7 +330,7 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
                 };
             }
             let (a, b) = map.split_at_mut(n);
-            if p.mode != Mode::Gl {
+            if p.mode == Mode::Cpu {
                 let s = CpuFrameStruct {
                     input: a.as_ptr(),
                     output: b.as_mut_ptr(),
@@ -336,15 +344,11 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
                     },
                 );
                 if unsafe { r.u } != FF_FAIL {
-                    p.mode = Mode::Cpu;
                     return Response::Done;
                 }
-                if p.mode == Mode::Cpu {
-                    return Response::Err {
-                        msg: "CPU process failed".into(),
-                    };
-                }
-                p.mode = Mode::Gl;
+                return Response::Err {
+                    msg: "CPU process failed".into(),
+                };
             }
             match p.process_gl(w, h, a, &mut b[..n]) {
                 Ok(()) => Response::Done,
