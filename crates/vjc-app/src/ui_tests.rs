@@ -7348,6 +7348,80 @@ fn preview_widget_arrow_keys_nudge_when_focused() {
     assert_eq!(xf_val(&h, t, F::Y), 10.0);
 }
 
+/// Click the Preview, then run `release`; arrows must no longer nudge.
+fn preview_focus_released_by(
+    text_field: bool,
+    release: impl FnOnce(&mut Harness<'static, State>),
+) {
+    use vjc_model::TransformField as F;
+    let (mut h, _, t) = xf_setup();
+    let from = xf_screen(&h, egui::vec2(100.0, 100.0));
+    click_at(&mut h, from);
+    h.key_press(egui::Key::ArrowRight);
+    settle(&mut h);
+    assert_eq!(xf_val(&h, t, F::X), 1.0, "focused Preview nudges");
+    assert!(h.ctx.memory(|m| m.focused()).is_some(), "Preview focused");
+    release(&mut h);
+    settle(&mut h);
+    if !text_field {
+        assert!(
+            h.ctx.memory(|m| m.focused()).is_none(),
+            "nothing keeps keyboard focus, so other panels get the arrows"
+        );
+    }
+    h.key_press(egui::Key::ArrowRight);
+    settle(&mut h);
+    assert_eq!(xf_val(&h, t, F::X), 1.0, "released Preview must not nudge");
+}
+
+#[test]
+fn preview_arrows_stop_after_click_outside() {
+    preview_focus_released_by(false, |h| {
+        let p = h.get_by_label("Select column 1").rect().center();
+        click_at(h, p);
+    });
+}
+
+#[test]
+fn preview_arrows_stop_after_click_on_empty_area() {
+    preview_focus_released_by(false, |h| click_at(h, egui::pos2(2.0, 2.0)));
+}
+
+#[test]
+fn preview_arrows_stop_after_escape() {
+    preview_focus_released_by(false, |h| h.key_press(egui::Key::Escape));
+}
+
+#[test]
+fn preview_arrows_stop_after_a_text_field_gets_focus() {
+    preview_focus_released_by(true, |h| {
+        let c = h.state().project.composition.columns[0].clone();
+        h.state_mut().col_renaming = Some((c.id, c.name));
+        settle(h);
+        assert!(h.query_by_label("Column name").is_some(), "text field shown");
+    });
+}
+
+#[test]
+fn preview_focus_does_not_block_the_palette_arrows() {
+    let (mut h, _, _) = xf_setup();
+    let from = xf_screen(&h, egui::vec2(100.0, 100.0));
+    click_at(&mut h, from);
+    h.state_mut().palette_open();
+    settle(&mut h);
+    h.key_press(egui::Key::ArrowDown);
+    settle(&mut h);
+    assert_eq!(h.state().palette.sel, 1, "palette got the arrow");
+}
+
+#[test]
+fn preview_shows_a_focus_outline_only_while_focused() {
+    assert_eq!(preview_focus_stroke(false), None);
+    let s = preview_focus_stroke(true).expect("outline while focused");
+    assert_eq!(s.color, theme::ACCENT);
+    assert!(s.width > 0.0 && s.width <= theme::FOCUS_W);
+}
+
 // ---- REST open-clips: the on-air invariants (issue #13) ----
 
 /// POST /api/v1/clips/open as a client would, answered by the app on its UI thread.
