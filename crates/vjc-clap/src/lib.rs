@@ -218,8 +218,14 @@ fn find_plugins(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Bumped when a cached field changes meaning, so older caches are rescanned.
+/// 2: `Entry.stereo` means "has usable audio ports" (mono and multi-channel count).
+const CACHE_VERSION: u32 = 2;
+
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
+    #[serde(default)]
+    version: u32,
     entries: BTreeMap<String, Vec<Entry>>,
     /// Files that failed, crashed or hung, by path -> mtime; not retried until the file changes.
     #[serde(default)]
@@ -265,7 +271,8 @@ pub fn scan_with(
 ) -> (Vec<Entry>, usize) {
     let mut cache: Cache = std::fs::read(cache_file)
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| serde_json::from_slice::<Cache>(&b).ok())
+        .filter(|c| c.version == CACHE_VERSION)
         .unwrap_or_default();
     if force {
         cache.failed.clear();
@@ -351,6 +358,7 @@ pub fn scan_with(
     let _ = std::fs::write(
         cache_file,
         serde_json::to_vec(&Cache {
+            version: CACHE_VERSION,
             entries: next,
             failed: next_failed,
             slow: next_slow,
