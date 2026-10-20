@@ -6309,6 +6309,10 @@ impl State {
                 .collect(),
         };
         api_ext::snap_service(&mut self.snap_jobs, &rs.device, &rs.queue, &targets);
+        if !self.snap_jobs.is_empty() {
+            // A job waiting for its target must get another pass even if the app is idle.
+            crate::wake::now();
+        }
         self.render_screens(rs);
     }
 
