@@ -597,6 +597,11 @@ fn palette_owns_keys(focused: Option<egui::Id>, query: egui::Id) -> bool {
     focused.is_none_or(|f| f == query)
 }
 
+/// Outline of the Preview while it owns the arrow keys (the theme focus ring, thinner).
+fn preview_focus_stroke(focused: bool) -> Option<egui::Stroke> {
+    focused.then(|| egui::Stroke::new(theme::FOCUS_W / 2.0, theme::ACCENT))
+}
+
 /// The autopilot after the "Every loops" field was set to `n`: the unit stays as it is.
 fn every_loops_edit(a: &vjc_model::Autopilot, n: f32) -> vjc_model::Autopilot {
     vjc_model::Autopilot {
@@ -9742,7 +9747,17 @@ impl State {
             // The drag ended: a nudge right after must not merge into it.
             self.history.seal();
         }
-        if resp.has_focus() {
+        // Esc or a press outside the Preview hands the arrows back to the other panels.
+        let leave = resp.has_focus()
+            && ui.input(|i| {
+                i.key_pressed(egui::Key::Escape)
+                    || (i.pointer.any_pressed()
+                        && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p)))
+            });
+        if leave {
+            ui.memory_mut(|m| m.surrender_focus(resp.id));
+        }
+        if resp.has_focus() && !leave {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
                     resp.id,
@@ -9893,6 +9908,14 @@ impl State {
                 }
             }
             if i == 1 {
+                if let Some(stroke) = preview_focus_stroke(resp.has_focus()) {
+                    painter.rect_stroke(
+                        rect.shrink(stroke.width / 2.0),
+                        0.0,
+                        stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 self.xf_paint(&painter, rect, (cw, ch));
                 let note = self.preview_caption();
                 painter.text(
