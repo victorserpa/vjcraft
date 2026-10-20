@@ -9747,17 +9747,17 @@ impl State {
             // The drag ended: a nudge right after must not merge into it.
             self.history.seal();
         }
-        if resp.has_focus() {
-            // Esc or a press outside the Preview hands the arrows back to the other panels.
-            let leave = ui.input(|i| {
+        // Esc or a press outside the Preview hands the arrows back to the other panels.
+        let leave = resp.has_focus()
+            && ui.input(|i| {
                 i.key_pressed(egui::Key::Escape)
                     || (i.pointer.any_pressed()
                         && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p)))
             });
-            if leave {
-                ui.memory_mut(|m| m.surrender_focus(resp.id));
-                return busy;
-            }
+        if leave {
+            ui.memory_mut(|m| m.surrender_focus(resp.id));
+        }
+        if resp.has_focus() && !leave {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
                     resp.id,
