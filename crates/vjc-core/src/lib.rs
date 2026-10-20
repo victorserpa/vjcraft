@@ -5986,6 +5986,35 @@ mod tests {
     }
 
     #[test]
+    fn clip_follow_sets_player_and_undoes() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let before = p.clone();
+        let follow = |player, master_tempo| Command::SetClipFollow {
+            deck: A,
+            layer: l,
+            column: 0,
+            player,
+            master_tempo,
+        };
+        h.exec(&mut p, follow(Some(2), true), t).unwrap();
+        let tr = clip(&p, l).unwrap().transport;
+        assert_eq!((tr.follow_player, tr.follow_master_tempo), (Some(2), true));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        assert_eq!(
+            apply(&mut p, follow(Some(5), false)),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(
+            apply(&mut p, follow(Some(0), false)),
+            Err(Error::InvalidValue)
+        );
+    }
+
+    #[test]
     fn seek_clip_is_a_runtime_event() {
         let (mut p, l) = setup();
         let mut h = History::new();

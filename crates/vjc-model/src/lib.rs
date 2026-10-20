@@ -2630,6 +2630,17 @@ mod tests {
     }
 
     #[test]
+    fn old_transport_loads_with_follow_off() {
+        let mut t = serde_json::to_value(Transport::default()).unwrap();
+        let o = t.as_object_mut().unwrap();
+        o.remove("follow_player");
+        o.remove("follow_master_tempo");
+        let t: Transport = serde_json::from_value(t).unwrap();
+        assert_eq!(t.follow_player, None);
+        assert!(!t.follow_master_tempo);
+    }
+
+    #[test]
     fn old_animation_without_motion_loads_as_loop_forward() {
         let a: Animation =
             serde_json::from_str(r#"{"Beats":{"beats":4.0,"curve":"Sine"}}"#).unwrap();

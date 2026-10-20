@@ -510,4 +510,236 @@ mod tests {
         f.update(&t, true, 0, false, &mut clock, t0);
         assert_eq!(clock.bpm(), 140.0);
     }
+
+    // ---- clip follows a player ----
+
+    const T128: f64 = 60.0 / 128.0;
+
+    fn st(player: u8, playing: bool, count: Option<u32>, pitch: u32) -> Status {
+        Status {
+            player,
+            master: false,
+            playing,
+            bpm: 128.0,
+            pitch,
+            beat_count: count,
+            beat_in_bar: 1,
+        }
+    }
+
+    fn feed_st(t: &mut Tracker, s: Status, at: Instant) {
+        t.feed(Packet::Status(decode_status(&s)), at);
+    }
+
+    /// Through the wire format, so decode is part of every follow test.
+    fn decode_status(s: &Status) -> Status {
+        match decode(&encode_status(s)) {
+            Some(Packet::Status(d)) => d,
+            other => panic!("not a status: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_roundtrip_for_all_four_players() {
+        for n in 1..=4u8 {
+            let s = st(n, n % 2 == 0, Some(u32::from(n) * 100), NORMAL_PITCH + 777);
+            let d = decode_status(&s);
+            assert_eq!(
+                (d.player, d.playing, d.beat_count, d.pitch),
+                (n, s.playing, s.beat_count, s.pitch)
+            );
+        }
+    }
+
+    #[test]
+    fn track_pos_64_beats_at_128_is_30_seconds() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        feed_st(&mut t, st(1, false, Some(64), NORMAL_PITCH), t0);
+        let p = t.track_pos(1, t0).unwrap();
+        assert!((p.secs - 30.0).abs() < 1e-9, "{}", p.secs);
+        assert!(!p.playing);
+        assert!((p.rate - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn track_pos_extrapolates_while_playing_and_holds_while_paused() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        feed_st(&mut t, st(1, true, Some(64), NORMAL_PITCH), t0);
+        let p = t.track_pos(1, ms(t0, 500)).unwrap();
+        assert!((p.secs - 30.5).abs() < 1e-6, "{}", p.secs);
+        // pause at the same beat count: position holds from there on
+        feed_st(&mut t, st(1, false, Some(64), NORMAL_PITCH), ms(t0, 500));
+        let a = t.track_pos(1, ms(t0, 600)).unwrap();
+        let b = t.track_pos(1, ms(t0, 1400)).unwrap();
+        assert!(!a.playing);
+        assert!((a.secs - b.secs).abs() < 1e-9);
+    }
+
+    #[test]
+    fn track_pos_none_without_status_or_when_beat_count_unknown() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        assert_eq!(t.track_pos(1, t0), None);
+        t.feed(Packet::Beat(beat(1, 128.0, NORMAL_PITCH, 1)), t0);
+        assert_eq!(t.track_pos(1, t0), None);
+        feed_st(&mut t, st(2, true, None, NORMAL_PITCH), t0);
+        assert_eq!(t.track_pos(2, t0), None);
+    }
+
+    #[test]
+    fn pitch_up_8_percent_gives_rate_1_08() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        let pitch = NORMAL_PITCH + NORMAL_PITCH * 8 / 100;
+        feed_st(&mut t, st(1, true, Some(64), pitch), t0);
+        let p = t.track_pos(1, t0).unwrap();
+        assert!((p.rate - 1.08).abs() < 1e-4, "{}", p.rate);
+        let later = t.track_pos(1, ms(t0, 1000)).unwrap();
+        assert!((later.secs - p.secs - 1.08).abs() < 1e-3);
+    }
+
+    fn tp(secs: f64, rate: f64, playing: bool) -> TrackPos {
+        TrackPos {
+            secs,
+            rate,
+            playing,
+        }
+    }
+
+    #[test]
+    fn follower_master_tempo_keeps_rate_1_and_holds_position() {
+        let mut f = ClipFollower::new(true);
+        let mut truth = 20.0;
+        for _ in 0..300 {
+            truth += 0.016 * 1.08;
+            f.step(Some(tp(truth, 1.08, true)), 0.016, 100.0);
+            assert!((f.rate - 1.0).abs() < 1e-9);
+            assert!((f.pos - truth).abs() < 0.001, "{} vs {truth}", f.pos);
+        }
+        let mut g = ClipFollower::new(false);
+        g.step(Some(tp(20.0, 1.08, true)), 0.016, 100.0);
+        assert!((g.rate - 1.08).abs() < 0.06);
+    }
+
+    #[test]
+    fn follower_jitter_never_hard_locks_and_stays_within_20ms() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        let mut f = ClipFollower::new(false);
+        let mut rng = 12345u64;
+        let mut jitter = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 33) % 21) as f64 - 10.0 // -10..=10 ms
+        };
+        // one status packet every 50 ms; the count follows the real position
+        let dt = 0.016;
+        let mut now_s = 0.0;
+        let mut next_pkt = 0.0;
+        let mut worst: f64 = 0.0;
+        let clip = 1000.0;
+        let start = 10.0; // track seconds at t = 0
+        while now_s < 60.0 {
+            while next_pkt <= now_s {
+                let truth = start + next_pkt;
+                let count = (truth / T128).floor() as u32;
+                // arrival time is shifted, the beat count describes the exact beat edge
+                let edge = f64::from(count) * T128 - start;
+                let at = t0 + Duration::from_secs_f64((edge.max(0.0)) + 0.0)
+                    + Duration::from_millis(10);
+                let _ = at;
+                let arrive = (next_pkt + jitter() / 1000.0).max(0.0);
+                feed_st(
+                    &mut t,
+                    st(1, true, Some(count), NORMAL_PITCH),
+                    t0 + Duration::from_secs_f64(arrive),
+                );
+                next_pkt += 0.05;
+            }
+            let now = t0 + Duration::from_secs_f64(now_s);
+            let target = t.track_pos(1, now);
+            f.step(target, dt, clip);
+            if now_s > 2.0 {
+                worst = worst.max((f.pos - (start + now_s)).abs());
+            }
+            now_s += dt;
+        }
+        assert_eq!(f.locks, 1, "only the first lock");
+        assert!(worst < 0.020, "worst drift {worst}");
+    }
+
+    #[test]
+    fn follower_jump_locks_in_one_step_and_pause_gives_rate_0() {
+        let mut f = ClipFollower::new(false);
+        f.step(Some(tp(10.0, 1.0, true)), 0.016, 100.0);
+        let locks = f.locks;
+        let jump = 10.0 + 16.0 * T128;
+        f.step(Some(tp(jump, 1.0, true)), 0.016, 100.0);
+        assert!((f.pos - jump).abs() < 1e-9);
+        assert_eq!(f.locks, locks + 1);
+        f.step(Some(tp(jump, 1.0, false)), 0.016, 100.0);
+        assert_eq!(f.rate, 0.0);
+        let held = f.pos;
+        f.step(Some(tp(jump, 1.0, false)), 0.016, 100.0);
+        assert_eq!(f.pos, held);
+    }
+
+    #[test]
+    fn follower_maps_track_time_onto_a_shorter_clip() {
+        let mut f = ClipFollower::new(false);
+        f.step(Some(tp(25.0, 1.0, true)), 0.016, 10.0);
+        assert!((f.pos - 5.0).abs() < 1e-9, "{}", f.pos);
+        f.step(Some(tp(25.0 + 0.016, 1.0, true)), 0.016, 10.0);
+        assert!((f.pos - 5.016).abs() < 1e-3);
+    }
+
+    #[test]
+    fn follower_wraps_drift_across_the_loop_point() {
+        let mut f = ClipFollower::new(false);
+        f.step(Some(tp(9.99, 1.0, true)), 0.0, 10.0);
+        let locks = f.locks;
+        // target just past the wrap: drift is 20 ms, not -9.98 s
+        f.step(Some(tp(10.01, 1.0, true)), 0.0, 10.0);
+        assert_eq!(f.locks, locks);
+    }
+
+    #[test]
+    fn stale_player_runs_free_then_relocks() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        let mut f = ClipFollower::new(false);
+        feed_st(&mut t, st(1, true, Some(64), NORMAL_PITCH), t0);
+        f.step(t.track_pos(1, t0), 0.016, 100.0);
+        let rate = f.rate;
+        let lost = ms(t0, 3000);
+        assert_eq!(t.track_pos(1, lost), None);
+        assert_eq!(t.follow_note(1, lost), Some(FollowNote::Lost(1)));
+        let before = f.pos;
+        f.step(t.track_pos(1, lost), 0.5, 100.0);
+        assert_eq!(f.rate, rate);
+        assert!((f.pos - (before + 0.5 * rate)).abs() < 1e-9);
+        // data returns somewhere else: locks again
+        feed_st(&mut t, st(1, true, Some(128), NORMAL_PITCH), ms(t0, 4000));
+        let l = f.locks;
+        f.step(t.track_pos(1, ms(t0, 4000)), 0.016, 100.0);
+        assert_eq!(f.locks, l + 1);
+        assert_eq!(t.follow_note(1, ms(t0, 4000)), None);
+    }
+
+    #[test]
+    fn beat_only_stream_stays_free_with_the_no_position_note() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        t.feed(Packet::Beat(beat(3, 128.0, NORMAL_PITCH, 2)), t0);
+        assert_eq!(t.track_pos(3, t0), None);
+        assert_eq!(t.follow_note(3, t0), Some(FollowNote::NoPosition(3)));
+        assert_eq!(t.follow_note(4, t0), Some(FollowNote::Lost(4)));
+        let mut f = ClipFollower::new(false);
+        f.rate = 1.0;
+        f.step(None, 0.1, 100.0);
+        assert!((f.pos - 0.1).abs() < 1e-9);
+    }
 }
