@@ -9588,3 +9588,57 @@ fn alt_held_on_empty_canvas_still_allows_delete_and_adds_no_point() {
     settle(&mut h);
     assert_eq!(n(&h), Some(3));
 }
+
+#[test]
+fn plain_click_after_an_alt_drag_still_adds_a_point() {
+    let (mut h, o, k) = curved_square_mask();
+    let n = |h: &Harness<'_, State>| {
+        h.state().project.output.screens[0]
+            .output_mask
+            .as_ref()
+            .map(|m| m.points().len())
+    };
+    assert_eq!(n(&h), Some(4));
+    click_at(&mut h, o + egui::vec2(1000.0 * k, 300.0 * k));
+    assert_eq!(n(&h), Some(5));
+}
+
+#[test]
+fn undo_and_redo_of_remove_point_restore_the_handles() {
+    let (mut h, _, _) = curved_square_mask();
+    let t = h.state().project.output.screens[0]
+        .output_mask_tangents
+        .clone();
+    h.state_mut().sel_slice = None;
+    h.state_mut().sel_slices.clear();
+    settle(&mut h);
+    h.state_mut().poly.sel_omask = Some(2);
+    settle(&mut h);
+    click_far(&mut h, "Remove output mask point");
+    let scr = |h: &Harness<'_, State>| h.state().project.output.screens[0].clone();
+    assert_eq!(scr(&h).output_mask_tangents.len(), 3);
+    click(&mut h, "Undo edit");
+    let s = scr(&h);
+    assert_eq!(s.output_mask.as_ref().map(|m| m.points().len()), Some(4));
+    assert_eq!(s.output_mask_tangents, t);
+    click(&mut h, "Redo edit");
+    let s = scr(&h);
+    assert_eq!(s.output_mask.as_ref().map(|m| m.points().len()), Some(3));
+    assert_eq!(s.output_mask_tangents.len(), 3);
+}
+
+#[test]
+fn remove_point_clears_handles_that_do_not_match_the_mask() {
+    let (mut h, _, _) = curved_square_mask();
+    h.state_mut().sel_slice = None;
+    h.state_mut().sel_slices.clear();
+    settle(&mut h);
+    h.state_mut().out_win.as_mut().unwrap().proj.output.screens[0].output_mask_tangents =
+        vec![(0.01, 0.0); 2];
+    h.state_mut().poly.sel_omask = Some(2);
+    settle(&mut h);
+    click_far(&mut h, "Remove output mask point");
+    let s = h.state().project.output.screens[0].clone();
+    assert_eq!(s.output_mask.as_ref().map(|m| m.points().len()), Some(3));
+    assert!(s.output_mask_tangents.is_empty());
+}

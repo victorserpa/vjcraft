@@ -857,3 +857,66 @@ fn mask_tangents_longer_than_the_mask_or_without_a_mask_are_rejected() {
     };
     assert!(run(&mut p, screen(1)).is_err(), "screen has no mask");
 }
+
+fn mask_cmds(sid: Uuid, slice: Uuid, mask: Vec<Pt>, tangents: Vec<Pt>) -> Command {
+    Command::Batch {
+        commands: vec![
+            Command::SetSliceMask {
+                screen: sid,
+                slice,
+                mask: Some(mask),
+            },
+            Command::SetSliceMaskTangents {
+                screen: sid,
+                slice,
+                tangents,
+            },
+        ],
+    }
+}
+
+fn mask_state(p: &Project) -> (usize, Vec<Pt>) {
+    let sl = &p.output.screens[0].slices[0];
+    (
+        sl.mask.as_ref().map_or(0, Vec::len),
+        sl.mask_tangents.clone(),
+    )
+}
+
+#[test]
+fn undo_redo_of_point_removal_and_redraw_batches_keep_the_handles() {
+    // `apply` has a large frame in debug builds and a batch nests it: give it room.
+    std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(removal_and_redraw_batches)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn removal_and_redraw_batches() {
+    let (mut p, sid, ids) = setup();
+    let mut hist = History::new();
+    let sq = vec![(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)];
+    let t = vec![(0.05, 0.0); 4];
+    let first = mask_cmds(sid, ids[0], sq.clone(), t.clone());
+    hist.exec(&mut p, first, Instant::now()).unwrap();
+    assert_eq!(mask_state(&p), (4, t.clone()));
+    // Remove point 2 together with its handle, like the editor does.
+    let cut = mask_cmds(sid, ids[0], vec![sq[0], sq[1], sq[3]], t[..3].to_vec());
+    hist.exec(&mut p, cut, Instant::now()).unwrap();
+    assert_eq!(mask_state(&p), (3, t[..3].to_vec()));
+    hist.undo(&mut p).unwrap().unwrap();
+    assert_eq!(mask_state(&p), (4, t.clone()));
+    hist.redo(&mut p).unwrap().unwrap();
+    assert_eq!(mask_state(&p), (3, t[..3].to_vec()));
+    hist.undo(&mut p).unwrap().unwrap();
+    // Redraw: a new 4-point mask and cleared handles in one batch.
+    let redraw = mask_cmds(sid, ids[0], sq, vec![]);
+    hist.exec(&mut p, redraw, Instant::now()).unwrap();
+    assert_eq!(mask_state(&p), (4, vec![]));
+    hist.undo(&mut p).unwrap().unwrap();
+    assert_eq!(mask_state(&p), (4, t));
+    hist.redo(&mut p).unwrap().unwrap();
+    assert_eq!(mask_state(&p), (4, vec![]));
+}
