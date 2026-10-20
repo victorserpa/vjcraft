@@ -111,7 +111,12 @@ impl Probe {
         let cell = Arc::new(OnceLock::new());
         let c = cell.clone();
         std::thread::spawn(move || {
-            let _ = c.set(f());
+            let list =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+                    eprintln!("vjc-media: codec probe panicked; no recording codecs listed");
+                    Vec::new()
+                });
+            let _ = c.set(list);
         });
         Self(cell)
     }
@@ -356,12 +361,15 @@ struct Job {
 /// Frames the encoder must finish before the larger warm-up queue ends.
 const WARM_DONE: u64 = 3;
 
-struct Pending(Arc<AtomicUsize>, Arc<AtomicU64>);
+/// Third field: true once the encoder owns the job, so only encoded frames count as done.
+struct Pending(Arc<AtomicUsize>, Arc<AtomicU64>, bool);
 
 impl Drop for Pending {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
-        self.1.fetch_add(1, Ordering::Relaxed);
+        if self.2 {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -416,11 +424,12 @@ impl FrameQueue {
         let job = Job {
             pts,
             data,
-            _pending: Pending(self.pending.clone(), self.done.clone()),
+            _pending: Pending(self.pending.clone(), self.done.clone(), true),
         };
         match self.tx.try_send(job) {
             Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Full(mut j) | TrySendError::Disconnected(mut j)) => {
+                j._pending.2 = false;
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
@@ -1167,7 +1176,11 @@ mod tests {
         let job = Job {
             pts: 0,
             data: vec![0; 16 * 16 * 4],
-            _pending: Pending(Arc::new(AtomicUsize::new(1)), Arc::new(AtomicU64::new(0))),
+            _pending: Pending(
+                Arc::new(AtomicUsize::new(1)),
+                Arc::new(AtomicU64::new(0)),
+                true,
+            ),
         };
         e.encode(&job).unwrap();
         let r = e.finish_video(Err(ff::Error::Bug));
@@ -1453,6 +1466,25 @@ mod tests {
         assert_eq!(ok, 5);
         gate_tx.send(()).unwrap();
         let _ = r.finish();
+    }
+
+    #[test]
+    fn rejected_frames_do_not_count_as_encoded() {
+        let (q, rx) = FrameQueue::with_extra(1, 4);
+        drop(rx);
+        assert!(!q.push_warm(0, vec![0], true));
+        assert_eq!(q.done.load(Ordering::Relaxed), 0);
+        assert_eq!(q.pending.load(Ordering::Relaxed), 0);
+        let (q, rx) = FrameQueue::new(2);
+        assert!(q.push(0, vec![0]));
+        drop(rx.recv().unwrap());
+        assert_eq!(q.done.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn panicking_probe_yields_an_empty_list() {
+        let p = Probe::start(|| panic!("probe boom"));
+        assert!(p.wait().is_empty());
     }
 
     #[test]

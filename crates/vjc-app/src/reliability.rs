@@ -415,6 +415,11 @@ static PARENT_GONE: AtomicBool = AtomicBool::new(false);
 /// Set by the UI when it starts the orphan quit, so the watcher lets it finish.
 pub static ORPHAN_QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// How long the watcher waits for the UI loop to start the orphan quit before exiting. The
+/// watcher wakes the UI, so a live loop starts the quit within a frame; this only bounds a
+/// UI thread that is blocked (a heavy load, a modal dialog), which must still get to save.
+const ORPHAN_START_GRACE: Duration = Duration::from_secs(10);
+
 /// True once the supervisor died (SIGKILL, crash): the app must save and quit.
 pub fn parent_gone() -> bool {
     PARENT_GONE.load(Ordering::SeqCst)
@@ -422,8 +427,8 @@ pub fn parent_gone() -> bool {
 
 /// Child mode: watches the supervisor every 500 ms. When it dies the app would otherwise
 /// keep playing unattended forever, so this flags `parent_gone` (the UI loop then saves
-/// recovery and exits). If the loop has not started that quit within 10 s (window hidden,
-/// UI stuck) the process exits; once the quit has started it gets up to 30 s to finish
+/// recovery and exits). If the loop has not started that quit within 1 s (window hidden,
+/// UI stuck; the watcher also wakes the UI every 50 ms meanwhile) the process exits; once the quit has started it gets up to 30 s to finish
 /// writing, so a large project's recovery file is not cut short.
 #[cfg(unix)]
 pub fn start_parent_watch() {
@@ -445,7 +450,10 @@ pub fn start_parent_watch() {
                 if unsafe { libc::getppid() } != parent {
                     PARENT_GONE.store(true, Ordering::SeqCst);
                     let t = std::time::Instant::now();
-                    while t.elapsed() < Duration::from_secs(10) {
+                    while t.elapsed() < ORPHAN_START_GRACE {
+                        // A hidden or occluded window repaints nothing on its own, so
+                        // the UI loop would never see `parent_gone`: wake it.
+                        crate::wake::now();
                         if ORPHAN_QUITTING.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_secs(30));
                             break;
@@ -504,6 +512,11 @@ pub fn fake_child(args: &[String]) {
         }
         // SAFETY: the handler only calls _exit.
         unsafe { libc::signal(libc::SIGTERM, die as *const () as libc::sighandler_t) };
+        std::thread::sleep(Duration::from_secs(20));
+        std::process::exit(0);
+    }
+    if mode == "stuck-ui" {
+        // A UI loop that never notices the dead supervisor: only the watcher can end it.
         std::thread::sleep(Duration::from_secs(20));
         std::process::exit(0);
     }
