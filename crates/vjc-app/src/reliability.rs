@@ -496,12 +496,14 @@ fn flush_slot_and_stop_helpers() {
         // SAFETY: SIGTERM to a pid this process spawned.
         unsafe { libc::kill(*pid as i32, libc::SIGTERM) };
     }
-    let snap = lock(&SLOT).take();
-    if let Some(s) = snap {
+    // Take the slot under the write lock: a Save or Don't Save that clears it (also under the
+    // lock) then either runs first (nothing to write) or after (deletes what was written).
+    let _w = lock(&WRITE_LOCK);
+    if let Some(s) = lock(&SLOT).take() {
         if let Some(d) = s.path.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = write_recovery(&s.path, &s.bytes);
+        let _ = vjc_io::write_atomic(&s.path, &s.bytes);
     }
 }
 

@@ -3572,12 +3572,14 @@ impl State {
     /// can leave a recovery file even if this thread never runs again. Same gates as
     /// `autosave_to` minus the autosave interval; re-encodes at most once a second and
     /// only when the project changed.
-    fn publish_recovery(&mut self) {
+    /// Publishes the recovery snapshot; `Some(wait)` when a change is held back by the
+    /// throttle, so the caller repaints in time to publish it even if nothing else does.
+    fn publish_recovery(&mut self) -> Option<std::time::Duration> {
         let path = self.recovery_path();
-        self.publish_recovery_to(path);
+        self.publish_recovery_to(path)
     }
 
-    fn publish_recovery_to(&mut self, path: Option<PathBuf>) {
+    fn publish_recovery_to(&mut self, path: Option<PathBuf>) -> Option<std::time::Duration> {
         let Some(r) = path.filter(|_| {
             self.persist
                 && !self.rehearsal
@@ -3588,18 +3590,30 @@ impl State {
             reliability::slot_set(None);
             // Whatever the gates reopen on must publish again.
             self.published_gen = u64::MAX;
-            return;
+            return None;
         };
         let bpm = self.clock.bpm();
         let changed = self.project_gen != self.published_gen || bpm != self.published_bpm;
-        if !changed || self.last_publish.elapsed() < std::time::Duration::from_secs(1) {
-            return;
+        if !changed {
+            return None;
         }
-        if let Ok(bytes) = self.with_effective_bpm(|p| vjc_io::encode(p, &r)) {
-            self.publish_count += 1;
-            reliability::slot_set(Some(reliability::Snapshot { path: r, bytes }));
+        let gap = std::time::Duration::from_secs(1);
+        if let Some(wait) = gap.checked_sub(self.last_publish.elapsed()) {
+            return Some(wait);
         }
-        self.note_published();
+        match self.with_effective_bpm(|p| vjc_io::encode(p, &r)) {
+            Ok(bytes) => {
+                self.publish_count += 1;
+                reliability::slot_set(Some(reliability::Snapshot { path: r, bytes }));
+                self.note_published();
+                None
+            }
+            // Retry after the gap rather than marking this change as published.
+            Err(_) => {
+                self.last_publish = std::time::Instant::now();
+                Some(gap)
+            }
+        }
     }
 
     fn window_title(&self) -> String {
@@ -12230,8 +12244,10 @@ impl eframe::App for State {
         if reliability::parent_gone() {
             self.quit_orphaned();
         }
-        if reliability::is_child() {
-            self.publish_recovery();
+        if reliability::is_child()
+            && let Some(wait) = self.publish_recovery()
+        {
+            ui.ctx().request_repaint_after(wait);
         }
         // Pace the UI: an unthrottled swapchain (vsync off, occluded window, output window
         // redrawing the parent) would otherwise run the whole UI thousands of times a second.

@@ -9290,6 +9290,10 @@ fn recovery_publish_encodes_at_most_once_a_second_across_100_edits() {
         st.publish_recovery_to(Some(file.clone()));
     }
     assert_eq!(st.publish_count, 1);
+    // A held-back change asks for a repaint in time to publish it.
+    edit(&mut st);
+    let wait = st.publish_recovery_to(Some(file.clone()));
+    assert!(wait.is_some_and(|w| w <= std::time::Duration::from_secs(1)));
     // Past the throttle the pending edits are published once...
     st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
     st.publish_recovery_to(Some(file.clone()));
