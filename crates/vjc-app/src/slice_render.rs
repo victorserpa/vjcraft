@@ -98,8 +98,9 @@ fn fs(in: VO) -> @location(0) vec4<f32> {
         uv = xform_uv(uv);
     }
     var c = textureSample(src, smp, uv);
-    if (u.tfx.y > 0.5 && (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)) {
-        // Outside the source: transparent.
+    let half = u.piv.zw * 0.5;
+    if (u.tfx.y > 0.5 && any(abs(uv - u.piv.xy) > half)) {
+        // Outside the slice's input area: transparent.
         c = vec4(0.0);
     }
     let flags = u32(u.con.w);
@@ -124,6 +125,22 @@ const REGION: usize = 64;
 const HEADER: usize = 36;
 /// Uniform block size: the header + 3 regions of 32 vec4.
 const UNIFORM_FLOATS: usize = HEADER + 3 * 2 * REGION;
+
+/// The transform as the shader may use it: scale inside its range (1 when not a number),
+/// non-finite shift or rotation as 0, so a hand-edited file still renders.
+fn sane_transform(t: &vjc_model::SliceTransform) -> vjc_model::SliceTransform {
+    let fin = |v: f32| if v.is_finite() { v } else { 0.0 };
+    vjc_model::SliceTransform {
+        scale: if t.scale.is_nan() {
+            1.0
+        } else {
+            t.scale
+                .clamp(mapping::SCALE_RANGE.0, mapping::SCALE_RANGE.1)
+        },
+        offset: (fin(t.offset.0), fin(t.offset.1)),
+        rotation: fin(t.rotation),
+    }
+}
 
 /// Packs the per-slice uniform (see `U` in the shader).
 fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
@@ -169,7 +186,7 @@ fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
     u[14] = screen.color.opacity;
     u[16..19].copy_from_slice(&mapping::slice_gain(&screen.color.color));
     u[19] = 1.0;
-    let t = &s.transform;
+    let t = sane_transform(&s.transform);
     u[24..28].copy_from_slice(&[t.scale, t.offset.0, t.offset.1, t.rotation.to_radians()]);
     let xs = s.input.iter().map(|p| p.0);
     let ys = s.input.iter().map(|p| p.1);
@@ -181,7 +198,7 @@ fn slice_uniform(screen: &Screen, s: &Slice, src_size: (u32, u32)) -> Vec<f32> {
         u[28..32].copy_from_slice(&[0.5, 0.5, 1.0, 1.0]);
     }
     u[32] = src_size.0.max(1) as f32 / src_size.1.max(1) as f32;
-    u[33] = (*t != vjc_model::SliceTransform::default()) as u32 as f32;
+    u[33] = (t != vjc_model::SliceTransform::default()) as u32 as f32;
     u[15] = (s.mask_invert as u32 | (s.is_key as u32) << 1 | (s.black_bg as u32) << 2) as f32;
     u
 }
@@ -384,7 +401,7 @@ impl SliceRenderer {
                             bind_with(view, &self.nearest),
                         ),
                         screen.pixel_perfect
-                            && s.transform == vjc_model::SliceTransform::default()
+                            && sane_transform(&s.transform) == vjc_model::SliceTransform::default()
                             && mapping::slice_unscaled(src_size, s),
                     )
                 })
@@ -950,6 +967,78 @@ mod tests {
                 "right half still shows the source"
             );
         }
+    }
+
+    /// The cutoff is the slice's input area, not the whole texture: a cropped input never
+    /// shows pixels from outside the crop.
+    #[test]
+    fn gpu_slice_transform_respects_cropped_input() {
+        let mut screen = mapping::new_screen("t", 4, 4);
+        let mut sl = mapping::new_slice(4, 4);
+        sl.input = vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)];
+        sl.transform.scale = 0.5;
+        screen.slices.push(sl);
+        // Left half grey, right half blue.
+        let src: Vec<u8> = (0..64u32)
+            .flat_map(|i| {
+                if i % 8 < 4 {
+                    [90, 90, 90, 255]
+                } else {
+                    [0, 0, 255, 255]
+                }
+            })
+            .collect();
+        if let Some(got) = render_src(&screen, &src, (8, 8), false) {
+            // Rows 1 and 2 are inside the zoomed-out content; 0 and 3 are above and below it.
+            for y in 1..3 {
+                assert_eq!(px(&got, 4, 0, y), [0, 0, 0, 0], "left of the crop");
+                assert!(close(px(&got, 4, 1, y), [90, 90, 90, 255]), "inside");
+                assert!(close(px(&got, 4, 2, y), [90, 90, 90, 255]), "inside");
+                assert_eq!(px(&got, 4, 3, y), [0, 0, 0, 0], "right half must not show");
+            }
+        }
+    }
+
+    /// Rotation 90 turns the content clockwise: the source's top-left corner ends up top-right.
+    #[test]
+    fn gpu_slice_transform_rotation_is_clockwise() {
+        let mut screen = mapping::new_screen("t", 8, 8);
+        let mut sl = mapping::new_slice(8, 8);
+        sl.transform.rotation = 90.0;
+        screen.slices.push(sl);
+        let src = gradient_8();
+        if let Some(got) = render_src(&screen, &src, (8, 8), false) {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let want = px(&src, 8, y, 7 - x);
+                    assert!(close(px(&got, 8, x, y), want), "({x},{y})");
+                }
+            }
+        }
+    }
+
+    /// A project file with a wild transform still renders sanely.
+    #[test]
+    fn transform_is_sanitized_for_the_shader() {
+        let screen = mapping::new_screen("t", 4, 4);
+        let tf = |scale, offset, rotation| {
+            let mut sl = mapping::new_slice(4, 4);
+            sl.transform = vjc_model::SliceTransform {
+                scale,
+                offset,
+                rotation,
+            };
+            slice_uniform(&screen, &sl, (4, 4))[24..28].to_vec()
+        };
+        assert_eq!(tf(0.0, (0.0, 0.0), 0.0)[0], 0.1);
+        assert_eq!(tf(-3.0, (0.0, 0.0), 0.0)[0], 0.1);
+        assert_eq!(tf(99.0, (0.0, 0.0), 0.0)[0], 10.0);
+        assert_eq!(tf(f32::NAN, (0.0, 0.0), 0.0)[0], 1.0);
+        assert_eq!(
+            tf(2.0, (f32::INFINITY, f32::NAN), f32::NAN),
+            [2.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(tf(2.0, (0.25, -0.5), 0.0), [2.0, 0.25, -0.5, 0.0]);
     }
 
     /// A triangular mask cuts the pixel outside it.

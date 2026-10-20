@@ -8,7 +8,7 @@ use crate::icons;
 use crate::output_hints::hint;
 use crate::output_poly::DrawFor;
 use crate::output_tree::{inset_mask, one_command, slice_label};
-use crate::params::{param_slider_step, text_field, text_field_free};
+use crate::params::{param_slider_step, param_slider_step_reset, text_field, text_field_free};
 use crate::theme::{self, COMBO_W_SM, FS_SM, PROP_LABEL_W, SP_2, SP_4, TEXT, bold_font};
 use crate::widgets::{self, Kind, toggle};
 use eframe::egui::{self, RichText};
@@ -76,7 +76,19 @@ fn num(
     id: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     value: f32,
+    spec: (f32, (f32, f32), f32),
+) -> Option<f32> {
+    num_with(ui, id, label, value, spec, false)
+}
+
+/// `num`; with `dbl_reset` a double-click on the slider resets it to the default.
+fn num_with(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    value: f32,
     (default, range, step): (f32, (f32, f32), f32),
+    dbl_reset: bool,
 ) -> Option<f32> {
     let tint = match label {
         "R" => Some(theme::CHANNEL_R),
@@ -85,7 +97,12 @@ fn num(
         _ => None,
     };
     widgets::prop_row_tint(ui, None, tint, |ui| {
-        param_slider_step(
+        let f = if dbl_reset {
+            param_slider_step_reset
+        } else {
+            param_slider_step
+        };
+        f(
             ui,
             id,
             label,
@@ -756,7 +773,7 @@ impl State {
                 for (key, label, pick, spec) in fields {
                     let mut cur = sl.transform;
                     let now = *pick(&mut cur);
-                    if let Some(v) = num(ui, (sl.id, "tf", key), label, now, spec) {
+                    if let Some(v) = num_with(ui, (sl.id, "tf", key), label, now, spec, true) {
                         let all = scr
                             .slices
                             .iter()

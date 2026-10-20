@@ -174,7 +174,17 @@ pub fn param_slider(
     default: f64,
     range: (f64, f64),
 ) -> Option<f64> {
-    slider_inner(ui, id, label, value, default, range, None, (None, false)).0
+    slider_inner(
+        ui,
+        id,
+        label,
+        value,
+        default,
+        range,
+        None,
+        (None, false, false),
+    )
+    .0
 }
 
 /// Like `param_slider`, with the -/+ buttons stepping by `step` instead of 1% of the range.
@@ -194,7 +204,29 @@ pub fn param_slider_step(
         default,
         range,
         None,
-        (Some(step), true),
+        (Some(step), true, false),
+    )
+    .0
+}
+
+/// `param_slider_step` where a double-click on the slider also resets to the default.
+pub fn param_slider_step_reset(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    value: f64,
+    default: f64,
+    (range, step): ((f64, f64), f64),
+) -> Option<f64> {
+    slider_inner(
+        ui,
+        id,
+        label,
+        value,
+        default,
+        range,
+        None,
+        (Some(step), true, true),
     )
     .0
 }
@@ -218,7 +250,7 @@ pub fn param_slider_anim(
         default,
         range,
         Some(anim),
-        (None, false),
+        (None, false, false),
     )
 }
 
@@ -242,7 +274,7 @@ pub fn param_slider_anim_step(
         default,
         range,
         Some(anim),
-        (Some(step), false),
+        (Some(step), false, false),
     )
 }
 
@@ -857,7 +889,7 @@ fn slider_inner(
     default: f64,
     range: (f64, f64),
     anim: Option<&Option<Animation>>,
-    (step, math): (Option<f64>, bool),
+    (step, math, dbl_reset): (Option<f64>, bool, bool),
 ) -> (Option<f64>, Option<Option<Animation>>) {
     let id = ui.id().with(id);
     let mut out = None;
@@ -943,9 +975,29 @@ fn slider_inner(
             out = Some(x);
         }
         let reset = reset_to(&Value::Number(value), &Value::Number(default));
-        // Double-click on the slider: reset to the default.
-        if sr.double_clicked() {
-            out = Some(default.clamp(range.0, range.1));
+        // Double-click on the slider: reset to the default. The slider keeps following the
+        // pointer until the button is released, so the reset holds until then.
+        if dbl_reset {
+            let held = id.with("dbl-reset");
+            let last = id.with("dbl-last");
+            if sr.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
+                let now = ui.input(|i| i.time);
+                let prev: Option<f64> = ui.data(|d| d.get_temp(last));
+                if prev.is_some_and(|t| now - t < 0.6) {
+                    ui.data_mut(|d| {
+                        d.insert_temp(held, true);
+                        d.remove_temp::<f64>(last);
+                    });
+                } else {
+                    ui.data_mut(|d| d.insert_temp(last, now));
+                }
+            }
+            if ui.data(|d| d.get_temp::<bool>(held)).unwrap_or(false) {
+                out = Some(default.clamp(range.0, range.1));
+                if !sr.is_pointer_button_down_on() {
+                    ui.data_mut(|d| d.remove_temp::<bool>(held));
+                }
+            }
         }
         // Right click on the slider: reset to the default.
         sr.interact(egui::Sense::click()).context_menu(|ui| {

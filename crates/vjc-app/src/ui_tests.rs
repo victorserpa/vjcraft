@@ -1129,6 +1129,52 @@ fn output_setup_slice_transform_scale_drag_undoes() {
     assert_eq!(scale(&h), 1.0);
 }
 
+/// Rect of the slider on the row of the lowest label `label` (the slice properties come
+/// after the other panels' rows of the same name).
+fn prop_slider(h: &mut Harness<'_, State>, label: &str) -> egui::Rect {
+    h.get_all_by_label(label)
+        .max_by(|a, b| a.rect().center().y.total_cmp(&b.rect().center().y))
+        .unwrap()
+        .scroll_to_me();
+    h.run_steps(30);
+    let y = h
+        .get_all_by_label(label)
+        .map(|n| n.rect().center().y)
+        .fold(f32::MIN, f32::max);
+    slider_rects(h)
+        .into_iter()
+        .find(|r| (r.center().y - y).abs() < 4.0)
+        .expect("slider on the row")
+}
+
+#[test]
+fn double_click_resets_transform_sliders_only() {
+    let mut h = app();
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    add_screen(&mut h);
+    add_slice(&mut h);
+    let sl = |h: &Harness<'_, State>| h.state().project.output.screens[0].slices[0].clone();
+    // A colour slider: a double-click must not reset it.
+    let r = prop_slider(&mut h, "Brightness");
+    double_click_at(
+        &mut h,
+        egui::pos2(r.left() + r.width() * 0.75, r.center().y),
+    );
+    assert_ne!(
+        sl(&h).color.brightness,
+        1.0,
+        "colour sliders keep their value"
+    );
+    // The Transform slider does reset.
+    let r = prop_slider(&mut h, "Scale");
+    double_click_at(
+        &mut h,
+        egui::pos2(r.left() + r.width() * 0.75, r.center().y),
+    );
+    assert_eq!(sl(&h).transform.scale, 1.0);
+}
+
 // 11
 #[test]
 fn panel_tabs_switch() {
