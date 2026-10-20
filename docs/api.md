@@ -123,7 +123,9 @@ change goes through the same commands as the UI (undo, dirty flag, locks); a com
 | `POST /effects/set` | `{"scope",...,"effect":1,"bypass":true,"dry_wet":0.5,"params":[{"index":1,"value":0.25}]}` | One undo step. |
 | `GET /animation?kind=layer_opacity&layer=1` | kind: `layer_opacity`, `master_opacity`, `crossfader`, `effect` (+ scope fields, `effect`, `param`), `generator` (`layer`,`column`,`param`) | `{"animation": ...}` (null = none). |
 | `POST /animation` | same target fields + `"animation": {...}` | Sets the parameter animation (the project's own JSON shape, e.g. `{"Beats":{"beats":4.0,"curve":"Linear","motion":...}}`); no `animation` or null clears it. |
-| `GET /monitors/composition.jpg` (or `.png`, `output.jpg`) | | Snapshot of the composition, at most 640 px on the long side, `image/jpeg` or `image/png`. Black while black-out is on. Rate limited: 4 per second, 429 beyond; 503 when the frame is not ready within 1.4 s. `preview.*` answers 501 (not available). |
+| `GET /monitors/composition.jpg` (or `.png`) | | Snapshot of the composition, at most 640 px on the long side, `image/jpeg` or `image/png`. Black while black-out is on. Rate limited: 4 per second, 429 beyond (one queue for all three monitors); 503 when the frame is not ready within 1.4 s. |
+| `GET /monitors/preview.jpg` (or `.png`) | | The Preview monitor: the clip or layer selected for preview, same encoding and size limit as the composition. 409 with `{"error":...}` when nothing is selected. |
+| `GET /monitors/output.jpg?screen=1` (or `.png`) | `screen`: 1-based index or screen id, default the first | What the output window of that screen shows, after slices, warp, masks and color, at the screen's size (at most 640 px on the long side). 404 for an unknown screen; 409 while that screen is not rendering. Black during black-out. |
 
 ```sh
 H='Content-Type: application/json'; B=http://127.0.0.1:8090/api/v1

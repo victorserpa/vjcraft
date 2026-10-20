@@ -734,7 +734,7 @@ fn f32_to_half01(v: f32) -> u16 {
 }
 
 /// RGBA half floats (little endian) to RGBA8, clamped.
-fn half_to_rgba8(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn half_to_rgba8(raw: &[u8]) -> Vec<u8> {
     raw.as_chunks::<2>()
         .0
         .iter()
@@ -2921,6 +2921,12 @@ impl Compositor {
             (master, master_opacity),
             &[],
         );
+    }
+
+    /// The texture of the Preview monitor, `None` while no preview is rendered.
+    /// Its size and format are its own (a rotated clip makes it portrait; 16-bit stays half float).
+    pub fn preview_texture(&self) -> Option<&wgpu::Texture> {
+        self.routed.get(&SliceSource::Preview).map(|t| &t.0)
     }
 
     /// The view of a routed layer / group rendered by the last `render_routed`.
@@ -7383,5 +7389,277 @@ mod tests {
         assert_eq!((w, h), (120, 160), "preview is portrait");
         close(&got, "preview");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs one snapshot job to completion against the real queue code.
+    fn snap_image(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        targets: &crate::api_ext::SnapTargets,
+        src: crate::api_ext::SnapSrc,
+    ) -> Result<image::RgbaImage, u16> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut jobs = vec![crate::api_ext::SnapJob::of(src, false, tx)];
+        for _ in 0..100 {
+            crate::api_ext::snap_service(&mut jobs, device, queue, targets);
+            if let Ok(r) = rx.try_recv() {
+                let v = r.map_err(|e| e.status)?;
+                let bytes: Vec<u8> = v["image"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .map(|c| c as u8)
+                    .collect();
+                return Ok(image::load_from_memory(&bytes).unwrap().to_rgba8());
+            }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        panic!("snapshot never answered");
+    }
+
+    /// Preview with a selected clip: the snapshot is the preview image at the composition
+    /// size, and a missing preview texture is a 409. Skipped without an adapter.
+    #[test]
+    fn gpu_preview_snapshot_is_the_selected_clip_at_composition_size() {
+        use crate::api_ext::{SnapSrc, SnapTargets};
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (red, green) = ([255u8, 0, 0, 255], [0u8, 255, 0, 255]);
+        let mut comp = Compositor::new(&device, 8, 4);
+        let mut clip = solid(9, &green, 1.0);
+        clip.id = PREVIEW_CLIP_ID;
+        let layers = [solid(1, &red, 1.0), clip];
+        comp.preview = Some(SliceSource::Layer(PREVIEW_CLIP_ID));
+        comp.render_routed(&device, &queue, (&layers, &[]), (&[], 1.0), &[]);
+        let mut t = SnapTargets {
+            comp: (comp.readable(), false),
+            preview: None,
+            screens: Default::default(),
+        };
+        assert_eq!(
+            snap_image(&device, &queue, &t, SnapSrc::Preview).unwrap_err(),
+            409
+        );
+        t.preview = comp.preview_texture().map(|x| (x, false));
+        let img = snap_image(&device, &queue, &t, SnapSrc::Preview).unwrap();
+        assert_eq!(img.dimensions(), (8, 4));
+        let p = img.get_pixel(4, 2).0;
+        assert!(p[1] > 200 && p[0] < 20, "preview shows the clip {p:?}");
+        let c = snap_image(&device, &queue, &t, SnapSrc::Composition).unwrap();
+        assert!(c.get_pixel(4, 2).0[0] > 200, "composition stays red");
+    }
+
+    /// Output: a screen whose slice covers only the left half shows black on the right
+    /// while the composition is red everywhere; the snapshot must be the screen texture.
+    #[test]
+    fn gpu_output_snapshot_differs_from_composition_after_slice_transform() {
+        use crate::api_ext::{SnapSrc, SnapTargets};
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let red = [255u8, 0, 0, 255];
+        let mut comp = Compositor::new(&device, 8, 4);
+        comp.render_routed(
+            &device,
+            &queue,
+            (&[solid(1, &red, 1.0)], &[]),
+            (&[], 1.0),
+            &[],
+        );
+        let mut screen = vjc_core::mapping::new_screen("t", 8, 4);
+        let mut sl = vjc_core::mapping::new_slice(8, 4);
+        sl.output_mesh = vec![(0.0, 0.0), (4.0, 0.0), (0.0, 4.0), (4.0, 4.0)];
+        screen.slices.push(sl);
+        let renderer = crate::slice_render::SliceRenderer::new(&device);
+        let (tex, view) = crate::slice_render::make_screen_target(&device, 8, 4);
+        let src = |_: &vjc_model::Slice| (&comp.target_view, comp.size);
+        renderer.render(&device, &queue, &screen, &src, &view);
+        let id = uuid::Uuid::from_u128(5);
+        let mut t = SnapTargets {
+            comp: (comp.readable(), false),
+            preview: None,
+            screens: Default::default(),
+        };
+        t.screens.insert(id, (&tex, false));
+        let out = snap_image(&device, &queue, &t, SnapSrc::Screen(id)).unwrap();
+        let cmp = snap_image(&device, &queue, &t, SnapSrc::Composition).unwrap();
+        assert_eq!(out.dimensions(), (8, 4));
+        assert!(out.get_pixel(1, 2).0[0] > 200, "left half is red");
+        assert!(
+            out.get_pixel(6, 2).0[0] < 20,
+            "right half is black: {:?}",
+            out.get_pixel(6, 2)
+        );
+        assert_ne!(out.as_raw(), cmp.as_raw());
+        let other = uuid::Uuid::from_u128(6);
+        assert_eq!(
+            snap_image(&device, &queue, &t, SnapSrc::Screen(other)).unwrap_err(),
+            409
+        );
+    }
+
+    /// A texture of `fmt` and size `(w, h)` filled with `px` (raw bytes of one pixel).
+    fn filled(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fmt: wgpu::TextureFormat,
+        (w, h): (u32, u32),
+        px: &[u8],
+    ) -> wgpu::Texture {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: fmt,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let data: Vec<u8> = px
+            .iter()
+            .copied()
+            .cycle()
+            .take(px.len() * (w * h) as usize)
+            .collect();
+        queue.write_texture(
+            tex.as_image_copy(),
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * px.len() as u32),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        tex
+    }
+
+    /// Snapshots read the texture's own size, not the composition's (a portrait preview or
+    /// a screen of another size). The size passed in the target is deliberately wrong.
+    #[test]
+    fn gpu_snapshot_uses_the_texture_size_not_the_composition_size() {
+        use crate::api_ext::{SnapSrc, SnapTargets};
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let rgba = wgpu::TextureFormat::Rgba8Unorm;
+        let comp_tex = filled(&device, &queue, rgba, (8, 4), &[255, 0, 0, 255]);
+        let portrait = filled(&device, &queue, rgba, (4, 8), &[0, 255, 0, 255]);
+        let id = uuid::Uuid::from_u128(5);
+        let mut t = SnapTargets {
+            comp: (&comp_tex, false),
+            preview: Some((&portrait, false)),
+            screens: Default::default(),
+        };
+        t.screens.insert(id, (&portrait, false));
+        for src in [SnapSrc::Preview, SnapSrc::Screen(id)] {
+            let img = snap_image(&device, &queue, &t, src).unwrap();
+            assert_eq!(img.dimensions(), (4, 8), "{src:?}");
+            assert_eq!(img.get_pixel(3, 7).0, [0, 255, 0, 255], "{src:?}");
+        }
+    }
+
+    /// The first request after idle: the preview is not rendered yet, it appears on the
+    /// second service pass. The job waits instead of answering 409.
+    #[test]
+    fn gpu_snapshot_waits_a_pass_for_a_target_that_is_about_to_render() {
+        use crate::api_ext::{SnapJob, SnapSrc, SnapTargets, snap_service};
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let rgba = wgpu::TextureFormat::Rgba8Unorm;
+        let comp_tex = filled(&device, &queue, rgba, (2, 2), &[255, 0, 0, 255]);
+        let prev = filled(&device, &queue, rgba, (2, 2), &[0, 255, 0, 255]);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut jobs = vec![SnapJob::of(SnapSrc::Preview, false, tx)];
+        let none = SnapTargets {
+            comp: (&comp_tex, false),
+            preview: None,
+            screens: Default::default(),
+        };
+        snap_service(&mut jobs, &device, &queue, &none);
+        assert_eq!(jobs.len(), 1, "still queued");
+        assert!(rx.try_recv().is_err(), "no answer yet");
+        let some = SnapTargets {
+            preview: Some((&prev, false)),
+            ..none
+        };
+        for _ in 0..50 {
+            snap_service(&mut jobs, &device, &queue, &some);
+            if rx.try_recv().is_ok_and(|r| r.is_ok()) {
+                return;
+            }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        panic!("never answered");
+    }
+
+    /// A 16-bit composition still gives a preview snapshot (half floats converted).
+    #[test]
+    fn gpu_preview_snapshot_works_at_16_bit() {
+        use crate::api_ext::{SnapSrc, SnapTargets};
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let green = [0u8, 255, 0, 255];
+        let mut comp = Compositor::with_format(&device, 8, 4, wgpu::TextureFormat::Rgba16Float);
+        let mut clip = solid(9, &green, 1.0);
+        clip.id = PREVIEW_CLIP_ID;
+        comp.preview = Some(SliceSource::Layer(PREVIEW_CLIP_ID));
+        comp.render_routed(&device, &queue, (&[clip], &[]), (&[], 1.0), &[]);
+        let t = SnapTargets {
+            comp: (comp.readable(), false),
+            preview: comp.preview_texture().map(|x| (x, false)),
+            screens: Default::default(),
+        };
+        let img = snap_image(&device, &queue, &t, SnapSrc::Preview).unwrap();
+        assert_eq!(img.dimensions(), (8, 4));
+        let p = img.get_pixel(4, 2).0;
+        assert!(p[1] > 250 && p[0] < 5, "{p:?}");
+    }
+
+    /// A screen texture in BGRA order comes out as RGBA.
+    #[test]
+    fn gpu_screen_snapshot_converts_bgra_to_rgba() {
+        use crate::api_ext::{SnapSrc, SnapTargets};
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let comp_tex = filled(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            (2, 2),
+            &[0; 4],
+        );
+        // BGRA bytes of pure red.
+        let scr = filled(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8Unorm,
+            (2, 2),
+            &[0, 0, 255, 255],
+        );
+        let id = uuid::Uuid::from_u128(5);
+        let mut t = SnapTargets {
+            comp: (&comp_tex, false),
+            preview: None,
+            screens: Default::default(),
+        };
+        t.screens.insert(id, (&scr, false));
+        let img = snap_image(&device, &queue, &t, SnapSrc::Screen(id)).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 }
