@@ -50,7 +50,9 @@ fn gl_plugin_inverts_a_64x64_frame() {
         rgba.extend([(i % 251) as u8, (i % 64 * 4) as u8, (i / 64 * 4) as u8, 200]);
     }
     let f = Frame { w: 64, h: 64, rgba };
-    let out = e.process(&f);
+    assert_eq!(e.process(&f).rgba, f.rgba, "frame 1 passes through");
+    std::thread::sleep(Duration::from_millis(500));
+    let out = e.process(&f); // the previous frame, inverted
     if let Status::Stopped(HostError::Plugin(m)) = &e.status
         && m.contains("OpenGL context")
     {
@@ -67,5 +69,6 @@ fn gl_plugin_inverts_a_64x64_frame() {
         );
     }
     // second frame, same size: the same path keeps working
+    std::thread::sleep(Duration::from_millis(500));
     assert_eq!(e.process(&f).rgba, out.rgba);
 }

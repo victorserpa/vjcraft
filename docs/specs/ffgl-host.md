@@ -105,3 +105,5 @@ Tests, written first:
 - frame 1 passes through;
 - a helper that sleeps 50 ms per frame does not slow the render loop: 10 frames finish in under 100 ms;
 - a killed helper still passes through.
+
+Implemented (stage 2a+): `FfglEffect::process` never waits. Two shared files (slots) hold input then output each; one request is in flight at a time, and a frame that finds the helper busy is not sent (the last result is shown again). The timeout is checked on every frame and marks the plugin stopped. The effect tooltip mentions the one-frame latency. Measured at 1080p in release (perf test `readback_cost_1080p`): the effect adds about 3 ms to the render thread, down from about 8.8 ms; the readback wait (about 1.3 ms) stays synchronous in the compositor, since reading it asynchronously would need per-effect buffer state and add a second frame of latency.

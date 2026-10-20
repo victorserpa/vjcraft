@@ -121,6 +121,9 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> F
                 if VALS[1] > 0.5 {
                     std::process::abort();
                 }
+                if VALS[2] == 0.25 {
+                    std::thread::sleep(std::time::Duration::from_millis(50)); // slow plugin
+                }
                 if VALS[2] > 0.5 {
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(1));

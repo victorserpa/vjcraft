@@ -11812,7 +11812,10 @@ impl State {
                             .ffgl
                             .name_of(&e.kind)
                             .unwrap_or_else(|| fx_label(&e.kind));
-                        let name = ui.strong(label);
+                        let mut name = ui.strong(label);
+                        if ffgl_host::is_kind(&e.kind) {
+                            name = name.on_hover_text(ffgl_host::LATENCY_TIP);
+                        }
                         if let Some(b) = &stopped {
                             ui.colored_label(theme::WARN, b.as_str())
                                 .on_hover_text(self.fx.ffgl.stop_reason(e).unwrap_or_default());

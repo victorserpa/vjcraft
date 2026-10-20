@@ -59,6 +59,14 @@ fn frame(v: u8) -> Frame {
     Frame { w: 4, h: 4, rgba }
 }
 
+/// Frames come back one late: send `f`, let the helper finish, then the next call returns it processed.
+fn settled(e: &mut FfglEffect, f: &Frame) -> Frame {
+    std::thread::sleep(Duration::from_millis(400)); // the request of an earlier call is done
+    e.process(f);
+    std::thread::sleep(Duration::from_millis(400));
+    e.process(f)
+}
+
 fn effect(timeout_ms: u64) -> FfglEffect {
     FfglEffect::new(
         &plugin(),
@@ -72,10 +80,10 @@ fn processes_a_frame_like_the_plugin_documents() {
     let mut e = effect(5000);
     assert_eq!(e.status, Status::Running);
     e.set_param(0, 0.5); // gain 0.5 -> x2*0.5 = identity
-    let out = e.process(&frame(100));
+    let out = settled(&mut e, &frame(100));
     assert_eq!(out.rgba[..4], [100, 50, 10, 200]);
     e.set_param(0, 1.0); // x2, alpha untouched, clamped
-    let out = e.process(&frame(100));
+    let out = settled(&mut e, &frame(100));
     assert_eq!(out.rgba[..4], [200, 100, 20, 200]);
 }
 
@@ -86,6 +94,8 @@ fn crash_mid_frame_passes_input_through_and_restarts_on_enable() {
     let f = frame(80);
     let out = e.process(&f);
     assert_eq!(out.rgba, f.rgba, "pass-through");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(e.process(&f).rgba, f.rgba, "pass-through");
     assert!(matches!(e.status, Status::Stopped(_)));
     // keeps rendering without panic while stopped
     assert_eq!(e.process(&f).rgba, f.rgba);
@@ -94,7 +104,7 @@ fn crash_mid_frame_passes_input_through_and_restarts_on_enable() {
     e.enable();
     assert_eq!(e.status, Status::Running);
     e.set_param(0, 1.0);
-    assert_eq!(e.process(&frame(100)).rgba[0], 200);
+    assert_eq!(settled(&mut e, &frame(100)).rgba[0], 200);
 }
 
 #[test]
@@ -104,8 +114,11 @@ fn hang_times_out_and_passes_through() {
     let f = frame(80);
     let t = std::time::Instant::now();
     let out = e.process(&f);
-    assert!(t.elapsed() < Duration::from_secs(3));
+    assert!(t.elapsed() < Duration::from_millis(300), "never blocks");
     assert_eq!(out.rgba, f.rgba);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(e.process(&f).rgba, f.rgba);
+    assert!(t.elapsed() < Duration::from_secs(3));
     assert_eq!(e.status, Status::Stopped(HostError::Timeout));
 }
 
@@ -279,7 +292,7 @@ fn macos_bundle_is_resolved_to_its_executable() {
     let mut fx = FfglEffect::new(&e[0].path, Path::new(HELPER), Duration::from_secs(5));
     assert_eq!(fx.status, Status::Running);
     fx.set_param(0, 1.0);
-    assert_eq!(fx.process(&frame(100)).rgba[0], 200);
+    assert_eq!(settled(&mut fx, &frame(100)).rgba[0], 200);
 }
 
 #[test]
@@ -316,7 +329,7 @@ fn enable_carries_on_when_restoring_a_parameter_returns_ff_fail() {
     e.enable();
     assert_eq!(e.status, Status::Running, "{:?}", e.status);
     e.set_param(0, 1.0);
-    assert_eq!(e.process(&frame(100)).rgba[0], 200);
+    assert_eq!(settled(&mut e, &frame(100)).rgba[0], 200);
 }
 
 fn slow_dir(tag: &str) -> PathBuf {
@@ -377,7 +390,7 @@ fn param_changes_are_coalesced_and_sent_with_the_frame() {
     e.set_param(1, 0.75);
     e.set_param(1, 0.0);
     e.set_param(0, 0.5);
-    let out = e.process(&frame(100));
+    let out = settled(&mut e, &frame(100));
     assert_eq!(e.status, Status::Running, "{:?}", e.status);
     assert_eq!(
         out.rgba[..4],
@@ -402,5 +415,55 @@ fn setting_a_param_never_talks_to_the_helper_before_the_frame() {
     );
     let f = frame(80);
     assert_eq!(e.process(&f).rgba, f.rgba);
+    assert!(matches!(e.status, Status::Stopped(_)));
+}
+
+#[test]
+fn the_first_frame_passes_through_and_the_next_is_the_previous_result() {
+    let mut e = effect(5000);
+    e.set_param(0, 1.0); // x2
+    let (a, b) = (frame(50), frame(60));
+    assert_eq!(e.process(&a).rgba, a.rgba, "frame 1 passes through");
+    std::thread::sleep(Duration::from_millis(400));
+    let out = e.process(&b);
+    assert_eq!(out.rgba[0], 100, "frame 2 shows frame 1 processed");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        e.process(&b).rgba[0],
+        120,
+        "frame 3 shows frame 2 processed"
+    );
+}
+
+#[test]
+fn a_slow_helper_never_slows_the_render_loop() {
+    let mut e = effect(5000);
+    e.set_param(0, 1.0);
+    e.set_param(2, 0.25); // fixture sleeps 50 ms per frame
+    let f = frame(50);
+    let t = std::time::Instant::now();
+    for _ in 0..10 {
+        e.process(&f);
+    }
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(e.status, Status::Running);
+    // busy frames were skipped, but results still arrive
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(e.process(&f).rgba[0], 100);
+}
+
+#[test]
+fn a_killed_helper_passes_through_without_blocking() {
+    let mut e = effect(5000);
+    let f = frame(50);
+    settled(&mut e, &f);
+    e.kill_helper();
+    let t = std::time::Instant::now();
+    assert_eq!(e.process(&f).rgba, f.rgba, "no stale result after the kill");
+    assert!(t.elapsed() < Duration::from_millis(300));
     assert!(matches!(e.status, Status::Stopped(_)));
 }
