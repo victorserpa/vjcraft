@@ -79,14 +79,6 @@ pub struct ProcessOpenGlStruct {
     pub host_fbo: u32,
 }
 
-/// Host info handed to INITIALISE_V2 (name, version). Layout not machine-checked.
-#[repr(C)]
-pub struct HostInfoStruct {
-    pub name: *const std::ffi::c_char,
-    pub major: u32,
-    pub minor: u32,
-}
-
 /// Documented viewport passed to INSTANTIATE_GL and RESIZE.
 #[repr(C)]
 pub struct ViewportStruct {

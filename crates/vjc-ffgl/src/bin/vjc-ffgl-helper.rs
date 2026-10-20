@@ -73,16 +73,11 @@ impl Plugin {
         unsafe { (self.main)(code, v, self.instance) }
     }
     fn initialise(&mut self) -> Result<(), String> {
-        let name = c"VJCraft";
-        let host = HostInfoStruct {
-            name: name.as_ptr(),
-            major: 0,
-            minor: 1,
-        };
+        // The SDK ignores INITIALISE_V2's input value; pass null.
         let r = self.call(
             FF_INITIALISE_V2,
             FFMixed {
-                p: &host as *const _ as *mut c_void,
+                p: std::ptr::null_mut(),
             },
         );
         if unsafe { r.u } == FF_FAIL {
