@@ -7349,10 +7349,7 @@ fn preview_widget_arrow_keys_nudge_when_focused() {
 }
 
 /// Click the Preview, then run `release`; arrows must no longer nudge.
-fn preview_focus_released_by(
-    text_field: bool,
-    release: impl FnOnce(&mut Harness<'static, State>),
-) {
+fn preview_focus_released_by(text_field: bool, release: impl FnOnce(&mut Harness<'static, State>)) {
     use vjc_model::TransformField as F;
     let (mut h, _, t) = xf_setup();
     let from = xf_screen(&h, egui::vec2(100.0, 100.0));
@@ -7398,7 +7395,10 @@ fn preview_arrows_stop_after_a_text_field_gets_focus() {
         let c = h.state().project.composition.columns[0].clone();
         h.state_mut().col_renaming = Some((c.id, c.name));
         settle(h);
-        assert!(h.query_by_label("Column name").is_some(), "text field shown");
+        assert!(
+            h.query_by_label("Column name").is_some(),
+            "text field shown"
+        );
     });
 }
 
