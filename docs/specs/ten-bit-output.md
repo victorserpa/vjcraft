@@ -57,3 +57,21 @@ A gradient on the LED wall, through an 8-bit processor, shows no visible bands a
 ## Risks
 
 Dithering may be visible at very low brightness on LED walls. The checkbox lets you turn it off.
+
+## Phase 2 spike (2026-10-20): parked
+
+A 10-bit surface for output windows was checked against egui/eframe 0.36.2:
+
+- `egui_wgpu::RenderState` holds a single `target_format`, picked once by
+  `preferred_framebuffer_format` and shared by every viewport and its renderer.
+- eframe exposes a raw window handle only for the root window
+  (`epi_integration.rs`), not per immediate viewport.
+
+So a 10-bit output window needs either a patched egui-winit (to own a
+viewport's surface) or output windows opened on raw winit outside egui, which
+means re-implementing placement, fullscreen and overlays. Neither can be
+verified without a 10-bit panel, and the dither from phase 1 already removes
+the banding on 8-bit outputs. Phase 2 stays parked until egui exposes per-viewport
+surfaces or a 10-bit display is available for testing. `select_output_format`
+and the `output_10bit` preference stay as they are; the startup warning still
+explains the fallback.
