@@ -83,3 +83,32 @@ fn default_folders_plus_prefs_folders_are_scanned_without_duplicates() {
     assert!(dirs.len() > 1, "platform defaults included");
     dirs.dedup();
 }
+
+#[test]
+fn badge_covers_stopped_clips_and_uses_the_catalog_for_missing() {
+    let host = ClapHost::default();
+    let e = crate::audio_fx_ui::new_clap_effect(&entry());
+    let plain = vjc_model::Effect {
+        kind: "gain".into(),
+        ..e.clone()
+    };
+    assert_eq!(host.badge(&plain), None);
+    // not scanned: missing, even though no lane ever ran
+    assert_eq!(host.badge(&e), Some(Badge::Missing));
+    host.set_entries(vec![entry()]);
+    assert_eq!(
+        host.badge(&e),
+        Some(Badge::Idle),
+        "stopped clip: no lane yet"
+    );
+    host.shared(&e).unwrap().mark_running();
+    assert_eq!(host.badge(&e), Some(Badge::Running));
+    host.shared(&e).unwrap().mark_bypassed("crashed");
+    assert_eq!(host.badge(&e), Some(Badge::Bypassed("crashed".into())));
+    host.set_entries(vec![]);
+    assert_eq!(
+        host.badge(&e),
+        Some(Badge::Missing),
+        "plugin gone from the catalog"
+    );
+}

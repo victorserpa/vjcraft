@@ -192,7 +192,8 @@ pub struct Entry {
     pub id: String,
     pub name: String,
     pub params: Vec<ParamInfo>,
-    /// Has stereo ports; a mono-only plugin is listed but cannot be used.
+    /// Has audio input and output ports the host can feed (mono and multi-channel are adapted to
+    /// the stereo bus); false means listed but not usable.
     #[serde(default = "yes")]
     pub stereo: bool,
 }

@@ -271,6 +271,10 @@ unsafe extern "C" fn p_process(p: *const Plugin, pr: *const Process) -> i32 {
             let dst = *o.d32.add(c);
             for k in 0..pr.frames as usize {
                 *dst.add(k) = *src.add(k) * st.vals[0] as f32;
+                // --cfg surround: channel 2 leaks into the left output (a host must feed 0)
+                if cfg!(surround) && c == 0 && i.channels > 2 {
+                    *dst.add(k) += *(*i.d32.add(2)).add(k);
+                }
             }
         }
         1
@@ -322,7 +326,8 @@ static PARAMS: ParamsExt = ParamsExt {
     from_text: x_from_text,
     flush: x_flush,
 };
-// clap.audio-ports: one input and one output port; stereo, or mono when built with --cfg mono.
+// clap.audio-ports: one input and one output port; stereo, or mono with --cfg mono, or six
+// channels with --cfg surround.
 #[repr(C)]
 struct PortInfo {
     id: u32,
@@ -348,7 +353,13 @@ unsafe extern "C" fn pt_get(_: *const Plugin, i: u32, _: bool, out: *mut PortInf
         (*out).id = 0;
         (*out).name = [0; 256];
         (*out).flags = 1;
-        (*out).channel_count = if cfg!(mono) { 1 } else { 2 };
+        (*out).channel_count = if cfg!(mono) {
+            1
+        } else if cfg!(surround) {
+            6
+        } else {
+            2
+        };
         (*out).port_type = if cfg!(mono) { c"mono".as_ptr() } else { c"stereo".as_ptr() };
         (*out).in_place_pair = u32::MAX;
     }

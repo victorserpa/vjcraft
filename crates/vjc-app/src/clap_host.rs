@@ -33,6 +33,17 @@ pub fn scan_dirs(extra: &[String]) -> Vec<PathBuf> {
     v
 }
 
+/// What the effect card says about a CLAP effect, playing or not.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Badge {
+    /// The plugin is not in the scanned catalog (removed, moved, or not scanned yet).
+    Missing,
+    /// No lane runs it (its clip is stopped, or it is still starting).
+    Idle,
+    Running,
+    Bypassed(String),
+}
+
 #[derive(Default)]
 struct Catalog {
     entries: Vec<Entry>,
@@ -142,6 +153,24 @@ impl ClapHost {
                 })
                 .clone(),
         )
+    }
+
+    /// Badge of a CLAP effect; None when the effect is not a CLAP one.
+    pub fn badge(&self, e: &Effect) -> Option<Badge> {
+        let shared = self.shared(e)?;
+        let (id, path) = parse_kind(&e.kind)?;
+        let known = self
+            .catalog
+            .lock()
+            .is_ok_and(|c| c.entries.iter().any(|en| en.id == id && en.path == path));
+        if !known {
+            return Some(Badge::Missing);
+        }
+        Some(match shared.status() {
+            vjc_clap::LaneStatus::Running => Badge::Running,
+            vjc_clap::LaneStatus::Bypassed(why) => Badge::Bypassed(why),
+            vjc_clap::LaneStatus::Starting => Badge::Idle,
+        })
     }
 
     /// Forgets the effects that are not in `live` (removed from the project); their lanes

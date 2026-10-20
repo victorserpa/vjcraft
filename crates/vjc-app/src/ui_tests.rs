@@ -9091,7 +9091,7 @@ fn clap_plugins_are_listed_in_their_own_group_of_the_audio_effect_menu() {
     assert!(exists(&h, "CLAP plugins"), "own group");
     assert!(exists(&h, "Warmth"));
     assert!(
-        has_text(&h, "MonoOnly") || exists(&h, "MonoOnly (no stereo port)"),
+        has_text(&h, "MonoOnly") || exists(&h, "MonoOnly (no audio port)"),
         "mono plugin is listed with the reason"
     );
     assert!(
@@ -9109,6 +9109,9 @@ fn clap_plugins_are_listed_in_their_own_group_of_the_audio_effect_menu() {
 fn bypassed_clap_effect_shows_a_badge_and_restart_works() {
     use vjc_core::EffectTarget;
     let mut h = app();
+    h.state_mut()
+        .clap
+        .set_entries(vec![clap_entry("Warmth", true)]);
     let e = crate::audio_fx_ui::new_clap_effect(&clap_entry("Warmth", true));
     h.state_mut().exec(Command::AddEffect {
         target: EffectTarget::MasterAudio,

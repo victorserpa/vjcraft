@@ -54,7 +54,7 @@ pub struct PluginInfo {
     pub id: String,
     pub name: String,
     pub params: Vec<ParamInfo>,
-    /// Has a stereo input and a stereo output port.
+    /// Has an audio input port and an audio output port (any channel count).
     #[serde(default = "yes")]
     pub stereo: bool,
 }
