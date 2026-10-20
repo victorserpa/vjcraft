@@ -203,6 +203,9 @@ struct State {
     col_marks: Vec<Uuid>,
     /// Playhead per layer, restarted with each trigger (stale entries are harmless).
     heads: HashMap<LayerId, Playhead>,
+    /// Followers of clips that track a DJ player, per layer (runtime only).
+    /// Keyed with the clip it belongs to; a different clip starts a fresh follower.
+    followers: HashMap<LayerId, ((DeckId, u32), vjc_core::djlink::ClipFollower)>,
     /// Codec / size / fps of file clips, probed on demand.
     src_info: source_info::SourceInfos,
     /// Convert to HAP: queue, the question being asked, and the swap offer after a finish.
@@ -619,6 +622,7 @@ fn remap_command(cmd: &mut Command, map: &impl Fn(u32) -> Option<u32>) -> bool {
         | Command::SeekClip { column, .. }
         | Command::SetInOut { column, .. }
         | Command::SetClipSync { column, .. }
+        | Command::SetClipFollow { column, .. }
         | Command::SetClipDuration { column, .. }
         | Command::RefreshClipThumb { column, .. }
         | Command::JumpToCue { column, .. }
@@ -2115,6 +2119,7 @@ impl State {
             gens: HashMap::new(),
             clip_start: HashMap::new(),
             heads: HashMap::new(),
+            followers: HashMap::new(),
             src_info: Default::default(),
             hap: Default::default(),
             hap_ask: None,
@@ -4255,6 +4260,7 @@ impl State {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(1, |d| d.as_nanos() as u64);
                         self.heads.insert(layer, Playhead::new(dir, seed));
+                        self.followers.remove(&layer);
                         self.flow.regions.remove(&layer);
                         let own_last =
                             resume_pos(&self.project, &self.flow.resume, (deck, src, column));
@@ -4304,6 +4310,7 @@ impl State {
                         .insert(layer, (deck, column, Player::open_capture(&device)));
                     self.set_origin(layer, deck, src_of(layer), column);
                     self.heads.remove(&layer);
+                    self.followers.remove(&layer);
                 }
                 Event::NetworkStarted {
                     deck,
@@ -4325,6 +4332,7 @@ impl State {
                                 .insert(layer, (deck, column, open_network(p, name)));
                             self.set_origin(layer, deck, src_of(layer), column);
                             self.heads.remove(&layer);
+                            self.followers.remove(&layer);
                         }
                         None => self.status = "Spout is not available on macOS".into(),
                     }
@@ -5087,8 +5095,40 @@ impl State {
                 let d = file_d * (reg.1 - reg.0);
                 // Timecode clips: position = timecode - start (random access, muted); without
                 // signal they freeze or run free from where they were, per the prefs.
-                let by_tc = tc_on && tr.timecode_start.is_some();
+                let following = tr.follow_player.is_some();
+                if !following {
+                    self.followers.remove(layer);
+                }
+                let by_tc = following || (tc_on && tr.timecode_start.is_some());
                 let t = match (&tr.timecode_start, tc_now) {
+                    _ if let Some(n) = tr.follow_player => {
+                        // Follows a DJ player: trigger, direction and play mode are ignored.
+                        let slot = self
+                            .followers
+                            .entry(*layer)
+                            .or_insert_with(|| ((*deck, *col), Default::default()));
+                        if slot.0 != (*deck, *col) {
+                            *slot = ((*deck, *col), Default::default());
+                        }
+                        let fl = &mut slot.1;
+                        let target = self
+                            .dj_tracker
+                            .track_pos(n, now)
+                            .map(|p| vjc_core::djlink::TrackPos { ..p });
+                        // Clip speed is ignored while following. A clip with no usable
+                        // length yet skips the frame and keeps the playhead where it was.
+                        fl.step(target, dt, d);
+                        match fl.fraction(d) {
+                            Some(position) => {
+                                head.seek(position);
+                                vjc_core::playhead::Tick {
+                                    position,
+                                    finished: false,
+                                }
+                            }
+                            None => head.tick(0.0, tr.play_mode, Direction::Pause, 1.0, 1.0),
+                        }
+                    }
                     (Some(start), Some(cur)) if tc_on => {
                         let t = vjc_core::timecode::clip_position(
                             cur,
@@ -10947,6 +10987,36 @@ impl State {
                         timecode_start: None,
                     });
                 }
+            }
+            let players: Vec<(Option<u8>, String)> = std::iter::once((None, "Off".to_string()))
+                .chain((1..=4u8).map(|n| (Some(n), format!("Player {n}"))))
+                .collect();
+            let mut follow_cmd = None;
+            if let Some(p) =
+                params::combo(ui, "follow", "Follow player", &t.follow_player, &players)
+            {
+                follow_cmd = Some(p);
+            }
+            if let Some(n) = t.follow_player {
+                ui.weak("Clip speed is ignored while following")
+                    .on_hover_text("The clip moves at the player's speed, pitch included");
+                match self.dj_tracker.follow_note(n, std::time::Instant::now()) {
+                    Some(vjc_core::djlink::FollowNote::Lost(n)) => {
+                        ui.weak(format!("Player {n} lost, running free"));
+                    }
+                    Some(vjc_core::djlink::FollowNote::NoPosition(n)) => {
+                        ui.weak(format!("Player {n} sends no position yet"));
+                    }
+                    None => {}
+                }
+            }
+            if let Some(player) = follow_cmd {
+                cmds.push(Command::SetClipFollow {
+                    deck,
+                    layer,
+                    column,
+                    player,
+                });
             }
             if let Some(mut start) = t.timecode_start {
                 ui.horizontal(|ui| {

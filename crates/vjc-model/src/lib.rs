@@ -676,6 +676,9 @@ pub struct Transport {
     /// speed is derived from it. Old files lack it: free speed.
     #[serde(default)]
     pub duration_secs: Option<f64>,
+    /// Follow this DJ player (1..=4): play state and track position drive the clip.
+    #[serde(default)]
+    pub follow_player: Option<u8>,
 }
 
 /// Timecode frame rates.
@@ -1968,6 +1971,7 @@ impl Default for Transport {
             out_point: 1.0,
             timecode_start: None,
             duration_secs: None,
+            follow_player: None,
         }
     }
 }
@@ -2627,6 +2631,16 @@ mod tests {
         t.as_object_mut().unwrap().remove("timecode_start");
         let t: Transport = serde_json::from_value(t).unwrap();
         assert_eq!(t.timecode_start, None);
+    }
+
+    #[test]
+    fn old_transport_loads_with_follow_off() {
+        let mut t = serde_json::to_value(Transport::default()).unwrap();
+        let o = t.as_object_mut().unwrap();
+        o.remove("follow_player");
+        o.insert("follow_master_tempo".into(), true.into()); // from a build that had it
+        let t: Transport = serde_json::from_value(t).unwrap();
+        assert_eq!(t.follow_player, None);
     }
 
     #[test]

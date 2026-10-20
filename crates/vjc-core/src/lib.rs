@@ -221,6 +221,13 @@ pub enum Command {
         beat_sync: Option<f64>,
         timecode_start: Option<Timecode>,
     },
+    /// Makes the clip follow DJ player 1..=4 (None = off). Other players are `InvalidValue`. Undoable.
+    SetClipFollow {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        player: Option<u8>,
+    },
     /// Plays the in..out region in `secs` seconds (speed derived from it); None = free
     /// speed. Beat sync wins when both are set. Undoable.
     SetClipDuration {
@@ -2607,6 +2614,27 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     column,
                     beat_sync: prev.0,
                     timecode_start: prev.1,
+                },
+                vec![],
+            )
+        }
+        Command::SetClipFollow {
+            deck,
+            layer,
+            column,
+            player,
+        } => {
+            if player.is_some_and(|n| !(1..=4).contains(&n)) {
+                return Err(Error::InvalidValue);
+            }
+            let t = transport_mut(p, deck, layer, column)?;
+            let prev = std::mem::replace(&mut t.follow_player, player);
+            undoable(
+                Command::SetClipFollow {
+                    deck,
+                    layer,
+                    column,
+                    player: prev,
                 },
                 vec![],
             )
@@ -5983,6 +6011,28 @@ mod tests {
             apply(&mut p, sync(None, Some(bad))),
             Err(Error::InvalidValue)
         );
+    }
+
+    #[test]
+    fn clip_follow_sets_player_and_undoes() {
+        let (mut p, l) = setup();
+        let mut h = History::new();
+        let t = Instant::now();
+        import(&mut p, &mut h, l, t);
+        let before = p.clone();
+        let follow = |player| Command::SetClipFollow {
+            deck: A,
+            layer: l,
+            column: 0,
+            player,
+        };
+        h.exec(&mut p, follow(Some(2)), t).unwrap();
+        let tr = clip(&p, l).unwrap().transport;
+        assert_eq!(tr.follow_player, Some(2));
+        h.undo(&mut p).unwrap().unwrap();
+        assert_eq!(p, before);
+        assert_eq!(apply(&mut p, follow(Some(5))), Err(Error::InvalidValue));
+        assert_eq!(apply(&mut p, follow(Some(0))), Err(Error::InvalidValue));
     }
 
     #[test]
