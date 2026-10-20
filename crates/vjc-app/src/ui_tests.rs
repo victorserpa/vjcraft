@@ -9183,3 +9183,146 @@ fn non_images_dropped_on_output_setup_do_not_reach_the_grid() {
         .out_take_drops(&ctx, vec!["/a/clip.mp4".into()]);
     assert_eq!(left.len(), 1);
 }
+
+// ---- orphan recovery off the UI thread (docs/specs/orphan-recovery-off-ui.md)
+
+/// The recovery slot and `WRITE_LOCK` are process-wide: tests that touch them take turns.
+static SLOT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn slot_state() -> State {
+    let mut p = prefs();
+    p.general.autosave = true;
+    p.general.autosave_secs = 30;
+    let mut st = State::headless(p);
+    st.persist = true;
+    // Past the one-second publish throttle.
+    st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    st
+}
+
+fn edit(st: &mut State) {
+    st.exec(Command::AddColumn {
+        column: vjc_model::Column {
+            color: None,
+            autopilot: Default::default(),
+            beat_snap: None,
+            id: Uuid::new_v4(),
+            name: "extra".into(),
+        },
+    });
+}
+
+#[test]
+fn recovery_slot_is_none_under_every_gate() {
+    let _g = SLOT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let file = tmp_vjc("slot-gates.vjc");
+    let publish = |st: &mut State| {
+        st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        st.publish_recovery_to(Some(file.clone()));
+    };
+    let mut st = slot_state();
+    publish(&mut st);
+    assert!(reliability::slot_peek().is_none(), "not dirty");
+    edit(&mut st);
+    assert!(st.dirty);
+    st.rehearsal = true;
+    reliability::slot_set(Some(reliability::Snapshot::test(&file)));
+    publish(&mut st);
+    assert!(reliability::slot_peek().is_none(), "rehearsal");
+    st.rehearsal = false;
+    st.recovery_offer = Some(file.clone());
+    reliability::slot_set(Some(reliability::Snapshot::test(&file)));
+    publish(&mut st);
+    assert!(reliability::slot_peek().is_none(), "open offer");
+    st.recovery_offer = None;
+    st.prefs.general.autosave = false;
+    reliability::slot_set(Some(reliability::Snapshot::test(&file)));
+    publish(&mut st);
+    assert!(reliability::slot_peek().is_none(), "autosave off");
+    st.prefs.general.autosave = true;
+    st.persist = false;
+    reliability::slot_set(Some(reliability::Snapshot::test(&file)));
+    publish(&mut st);
+    assert!(reliability::slot_peek().is_none(), "persist false");
+    st.persist = true;
+    publish(&mut st);
+    assert!(reliability::slot_peek().is_some(), "all gates open");
+    reliability::slot_set(None);
+}
+
+#[test]
+fn recovery_slot_follows_edit_save_and_discard() {
+    let _g = SLOT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let file = tmp_vjc("slot-flow.vjc");
+    let mut st = slot_state();
+    edit(&mut st);
+    st.publish_recovery_to(Some(file.clone()));
+    let snap = reliability::slot_peek().expect("slot set after an edit");
+    assert_eq!(snap.path, file);
+    let on_disk: vjc_model::Project = serde_json::from_slice(&snap.bytes).unwrap();
+    assert_eq!(
+        on_disk.composition.columns.len(),
+        st.project.composition.columns.len()
+    );
+    // Save clears the slot.
+    let saved = tmp_vjc("slot-flow-saved.vjc");
+    assert!(st.save_to(saved));
+    assert!(reliability::slot_peek().is_none(), "slot cleared by save");
+    // Don't Save clears it too.
+    edit(&mut st);
+    st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    st.publish_recovery_to(Some(file.clone()));
+    assert!(reliability::slot_peek().is_some());
+    clear_recovery(Some(file));
+    assert!(
+        reliability::slot_peek().is_none(),
+        "slot cleared by discard"
+    );
+}
+
+#[test]
+fn recovery_publish_encodes_at_most_once_a_second_across_100_edits() {
+    let _g = SLOT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let file = tmp_vjc("slot-throttle.vjc");
+    let mut st = slot_state();
+    for _ in 0..100 {
+        edit(&mut st);
+        st.publish_recovery_to(Some(file.clone()));
+    }
+    assert_eq!(st.publish_count, 1);
+    // A held-back change asks for a repaint in time to publish it.
+    edit(&mut st);
+    let wait = st.publish_recovery_to(Some(file.clone()));
+    assert!(wait.is_some_and(|w| w <= std::time::Duration::from_secs(1)));
+    // Past the throttle the pending edits are published once...
+    st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    st.publish_recovery_to(Some(file.clone()));
+    assert_eq!(st.publish_count, 2);
+    // ...and with no change since, nothing is encoded again.
+    st.last_publish = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    st.publish_recovery_to(Some(file.clone()));
+    assert_eq!(st.publish_count, 2, "unchanged project costs nothing");
+    reliability::slot_set(None);
+}
+
+#[test]
+fn write_lock_serialises_two_writers_and_leaves_no_tmp() {
+    let _g = SLOT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let file = tmp_vjc("write-lock.vjc");
+    let _ = std::fs::remove_file(&file);
+    let bytes = vjc_io::encode(&vjc_model::Project::new("Lock"), &file).unwrap();
+    let w = |f: PathBuf, b: Vec<u8>| {
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                reliability::write_recovery(&f, &b).unwrap();
+            }
+        })
+    };
+    let (a, b) = (w(file.clone(), bytes.clone()), w(file.clone(), bytes));
+    a.join().unwrap();
+    b.join().unwrap();
+    vjc_io::open(&file).expect("valid project");
+    let mut tmp = file.as_os_str().to_owned();
+    tmp.push(".tmp");
+    assert!(!std::path::Path::new(&tmp).exists());
+}

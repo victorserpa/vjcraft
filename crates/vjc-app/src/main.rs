@@ -325,6 +325,12 @@ struct State {
     /// Path of the open .vjc, if any.
     file: Option<PathBuf>,
     dirty: bool,
+    /// Bumped with every edit that sets `dirty`; the recovery publish encodes on change.
+    project_gen: u64,
+    published_gen: u64,
+    published_bpm: f64,
+    last_publish: std::time::Instant,
+    publish_count: u32,
     last_autosave: std::time::Instant,
     prefs: Prefs,
     prefs_open: bool,
@@ -1700,9 +1706,13 @@ fn prefs_path() -> Option<PathBuf> {
 
 /// Removes the recovery file (Don't Save, saved, discarded). Missing file is fine.
 fn clear_recovery(path: Option<PathBuf>) {
-    if let Some(r) = path {
-        let _ = std::fs::remove_file(r);
-    }
+    // The slot goes first, and the delete runs under the write lock: the watcher never
+    // brings back a file the user just discarded.
+    reliability::clear_slot_then(|| {
+        if let Some(r) = path {
+            let _ = std::fs::remove_file(r);
+        }
+    });
 }
 
 /// Keeps an unreadable recovery file aside (`recovery.bad.vjc`, then
@@ -1755,6 +1765,7 @@ impl State {
         if self.load(r.clone()) {
             self.file = None;
             self.dirty = true;
+            self.project_gen += 1;
             // The file stays: a second crash before the next autosave must still find it.
             // The next autosave overwrites it; a save or clean quit clears it.
             true
@@ -2172,6 +2183,11 @@ impl State {
             master_bypass: false,
             file: None,
             dirty: false,
+            project_gen: 0,
+            published_gen: 0,
+            published_bpm: 0.0,
+            last_publish: std::time::Instant::now() - std::time::Duration::from_secs(2),
+            publish_count: 0,
             last_autosave: std::time::Instant::now(),
             prefs_open: false,
             sc_ed: Default::default(),
@@ -3234,6 +3250,7 @@ impl State {
         if ask == rfd::MessageDialogResult::Yes {
             self.project.shortcuts = vjc_core::shortcuts::default_shortcuts();
             self.dirty = true;
+            self.project_gen += 1;
         }
     }
 
@@ -3476,9 +3493,7 @@ impl State {
                 self.save_prefs();
                 self.file = Some(path);
                 self.dirty = false;
-                if let Some(r) = self.recovery_path() {
-                    let _ = std::fs::remove_file(r);
-                }
+                clear_recovery(self.recovery_path());
                 true
             }
             Err(e) => {
@@ -3527,8 +3542,76 @@ impl State {
             if let Some(d) = r.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
-            if let Err(e) = self.with_effective_bpm(|p| vjc_io::save(p, &r)) {
-                self.status = format!("Autosave failed: {e}");
+            let encoded = self.with_effective_bpm(|p| vjc_io::encode(p, &r));
+            match encoded {
+                Ok(bytes) => {
+                    // Publish before writing: the slot is never older than the file.
+                    if self.persist {
+                        self.note_published();
+                        reliability::slot_set(Some(reliability::Snapshot {
+                            path: r.clone(),
+                            bytes: bytes.clone(),
+                        }));
+                    }
+                    if let Err(e) = reliability::write_recovery(&r, &bytes) {
+                        self.status = format!("Autosave failed: {e}");
+                    }
+                }
+                Err(e) => self.status = format!("Autosave failed: {e}"),
+            }
+        }
+    }
+
+    fn note_published(&mut self) {
+        self.published_gen = self.project_gen;
+        self.published_bpm = self.clock.bpm();
+        self.last_publish = std::time::Instant::now();
+    }
+
+    /// Child mode, every frame: keeps the watcher's recovery slot current, so the process
+    /// can leave a recovery file even if this thread never runs again. Same gates as
+    /// `autosave_to` minus the autosave interval; re-encodes at most once a second and
+    /// only when the project changed.
+    /// Publishes the recovery snapshot; `Some(wait)` when a change is held back by the
+    /// throttle, so the caller repaints in time to publish it even if nothing else does.
+    fn publish_recovery(&mut self) -> Option<std::time::Duration> {
+        let path = self.recovery_path();
+        self.publish_recovery_to(path)
+    }
+
+    fn publish_recovery_to(&mut self, path: Option<PathBuf>) -> Option<std::time::Duration> {
+        let Some(r) = path.filter(|_| {
+            self.persist
+                && !self.rehearsal
+                && self.recovery_offer.is_none()
+                && self.prefs.general.autosave
+                && self.dirty
+        }) else {
+            reliability::slot_set(None);
+            // Whatever the gates reopen on must publish again.
+            self.published_gen = u64::MAX;
+            return None;
+        };
+        let bpm = self.clock.bpm();
+        let changed = self.project_gen != self.published_gen || bpm != self.published_bpm;
+        if !changed {
+            return None;
+        }
+        let gap = std::time::Duration::from_secs(1);
+        if let Some(wait) = gap.checked_sub(self.last_publish.elapsed()) {
+            return Some(wait);
+        }
+        match self.with_effective_bpm(|p| vjc_io::encode(p, &r)) {
+            Ok(bytes) => {
+                self.publish_count += 1;
+                reliability::slot_set(Some(reliability::Snapshot { path: r, bytes }));
+                self.note_published();
+                None
+            }
+            // Retry after the gap rather than marking this change as published.
+            Err(_) => {
+                self.last_publish = std::time::Instant::now();
+                Some(gap)
             }
         }
     }
@@ -3571,6 +3654,7 @@ impl State {
                 self.gens.clear();
                 self.file = None;
                 self.dirty = true;
+                self.project_gen += 1;
             }
             Err(e) => self.status = format!("Import failed: {e}"),
         }
@@ -3822,6 +3906,7 @@ impl State {
                 self.prune_col_sel();
                 if !runtime {
                     self.dirty = true;
+                    self.project_gen += 1;
                 }
                 self.handle(events);
                 self.redirect = None;
@@ -3845,6 +3930,7 @@ impl State {
                     self.link_sync.note_bpm_edit();
                 }
                 self.dirty = true;
+                self.project_gen += 1;
                 self.prune_col_sel();
                 // Mask points may have been added or removed.
                 self.poly.sel_omask = None;
@@ -3865,6 +3951,7 @@ impl State {
                     self.link_sync.note_bpm_edit();
                 }
                 self.dirty = true;
+                self.project_gen += 1;
                 self.prune_col_sel();
                 self.poly.sel_omask = None;
                 self.handle(ev);
@@ -6780,6 +6867,7 @@ impl State {
             );
         if dj_io::mirror_bpm(&mut self.project, self.clock.bpm(), locked) {
             self.dirty = true;
+            self.project_gen += 1;
         }
     }
 
@@ -12155,6 +12243,11 @@ impl eframe::App for State {
         reliability::beat();
         if reliability::parent_gone() {
             self.quit_orphaned();
+        }
+        if reliability::is_child()
+            && let Some(wait) = self.publish_recovery()
+        {
+            ui.ctx().request_repaint_after(wait);
         }
         // Pace the UI: an unthrottled swapchain (vsync off, occluded window, output window
         // redrawing the parent) would otherwise run the whole UI thousands of times a second.
