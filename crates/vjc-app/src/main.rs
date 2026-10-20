@@ -6296,14 +6296,12 @@ impl State {
                 cap.capture(&rs.device, &rs.queue, comp.readable());
             }
         }
-        api_ext::snap_service(
-            &mut self.snap_jobs,
-            &rs.device,
-            &rs.queue,
-            comp.readable(),
-            comp.size,
-            self.master_bypass,
-        );
+        let targets = api_ext::SnapTargets {
+            comp: (comp.readable(), comp.size, self.master_bypass),
+            preview: None,
+            screens: Default::default(),
+        };
+        api_ext::snap_service(&mut self.snap_jobs, &rs.device, &rs.queue, &targets);
         self.render_screens(rs);
     }
 

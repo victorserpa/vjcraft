@@ -645,18 +645,76 @@ pub const SNAP_EVERY: std::time::Duration = std::time::Duration::from_millis(250
 pub const SNAP_QUEUE: usize = 2;
 const SNAP_TTL: std::time::Duration = std::time::Duration::from_millis(1400);
 
+/// What a snapshot shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapSrc {
+    Composition,
+    Preview,
+    /// The finished texture of one output screen (after slices, warp, masks and color).
+    Screen(uuid::Uuid),
+}
+
+/// A texture to read back: texture, size, whether it goes out black (black-out).
+pub type SnapTex<'a> = (&'a eframe::egui_wgpu::wgpu::Texture, (u32, u32), bool);
+
+/// Every texture a snapshot can come from, as of this frame.
+pub struct SnapTargets<'a> {
+    pub comp: SnapTex<'a>,
+    /// `None` while the app renders no preview.
+    pub preview: Option<SnapTex<'a>>,
+    pub screens: std::collections::HashMap<uuid::Uuid, SnapTex<'a>>,
+}
+
+/// The texture for `src`.
+pub fn snap_target<'a>(src: SnapSrc, t: &SnapTargets<'a>) -> Result<SnapTex<'a>, ApiErr> {
+    let _ = src;
+    Ok(t.comp)
+}
+
+/// Turns the request into a source. `preview_selected`: a clip or layer is selected for the
+/// Preview. `screens`: ids of the project's output screens, in order. `screen` is the
+/// request's `screen` parameter: an id or a 1-based index, the first screen when absent.
+pub fn snap_plan(
+    kind: &str,
+    screen: Option<&Value>,
+    preview_selected: bool,
+    screens: &[uuid::Uuid],
+) -> Result<SnapSrc, ApiErr> {
+    let _ = (screen, preview_selected, screens);
+    match kind {
+        "preview" => Err(err(
+            501,
+            "preview snapshots are not available; use composition",
+        )),
+        _ => Ok(SnapSrc::Composition),
+    }
+}
+
 /// One snapshot request waiting for the GPU readback.
 pub struct SnapJob {
     pub jpeg: bool,
+    pub src: SnapSrc,
     pub reply: std::sync::mpsc::SyncSender<Reply>,
     pub at: std::time::Instant,
-    read: Option<(eframe::egui_wgpu::wgpu::Buffer, crate::capture::MapState)>,
+    read: Option<Readback>,
+}
+
+struct Readback {
+    buf: eframe::egui_wgpu::wgpu::Buffer,
+    state: crate::capture::MapState,
+    size: (u32, u32),
+    black: bool,
 }
 
 impl SnapJob {
     pub fn new(jpeg: bool, reply: std::sync::mpsc::SyncSender<Reply>) -> Self {
+        Self::of(SnapSrc::Composition, jpeg, reply)
+    }
+
+    pub fn of(src: SnapSrc, jpeg: bool, reply: std::sync::mpsc::SyncSender<Reply>) -> Self {
         SnapJob {
             jpeg,
+            src,
             reply,
             at: std::time::Instant::now(),
             read: None,
@@ -709,34 +767,42 @@ pub fn snap_expire(jobs: &mut Vec<SnapJob>) {
     });
 }
 
-/// Once per rendered frame: starts the readback of queued jobs from `tex` (the composition)
-/// and answers the ones whose buffer is mapped. Never waits. `blackout` sends black only.
+/// Once per rendered frame: starts the readback of queued jobs from their texture and
+/// answers the ones whose buffer is mapped. Never waits.
 pub fn snap_service(
     jobs: &mut Vec<SnapJob>,
     device: &eframe::egui_wgpu::wgpu::Device,
     queue: &eframe::egui_wgpu::wgpu::Queue,
-    tex: &eframe::egui_wgpu::wgpu::Texture,
-    (w, h): (u32, u32),
-    blackout: bool,
+    targets: &SnapTargets,
 ) {
     if jobs.is_empty() {
         return;
     }
     let _ = device.poll(eframe::egui_wgpu::wgpu::PollType::Poll);
-    for j in jobs.iter_mut().filter(|j| j.read.is_none()) {
-        j.read = Some(crate::capture::start_readback(
-            device,
-            queue,
-            tex,
-            (w, h),
-            "snapshot",
-        ));
-    }
-    jobs.retain(|j| {
-        let Some((buf, st)) = &j.read else {
+    jobs.retain_mut(|j| {
+        if j.read.is_none() {
+            match snap_target(j.src, targets) {
+                Ok((tex, size, black)) => {
+                    let (buf, state) =
+                        crate::capture::start_readback(device, queue, tex, size, "snapshot");
+                    j.read = Some(Readback {
+                        buf,
+                        state,
+                        size,
+                        black,
+                    });
+                }
+                Err(e) => {
+                    let _ = j.reply.try_send(Err(e));
+                    return false;
+                }
+            }
+        }
+        let Some(r) = &j.read else {
             return true;
         };
-        let s = st.load(std::sync::atomic::Ordering::Acquire);
+        let (w, h) = r.size;
+        let s = r.state.load(std::sync::atomic::Ordering::Acquire);
         if s == crate::capture::PENDING {
             if j.at.elapsed() > SNAP_TTL {
                 let _ = j.reply.try_send(Err(err(503, "snapshot timed out")));
@@ -745,13 +811,14 @@ pub fn snap_service(
             return true;
         }
         let reply = if s == crate::capture::OK {
-            let mut px = buf
+            let mut px = r
+                .buf
                 .slice(..)
                 .get_mapped_range()
                 .map(|m| crate::capture::unpad(&m, w, h))
                 .unwrap_or_default();
-            buf.unmap();
-            if blackout {
+            r.buf.unmap();
+            if r.black {
                 crate::capture::blacken(&mut px);
             }
             encode_snapshot(&px, w, h, j.jpeg).map_or_else(
@@ -1069,5 +1136,67 @@ mod snap_expire_tests {
         snap_expire(&mut jobs);
         assert!(jobs.is_empty());
         assert_eq!(rx.try_recv().unwrap().unwrap_err().status, 503);
+    }
+}
+
+#[cfg(test)]
+mod snap_plan_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn ids() -> Vec<Uuid> {
+        vec![Uuid::from_u128(1), Uuid::from_u128(2)]
+    }
+
+    #[test]
+    fn preview_without_selection_is_409_with_a_message() {
+        let e = snap_plan("preview", None, false, &ids()).unwrap_err();
+        assert_eq!(e.status, 409);
+        assert!(e.msg.contains("preview"), "{}", e.msg);
+    }
+
+    #[test]
+    fn preview_with_selection_and_composition_resolve() {
+        assert_eq!(
+            snap_plan("preview", None, true, &ids()).unwrap(),
+            SnapSrc::Preview
+        );
+        assert_eq!(
+            snap_plan("composition", None, false, &[]).unwrap(),
+            SnapSrc::Composition
+        );
+    }
+
+    #[test]
+    fn output_takes_first_screen_by_default_then_index_or_id() {
+        let s = ids();
+        let want = |v: Option<Value>| snap_plan("output", v.as_ref(), false, &s);
+        assert_eq!(want(None).unwrap(), SnapSrc::Screen(s[0]));
+        assert_eq!(want(Some(json!(2))).unwrap(), SnapSrc::Screen(s[1]));
+        assert_eq!(
+            want(Some(json!(s[1].to_string()))).unwrap(),
+            SnapSrc::Screen(s[1])
+        );
+    }
+
+    #[test]
+    fn output_unknown_screen_is_404() {
+        let s = ids();
+        for v in [
+            json!(0),
+            json!(3),
+            json!(Uuid::from_u128(9).to_string()),
+            json!("x"),
+        ] {
+            assert_eq!(
+                snap_plan("output", Some(&v), false, &s).unwrap_err().status,
+                404,
+                "{v}"
+            );
+        }
+        assert_eq!(
+            snap_plan("output", None, false, &[]).unwrap_err().status,
+            404
+        );
     }
 }

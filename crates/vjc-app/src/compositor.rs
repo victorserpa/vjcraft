@@ -2923,6 +2923,11 @@ impl Compositor {
         );
     }
 
+    /// The texture of the Preview monitor, `None` while no preview is rendered.
+    pub fn preview_texture(&self) -> Option<&wgpu::Texture> {
+        None
+    }
+
     /// The view of a routed layer / group rendered by the last `render_routed`.
     pub fn routed_view(&self, source: SliceSource) -> Option<&wgpu::TextureView> {
         self.routed.get(&source).map(|t| &t.1)
@@ -7383,5 +7388,116 @@ mod tests {
         assert_eq!((w, h), (120, 160), "preview is portrait");
         close(&got, "preview");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs one snapshot job to completion against the real queue code.
+    fn snap_image(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        targets: &crate::api_ext::SnapTargets,
+        src: crate::api_ext::SnapSrc,
+    ) -> Result<image::RgbaImage, u16> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut jobs = vec![crate::api_ext::SnapJob::of(src, false, tx)];
+        for _ in 0..100 {
+            crate::api_ext::snap_service(&mut jobs, device, queue, targets);
+            if let Ok(r) = rx.try_recv() {
+                let v = r.map_err(|e| e.status)?;
+                let bytes: Vec<u8> = v["image"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .map(|c| c as u8)
+                    .collect();
+                return Ok(image::load_from_memory(&bytes).unwrap().to_rgba8());
+            }
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        panic!("snapshot never answered");
+    }
+
+    /// Preview with a selected clip: the snapshot is the preview image at the composition
+    /// size, and a missing preview texture is a 409. Skipped without an adapter.
+    #[test]
+    fn gpu_preview_snapshot_is_the_selected_clip_at_composition_size() {
+        use crate::api_ext::{SnapSrc, SnapTargets};
+        use vjc_model::SliceSource;
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let (red, green) = ([255u8, 0, 0, 255], [0u8, 255, 0, 255]);
+        let mut comp = Compositor::new(&device, 8, 4);
+        let mut clip = solid(9, &green, 1.0);
+        clip.id = PREVIEW_CLIP_ID;
+        let layers = [solid(1, &red, 1.0), clip];
+        comp.preview = Some(SliceSource::Layer(PREVIEW_CLIP_ID));
+        comp.render_routed(&device, &queue, (&layers, &[]), (&[], 1.0), &[]);
+        let size = comp.size;
+        let mut t = SnapTargets {
+            comp: (comp.readable(), size, false),
+            preview: None,
+            screens: Default::default(),
+        };
+        assert_eq!(
+            snap_image(&device, &queue, &t, SnapSrc::Preview).unwrap_err(),
+            409
+        );
+        t.preview = comp.preview_texture().map(|x| (x, size, false));
+        let img = snap_image(&device, &queue, &t, SnapSrc::Preview).unwrap();
+        assert_eq!(img.dimensions(), (8, 4));
+        let p = img.get_pixel(4, 2).0;
+        assert!(p[1] > 200 && p[0] < 20, "preview shows the clip {p:?}");
+        let c = snap_image(&device, &queue, &t, SnapSrc::Composition).unwrap();
+        assert!(c.get_pixel(4, 2).0[0] > 200, "composition stays red");
+    }
+
+    /// Output: a screen whose slice covers only the left half shows black on the right
+    /// while the composition is red everywhere; the snapshot must be the screen texture.
+    #[test]
+    fn gpu_output_snapshot_differs_from_composition_after_slice_transform() {
+        use crate::api_ext::{SnapSrc, SnapTargets};
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let red = [255u8, 0, 0, 255];
+        let mut comp = Compositor::new(&device, 8, 4);
+        comp.render_routed(
+            &device,
+            &queue,
+            (&[solid(1, &red, 1.0)], &[]),
+            (&[], 1.0),
+            &[],
+        );
+        let mut screen = vjc_core::mapping::new_screen("t", 8, 4);
+        let mut sl = vjc_core::mapping::new_slice(8, 4);
+        sl.output_mesh = vec![(0.0, 0.0), (0.5, 0.0), (0.0, 1.0), (0.5, 1.0)];
+        screen.slices.push(sl);
+        let renderer = crate::slice_render::SliceRenderer::new(&device);
+        let (tex, view) = crate::slice_render::make_screen_target(&device, 8, 4);
+        let src = |_: &vjc_model::Slice| (&comp.target_view, comp.size);
+        renderer.render(&device, &queue, &screen, &src, &view);
+        let id = uuid::Uuid::from_u128(5);
+        let size = comp.size;
+        let mut t = SnapTargets {
+            comp: (comp.readable(), size, false),
+            preview: None,
+            screens: Default::default(),
+        };
+        t.screens.insert(id, (&tex, (8, 4), false));
+        let out = snap_image(&device, &queue, &t, SnapSrc::Screen(id)).unwrap();
+        let cmp = snap_image(&device, &queue, &t, SnapSrc::Composition).unwrap();
+        assert_eq!(out.dimensions(), (8, 4));
+        assert!(out.get_pixel(1, 2).0[0] > 200, "left half is red");
+        assert!(
+            out.get_pixel(6, 2).0[0] < 20,
+            "right half is black: {:?}",
+            out.get_pixel(6, 2)
+        );
+        assert_ne!(out.as_raw(), cmp.as_raw());
+        let other = uuid::Uuid::from_u128(6);
+        assert_eq!(
+            snap_image(&device, &queue, &t, SnapSrc::Screen(other)).unwrap_err(),
+            409
+        );
     }
 }
