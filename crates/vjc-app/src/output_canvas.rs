@@ -4,6 +4,7 @@
 //! and box handles on the selected slice.
 
 use crate::output_hints::hint;
+use crate::output_poly::Curve;
 use crate::output_tree::slice_label;
 use crate::output_ui::{Drag, GridKind, Opts, OutMode, OutTab, handles};
 use crate::slice_inspector::{GUIDE_PX, arrow_move, snap_dragged};
@@ -908,6 +909,7 @@ impl State {
                     (view.rect, canvas),
                     &mut sel,
                     &set,
+                    None,
                     cmds,
                 );
                 self.poly.sel = sel;
@@ -924,6 +926,14 @@ impl State {
                     vjc_model::Mask::Polygon(pts)
                 }),
             };
+            let set_t = move |tangents: Vec<(f32, f32)>| Command::SetScreenMaskTangents {
+                screen: sid,
+                tangents,
+            };
+            let curve = Curve {
+                tangents: &scr.output_mask_tangents,
+                set: &set_t,
+            };
             self.poly_canvas(
                 ui,
                 &resp,
@@ -932,6 +942,7 @@ impl State {
                 (view.rect, canvas),
                 &mut sel,
                 &set,
+                Some(curve),
                 cmds,
             );
             self.poly.sel_omask = sel;
@@ -1189,6 +1200,15 @@ impl State {
             slice: slid,
             mask: Some(mask),
         };
+        let set_t = move |tangents: Vec<(f32, f32)>| Command::SetSliceMaskTangents {
+            screen: sid,
+            slice: slid,
+            tangents,
+        };
+        let curve = Curve {
+            tangents: &sl.mask_tangents,
+            set: &set_t,
+        };
         let mut sel = self.sel_mask_pt;
         let size = (scr.width.max(1) as f32, scr.height.max(1) as f32);
         self.poly_canvas(
@@ -1199,6 +1219,7 @@ impl State {
             (rect, clip),
             &mut sel,
             &set,
+            Some(curve),
             cmds,
         );
         self.sel_mask_pt = sel;

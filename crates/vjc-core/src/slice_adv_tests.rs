@@ -762,12 +762,7 @@ fn four_points_with_tangents_match_a_reference_disc_within_one_pixel() {
         (n(c - r), n(c)),
         (n(c), n(c - r)),
     ];
-    let tangents = vec![
-        (0.0, n(k)),
-        (n(-k), 0.0),
-        (0.0, n(-k)),
-        (n(k), 0.0),
-    ];
+    let tangents = vec![(0.0, n(k)), (n(-k), 0.0), (0.0, n(-k)), (n(k), 0.0)];
     let flat = flatten_mask(&poly, &tangents);
     assert!(flat.len() <= MAX_POLY_POINTS && flat.len() > 4 * 8);
     let cov = rasterize_coverage(&flat, w, h);
@@ -820,4 +815,16 @@ fn mask_tangent_commands_undo_and_clear_when_the_point_count_changes() {
     assert_eq!(p.output.screens[0].output_mask_tangents, t);
     hist.undo(&mut p).unwrap().unwrap();
     assert!(p.output.screens[0].output_mask_tangents.is_empty());
+}
+
+#[test]
+fn smooth_tangents_round_a_stroke_and_zero_means_corners() {
+    let sq = vec![(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)];
+    assert!(smooth_tangents(&sq, 0.0).is_empty());
+    let t = smooth_tangents(&sq, 1.0);
+    assert_eq!(t.len(), 4);
+    // Point 0 sits between (0.1, 0.9) and (0.9, 0.1): the handle runs along that chord.
+    assert!(t[0].0 > 0.0 && t[0].1 < 0.0);
+    let flat = flatten_mask(&sq, &t);
+    assert!(flat.len() <= MAX_POLY_POINTS);
 }

@@ -290,6 +290,21 @@ impl State {
                 });
                 if let Some(m) = &scr.output_mask {
                     toggle(ui, &mut self.poly.edit_omask, "Edit output mask points");
+                    if let vjc_model::Mask::Path(pts) = m {
+                        // Rounds the pen outline; the value lives only while the panel does.
+                        let key = egui::Id::new(("mask-smooth", scr.id));
+                        let mut amount = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+                        if ui
+                            .add(egui::Slider::new(&mut amount, 0.0..=1.0).text("Smooth"))
+                            .changed()
+                        {
+                            ui.data_mut(|d| d.insert_temp(key, amount));
+                            cmds.push(Command::SetScreenMaskTangents {
+                                screen: scr.id,
+                                tangents: vjc_core::slice_adv::smooth_tangents(pts, amount),
+                            });
+                        }
+                    }
                     let n = m.points().len();
                     let can_rm = n > 3 && self.poly.sel_omask.is_some_and(|i| i < n);
                     if widgets::btn_if(ui, can_rm, "Remove output mask point", Kind::Secondary)

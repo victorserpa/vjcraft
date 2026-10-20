@@ -543,6 +543,18 @@ pub enum Command {
         screen: Uuid,
         mask: Option<vjc_model::Mask>,
     },
+    /// Curve handles of the output mask (one per point, normalized offsets; empty =
+    /// straight edges). Coalesces.
+    SetScreenMaskTangents {
+        screen: Uuid,
+        tangents: Vec<(f32, f32)>,
+    },
+    /// Curve handles of a slice mask, like `SetScreenMaskTangents`. Coalesces.
+    SetSliceMaskTangents {
+        screen: Uuid,
+        slice: Uuid,
+        tangents: Vec<(f32, f32)>,
+    },
     /// Replaces the meshes of several slices at once (same grids); one undo step.
     SetSliceMeshes {
         screen: Uuid,
@@ -1098,6 +1110,8 @@ enum Target {
     /// different points are separate steps.
     SliceMask(Uuid, usize, usize),
     SliceSoftEdge(Uuid),
+    /// Screen or slice whose mask handles are being dragged.
+    MaskTangents(Uuid),
     SliceMaskInvert(Uuid),
     SliceKey(Uuid),
     ScreenDelay(Uuid),
@@ -1144,6 +1158,8 @@ impl Command {
                 0,
             )),
             Command::SetSliceSoftEdge { slice, .. } => Some(Target::SliceSoftEdge(*slice)),
+            Command::SetScreenMaskTangents { screen, .. } => Some(Target::MaskTangents(*screen)),
+            Command::SetSliceMaskTangents { slice, .. } => Some(Target::MaskTangents(*slice)),
             Command::SetSliceMaskInvert { slice, .. } => Some(Target::SliceMaskInvert(*slice)),
             Command::SetSliceKey { slice, .. } => Some(Target::SliceKey(*slice)),
             Command::SetScreenDelay { screen, .. } => Some(Target::ScreenDelay(*screen)),
@@ -1446,6 +1462,14 @@ fn apply_inner_meshes(
         inverse = Command::Batch { commands: shapes };
     }
     undoable(inverse, vec![])
+}
+
+/// Mask handles that are finite and at most as many as a mask has points.
+fn checked_tangents(t: Vec<(f32, f32)>) -> Result<Vec<(f32, f32)>, Error> {
+    let ok = t.len() <= slice_adv::MAX_POLY_POINTS
+        && t.iter()
+            .all(|h| h.0.is_finite() && h.1.is_finite() && h.0.abs() <= 8.0 && h.1.abs() <= 8.0);
+    if ok { Ok(t) } else { Err(Error::InvalidValue) }
 }
 
 fn has_duplicates(ids: impl Iterator<Item = Uuid>) -> bool {
@@ -3195,7 +3219,26 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     .collect()
             });
             let s = slice_mut(p, screen, slice)?;
+            let count = mask.as_ref().map(Vec::len);
             let prev = std::mem::replace(&mut s.mask, mask);
+            if !s.mask_tangents.is_empty() && count != Some(s.mask_tangents.len()) {
+                let old = std::mem::take(&mut s.mask_tangents);
+                let inverse = Command::Batch {
+                    commands: vec![
+                        Command::SetSliceMask {
+                            screen,
+                            slice,
+                            mask: prev,
+                        },
+                        Command::SetSliceMaskTangents {
+                            screen,
+                            slice,
+                            tangents: old,
+                        },
+                    ],
+                };
+                return undoable(inverse, vec![]);
+            }
             undoable(
                 Command::SetSliceMask {
                     screen,
@@ -3478,8 +3521,48 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                 }
             };
             let s = screen_mut(p, screen)?;
+            let count = mask.as_ref().map(|m| m.points().len());
             let prev = std::mem::replace(&mut s.output_mask, mask);
+            // A new point count orphans the handles: drop them, and bring them back on undo.
+            if !s.output_mask_tangents.is_empty() && count != Some(s.output_mask_tangents.len()) {
+                let old = std::mem::take(&mut s.output_mask_tangents);
+                let inverse = Command::Batch {
+                    commands: vec![
+                        Command::SetScreenMask { screen, mask: prev },
+                        Command::SetScreenMaskTangents {
+                            screen,
+                            tangents: old,
+                        },
+                    ],
+                };
+                return undoable(inverse, vec![]);
+            }
             undoable(Command::SetScreenMask { screen, mask: prev }, vec![])
+        }
+        Command::SetScreenMaskTangents { screen, tangents } => {
+            let tangents = checked_tangents(tangents)?;
+            let s = screen_mut(p, screen)?;
+            let prev = std::mem::replace(&mut s.output_mask_tangents, tangents);
+            let inverse = Command::SetScreenMaskTangents {
+                screen,
+                tangents: prev,
+            };
+            undoable(inverse, vec![])
+        }
+        Command::SetSliceMaskTangents {
+            screen,
+            slice,
+            tangents,
+        } => {
+            let tangents = checked_tangents(tangents)?;
+            let s = slice_mut(p, screen, slice)?;
+            let prev = std::mem::replace(&mut s.mask_tangents, tangents);
+            let inverse = Command::SetSliceMaskTangents {
+                screen,
+                slice,
+                tangents: prev,
+            };
+            undoable(inverse, vec![])
         }
         Command::SetSliceMeshes { screen, meshes } => {
             if has_duplicates(meshes.iter().map(|m| m.0)) {

@@ -1487,6 +1487,11 @@ pub struct Screen {
     /// Output mask: the screen shows only inside it (black outside).
     #[serde(default)]
     pub output_mask: Option<Mask>,
+    /// Curve handle per output-mask point, as an offset in normalized screen units: the
+    /// outgoing control point sits at `point + handle`, the incoming one at
+    /// `point - handle`. Empty (or not one per point) = straight edges.
+    #[serde(default)]
+    pub output_mask_tangents: Vec<(f32, f32)>,
 }
 
 fn default_true() -> bool {
@@ -1702,6 +1707,10 @@ pub struct Slice {
     /// shorter than the mesh = zero handles.
     #[serde(default)]
     pub mesh_tangents: Vec<((f32, f32), (f32, f32))>,
+    /// Curve handle per slice-mask point (see `Screen::output_mask_tangents`). Empty =
+    /// straight edges.
+    #[serde(default)]
+    pub mask_tangents: Vec<(f32, f32)>,
     /// Zoom, shift and turn of the content inside the slice; the outline does not move.
     #[serde(default)]
     pub transform: SliceTransform,
@@ -3005,6 +3014,7 @@ mod tests {
             delay_ms: 0,
             additive_overlap: true,
             output_mask: None,
+            output_mask_tangents: vec![],
         };
         let mut v = serde_json::to_value(&scr).unwrap();
         assert!(

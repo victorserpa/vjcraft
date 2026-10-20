@@ -9386,7 +9386,10 @@ fn drag_held(h: &mut Harness<'_, State>, from: egui::Pos2, to: egui::Pos2, mods:
     h.event_modifiers(button(from, true), mods);
     h.step();
     for i in 1..=6 {
-        h.event_modifiers(egui::Event::PointerMoved(from.lerp(to, i as f32 / 6.0)), mods);
+        h.event_modifiers(
+            egui::Event::PointerMoved(from.lerp(to, i as f32 / 6.0)),
+            mods,
+        );
         h.step();
     }
     h.event_modifiers(button(to, false), mods);
@@ -9398,7 +9401,12 @@ fn alt_drag_on_a_mask_point_pulls_out_a_handle_and_undo_removes_it() {
     let mut h = precise_slice_setup();
     let (o, k) = (out_canvas_origin(&h), out_k(&h));
     nested_menu(&mut h, "Add output mask", "Draw points");
-    let corners = [(600.0, 300.0), (1400.0, 300.0), (1400.0, 800.0), (600.0, 800.0)];
+    let corners = [
+        (600.0, 300.0),
+        (1400.0, 300.0),
+        (1400.0, 800.0),
+        (600.0, 800.0),
+    ];
     for (x, y) in corners {
         click_at(&mut h, o + egui::vec2(x * k, y * k));
     }
@@ -9409,17 +9417,27 @@ fn alt_drag_on_a_mask_point_pulls_out_a_handle_and_undo_removes_it() {
     assert!(scr.output_mask_tangents.is_empty(), "straight at first");
     let before = scr.output_mask.clone();
     let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
-    drag_held(&mut h, at(600.0, 300.0), at(800.0, 300.0), egui::Modifiers::ALT);
+    drag_held(
+        &mut h,
+        at(600.0, 300.0),
+        at(800.0, 300.0),
+        egui::Modifiers::ALT,
+    );
     let scr = h.state().project.output.screens[0].clone();
     assert_eq!(scr.output_mask, before, "the point itself did not move");
     assert_eq!(scr.output_mask_tangents.len(), 4);
-    assert!(scr.output_mask_tangents[0].0 > 0.05, "handle pulled to the right");
+    assert!(
+        scr.output_mask_tangents[0].0 > 0.05,
+        "handle pulled to the right"
+    );
     assert_eq!(scr.output_mask_tangents[1], (0.0, 0.0));
     click(&mut h, "Undo edit");
-    assert!(h.state().project.output.screens[0]
-        .output_mask_tangents
-        .iter()
-        .all(|t| *t == (0.0, 0.0)));
+    assert!(
+        h.state().project.output.screens[0]
+            .output_mask_tangents
+            .iter()
+            .all(|t| *t == (0.0, 0.0))
+    );
 }
 
 #[test]
@@ -9427,14 +9445,27 @@ fn alt_click_turns_a_curved_mask_point_back_into_a_corner() {
     let mut h = precise_slice_setup();
     let (o, k) = (out_canvas_origin(&h), out_k(&h));
     nested_menu(&mut h, "Add output mask", "Draw points");
-    for (x, y) in [(600.0, 300.0), (1400.0, 300.0), (1400.0, 800.0), (600.0, 800.0)] {
+    for (x, y) in [
+        (600.0, 300.0),
+        (1400.0, 300.0),
+        (1400.0, 800.0),
+        (600.0, 800.0),
+    ] {
         click_at(&mut h, o + egui::vec2(x * k, y * k));
     }
     h.key_press(egui::Key::Enter);
     settle(&mut h);
     let at = |x: f32, y: f32| o + egui::vec2(x * k, y * k);
-    drag_held(&mut h, at(600.0, 300.0), at(800.0, 300.0), egui::Modifiers::ALT);
-    assert_ne!(h.state().project.output.screens[0].output_mask_tangents[0], (0.0, 0.0));
+    drag_held(
+        &mut h,
+        at(600.0, 300.0),
+        at(800.0, 300.0),
+        egui::Modifiers::ALT,
+    );
+    assert_ne!(
+        h.state().project.output.screens[0].output_mask_tangents[0],
+        (0.0, 0.0)
+    );
     let p = at(600.0, 300.0);
     h.hover_at(p);
     h.step();
@@ -9448,5 +9479,8 @@ fn alt_click_turns_a_curved_mask_point_back_into_a_corner() {
     h.step();
     h.event_modifiers(ev(false), egui::Modifiers::ALT);
     settle(&mut h);
-    assert_eq!(h.state().project.output.screens[0].output_mask_tangents[0], (0.0, 0.0));
+    assert_eq!(
+        h.state().project.output.screens[0].output_mask_tangents[0],
+        (0.0, 0.0)
+    );
 }
