@@ -3,7 +3,9 @@ use libloading::{Library, Symbol};
 use memmap2::MmapMut;
 use std::ffi::c_void;
 use std::io::{BufRead, Write};
+use std::time::Instant;
 use vjc_ffgl::abi::*;
+use vjc_ffgl::glhost::GlHost;
 use vjc_ffgl::proto::*;
 
 /// Lifecycle per the documented ABI: INITIALISE, INSTANTIATE (instance id kept and passed on
@@ -12,14 +14,33 @@ struct Plugin {
     main: PlugMain,
     initialised: bool,
     instance: *mut c_void,
+    /// OpenGL context (Load only). Declared before the library so it outlives nothing it needs.
+    gl: Option<GlHost>,
+    gl_error: String,
+    /// Viewport the instance currently knows about.
+    viewport: (u32, u32),
+    mode: Mode,
+    started: Instant,
     _lib: Library,
 }
+
+/// How frames are processed. Decided on the first frame: a plugin that answers the VJCraft CPU
+/// test code (fixture only) stays on the CPU path, everything else is driven over OpenGL.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Unknown,
+    Cpu,
+    Gl,
+}
+
+/// Initial viewport for INSTANTIATE_GL; the first frame sends RESIZE if the size differs.
+const DEFAULT_VIEWPORT: (u32, u32) = (640, 480);
 
 impl Drop for Plugin {
     fn drop(&mut self) {
         unsafe {
             if !self.instance.is_null() {
-                (self.main)(FF_DEINSTANTIATE, FFMixed { u: 0 }, self.instance);
+                (self.main)(FF_DEINSTANTIATE_GL, FFMixed { u: 0 }, self.instance);
             }
             if self.initialised {
                 (self.main)(FF_DEINITIALISE, FFMixed { u: 0 }, std::ptr::null_mut());
@@ -39,6 +60,11 @@ impl Plugin {
                 main,
                 initialised: false,
                 instance: std::ptr::null_mut(),
+                gl: None,
+                gl_error: String::new(),
+                viewport: DEFAULT_VIEWPORT,
+                mode: Mode::Unknown,
+                started: Instant::now(),
                 _lib: lib,
             })
         }
@@ -47,7 +73,19 @@ impl Plugin {
         unsafe { (self.main)(code, v, self.instance) }
     }
     fn initialise(&mut self) -> Result<(), String> {
-        if self.uint(FF_INITIALISE, 0) == FF_FAIL {
+        let name = c"VJCraft";
+        let host = HostInfoStruct {
+            name: name.as_ptr(),
+            major: 0,
+            minor: 1,
+        };
+        let r = self.call(
+            FF_INITIALISE_V2,
+            FFMixed {
+                p: &host as *const _ as *mut c_void,
+            },
+        );
+        if unsafe { r.u } == FF_FAIL {
             return Err("INITIALISE failed".into());
         }
         self.initialised = true;
@@ -57,21 +95,96 @@ impl Plugin {
         let vp = ViewportStruct {
             x: 0,
             y: 0,
-            width: 0,
-            height: 0,
+            width: self.viewport.0,
+            height: self.viewport.1,
         };
         let r = self.call(
-            FF_INSTANTIATE,
+            FF_INSTANTIATE_GL,
             FFMixed {
                 p: &vp as *const _ as *mut c_void,
             },
         );
         let p = unsafe { r.p };
         if p.is_null() || p as usize == FF_FAIL as usize {
-            return Err("INSTANTIATE failed".into());
+            return Err("INSTANTIATE_GL failed".into());
         }
         self.instance = p;
         Ok(())
+    }
+    /// One frame over OpenGL: RESIZE when the size changed, SET_TIME, then PROCESS_OPENGL with
+    /// one input texture and the host FBO.
+    fn process_gl(
+        &mut self,
+        w: u32,
+        h: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), String> {
+        if self.gl.is_none() {
+            return Err(if self.gl_error.is_empty() {
+                "no OpenGL context".into()
+            } else {
+                self.gl_error.clone()
+            });
+        }
+        if self.viewport != (w, h) {
+            let vp = ViewportStruct {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            };
+            let r = self.call(
+                FF_RESIZE,
+                FFMixed {
+                    p: &vp as *const _ as *mut c_void,
+                },
+            );
+            if unsafe { r.u } == FF_FAIL {
+                return Err("RESIZE failed".into());
+            }
+            self.viewport = (w, h);
+        }
+        let mut t = self.started.elapsed().as_secs_f64();
+        self.call(
+            FF_SET_TIME,
+            FFMixed {
+                p: &mut t as *mut f64 as *mut c_void,
+            },
+        );
+        let (main, instance) = (self.main, self.instance);
+        let mut ok = true;
+        let gl = self.gl.as_mut().unwrap();
+        gl.frame(w, h, input, output, |tex, fbo| {
+            let mut ts = TextureStruct {
+                width: w,
+                height: h,
+                hardware_width: w,
+                hardware_height: h,
+                handle: tex,
+            };
+            let mut tp: *mut TextureStruct = &mut ts;
+            let ps = ProcessOpenGlStruct {
+                num_input_textures: 1,
+                input_textures: &mut tp,
+                host_fbo: fbo,
+            };
+            let r = unsafe {
+                main(
+                    FF_PROCESS_OPENGL,
+                    FFMixed {
+                        p: &ps as *const _ as *mut c_void,
+                    },
+                    instance,
+                )
+            };
+            ok = unsafe { r.u } != FF_FAIL;
+        })?;
+        if ok {
+            Ok(())
+        } else {
+            Err("PROCESS_OPENGL failed".into())
+        }
     }
     fn uint(&self, code: u32, v: u32) -> u32 {
         unsafe { self.call(code, FFMixed { u: v }).u }
@@ -135,13 +248,21 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
         Request::Load { path } => {
             *cur = None; // DEINSTANTIATE + DEINITIALISE the old plugin first
             match Plugin::open(&path) {
-                Ok(mut p) => match p.info().and_then(|i| p.instantiate().map(|_| i)) {
-                    Ok(info) => {
-                        *cur = Some(p);
-                        Response::Info { info }
+                Ok(mut p) => {
+                    // The context must be current before INSTANTIATE_GL. Without one the CPU
+                    // fixture still works; a GL frame then reports why it cannot run.
+                    match GlHost::new() {
+                        Ok(g) => p.gl = Some(g),
+                        Err(e) => p.gl_error = e,
                     }
-                    Err(msg) => Response::Err { msg },
-                },
+                    match p.info().and_then(|i| p.instantiate().map(|_| i)) {
+                        Ok(info) => {
+                            *cur = Some(p);
+                            Response::Info { info }
+                        }
+                        Err(msg) => Response::Err { msg },
+                    }
+                }
                 Err(msg) => Response::Err { msg },
             }
         }
@@ -206,24 +327,34 @@ fn handle(req: Request, cur: &mut Option<Plugin>) -> Response {
                 };
             }
             let (a, b) = map.split_at_mut(n);
-            let s = CpuFrameStruct {
-                input: a.as_ptr(),
-                output: b.as_mut_ptr(),
-                width: w,
-                height: h,
-            };
-            let r = p.call(
-                FF_PROCESS_CPU_EXT,
-                FFMixed {
-                    p: &s as *const _ as *mut c_void,
-                },
-            );
-            if unsafe { r.u } == FF_FAIL {
-                return Response::Err {
-                    msg: "plugin has no CPU path (needs the OpenGL host, stage 2)".into(),
+            if p.mode != Mode::Gl {
+                let s = CpuFrameStruct {
+                    input: a.as_ptr(),
+                    output: b.as_mut_ptr(),
+                    width: w,
+                    height: h,
                 };
+                let r = p.call(
+                    FF_PROCESS_CPU_EXT,
+                    FFMixed {
+                        p: &s as *const _ as *mut c_void,
+                    },
+                );
+                if unsafe { r.u } != FF_FAIL {
+                    p.mode = Mode::Cpu;
+                    return Response::Done;
+                }
+                if p.mode == Mode::Cpu {
+                    return Response::Err {
+                        msg: "CPU process failed".into(),
+                    };
+                }
+                p.mode = Mode::Gl;
             }
-            Response::Done
+            match p.process_gl(w, h, a, &mut b[..n]) {
+                Ok(()) => Response::Done,
+                Err(msg) => Response::Err { msg },
+            }
         }
         Request::Quit => {
             *cur = None;

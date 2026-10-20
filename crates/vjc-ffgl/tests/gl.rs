@@ -51,11 +51,11 @@ fn gl_plugin_inverts_a_64x64_frame() {
     }
     let f = Frame { w: 64, h: 64, rgba };
     let out = e.process(&f);
-    if let Status::Stopped(HostError::Plugin(m)) = &e.status {
-        if m.contains("OpenGL context") {
-            eprintln!("skipping: no GL context available ({m})");
-            return;
-        }
+    if let Status::Stopped(HostError::Plugin(m)) = &e.status
+        && m.contains("OpenGL context")
+    {
+        eprintln!("skipping: no GL context available ({m})");
+        return;
     }
     assert_eq!(e.status, Status::Running, "{:?}", e.status);
     assert_eq!(out.rgba.len(), f.rgba.len());
