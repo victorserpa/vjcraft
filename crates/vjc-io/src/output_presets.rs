@@ -305,6 +305,7 @@ mod tests {
         let mut b = mapping::new_screen("Side", 640, 360);
         b.device = OutputDevice::Syphon;
         OutputSetup {
+            dither: true,
             screens: vec![a, b],
         }
     }
