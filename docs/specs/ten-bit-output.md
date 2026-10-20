@@ -46,7 +46,7 @@ Output settings get a "Dither 16-bit to 8-bit output" checkbox. It is greyed out
 - **Model:** a project without `dither` loads as `true`, and a round trip keeps `false`.
 - **Headless GPU:** a 16-bit ramp from 0.40 to 0.42 rendered into an 8-bit target 1024 px wide.
   - With dither off: at most 6 distinct values, and runs of more than 100 equal pixels.
-  - With dither on: the mean over each 64 px block stays within 0.5/255 of the ramp, and no run of equal pixels is longer than 16 px.
+  - With dither on: the mean over each 64 px block stays within 0.5/255 of the ramp, and runs of equal pixels stay under 90 px (one 8×8 Bayer row spans about two thirds of the thresholds).
 - **Headless GPU:** with bit_depth 8, turning dither on gives output byte-identical to dither off.
 - **Headless GPU:** black stays exactly 0 and white exactly 255.
 
