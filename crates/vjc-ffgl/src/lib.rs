@@ -122,6 +122,11 @@ impl Helper {
         }
     }
 
+    /// True once the process has exited (checked without blocking).
+    pub fn exited(&mut self) -> bool {
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -574,6 +579,10 @@ impl FfglEffect {
             h: input.h,
             rgba: input.rgba.clone(),
         };
+        if self.helper.as_mut().is_some_and(|h| h.exited()) {
+            // died while a request was in flight: drop the stale result, pass through now
+            self.stop(HostError::Died);
+        }
         self.poll();
         if self.helper.is_none() {
             return pass();
