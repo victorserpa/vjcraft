@@ -221,6 +221,15 @@ pub enum Command {
         beat_sync: Option<f64>,
         timecode_start: Option<Timecode>,
     },
+    /// Makes the clip follow DJ player 1..=4 (None = off); `master_tempo` keeps clip speed
+    /// while position is still held. Other players are `InvalidValue`. Undoable.
+    SetClipFollow {
+        deck: DeckId,
+        layer: LayerId,
+        column: ColumnIdx,
+        player: Option<u8>,
+        master_tempo: bool,
+    },
     /// Plays the in..out region in `secs` seconds (speed derived from it); None = free
     /// speed. Beat sync wins when both are set. Undoable.
     SetClipDuration {
@@ -2607,6 +2616,32 @@ fn apply_raw(p: &mut Project, cmd: Command) -> Result<Applied, Error> {
                     column,
                     beat_sync: prev.0,
                     timecode_start: prev.1,
+                },
+                vec![],
+            )
+        }
+        Command::SetClipFollow {
+            deck,
+            layer,
+            column,
+            player,
+            master_tempo,
+        } => {
+            if player.is_some_and(|n| !(1..=4).contains(&n)) {
+                return Err(Error::InvalidValue);
+            }
+            let t = transport_mut(p, deck, layer, column)?;
+            let prev = (
+                std::mem::replace(&mut t.follow_player, player),
+                std::mem::replace(&mut t.follow_master_tempo, master_tempo),
+            );
+            undoable(
+                Command::SetClipFollow {
+                    deck,
+                    layer,
+                    column,
+                    player: prev.0,
+                    master_tempo: prev.1,
                 },
                 vec![],
             )

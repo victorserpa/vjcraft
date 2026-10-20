@@ -676,6 +676,12 @@ pub struct Transport {
     /// speed is derived from it. Old files lack it: free speed.
     #[serde(default)]
     pub duration_secs: Option<f64>,
+    /// Follow this DJ player (1..=4): play state and track position drive the clip.
+    #[serde(default)]
+    pub follow_player: Option<u8>,
+    /// While following, keep clip speed (the player's key lock) and still hold position.
+    #[serde(default)]
+    pub follow_master_tempo: bool,
 }
 
 /// Timecode frame rates.
@@ -1968,6 +1974,8 @@ impl Default for Transport {
             out_point: 1.0,
             timecode_start: None,
             duration_secs: None,
+            follow_player: None,
+            follow_master_tempo: false,
         }
     }
 }
