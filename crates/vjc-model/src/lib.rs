@@ -2316,6 +2316,26 @@ mod tests {
     }
 
     #[test]
+    fn slice_transform_roundtrips_and_old_files_load_as_identity() {
+        let s = r#"{"id":"00000000-0000-0000-0000-000000000001","input":[],"output_mesh":[],"mesh_cols":2,"mask":null,"soft_edge":null}"#;
+        let sl: Slice = serde_json::from_str(s).unwrap();
+        assert_eq!(sl.transform, SliceTransform::default());
+        assert_eq!(sl.transform.scale, 1.0);
+        assert_eq!(sl.transform.offset, (0.0, 0.0));
+        assert_eq!(sl.transform.rotation, 0.0);
+        // Negative control: a stored transform survives a save and load.
+        let mut set = sl.clone();
+        set.transform = SliceTransform {
+            scale: 2.5,
+            offset: (0.1, -0.2),
+            rotation: 30.0,
+        };
+        let back: Slice = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.transform, set.transform);
+        assert_ne!(back.transform, SliceTransform::default());
+    }
+
+    #[test]
     fn autopilot_from_an_older_file_defaults_to_loops_and_new_fields_roundtrip() {
         let old: Autopilot = serde_json::from_str(r#"{"mode":"Next","every_loops":3}"#).unwrap();
         assert_eq!(old.unit, AutopilotUnit::Loops);

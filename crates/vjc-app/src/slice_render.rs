@@ -640,6 +640,16 @@ mod tests {
 
     /// Same, optionally stamping the test card on the target like the app does.
     fn render_rgba_card(screen: &Screen, src_px: [u8; 4], card: bool) -> Option<Vec<u8>> {
+        render_src(screen, &src_px, (1, 1), card)
+    }
+
+    /// Same from a `size` source image (RGBA bytes, row-major).
+    fn render_src(
+        screen: &Screen,
+        src_px: &[u8],
+        size: (u32, u32),
+        card: bool,
+    ) -> Option<Vec<u8>> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no wgpu adapter: skipped");
@@ -651,25 +661,25 @@ mod tests {
             eprintln!("no wgpu device: skipped");
             return None;
         };
-        let (src, src_v) = make_screen_target(&device, 1, 1);
+        let (src, src_v) = make_screen_target(&device, size.0, size.1);
         let one = wgpu::Extent3d {
-            width: 1,
-            height: 1,
+            width: size.0,
+            height: size.1,
             depth_or_array_layers: 1,
         };
         queue.write_texture(
             src.as_image_copy(),
-            &src_px,
+            src_px,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
+                bytes_per_row: Some(4 * size.0),
+                rows_per_image: Some(size.1),
             },
             one,
         );
         let (w, h) = (screen.width, screen.height);
         let (dst, dst_v) = make_screen_target(&device, w, h);
-        SliceRenderer::new(&device).render(&device, &queue, screen, &|_| (&src_v, (1, 1)), &dst_v);
+        SliceRenderer::new(&device).render(&device, &queue, screen, &|_| (&src_v, size), &dst_v);
         if card {
             Stamper::new(&device).stamp_card(&device, &queue, &dst_v, screen, (w, h));
         }
@@ -833,6 +843,66 @@ mod tests {
         screen.slices.push(mapping::new_slice(1, 1));
         if let Some(got) = render_rgba(&screen, [200, 100, 50, 255]) {
             assert_eq!(got, vec![200, 100, 50, 255]);
+        }
+    }
+
+    /// 8x8 source whose pixel (x, y) is (30x, 30y, 0, 255).
+    fn gradient_8() -> Vec<u8> {
+        (0..64u32)
+            .flat_map(|i| [(i % 8 * 30) as u8, (i / 8 * 30) as u8, 0, 255])
+            .collect()
+    }
+
+    fn close(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 1)
+    }
+
+    /// The identity transform draws exactly the source, as before the transform existed.
+    #[test]
+    fn gpu_slice_transform_identity_matches_source() {
+        let mut screen = mapping::new_screen("t", 8, 8);
+        let mut sl = mapping::new_slice(8, 8);
+        sl.transform = vjc_model::SliceTransform::default();
+        screen.slices.push(sl);
+        let src = gradient_8();
+        if let Some(got) = render_src(&screen, &src, (8, 8), false) {
+            for y in 0..8 {
+                for x in 0..8 {
+                    assert!(close(px(&got, 8, x, y), px(&src, 8, x, y)), "({x},{y})");
+                }
+            }
+        }
+    }
+
+    /// Scale 2 shows the centre quarter of the source; the slice itself stays put.
+    #[test]
+    fn gpu_slice_transform_scale_two_shows_centre_quarter() {
+        let mut screen = mapping::new_screen("t", 4, 4);
+        let mut sl = mapping::new_slice(4, 4);
+        sl.transform.scale = 2.0;
+        screen.slices.push(sl);
+        let src = gradient_8();
+        if let Some(got) = render_src(&screen, &src, (8, 8), false) {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let want = px(&src, 8, x + 2, y + 2);
+                    assert!(close(px(&got, 4, x, y), want), "({x},{y}) {:?}", px(&got, 4, x, y));
+                }
+            }
+        }
+    }
+
+    /// Shifting the content right by half the slice leaves transparent pixels.
+    #[test]
+    fn gpu_slice_transform_outside_source_is_transparent() {
+        let mut screen = mapping::new_screen("t", 4, 4);
+        let mut sl = mapping::new_slice(4, 4);
+        sl.transform.offset = (0.5, 0.0);
+        screen.slices.push(sl);
+        let src = gradient_8();
+        if let Some(got) = render_src(&screen, &src, (8, 8), false) {
+            assert_eq!(px(&got, 4, 0, 0), [0, 0, 0, 0], "left edge is outside the source");
+            assert_eq!(px(&got, 4, 3, 0)[3], 255, "right half still shows the source");
         }
     }
 

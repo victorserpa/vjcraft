@@ -1091,6 +1091,39 @@ fn output_setup_soft_edge_and_mask() {
     snap(&mut h, "10-output-soft-edge");
 }
 
+#[test]
+fn output_setup_slice_transform_scale_drag_undoes() {
+    use egui_kittest::kittest::NodeT;
+    let mut h = app();
+    click(&mut h, "Output");
+    click(&mut h, "Setup...");
+    add_screen(&mut h);
+    add_slice(&mut h);
+    let scale = |h: &Harness<'_, State>| {
+        h.state().project.output.screens[0].slices[0]
+            .transform
+            .scale
+    };
+    assert_eq!(scale(&h), 1.0);
+    let find = |h: &Harness<'_, State>| {
+        h.query_all_by_role(egui::accesskit::Role::Slider)
+            .find(|n| n.accesskit_node().label().as_deref() == Some("Scale"))
+            .expect("Scale slider")
+            .rect()
+    };
+    h.query_all_by_role(egui::accesskit::Role::Slider)
+        .find(|n| n.accesskit_node().label().as_deref() == Some("Scale"))
+        .expect("Scale slider")
+        .scroll_to_me();
+    h.run_steps(30);
+    let rect = find(&h);
+    drag_to_slider_pct(&mut h, rect, 0.8);
+    assert!(scale(&h) > 1.0, "{}", scale(&h));
+    // The whole drag is one undo step.
+    click(&mut h, "Undo edit");
+    assert_eq!(scale(&h), 1.0);
+}
+
 // 11
 #[test]
 fn panel_tabs_switch() {
