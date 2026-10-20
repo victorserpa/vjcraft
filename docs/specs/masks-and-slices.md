@@ -34,7 +34,7 @@ Non-goal: animating the transform from audio or an LFO. That can come later thro
 - **Model:** `Slice.transform: SliceTransform { scale, offset: (f32, f32), rotation }` with `#[serde(default)]`. The default is the identity, so old projects load unchanged.
 - **Render:** the input UV goes through the inverse transform before sampling, in the slice shader used by `crates/vjc-app/src/slice_render.rs`. Areas outside the source are transparent.
 - **UI:** a fold section in `crates/vjc-app/src/output_props.rs` next to "Mask" (line 808).
-  - Double-clicking a value resets it.
+  - Right-clicking a slider resets it to its default, as every slider already does.
   - A drag is one undo step.
 - **Tests, written first:**
   - The model round-trips, and an old file loads with the identity transform.
