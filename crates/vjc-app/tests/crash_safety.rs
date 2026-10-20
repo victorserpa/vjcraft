@@ -209,7 +209,7 @@ fn child_exits_when_the_supervisor_is_sigkilled() {
 }
 
 /// The UI loop may never start the quit (its thread is blocked): the watcher must still end
-/// the orphan once the start grace (10 s) runs out.
+/// the orphan once the start grace (1 s) runs out.
 #[cfg(unix)]
 #[test]
 fn stuck_ui_child_exits_after_the_start_grace() {
@@ -220,7 +220,7 @@ fn stuck_ui_child_exits_after_the_start_grace() {
     unsafe { libc::kill(sup.id() as i32, libc::SIGKILL) };
     let _ = sup.wait();
     let t = std::time::Instant::now();
-    while t.elapsed() < std::time::Duration::from_millis(12_000)
+    while t.elapsed() < std::time::Duration::from_millis(2_000)
         && unsafe { libc::kill(child, 0) } == 0
     {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -229,6 +229,57 @@ fn stuck_ui_child_exits_after_the_start_grace() {
     if alive {
         unsafe { libc::kill(child, libc::SIGKILL) };
     }
-    assert!(!alive, "stuck-UI orphan lived past 12 s");
+    assert!(!alive, "stuck-UI orphan lived past 2 s");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Kills the supervisor and returns whether `child` is gone within 2 s.
+#[cfg(unix)]
+fn orphan_gone_within_2s(sup: &mut std::process::Child, child: i32) -> bool {
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    unsafe { libc::kill(sup.id() as i32, libc::SIGKILL) };
+    let _ = sup.wait();
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_millis(2_000)
+        && unsafe { libc::kill(child, 0) } == 0
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let alive = unsafe { libc::kill(child, 0) } == 0;
+    if alive {
+        unsafe { libc::kill(child, libc::SIGKILL) };
+    }
+    !alive
+}
+
+/// A published snapshot reaches disk even though the UI never runs again.
+#[cfg(unix)]
+#[test]
+fn stuck_ui_orphan_writes_the_published_snapshot() {
+    let dir = data_dir("orphan-snap");
+    let mut sup = spawn_supervisor(&dir, "snapshot-stuck-ui");
+    let child = wait_child_pid(&dir);
+    assert!(
+        orphan_gone_within_2s(&mut sup, child),
+        "orphan lived past 2 s"
+    );
+    let got = std::fs::read(dir.join("recovery.vjc")).expect("recovery file written");
+    assert_eq!(got, b"{\"published\":\"snapshot\"}");
+    assert!(!dir.join("recovery.vjc.tmp").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An empty slot means nothing to write: no recovery file appears.
+#[cfg(unix)]
+#[test]
+fn stuck_ui_orphan_with_an_empty_slot_writes_nothing() {
+    let dir = data_dir("orphan-empty");
+    let mut sup = spawn_supervisor(&dir, "stuck-ui");
+    let child = wait_child_pid(&dir);
+    assert!(
+        orphan_gone_within_2s(&mut sup, child),
+        "orphan lived past 2 s"
+    );
+    assert!(!dir.join("recovery.vjc").exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -276,6 +276,19 @@ mod tests {
     }
 
     #[test]
+    fn encode_then_write_atomic_matches_save() {
+        let d = tmp("encode");
+        let mut p = Project::new("T");
+        p.composition.name = "Enc".into();
+        let a = d.join("a.vjc");
+        let b = d.join("b.vjc");
+        save(&p, &a).unwrap();
+        let bytes = encode(&p, &b).unwrap();
+        write_atomic(&b, &bytes).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    #[test]
     fn open_binds_legacy_positional_effect_shortcuts() {
         let d = tmp("legacyfx");
         let mut p = Project::new("T");
