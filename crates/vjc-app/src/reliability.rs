@@ -109,7 +109,7 @@ pub fn panic_report(info: &std::panic::PanicHookInfo<'_>) -> String {
         thread.name().unwrap_or("<unnamed>"),
         recovery_note(),
         std::backtrace::Backtrace::force_capture()
-    )
+    ) + &crate::logfile::tail_section(crate::logfile::log_path().as_deref())
 }
 
 /// Installs the panic hook: the default hook output stays; then a report goes to

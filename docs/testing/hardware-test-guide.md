@@ -13,7 +13,7 @@ Menu and label names below are the ones in the app. Where a name could not be ma
 - **What you did**: step number, what you expected, what happened, a photo or screen recording if it is visual.
 - **App data folder**: `~/Library/Application Support/VJCraft/` (Finder: Go > Go to Folder). Send `prefs.json` and `recovery.vjc` from it.
 - **Crash reports**: `~/Library/Application Support/VJCraft/crashes/` has `<YYYYMMDD-HHMMSS>.txt` for panics and `stall-<stamp>.txt` when the UI froze for more than 2 s. Send all files from the day of the test. If the app was killed by the system there is also a macOS report in `~/Library/Logs/DiagnosticReports/` (look for "vjcraft").
-- **Logs**: the app has no log file. Messages go to stderr, which a double-click launch discards. To capture them, quit the app and run in Terminal: `/Applications/VJCraft.app/Contents/MacOS/vjcraft 2>&1 | tee ~/Desktop/vjcraft-log.txt` and send that file. (The binary name inside the bundle is not checked here; use the one in `Contents/MacOS`.)
+- **Logs**: the app writes `~/Library/Application Support/VJCraft/logs/vjcraft.log` (the last 5 runs are kept as `vjcraft.log.1` ... `.4`). Use **View > Show Logs in Finder** to reveal it and send the files. Crash reports also end with the last 200 log lines.
 - **Optional counters**: launch from Terminal with `VJC_FRAME_LOG=1` to print the frame time every 120 frames, or `VJC_UI_STATS=1` for UI repaint counts once per second.
 - **System**: Mac model, macOS version, monitor and processor model, the project file if you can share it.
 - File issues on GitHub with the label `hardware`.
@@ -95,7 +95,7 @@ Machine: Mac on macOS 12 (Monterey).
 ## (f) 2-hour show soak
 Use the app's own tools only. Build a realistic show: 4 or more layers of mixed H.264 and HAP, effects including one FFGL and one CLAP if possible, output fullscreen on the real display, DJ sync on if you have a player.
 
-1. Launch from Terminal with `VJC_FRAME_LOG=1` and redirect stderr to a file as in "What to send" (frame time is printed every 120 frames). Turn on **View > Show FPS & Stats**.
+1. Launch from Terminal with `VJC_FRAME_LOG=1` (the output also lands in the log file, see "Logs") (frame time is printed every 120 frames). Turn on **View > Show FPS & Stats**.
 2. Record at start: fps, frame time, CPU and memory (Activity Monitor, "Memory" column for VJCraft).
 3. Run the show for 2 hours: trigger columns, change clips and effects every few minutes, as at a gig.
 4. Every 15 minutes note fps, memory and any visible glitch. Expected: fps steady, memory not growing without bound.
