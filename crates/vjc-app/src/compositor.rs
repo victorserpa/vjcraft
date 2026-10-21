@@ -1278,6 +1278,11 @@ impl Fx {
                             mapped_at_creation: false,
                         }));
                 }
+                // Readback without waiting: pick up a finished earlier frame, then queue this
+                // one. Until some data exists the frame passes through.
+                let (w, h) = (scratch[tmp].0.width(), scratch[tmp].0.height());
+                let Ok(mut rb) = f.rb.lock() else { continue };
+                let raw = rb.harvest(device, (w, h, bpp));
                 mix_draw(
                     device,
                     queue,
@@ -1288,15 +1293,16 @@ impl Fx {
                     [0.0; 4],
                 );
                 self.mix_next += 1;
-                // The copy was drawn into `enc`: send it before reading.
+                let slot = rb.copy_in(enc, &scratch[tmp].0);
+                // The copy was drawn into `enc`: send it before mapping.
                 let done =
                     std::mem::replace(enc, device.create_command_encoder(&Default::default()));
                 queue.submit(Some(done.finish()));
-                let Some((w, h, raw)) =
-                    Compositor::read_texture_bpp(device, queue, &scratch[tmp].0, bpp)
-                else {
-                    continue;
-                };
+                if let Some(k) = slot {
+                    rb.start(k);
+                }
+                drop(rb);
+                let Some(raw) = raw else { continue };
                 let rgba = if bpp == 8 { half_to_rgba8(&raw) } else { raw };
                 let Ok(mut f) = f.lock() else { continue };
                 f.note = (in_size != size).then(|| {
