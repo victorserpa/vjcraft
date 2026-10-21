@@ -18,6 +18,10 @@ pub const GROUP: &str = "FFGL plugins";
 /// Effect tooltip: frames are pipelined to keep the render thread free.
 pub const LATENCY_TIP: &str = "FFGL plugin: runs in a helper process, so its output has at least two frames of latency (the GPU readback is not waited for); more when the plugin is slower than the frame rate.";
 
+/// How old a kept plugin output may be and still stand in for a frame whose readback is late;
+/// older (after a pause) the frame passes through instead.
+pub const LAST_OUT_MAX_AGE: Duration = Duration::from_millis(100);
+
 /// How long one request to the helper may take before the plugin counts as stopped.
 const TIMEOUT: Duration = Duration::from_secs(3);
 /// An instance that no frame asked for during this long is shut down.
@@ -44,6 +48,9 @@ impl Handle {
 
 pub type Shared = Arc<Handle>;
 
+/// A kept plugin output: (width, height, bytes per pixel), when it was made, texture bytes.
+pub type LastOut = ((u32, u32, u32), Instant, Vec<u8>);
+
 /// Ring of 2 staging buffers: frame N copies its input into slot N%2 and starts the mapping
 /// without waiting; a later frame picks the bytes up once the GPU has finished.
 #[derive(Default)]
@@ -54,8 +61,9 @@ pub struct Staging {
     /// Per slot: the mapping in flight (0 pending, 1 ready, 2 failed).
     pending: [Option<Arc<AtomicU8>>; 2],
     next: usize,
-    /// Last plugin output (width, height, texture bytes), shown again while no readback is ready.
-    pub last_out: Option<(u32, u32, Vec<u8>)>,
+    /// Last plugin output ((width, height, bytes per pixel), when, texture bytes), shown again
+    /// while no readback is ready, if it is recent (`LAST_OUT_MAX_AGE`).
+    pub last_out: Option<LastOut>,
 }
 
 impl Staging {

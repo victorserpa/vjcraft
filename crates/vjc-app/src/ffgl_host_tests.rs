@@ -414,6 +414,20 @@ fn stream_skipping(
     frames: &[(u8, u32)],
     not_ready: &[usize],
 ) -> Option<Vec<[u8; 4]>> {
+    stream_inner(host, frames, not_ready, None)
+}
+
+/// `stream_skipping` of one not-ready frame `at`, after a pause longer than the kept output lives.
+fn stream_paused(host: &FfglHost, frames: &[(u8, u32)], at: usize) -> Option<Vec<[u8; 4]>> {
+    stream_inner(host, frames, &[at], Some(at))
+}
+
+fn stream_inner(
+    host: &FfglHost,
+    frames: &[(u8, u32)],
+    not_ready: &[usize],
+    pause_before: Option<usize>,
+) -> Option<Vec<[u8; 4]>> {
     let (device, queue) = gpu()?;
     let id = vjc_ffgl::effect_id(&host.effect_entries()[0]);
     let effect = host.new_effect(&id).unwrap();
@@ -440,6 +454,9 @@ fn stream_skipping(
             {
                 return None;
             }
+        }
+        if pause_before == Some(ver) {
+            std::thread::sleep(crate::ffgl_host::LAST_OUT_MAX_AGE * 2);
         }
         if not_ready.contains(&ver)
             && let Some(fx) = host.shared(&effect)
@@ -626,4 +643,19 @@ fn a_frame_without_a_ready_readback_shows_the_last_plugin_output() {
             outs[4], outs[3]
         );
     }
+}
+
+#[test]
+fn a_late_readback_after_a_pause_passes_through_instead_of_an_old_output() {
+    let (host, _dir) = scanned("stale");
+    let colors = [20u8, 50, 80, 110, 140];
+    let frames: Vec<(u8, u32)> = colors.iter().map(|&c| (c, N)).collect();
+    let Some(outs) = stream_paused(&host, &frames, 4) else {
+        return;
+    };
+    assert_eq!(
+        outs[4][0], colors[4],
+        "frame 4 after a pause: {:?}",
+        outs[4]
+    );
 }

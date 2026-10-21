@@ -1309,7 +1309,10 @@ impl Fx {
                     }
                 } else {
                     match &rb.last_out {
-                        Some((lw, lh, b)) if (*lw, *lh) == (w, h) => {
+                        Some((shape, at, b))
+                            if *shape == (w, h, bpp)
+                                && at.elapsed() < crate::ffgl_host::LAST_OUT_MAX_AGE =>
+                        {
                             write_rgba(queue, &scratch[out].0, b, w, h, bpp);
                         }
                         _ => continue,
@@ -3582,7 +3585,7 @@ fn ffgl_process(
     };
     write_rgba(queue, out, &bytes, w, h, bpp);
     if let Ok(mut rb) = handle.rb.lock() {
-        rb.last_out = Some((w, h, bytes));
+        rb.last_out = Some(((w, h, bpp), std::time::Instant::now(), bytes));
     }
     true
 }
