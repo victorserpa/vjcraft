@@ -352,7 +352,8 @@ mod tests {
             assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
             let null = std::fs::File::create("/dev/null").unwrap();
             let orig = libc::dup(std::os::fd::AsRawFd::as_raw_fd(&null));
-            let target = libc::dup(fds[1]);
+            // Kept open for the whole test run: the tee dup2()s onto it at EOF.
+            let target = libc::dup(orig);
             spawn_tee(fds[0], orig, target, w).unwrap();
             let mut wr = <File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]);
             for i in 0..2000 {
@@ -361,7 +362,6 @@ mod tests {
             drain();
             let text = std::fs::read_to_string(d.join(NAME)).unwrap();
             assert!(text.contains("line 1999"), "tail missing after drain");
-            libc::close(target);
         }
         let _ = std::fs::remove_dir_all(&d);
     }
