@@ -260,7 +260,7 @@ unsafe extern "C" fn p_process(p: *const Plugin, pr: *const Process) -> i32 {
         let pr = &*pr;
         apply(st, pr.in_events);
         if st.vals[1] > 0.5 {
-            std::process::abort();
+            crash();
         }
         if st.vals[2] > 0.5 {
             std::thread::sleep(std::time::Duration::from_secs(30));
@@ -375,4 +375,18 @@ unsafe extern "C" fn p_ext(_: *const Plugin, id: *const c_char) -> *const c_void
     } else {
         std::ptr::null()
     }
+}
+
+/// Kills the host process by a signal, like a crashing plugin would. SIGKILL, not abort():
+/// macOS writes no crash report for it, so test runs do not flood ReportCrash.
+fn crash() -> ! {
+    unsafe extern "C" {
+        fn getpid() -> i32;
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SAFETY: plain libc calls on our own pid.
+    unsafe {
+        kill(getpid(), 9);
+    }
+    std::process::abort()
 }

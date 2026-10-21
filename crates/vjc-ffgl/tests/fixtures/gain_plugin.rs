@@ -107,7 +107,7 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> F
             8 => {
                 let s = &*(v.p as *const SetP);
                 if s.index == 1 && f32::from_bits(s.value.u) == 0.75 {
-                    std::process::abort(); // crash while setting
+                    crash(); // crash while setting
                 }
                 if s.index == 1 && f32::from_bits(s.value.u) == 0.25 {
                     return FFMixed { u: 0xFFFF_FFFF }; // rejects this single value
@@ -119,7 +119,7 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> F
             0x7F00 => {
                 let c = &*(v.p as *const Cpu);
                 if VALS[1] > 0.5 {
-                    std::process::abort();
+                    crash();
                 }
                 if VALS[2] == 0.25 {
                     std::thread::sleep(std::time::Duration::from_millis(50)); // slow plugin
@@ -141,4 +141,18 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> F
             _ => FFMixed { u: 0xFFFF_FFFF },
         }
     }
+}
+
+/// Kills the host process by a signal, like a crashing plugin would. SIGKILL, not abort():
+/// macOS writes no crash report for it, so test runs do not flood ReportCrash.
+fn crash() -> ! {
+    unsafe extern "C" {
+        fn getpid() -> i32;
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SAFETY: plain libc calls on our own pid.
+    unsafe {
+        kill(getpid(), 9);
+    }
+    std::process::abort()
 }
