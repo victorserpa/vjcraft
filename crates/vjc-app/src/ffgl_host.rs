@@ -3,8 +3,10 @@
 //! `vjc-ffgl-helper` process, so a crashing plugin shows "plugin stopped" and the layer
 //! passes through.
 
+use eframe::egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use vjc_ffgl::{Entry, FfglEffect, Status};
@@ -14,7 +16,11 @@ use vjc_model::{Effect, EffectId, Param, Value};
 pub const GROUP: &str = "FFGL plugins";
 
 /// Effect tooltip: frames are pipelined to keep the render thread free.
-pub const LATENCY_TIP: &str = "FFGL plugin: runs in a helper process, so its output has at least one frame of latency; more when the plugin is slower than the frame rate.";
+pub const LATENCY_TIP: &str = "FFGL plugin: runs in a helper process, so its output has at least two frames of latency (the GPU readback is not waited for); more when the plugin is slower than the frame rate.";
+
+/// How old a kept plugin output may be and still stand in for a frame whose readback is late;
+/// older (after a pause) the frame passes through instead.
+pub const LAST_OUT_MAX_AGE: Duration = Duration::from_millis(100);
 
 /// How long one request to the helper may take before the plugin counts as stopped.
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -26,7 +32,147 @@ pub fn is_kind(kind: &str) -> bool {
     kind.starts_with("ffgl:")
 }
 
-pub type Shared = Arc<Mutex<FfglEffect>>;
+/// One running plugin plus the staging buffers of its GPU readback. Both live and die with the
+/// effect's slot in the rack.
+pub struct Handle {
+    fx: Mutex<FfglEffect>,
+    /// Locked by the compositor only.
+    pub rb: Mutex<Staging>,
+}
+
+impl Handle {
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, FfglEffect>> {
+        self.fx.lock()
+    }
+}
+
+pub type Shared = Arc<Handle>;
+
+/// A kept plugin output: (width, height, bytes per pixel), when it was made, texture bytes.
+pub type LastOut = ((u32, u32, u32), Instant, Vec<u8>);
+
+/// Ring of 2 staging buffers: frame N copies its input into slot N%2 and starts the mapping
+/// without waiting; a later frame picks the bytes up once the GPU has finished.
+#[derive(Default)]
+pub struct Staging {
+    /// (width, height, bytes per pixel) the buffers were made for.
+    shape: (u32, u32, u32),
+    bufs: Vec<wgpu::Buffer>,
+    /// Per slot: the mapping in flight (0 pending, 1 ready, 2 failed).
+    pending: [Option<Arc<AtomicU8>>; 2],
+    next: usize,
+    /// Last plugin output ((width, height, bytes per pixel), when, texture bytes), shown again
+    /// while no readback is ready, if it is recent (`LAST_OUT_MAX_AGE`).
+    pub last_out: Option<LastOut>,
+}
+
+impl Staging {
+    /// Test hook: forgets every readback in flight, as if none had finished yet.
+    #[cfg(test)]
+    pub fn forget_pending(&mut self) {
+        self.pending = [None, None];
+    }
+
+    fn row(&self) -> u32 {
+        (self.shape.0 * self.shape.2).div_ceil(256) * 256
+    }
+
+    /// Makes the buffers fit `(w, h, bpp)`; a change drops the old ones (and what they held).
+    fn ensure(&mut self, device: &wgpu::Device, shape: (u32, u32, u32)) {
+        if self.shape == shape && self.bufs.len() == 2 {
+            return;
+        }
+        self.shape = shape;
+        self.pending = [None, None];
+        self.next = 0;
+        let size = u64::from(self.row()) * u64::from(shape.1);
+        self.bufs = (0..2)
+            .map(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ffgl_staging"),
+                    size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+    }
+
+    /// Polls the device without waiting and returns the tight bytes of the newest finished
+    /// readback, if any.
+    pub fn harvest(&mut self, device: &wgpu::Device, shape: (u32, u32, u32)) -> Option<Vec<u8>> {
+        self.ensure(device, shape);
+        let _ = device.poll(wgpu::PollType::Poll);
+        let (w, h, bpp) = shape;
+        let row = self.row() as usize;
+        let mut out = None;
+        // Older slot first, so the newer finished one wins.
+        for k in [self.next, 1 - self.next] {
+            let Some(flag) = self.pending[k].as_ref() else {
+                continue;
+            };
+            match flag.load(Ordering::Acquire) {
+                0 => continue,
+                1 => {
+                    let mut v = Vec::with_capacity((w * h * bpp) as usize);
+                    if let Ok(data) = self.bufs[k].slice(..).get_mapped_range() {
+                        for y in 0..h as usize {
+                            v.extend_from_slice(&data[y * row..][..(w * bpp) as usize]);
+                        }
+                        out = Some(v);
+                    }
+                    self.bufs[k].unmap();
+                }
+                _ => {}
+            }
+            self.pending[k] = None;
+        }
+        out
+    }
+
+    /// Records the copy of `tex` into the free slot; None when both are still busy. Call
+    /// `start` with the slot after submitting `enc`.
+    pub fn copy_in(
+        &mut self,
+        enc: &mut wgpu::CommandEncoder,
+        tex: &wgpu::Texture,
+    ) -> Option<usize> {
+        let k = self.next;
+        if self.pending[k].is_some() {
+            return None;
+        }
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.bufs[k],
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.row()),
+                    rows_per_image: Some(self.shape.1),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.shape.0,
+                height: self.shape.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.next = 1 - k;
+        Some(k)
+    }
+
+    /// Starts the mapping of a slot whose copy was submitted.
+    pub fn start(&mut self, k: usize) {
+        let flag = Arc::new(AtomicU8::new(0));
+        let f = flag.clone();
+        self.bufs[k]
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                f.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release);
+            });
+        self.pending[k] = Some(flag);
+    }
+}
 
 #[derive(Default)]
 struct Catalog {
@@ -196,11 +342,14 @@ impl FfglHost {
             return Some(s.fx.clone());
         }
         let entry = self.entry_of(&e.kind)?;
-        let fx = Arc::new(Mutex::new(FfglEffect::new(
-            &entry.path,
-            &vjc_ffgl::helper_path(),
-            TIMEOUT,
-        )));
+        let fx = Arc::new(Handle {
+            fx: Mutex::new(FfglEffect::new(
+                &entry.path,
+                &vjc_ffgl::helper_path(),
+                TIMEOUT,
+            )),
+            rb: Mutex::default(),
+        });
         rack.insert(
             e.id,
             Slot {

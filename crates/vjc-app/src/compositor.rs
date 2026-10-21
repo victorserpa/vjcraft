@@ -1278,6 +1278,11 @@ impl Fx {
                             mapped_at_creation: false,
                         }));
                 }
+                // Readback without waiting: pick up a finished earlier frame, then queue this
+                // one. Until some data exists the frame passes through.
+                let (w, h) = (scratch[tmp].0.width(), scratch[tmp].0.height());
+                let Ok(mut rb) = f.rb.lock() else { continue };
+                let raw = rb.harvest(device, (w, h, bpp));
                 mix_draw(
                     device,
                     queue,
@@ -1288,46 +1293,31 @@ impl Fx {
                     [0.0; 4],
                 );
                 self.mix_next += 1;
-                // The copy was drawn into `enc`: send it before reading.
+                let slot = rb.copy_in(enc, &scratch[tmp].0);
+                // The copy was drawn into `enc`: send it before mapping.
                 let done =
                     std::mem::replace(enc, device.create_command_encoder(&Default::default()));
                 queue.submit(Some(done.finish()));
-                let Some((w, h, raw)) =
-                    Compositor::read_texture_bpp(device, queue, &scratch[tmp].0, bpp)
-                else {
-                    continue;
-                };
-                let rgba = if bpp == 8 { half_to_rgba8(&raw) } else { raw };
-                let Ok(mut f) = f.lock() else { continue };
-                f.note = (in_size != size).then(|| {
-                    format!(
-                        "Input size {}x{} differs from {}x{}",
-                        in_size.0, in_size.1, size.0, size.1
-                    )
-                });
-                let res = f.process(&vjc_ffgl::Frame { w, h, rgba });
-                if f.status != vjc_ffgl::Status::Running {
-                    continue;
+                if let Some(k) = slot {
+                    rb.start(k);
                 }
-                let bytes = if bpp == 8 {
-                    rgba8_to_half(&res.rgba)
+                // No readback ready yet: keep showing the last plugin result, not the raw input.
+                if let Some(raw) = raw {
+                    drop(rb);
+                    if !ffgl_process(f, raw, (w, h, bpp), (in_size, size), queue, &scratch[out].0) {
+                        continue;
+                    }
                 } else {
-                    res.rgba
-                };
-                queue.write_texture(
-                    scratch[out].0.as_image_copy(),
-                    &bytes,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(w * bpp),
-                        rows_per_image: Some(h),
-                    },
-                    wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                    match &rb.last_out {
+                        Some((shape, at, b))
+                            if *shape == (w, h, bpp)
+                                && at.elapsed() < crate::ffgl_host::LAST_OUT_MAX_AGE =>
+                        {
+                            write_rgba(queue, &scratch[out].0, b, w, h, bpp);
+                        }
+                        _ => continue,
+                    }
+                }
             } else if let Some(passes) = self.passes.get(&e.kind) {
                 let base = e.persistent.map(|id| persist_key(id, self.persist_scope));
                 let names = vjc_fx::targets_of(passes);
@@ -3561,6 +3551,61 @@ impl Compositor {
     ) {
         self.fx.ml.set_mask(device, queue, key, size, data);
     }
+}
+
+/// Runs the plugin on read-back pixels and uploads its output into `out`; keeps a copy for
+/// frames whose readback is not ready yet. False when the frame should pass through.
+fn ffgl_process(
+    handle: &crate::ffgl_host::Handle,
+    raw: Vec<u8>,
+    (w, h, bpp): (u32, u32, u32),
+    (in_size, size): ((u32, u32), (u32, u32)),
+    queue: &wgpu::Queue,
+    out: &wgpu::Texture,
+) -> bool {
+    let rgba = if bpp == 8 { half_to_rgba8(&raw) } else { raw };
+    let Ok(mut f) = handle.lock() else {
+        return false;
+    };
+    f.note = (in_size != size).then(|| {
+        format!(
+            "Input size {}x{} differs from {}x{}",
+            in_size.0, in_size.1, size.0, size.1
+        )
+    });
+    let res = f.process(&vjc_ffgl::Frame { w, h, rgba });
+    if f.status != vjc_ffgl::Status::Running {
+        return false;
+    }
+    drop(f);
+    let bytes = if bpp == 8 {
+        rgba8_to_half(&res.rgba)
+    } else {
+        res.rgba
+    };
+    write_rgba(queue, out, &bytes, w, h, bpp);
+    if let Ok(mut rb) = handle.rb.lock() {
+        rb.last_out = Some(((w, h, bpp), std::time::Instant::now(), bytes));
+    }
+    true
+}
+
+/// Uploads tightly packed pixels into the whole of `tex`.
+fn write_rgba(queue: &wgpu::Queue, tex: &wgpu::Texture, bytes: &[u8], w: u32, h: u32, bpp: u32) {
+    queue.write_texture(
+        tex.as_image_copy(),
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * bpp),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 #[cfg(test)]

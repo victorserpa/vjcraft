@@ -105,7 +105,7 @@ struct Opts {
     dry_wet: f32,
     fmt: wgpu::TextureFormat,
     place: Place,
-    /// Frames rendered; the plugin's result shows one frame late.
+    /// Frames rendered; the plugin's result shows two frames late (readback + helper).
     frames: u32,
 }
 
@@ -116,7 +116,7 @@ impl Default for Opts {
             dry_wet: 1.0,
             fmt: wgpu::TextureFormat::Rgba8Unorm,
             place: Place::Layer,
-            frames: 2,
+            frames: 3,
         }
     }
 }
@@ -213,6 +213,7 @@ fn render_with(host: &FfglHost, o: Opts) -> Option<(Vec<u8>, vjc_model::Effect)>
             fx.lock().unwrap().settle(); // let the helper finish the frame in flight
         }
         comp.render_groups(&device, &queue, &layers, &groups, &on_master, 1.0);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely()); // the readback is ready
     }
     let (_, _, out) = comp.read_rgba(&device, &queue)?;
     Some((out, effect))
@@ -344,7 +345,7 @@ fn a_layer_with_the_ffgl_effect_comes_out_inverted() {
 }
 
 #[test]
-fn the_first_frame_passes_through_and_the_second_shows_it_inverted() {
+fn the_first_frame_passes_through_and_the_third_shows_it_inverted() {
     let (host, _dir) = scanned("lag");
     let one = Opts {
         frames: 1,
@@ -397,6 +398,137 @@ fn saving_prefs_with_ffgl_folders_starts_a_scan_of_those_folders_only() {
         dir.join("cache.json").exists(),
         "the scan ran on the isolated cache"
     );
+}
+
+/// Renders one flat-colored frame per entry of `frames` (color, size) through one compositor
+/// with the fixture on the layer; returns the first pixel of the output of each frame. The GPU
+/// and the helper are settled between frames, so the readback of a frame is always ready.
+fn stream(host: &FfglHost, frames: &[(u8, u32)]) -> Option<Vec<[u8; 4]>> {
+    stream_skipping(host, frames, &[])
+}
+
+/// `stream`, but before each frame listed in `not_ready` the finished readbacks are dropped,
+/// as when the GPU has not caught up yet.
+fn stream_skipping(
+    host: &FfglHost,
+    frames: &[(u8, u32)],
+    not_ready: &[usize],
+) -> Option<Vec<[u8; 4]>> {
+    stream_inner(host, frames, not_ready, None)
+}
+
+/// `stream_skipping` of one not-ready frame `at`, after a pause longer than the kept output lives.
+fn stream_paused(host: &FfglHost, frames: &[(u8, u32)], at: usize) -> Option<Vec<[u8; 4]>> {
+    stream_inner(host, frames, &[at], Some(at))
+}
+
+fn stream_inner(
+    host: &FfglHost,
+    frames: &[(u8, u32)],
+    not_ready: &[usize],
+    pause_before: Option<usize>,
+) -> Option<Vec<[u8; 4]>> {
+    let (device, queue) = gpu()?;
+    let id = vjc_ffgl::effect_id(&host.effect_entries()[0]);
+    let effect = host.new_effect(&id).unwrap();
+    let mut lib = crate::fx::FxLib::new();
+    lib.ffgl = host.clone();
+    let mut ml = crate::ml_fx::MlHub::new();
+    let ctx = vjc_core::anim::AnimCtx::default();
+    let mut comp = Compositor::with_format(&device, N, N, wgpu::TextureFormat::Rgba8Unorm);
+    let mut outs = vec![];
+    for (ver, &(c, n)) in frames.iter().enumerate() {
+        let draws = crate::draw_chain(
+            &mut lib,
+            &mut ml,
+            None,
+            std::slice::from_ref(&effect),
+            0.0,
+            (n, n),
+            &ctx,
+        );
+        if let Some(fx) = host.shared(&effect) {
+            let fx = fx.lock().unwrap();
+            if let vjc_ffgl::Status::Stopped(vjc_ffgl::HostError::Plugin(m)) = &fx.status
+                && m.contains("OpenGL context")
+            {
+                return None;
+            }
+        }
+        if pause_before == Some(ver) {
+            std::thread::sleep(crate::ffgl_host::LAST_OUT_MAX_AGE * 2);
+        }
+        if not_ready.contains(&ver)
+            && let Some(fx) = host.shared(&effect)
+        {
+            fx.rb.lock().unwrap().forget_pending();
+        }
+        comp.resize(&device, n, n);
+        let src: Vec<u8> = [c, c, c, 255].repeat((n * n) as usize);
+        let layer = LayerDraw {
+            id: uuid::Uuid::from_u128(1),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            fit: FitMode::Stretch,
+            effects: draws,
+            frame: Some((n, n, &src, ver as u64 + 1)),
+            generator: None,
+            transition: None,
+            transform: vjc_core::transform::Affine::IDENTITY,
+            channels: Default::default(),
+            mask: Default::default(),
+            orient: Default::default(),
+        };
+        comp.render_groups(&device, &queue, &[layer], &[], &[], 1.0);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        if let Some(fx) = host.shared(&effect) {
+            fx.lock().unwrap().settle();
+        }
+        let (_, _, out) = comp.read_rgba(&device, &queue)?;
+        outs.push([out[0], out[1], out[2], out[3]]);
+    }
+    Some(outs)
+}
+
+#[test]
+fn steady_state_output_is_the_input_of_two_frames_earlier_inverted() {
+    let (host, _dir) = scanned("async2");
+    let colors = [20u8, 50, 80, 110, 140, 170, 200];
+    let frames: Vec<(u8, u32)> = colors.iter().map(|&c| (c, N)).collect();
+    let Some(outs) = stream(&host, &frames) else {
+        return;
+    };
+    assert_eq!(outs[0][0], colors[0], "frame 0 passes through");
+    for k in 2..colors.len() {
+        let want = 255 - i32::from(colors[k - 2]);
+        for ch in 0..3 {
+            assert!(
+                (want - i32::from(outs[k][ch])).abs() <= 2,
+                "frame {k} ch {ch}: {:?}, want {want} (input of frame {})",
+                outs[k],
+                k - 2
+            );
+        }
+    }
+}
+
+#[test]
+fn a_size_change_mid_stream_does_not_panic_and_passes_through_for_two_frames() {
+    let (host, _dir) = scanned("asyncsize");
+    let mut frames: Vec<(u8, u32)> = (0..4).map(|k| (20 + 30 * k, N)).collect();
+    frames.extend([(200, 32), (200, 32), (200, 32)]);
+    let Some(outs) = stream(&host, &frames) else {
+        return;
+    };
+    for k in [4, 5] {
+        for ch in 0..3 {
+            assert!(
+                (i32::from(outs[k][ch]) - 200).abs() <= 2,
+                "frame {k} after the resize passes through: {:?}",
+                outs[k]
+            );
+        }
+    }
 }
 
 /// Cost of one CPU round trip at 1080p (GPU readback + helper + upload). Run by hand:
@@ -491,5 +623,39 @@ fn readback_cost_1080p() {
             .iter()
             .map(|t| t.as_secs_f64() * 1e3)
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_frame_without_a_ready_readback_shows_the_last_plugin_output() {
+    let (host, _dir) = scanned("notready");
+    let colors = [20u8, 50, 80, 110, 140];
+    let frames: Vec<(u8, u32)> = colors.iter().map(|&c| (c, N)).collect();
+    let Some(outs) = stream_skipping(&host, &frames, &[4]) else {
+        return;
+    };
+    // Frame 3 showed inverted colors[1]; frame 4 has no readback and must repeat it,
+    // not show its raw input.
+    for ch in 0..3 {
+        assert_eq!(
+            outs[4][ch], outs[3][ch],
+            "frame 4 ch {ch}: {:?} vs {:?}",
+            outs[4], outs[3]
+        );
+    }
+}
+
+#[test]
+fn a_late_readback_after_a_pause_passes_through_instead_of_an_old_output() {
+    let (host, _dir) = scanned("stale");
+    let colors = [20u8, 50, 80, 110, 140];
+    let frames: Vec<(u8, u32)> = colors.iter().map(|&c| (c, N)).collect();
+    let Some(outs) = stream_paused(&host, &frames, 4) else {
+        return;
+    };
+    assert_eq!(
+        outs[4][0], colors[4],
+        "frame 4 after a pause: {:?}",
+        outs[4]
     );
 }
