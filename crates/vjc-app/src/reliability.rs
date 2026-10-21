@@ -109,7 +109,7 @@ pub fn panic_report(info: &std::panic::PanicHookInfo<'_>) -> String {
         thread.name().unwrap_or("<unnamed>"),
         recovery_note(),
         std::backtrace::Backtrace::force_capture()
-    )
+    ) + &crate::logfile::tail_section(crate::logfile::log_path().as_deref())
 }
 
 /// Installs the panic hook: the default hook output stays; then a report goes to
@@ -118,6 +118,7 @@ pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
+        crate::logfile::drain();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(dir) = crash_dir() {
                 let path = write_unique(&dir, "", &panic_report(info));

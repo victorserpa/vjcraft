@@ -30,6 +30,7 @@ mod hold;
 mod icons;
 mod io_monitor;
 mod link_io;
+mod logfile;
 mod mcp;
 mod midi_io;
 mod ml_fx;
@@ -2565,6 +2566,15 @@ impl State {
         {
             h = !h;
             self.set_help(h);
+        }
+        #[cfg(target_os = "macos")]
+        if ui.button("Show Logs in Finder").clicked() {
+            ui.close();
+            if let Some(p) = logfile::log_path()
+                && let Ok(mut c) = std::process::Command::new("open").arg("-R").arg(p).spawn()
+            {
+                std::thread::spawn(move || c.wait());
+            }
         }
         if new != l {
             self.prefs.layouts.current = new;
@@ -12637,6 +12647,11 @@ fn main() -> eframe::Result {
     reliability::start_watchdog();
     if args.iter().any(|a| a == "--mcp") {
         std::process::exit(mcp::run(&args));
+    }
+    if let Some(dir) = logfile::log_path().and_then(|p| p.parent().map(Path::to_path_buf))
+        && logfile::install(&dir).is_none()
+    {
+        eprintln!("VJCraft: no log file, logging to stderr only");
     }
     let (prefs, warn) = match prefs_path() {
         Some(p) => Prefs::load(&p),
