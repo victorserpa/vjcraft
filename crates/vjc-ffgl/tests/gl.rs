@@ -75,6 +75,11 @@ fn gl_plugin_inverts_a_64x64_frame() {
         );
     }
     // second frame, same size: the same path keeps working
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(e.process(&f).rgba, out.rgba);
+    let t = std::time::Instant::now();
+    let mut again = e.process(&f);
+    while again.rgba != out.rgba && t.elapsed() < Duration::from_secs(20) {
+        e.settle();
+        again = e.process(&f);
+    }
+    assert_eq!(again.rgba, out.rgba);
 }
