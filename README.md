@@ -41,6 +41,11 @@ cargo test
 macOS (Apple Silicon) is tested. Windows and Linux builds are in progress; please report what
 works and what breaks.
 
+## Release and testing
+
+- Release gates for macOS 1.0: `docs/release/1.0-checklist.md`.
+- Hardware test guide for testers with a real rig: `docs/testing/hardware-test-guide.md`.
+
 ## Contributing
 
 See `CONTRIBUTING.md`. Bugs and ideas go to GitHub Issues.
