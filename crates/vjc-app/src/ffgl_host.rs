@@ -54,9 +54,17 @@ pub struct Staging {
     /// Per slot: the mapping in flight (0 pending, 1 ready, 2 failed).
     pending: [Option<Arc<AtomicU8>>; 2],
     next: usize,
+    /// Last plugin output (width, height, texture bytes), shown again while no readback is ready.
+    pub last_out: Option<(u32, u32, Vec<u8>)>,
 }
 
 impl Staging {
+    /// Test hook: forgets every readback in flight, as if none had finished yet.
+    #[cfg(test)]
+    pub fn forget_pending(&mut self) {
+        self.pending = [None, None];
+    }
+
     fn row(&self) -> u32 {
         (self.shape.0 * self.shape.2).div_ceil(256) * 256
     }

@@ -404,6 +404,16 @@ fn saving_prefs_with_ffgl_folders_starts_a_scan_of_those_folders_only() {
 /// with the fixture on the layer; returns the first pixel of the output of each frame. The GPU
 /// and the helper are settled between frames, so the readback of a frame is always ready.
 fn stream(host: &FfglHost, frames: &[(u8, u32)]) -> Option<Vec<[u8; 4]>> {
+    stream_skipping(host, frames, &[])
+}
+
+/// `stream`, but before each frame listed in `not_ready` the finished readbacks are dropped,
+/// as when the GPU has not caught up yet.
+fn stream_skipping(
+    host: &FfglHost,
+    frames: &[(u8, u32)],
+    not_ready: &[usize],
+) -> Option<Vec<[u8; 4]>> {
     let (device, queue) = gpu()?;
     let id = vjc_ffgl::effect_id(&host.effect_entries()[0]);
     let effect = host.new_effect(&id).unwrap();
@@ -430,6 +440,11 @@ fn stream(host: &FfglHost, frames: &[(u8, u32)]) -> Option<Vec<[u8; 4]>> {
             {
                 return None;
             }
+        }
+        if not_ready.contains(&ver)
+            && let Some(fx) = host.shared(&effect)
+        {
+            fx.rb.lock().unwrap().forget_pending();
         }
         comp.resize(&device, n, n);
         let src: Vec<u8> = [c, c, c, 255].repeat((n * n) as usize);
@@ -592,4 +607,23 @@ fn readback_cost_1080p() {
             .map(|t| t.as_secs_f64() * 1e3)
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn a_frame_without_a_ready_readback_shows_the_last_plugin_output() {
+    let (host, _dir) = scanned("notready");
+    let colors = [20u8, 50, 80, 110, 140];
+    let frames: Vec<(u8, u32)> = colors.iter().map(|&c| (c, N)).collect();
+    let Some(outs) = stream_skipping(&host, &frames, &[4]) else {
+        return;
+    };
+    // Frame 3 showed inverted colors[1]; frame 4 has no readback and must repeat it,
+    // not show its raw input.
+    for ch in 0..3 {
+        assert_eq!(
+            outs[4][ch], outs[3][ch],
+            "frame 4 ch {ch}: {:?} vs {:?}",
+            outs[4], outs[3]
+        );
+    }
 }
