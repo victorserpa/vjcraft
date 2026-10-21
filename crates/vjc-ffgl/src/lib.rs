@@ -28,6 +28,7 @@ pub struct Helper {
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<Response>,
+    wait_err_logged: bool,
 }
 
 /// Helper binary next to the running executable.
@@ -71,7 +72,12 @@ impl Helper {
                 }
             }
         });
-        Ok(Helper { child, stdin, rx })
+        Ok(Helper {
+            child,
+            stdin,
+            rx,
+            wait_err_logged: false,
+        })
     }
 
     /// One request/response with a deadline. On timeout the helper is killed.
@@ -124,7 +130,14 @@ impl Helper {
 
     /// True once the process has exited (checked without blocking).
     pub fn exited(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
+        let r = self.child.try_wait();
+        if let Err(e) = &r
+            && !self.wait_err_logged
+        {
+            self.wait_err_logged = true;
+            eprintln!("vjc-ffgl: try_wait failed, relying on reader EOF: {e}");
+        }
+        has_exited(&r)
     }
 
     pub fn kill(&mut self) {
@@ -666,5 +679,22 @@ impl Drop for FfglEffect {
         for p in &self.shm_path {
             let _ = std::fs::remove_file(p);
         }
+    }
+}
+
+/// A `try_wait` error is not an exit: the reader-EOF path catches a real death.
+fn has_exited(r: &std::io::Result<Option<std::process::ExitStatus>>) -> bool {
+    matches!(r, Ok(Some(_)))
+}
+
+#[cfg(test)]
+mod exited_tests {
+    use super::has_exited;
+
+    #[test]
+    fn try_wait_error_is_not_exited() {
+        let err = Err(std::io::Error::other("transient"));
+        assert!(!has_exited(&err));
+        assert!(!has_exited(&Ok(None)));
     }
 }
