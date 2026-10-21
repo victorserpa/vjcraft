@@ -24,6 +24,10 @@ cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+# Info.plist versions must be dot-separated integers: drop a "-alpha.1" style suffix, and use
+# the commit count as a build number that always grows.
+SHORT_VERSION=${VERSION%%-*}
+BUILD_NUMBER=$(git rev-list --count HEAD 2>/dev/null || echo 1)
 DIST=target/dist
 APP="$DIST/VJCraft.app"
 DMG="$DIST/VJCraft-$VERSION-macos.dmg"
@@ -94,8 +98,8 @@ cat > "$APP/Contents/Info.plist" <<PL
   <key>CFBundleExecutable</key><string>vjcraft</string>
   <key>CFBundleIconFile</key><string>VJCraft</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$SHORT_VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>VJCraft uses the local network for NDI video, Ableton Link tempo sync, OSC and Art-Net.</string>
