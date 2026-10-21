@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 pub const KEEP: usize = 5;
 pub const MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -124,14 +125,28 @@ pub fn tail_section(path: Option<&Path>) -> String {
     }
 }
 
+/// Read end of the stderr pipe while the tee runs; -1 otherwise.
+static READ_FD: AtomicI32 = AtomicI32::new(-1);
+/// Bytes taken from the pipe but not yet forwarded to the terminal and queued.
+static TEE_BUSY: AtomicBool = AtomicBool::new(false);
+/// Lines queued for the file writer and not yet written.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+/// Lines dropped because the file writer fell behind (slow or stuck disk).
+static DROPPED: AtomicUsize = AtomicUsize::new(0);
+const QUEUE: usize = 4096;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Starts the tee. Returns the log path, or None (stderr only) on any failure.
 #[cfg(unix)]
 pub fn install(dir: &Path) -> Option<PathBuf> {
-    use std::io::{BufRead, BufReader};
-    use std::os::fd::FromRawFd;
-    let mut w = LogWriter::open(dir, KEEP, MAX_BYTES)?;
+    let w = LogWriter::open(dir, KEEP, MAX_BYTES)?;
     let mut fds = [0i32; 2];
-    // SAFETY: plain libc fd plumbing; every fd is checked and owned by a File below.
+    // SAFETY: plain libc fd plumbing; every fd is checked and closed or owned below.
     unsafe {
         if libc::pipe(fds.as_mut_ptr()) != 0 {
             return None;
@@ -146,26 +161,105 @@ pub fn install(dir: &Path) -> Option<PathBuf> {
             return None;
         }
         libc::close(fds[1]);
-        let mut orig = File::from_raw_fd(orig);
-        let reader = File::from_raw_fd(fds[0]);
-        std::thread::Builder::new()
-            .name("log-tee".into())
-            .spawn(move || {
-                let mut r = BufReader::new(reader);
-                let mut buf = Vec::new();
-                while matches!(r.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
-                    let _ = orig.write_all(&buf);
-                    let secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    let text = String::from_utf8_lossy(&buf);
-                    w.write_line(secs, text.trim_end_matches(['\n', '\r']));
-                    buf.clear();
-                }
-            })
-            .ok()?;
+        spawn_tee(fds[0], orig, 2, w)?;
+        libc::atexit(drain_at_exit);
     }
     Some(dir.join(NAME))
+}
+
+#[cfg(unix)]
+extern "C" fn drain_at_exit() {
+    drain();
+}
+
+/// Copies `read_fd` to `orig` (the real stderr) and queues each line for the file.
+/// The disk write runs on its own thread with a bounded queue, so a slow disk drops
+/// log lines instead of blocking stderr writers. If the tee stops, `target` is
+/// pointed back at `orig` so writers never block on an undrained pipe.
+#[cfg(unix)]
+fn spawn_tee(read_fd: i32, orig: i32, target: i32, mut w: LogWriter) -> Option<()> {
+    use std::os::fd::FromRawFd;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, String)>(QUEUE);
+    std::thread::Builder::new()
+        .name("log-file".into())
+        .spawn(move || {
+            for (secs, line) in rx {
+                w.write_line(secs, &line);
+                PENDING.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+        .ok()?;
+    READ_FD.store(read_fd, Ordering::SeqCst);
+    std::thread::Builder::new()
+        .name("log-tee".into())
+        .spawn(move || {
+            // SAFETY: both fds were handed over to this thread.
+            let mut reader = unsafe { File::from_raw_fd(read_fd) };
+            let mut out = unsafe { File::from_raw_fd(libc::dup(orig)) };
+            let mut chunk = [0u8; 8192];
+            let mut line = Vec::new();
+            loop {
+                let n = match std::io::Read::read(&mut reader, &mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                TEE_BUSY.store(true, Ordering::SeqCst);
+                let _ = out.write_all(&chunk[..n]);
+                for &b in &chunk[..n] {
+                    if b == b'\n' {
+                        let text = String::from_utf8_lossy(&line)
+                            .trim_end_matches('\r')
+                            .to_string();
+                        line.clear();
+                        PENDING.fetch_add(1, Ordering::SeqCst);
+                        if tx.try_send((now_secs(), text)).is_err() {
+                            PENDING.fetch_sub(1, Ordering::SeqCst);
+                            DROPPED.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else {
+                        line.push(b);
+                    }
+                }
+                TEE_BUSY.store(false, Ordering::SeqCst);
+            }
+            READ_FD.store(-1, Ordering::SeqCst);
+            // SAFETY: restores the target fd to the real stderr; `orig` stays open.
+            unsafe {
+                libc::dup2(orig, target);
+            }
+        })
+        .ok()?;
+    Some(())
+}
+
+/// Waits (at most 200 ms) until stderr written so far reached the terminal and the
+/// log file. Called at exit and in the panic hook before the crash report reads the tail.
+pub fn drain() {
+    #[cfg(unix)]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let mut idle = 0;
+        while std::time::Instant::now() < deadline {
+            let fd = READ_FD.load(Ordering::SeqCst);
+            let mut queued: libc::c_int = 0;
+            // SAFETY: FIONREAD on an fd we own; a closed fd only makes it fail.
+            let pipe_empty = fd < 0
+                || unsafe { libc::ioctl(fd, libc::FIONREAD, &mut queued) } != 0
+                || queued == 0;
+            if pipe_empty && !TEE_BUSY.load(Ordering::SeqCst) && PENDING.load(Ordering::SeqCst) == 0
+            {
+                idle += 1;
+                if idle >= 2 {
+                    return;
+                }
+            } else {
+                idle = 0;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -244,6 +338,31 @@ mod tests {
         assert!(rep.contains("msg 100"));
         assert!(!rep.contains("msg 99\n"));
         assert!(rep.contains("last 200 lines"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_flushes_pipe_to_file() {
+        let d = tmp("drain");
+        let w = LogWriter::open(&d, KEEP, MAX_BYTES).unwrap();
+        let mut fds = [0i32; 2];
+        // SAFETY: test-only fd plumbing.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let null = std::fs::File::create("/dev/null").unwrap();
+            let orig = libc::dup(std::os::fd::AsRawFd::as_raw_fd(&null));
+            let target = libc::dup(fds[1]);
+            spawn_tee(fds[0], orig, target, w).unwrap();
+            let mut wr = <File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]);
+            for i in 0..2000 {
+                writeln!(wr, "line {i}").unwrap();
+            }
+            drain();
+            let text = std::fs::read_to_string(d.join(NAME)).unwrap();
+            assert!(text.contains("line 1999"), "tail missing after drain");
+            libc::close(target);
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

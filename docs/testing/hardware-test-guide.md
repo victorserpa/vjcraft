@@ -103,4 +103,4 @@ Use the app's own tools only. Build a realistic show: 4 or more layers of mixed 
 6. At the end check `~/Library/Application Support/VJCraft/crashes/`. Expected: no new files. A `stall-*.txt` means the UI froze for more than 2 s.
 7. If the app crashed and relaunched on its own, note the time and send the crash file; the show should have resumed with the project restored.
 8. Quit with File menu or Cmd+Q and confirm it exits cleanly.
-Send: the stderr file, the table of readings, crash files, and the project.
+Send: the log files (View > Show Logs in Finder), the table of readings, crash files, and the project.

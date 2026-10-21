@@ -2570,8 +2570,10 @@ impl State {
         #[cfg(target_os = "macos")]
         if ui.button("Show Logs in Finder").clicked() {
             ui.close();
-            if let Some(p) = logfile::log_path() {
-                let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
+            if let Some(p) = logfile::log_path()
+                && let Ok(mut c) = std::process::Command::new("open").arg("-R").arg(p).spawn()
+            {
+                std::thread::spawn(move || c.wait());
             }
         }
         if new != l {
