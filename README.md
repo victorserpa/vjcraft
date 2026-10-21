@@ -1,7 +1,7 @@
 # VJCraft
 
 An open-source, GPL-3.0 live-visuals (VJ) application written in Rust.
-Free, open and built for the long show. Alpha release (v0.1.0).
+Free, open and built for the long show. Alpha release (v0.1.0-alpha.1).
 
 **Clean-room.** The design comes from public documentation and observation of file
 formats only. No third-party code, assets, names or icons are included.
