@@ -1,6 +1,6 @@
 // Minimal FFGL 2.x style test plugin written from the documented ABI. Built by the tests
 // with rustc --crate-type cdylib. Params: 0 Gain (default 0.5, output = input * 2 * gain),
-// 1 Crash (>0.5: abort while processing; exactly 0.75: abort while setting, exactly 0.25: SETPARAMETER returns FF_FAIL), 2 Hang (>0.5: never return while processing).
+// 1 Crash (>0.5: crash while processing; exactly 0.75: crash while setting, exactly 0.25: SETPARAMETER returns FF_FAIL), 2 Hang (>0.5: never return while processing).
 use std::ffi::c_void;
 
 #[repr(C)]
@@ -146,13 +146,16 @@ pub unsafe extern "C" fn plugMain(code: u32, v: FFMixed, inst: *mut c_void) -> F
 /// Kills the host process by a signal, like a crashing plugin would. SIGKILL, not abort():
 /// macOS writes no crash report for it, so test runs do not flood ReportCrash.
 fn crash() -> ! {
-    unsafe extern "C" {
-        fn getpid() -> i32;
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    // SAFETY: plain libc calls on our own pid.
-    unsafe {
-        kill(getpid(), 9);
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn getpid() -> i32;
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: plain libc calls on our own pid.
+        unsafe {
+            kill(getpid(), 9);
+        }
     }
     std::process::abort()
 }

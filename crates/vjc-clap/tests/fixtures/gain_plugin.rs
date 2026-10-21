@@ -1,6 +1,6 @@
 // Minimal CLAP effect written from the documented ABI (no header, no crate). Built by the
 // tests with rustc --crate-type cdylib. Params (CLAP ids 0..3):
-// 0 Gain (0..4, default 1.0: output = input * gain), 1 Crash (>0.5: abort while processing),
+// 0 Gain (0..4, default 1.0: output = input * gain), 1 Crash (>0.5: crash while processing),
 // 2 Hang (>0.5: sleep 30 s while processing).
 use std::ffi::{c_char, c_void};
 
@@ -380,13 +380,16 @@ unsafe extern "C" fn p_ext(_: *const Plugin, id: *const c_char) -> *const c_void
 /// Kills the host process by a signal, like a crashing plugin would. SIGKILL, not abort():
 /// macOS writes no crash report for it, so test runs do not flood ReportCrash.
 fn crash() -> ! {
-    unsafe extern "C" {
-        fn getpid() -> i32;
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    // SAFETY: plain libc calls on our own pid.
-    unsafe {
-        kill(getpid(), 9);
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn getpid() -> i32;
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: plain libc calls on our own pid.
+        unsafe {
+            kill(getpid(), 9);
+        }
     }
     std::process::abort()
 }
